@@ -102,7 +102,7 @@
 
 | ID | 要件 | フェーズ | 作り込み / 検証 | MASVS |
 | --- | --- | --- | --- | --- |
-| SEC-APP-01 | アプリがバックグラウンドに移るとき、アプリ切り替え画面のスナップショットに文字起こしやノートが写らないように、内容を隠す画面に切り替える | MVP | 実装 / 実機 | PLATFORM |
+| SEC-APP-01 | アプリがバックグラウンドに移るとき、アプリ切り替え画面のスナップショットに D1〜D3 の情報（文字起こし・要約・ノートに加え、会議タイトルなどのメタデータ）が写らないように、内容を隠す画面に切り替える。どの画面を表示中でも適用し、会議一覧を表示中の場合も、タイトルに含まれる案件名や参加者名が残らないようにする | MVP | 実装 / 実機 | PLATFORM |
 | SEC-APP-02 | アプリのロック（Face ID / Touch ID / パスコード。LocalAuthentication）を任意で設定できる。ロック中でも録音状態の表示と停止はできる（録音を失わない） | P2 | 設計 / 単体・実機 | AUTH |
 | SEC-PLT-01 | 文字起こしやノートをコピーするときは、ユニバーサルクリップボード（他の Apple 端末への同期）を使わない（ペーストボードに端末内限定の指定をする）。有効期限も付ける | MVP | 実装 / 単体 | PLATFORM、PRIVACY |
 | SEC-PLT-02 | 文字起こし・要約・ノートの本文を Spotlight の索引や Siri の提案（App Intents・NSUserActivity の提供）に渡さない。会議タイトルも渡さない | MVP | 設計 / レビュー | PLATFORM、PRIVACY |
@@ -144,7 +144,7 @@
 
 | ID | 要件 | フェーズ | 作り込み / 検証 | MASVS |
 | --- | --- | --- | --- | --- |
-| SEC-SUP-01 | 依存は Swift Package Manager で管理し、`Package.resolved` をコミットして版を固定する。版の範囲指定は「最新安定版を確認日付きで固定」し、更新は PR で差分を見て行う | MVP | 実装 / CI | CODE |
+| SEC-SUP-01 | すべての依存（ライブラリ・開発ツール・モデル）の版を固定し、更新は PR で差分を見て行う。版は「最新安定版を確認日付きで固定」する。固定の方法は区分ごとに定める。アプリに組み込むライブラリは Swift Package Manager で管理し、`Package.resolved` をコミットする。SPM 以外の開発ツール（Homebrew で導入する gitleaks CLI など）とモデルは、版・取得元（必要に応じて SHA-256）を台帳に記録し、検査スクリプトで照合する（[dependencies-and-costs.md](dependencies-and-costs.md) §4 手順 5） | MVP | 実装 / CI | CODE |
 | SEC-SUP-02 | 依存を追加する前に、ライセンス（許可: MIT / Apache-2.0 / BSD 系。その他はオーナーに確認）、有償要素、通信の有無、保守状況を確認し、[dependencies-and-costs.md](dependencies-and-costs.md) に記録する | MVP | 設計 / レビュー・CI（ライセンス確認） | CODE |
 | SEC-SUP-03 | 秘密情報の検出（gitleaks）をコミット前（pre-commit）と CI で実行する | MVP | CI | CODE |
 | SEC-SUP-04 | `.gitignore` で、録音データ（`*.wav` など）・個人の Xcode 設定（`xcuserdata`）・ビルド成果物・`.env` を管理対象から外す | MVP | 実装 / レビュー | CODE |
