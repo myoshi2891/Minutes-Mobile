@@ -109,6 +109,7 @@
 | SEC-PLT-03 | ノート編集などの入力欄では、サードパーティー製キーボードの使用を禁止できるようにする（既定は禁止。キーボードの拡張機能は入力内容を外部へ送れるため） | P2 | 設計 / 実機 | PLATFORM |
 | SEC-PLT-04 | URL スキーム・ユニバーサルリンク・共有拡張は MVP では提供しない。追加する場合は、受け取る値をすべて外部入力として検証する | MVP | 設計 | PLATFORM |
 | SEC-PLT-05 | WebView を使わない。必要になったら、ローカルの内容だけを表示し、JavaScript を無効にする | MVP | 設計 | PLATFORM |
+| SEC-PLT-06 | 会議タイトルなど D3 を入力する欄では、サードパーティー製キーボードの使用を禁止できるようにする。既定は禁止とする（SEC-PLT-03 の MVP 範囲の先行適用） | MVP | 設計 / 実機 | PLATFORM |
 
 ---
 
@@ -186,7 +187,7 @@
 | MASVS-CRYPTO | SEC-DAT-08、SEC-INT-01、SEC-KEY-01 | 独自の暗号化は P2 で再評価。SHA-256 は完全性検証用 |
 | MASVS-AUTH | SEC-APP-02 | アカウントはない（CON-06）。アプリロックのみ |
 | MASVS-NETWORK | SEC-NET-01〜06 | 通信しないことが基本。例外は SEC-NET-03・04 |
-| MASVS-PLATFORM | SEC-APP-01、SEC-PLT-01〜05、SEC-DAT-06、SEC-AI-03 | OS 機能を経由した流出の防止 |
+| MASVS-PLATFORM | SEC-APP-01、SEC-PLT-01〜06、SEC-DAT-06、SEC-AI-03 | OS 機能を経由した流出の防止 |
 | MASVS-CODE | SEC-INP 群、SEC-INT 群、SEC-AI-01・02、SEC-SUP-01〜04 | 依存管理と入力検証 |
 | MASVS-RESILIENCE | SEC-SUP-06 | 個人利用の段階では対象外 |
 | MASVS-PRIVACY | SEC-NET-01〜03・06、SEC-PRV 群、SEC-PLT-01・02、SEC-LOG-05 | 同意確認と端末内処理 |
