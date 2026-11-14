@@ -13,7 +13,8 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 - セキュリティ要件（SEC）と静的解析の禁止事項: `docs/01-requirements/security-requirements.md`
 - テスト要件（TST）と CI ゲート: `docs/01-requirements/test-requirements.md`
 - 依存・費用台帳（COST）と依存追加手順: `docs/01-requirements/dependencies-and-costs.md`
-- 基本設計・詳細設計: `docs/02-basic-design/`、`docs/03-detailed-design/`（未着手。作成予定の文書一覧が各 README にある）
+- 基本設計（MVP の 7 文書。設計決定は `BD-<領域>-nn`）: `docs/02-basic-design/`。入口は `README.md`（索引・OQ の解決状況）と `architecture.md`（全体構成・セキュリティとテストの注意点の総覧）
+- 詳細設計: `docs/03-detailed-design/`（未着手。方針は README にある）
 
 ## ビルド・テスト
 
@@ -54,8 +55,10 @@ xcodebuild ... test -only-testing:MinutesMobileTests/RecordingStateMachineTests/
 
 ```text
 録音 Chunk（WAV 原音）→ 文字起こしセグメント（Chunk 単位）→ 確定文字起こし（版番号付き）
-  → AI 議事録（P2、版管理・上書きしない）→ 手動ノート（P2、利用者所有。AI は書き込まない）
+  → AI 議事録（P2、版管理・上書きしない）
 ```
+
+**手動ノート（P2）は上の連鎖に含めない独立した原本**。利用者所有で AI・バックグラウンド処理は書き込まず、録音からは再生成できない。会議ディレクトリにノート単独のファイルとして保存し、復元・Markdown 書き出しができるようにする。文字起こし・AI 議事録の再生成でノートのファイルを変更・削除しない（FR-NOT-01・02・05）。
 
 - **Zero External Data Egress**: 音声・文字起こし・要約・ノートはどの段階でも端末外へ出ない。アプリコードはネットワーク API を使わない（例外は SEC-NET-03 / 04 のみで、通信コードは 1 つの型に集約する）
 - **Recording-First**: 録音の継続を他の全機能より優先する。文字起こし・UI・保存の不調で録音を止めない
