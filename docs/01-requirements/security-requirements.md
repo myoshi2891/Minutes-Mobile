@@ -106,10 +106,11 @@
 | SEC-APP-02 | アプリのロック（Face ID / Touch ID / パスコード。LocalAuthentication）を任意で設定できる。ロック中でも録音状態の表示と停止はできる（録音を失わない） | P2 | 設計 / 単体・実機 | AUTH |
 | SEC-PLT-01 | 文字起こしやノートをコピーするときは、ユニバーサルクリップボード（他の Apple 端末への同期）を使わない（ペーストボードに端末内限定の指定をする）。有効期限も付ける | MVP | 実装 / 単体 | PLATFORM、PRIVACY |
 | SEC-PLT-02 | 文字起こし・要約・ノートの本文を Spotlight の索引や Siri の提案（App Intents・NSUserActivity の提供）に渡さない。会議タイトルも渡さない | MVP | 設計 / レビュー | PLATFORM、PRIVACY |
-| SEC-PLT-03 | ノート編集などの入力欄では、サードパーティー製キーボードの使用を禁止できるようにする（既定は禁止。キーボードの拡張機能は入力内容を外部へ送れるため） | P2 | 設計 / 実機 | PLATFORM |
+| SEC-PLT-03 | P2 で追加するノート編集・検索などの入力欄にも、SEC-PLT-06 のサードパーティー製キーボードの禁止を適用する（キーボードの拡張機能は入力内容を外部へ送れるため。T-04）。利用者による解除は SEC-PLT-06 と同じく認めない | P2 | 設計 / 実機（TST-SEC-10） | PLATFORM |
 | SEC-PLT-04 | URL スキーム・ユニバーサルリンク・共有拡張は MVP では提供しない。追加する場合は、受け取る値をすべて外部入力として検証する | MVP | 設計 | PLATFORM |
 | SEC-PLT-05 | WebView を使わない。必要になったら、ローカルの内容だけを表示し、JavaScript を無効にする | MVP | 設計 | PLATFORM |
-| SEC-PLT-06 | 会議タイトルなど D3 を入力する欄では、サードパーティー製キーボードの使用を禁止できるようにする。既定は禁止とする（SEC-PLT-03 の MVP 範囲の先行適用） | MVP | 設計 / 実機 | PLATFORM |
+| SEC-PLT-06 | アプリ内のすべての入力欄（会議タイトルなど D2・D3 を入力する欄を含む）で、サードパーティー製キーボードを使えないようにする。①**利用者による解除は認めない**（解除の設定項目を設けない）。キーボードの拡張機能は入力内容を外部へ送れるため（T-04）、解除を認めると D2・D3 の保護が利用者の設定に依存するためである。②OS 標準のキーボード（日本語入力を含む）は使える。③OS の制御がアプリ単位であれば、入力欄ごとではなくアプリ全体に適用する（方式は詳細設計で確認する）。④D2・D3 が保護されている条件は「本アプリの入力欄にサードパーティー製キーボードが表示されない」ことであり、実機で確認する（TST-SEC-10） | MVP | 設計 / 実機（TST-SEC-10） | PLATFORM |
+| SEC-PLT-07 | 端末のロック中に他人が見られる場所に出す表示（Live Activity・ローカル通知・バックグラウンド処理の進行表示など）に、D1〜D3（会議タイトルを含む）を含めない。表示するのは状態・経過時間・進み具合だけとする（基本設計で追加。[ui.md](../02-basic-design/ui.md) §8） | MVP | 設計・実装 / 単体・実機（TST-DEV-12） | PLATFORM、PRIVACY |
 
 ---
 
@@ -166,6 +167,14 @@
 | `UserDefaults` への文字列の保存（許可した鍵以外） | 機微情報の保存を防ぐため | SEC-DAT-07 |
 | `FileManager` の `.documentDirectory` | 保存場所を Application Support に限るため | SEC-DAT-04 |
 | `NSAllowsArbitraryLoads`（Info.plist） | ATS の例外を作らないため | SEC-NET-05 |
+| `SFSpeechRecognizer`（旧来の音声認識） | サーバーでの認識に切り替わる余地をなくすため | SEC-NET-01 |
+| `PrivateCloudComputeLanguageModel`（端末外のモデル） | オンデバイスモデルだけを使うため | SEC-NET-02 |
+| コピーを集約する型の外での `UIPasteboard`、D2 の表示への `.textSelection(` | 端末内限定と有効期限の付け忘れを防ぐため（標準のコピーは他の端末へ同期されうる） | SEC-PLT-01 |
+| `ShareLink` | 共有の完了を受け取って一時ファイルを消すため | SEC-DAT-06 |
+| `NSTemporaryDirectory`、保存ルートを管理する型の外でのディレクトリ作成 | バックアップ除外と保護クラスの付け忘れを防ぐため | SEC-DAT-01・03 |
+| `WKWebView`・`CoreSpotlight`・`NSUserActivity` | WebView を使わず、Spotlight・Siri にデータを渡さないため | SEC-PLT-02・05 |
+
+「`SFSpeechRecognizer`」以降の 6 行は基本設計（2026-11-15）で追加した。規則の実現方法と例外を認める場所は [dev-environment.md](../02-basic-design/dev-environment.md) §7 にある。
 
 ### 10.2 PR のセキュリティチェックリスト
 
@@ -187,9 +196,9 @@
 | MASVS-CRYPTO | SEC-DAT-08、SEC-INT-01、SEC-KEY-01 | 独自の暗号化は P2 で再評価。SHA-256 は完全性検証用 |
 | MASVS-AUTH | SEC-APP-02 | アカウントはない（CON-06）。アプリロックのみ |
 | MASVS-NETWORK | SEC-NET-01〜06 | 通信しないことが基本。例外は SEC-NET-03・04 |
-| MASVS-PLATFORM | SEC-APP-01、SEC-PLT-01〜06、SEC-DAT-06、SEC-AI-03 | OS 機能を経由した流出の防止 |
+| MASVS-PLATFORM | SEC-APP-01、SEC-PLT-01〜07、SEC-DAT-06、SEC-AI-03 | OS 機能を経由した流出の防止 |
 | MASVS-CODE | SEC-INP 群、SEC-INT 群、SEC-AI-01・02、SEC-SUP-01〜04 | 依存管理と入力検証 |
 | MASVS-RESILIENCE | SEC-SUP-06 | 個人利用の段階では対象外 |
-| MASVS-PRIVACY | SEC-NET-01〜03・06、SEC-PRV 群、SEC-PLT-01・02、SEC-LOG-05 | 同意確認と端末内処理 |
+| MASVS-PRIVACY | SEC-NET-01〜03・06、SEC-PRV 群、SEC-PLT-01・02・07、SEC-LOG-05 | 同意確認と端末内処理 |
 
 出典: [OWASP MASVS](https://mas.owasp.org/MASVS/)、[OWASP MASTG](https://mas.owasp.org/MASTG/)（確認日 2026-11-14）。基本設計の着手時に、最新版の分類名と試験項目を確認する。
