@@ -140,8 +140,8 @@ AI 議事録（版管理。上書きしない）
 
 | ID | 要件 | フェーズ | 出典 |
 | --- | --- | --- | --- |
-| FR-FIN-01 | 停止操作で末尾 Chunk を保存し、会議を確定（finalize）する。確定は次の条件をすべて満たしたときだけ行う（Finalization Barrier）。①連番が 0 から欠番なく続く。②全 Chunk のファイルが存在し、記録した SHA-256 と一致する。③メモリ上の未保存 Chunk が 0 件 | MVP | P1 §22 |
-| FR-FIN-02 | 確定条件を満たさない会議は「確定待ち」として残し、理由（欠番・不一致・未保存件数）を表示する。利用者は再試行、または欠落を承知で確定できる | MVP | P1 §22、Minutes README の「確定を中止」 |
+| FR-FIN-01 | 停止操作で末尾 Chunk を保存し、会議を確定（finalize）する。自動の確定は次の条件をすべて満たしたときだけ行う（Finalization Barrier）。①連番が 0 から欠番なく続く。②全 Chunk のファイルが存在し、記録した SHA-256 と一致する。③メモリ上の未保存 Chunk が 0 件。Barrier を満たさない会議を確定できるのは、FR-FIN-02 の例外確定だけとする | MVP | P1 §22 |
+| FR-FIN-02 | 確定条件を満たさない会議は「確定待ち」（`stop_requested`）として残し、理由（欠番・不一致・未保存件数）を表示する。利用者は再試行するか、欠落を承知で確定（**例外確定**）できる。例外確定は次のとおり扱う。①例外確定は Barrier を満たしたことにはしない。会議の状態は `finalized` とし、確定方式（`finalizationMode`: `barrier` / `acknowledged_loss`）を記録する。②欠落の内容（欠番の連番・ハッシュ不一致の連番・ファイル欠損の連番・確定時に破棄したメモリ上の未保存件数）と、利用者が承認した日時を会議メタデータ（`lossRecord`）に記録する。③欠番・ファイル欠損の区間は空白区間として扱い（FR-TRV-03）、ハッシュ不一致の Chunk は削除せず残したうえで文字起こしの対象から外す（SEC-INT-01）。④一覧・詳細画面で、例外確定した会議であることを表示する | MVP | P1 §22、Minutes README の「確定を中止」 |
 | FR-FIN-03 | 会議の状態を次の状態遷移図に従って管理し、状態と遷移時刻を永続化する | MVP | P1 §22、P2 §9.6 |
 
 ```mermaid
@@ -152,6 +152,7 @@ stateDiagram-v2
     stop_requested --> finalizing: 末尾 Chunk 保存完了
     finalizing --> finalized: Finalization Barrier 通過
     finalizing --> stop_requested: Barrier 不成立（確定待ち）
+    stop_requested --> finalized: 欠落を承知した例外確定（FR-FIN-02。lossRecord を記録）
     finalized --> transcribing: 文字起こしジョブ開始
     transcribing --> transcribed: 全 Chunk 処理 + 統合完了
     transcribing --> transcribing: 一部失敗（再試行待ち）
@@ -215,7 +216,7 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | FR-NOT-01 | 会議ごとに利用者が編集できる手動ノートを持つ。AI・バックグラウンド処理はノートに書き込まない | P2 | P2 §19、Invariant 6 |
 | FR-NOT-02 | AI 議事録からノートへの反映は、利用者の「先頭に追加」「差分を見る」「破棄」の操作に限る。新しい AI 議事録ができてもノートは変えず、通知だけを出す | P2 | P2 §19 |
-| FR-NOT-03 | ノートは編集のたびに自動保存（debounce 1〜2 秒）し、アプリの終了で編集内容を失わない | P2 | P2 §19 |
+| FR-NOT-03 | ノートは編集のたびに自動保存（debounce 1〜2 秒）する。正常な終了とバックグラウンドへの遷移では、debounce を待たずに未保存の編集を直ちに保存（flush）する。強制終了・クラッシュで失う可能性がある編集は、debounce の待機中だった分（最大 2 秒分）に限る | P2 | P2 §19 |
 | FR-NOT-04 | 文字起こしのセグメントを選んでノートへ引用できる | P2 | P2 §19（Live STT からの「議事録へ追加」の読み替え） |
 
 ### 5.11 会議一覧・管理（MTG）
