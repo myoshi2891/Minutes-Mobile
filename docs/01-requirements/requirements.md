@@ -123,7 +123,7 @@ AI 議事録（版管理。上書きしない）
 | ID | 要件 | フェーズ | 出典 |
 | --- | --- | --- | --- |
 | FR-INT-01 | 着信・Siri・アラームなどのオーディオ割り込みで入力が止まったら、それまでの音声を Chunk として保存し、割り込みの開始・終了時刻を「録音の空白区間」として記録する | MVP | P1 §19 の読み替え |
-| FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する | MVP | 新規（iOS 固有）、OQ-01 |
+| FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する | MVP | 新規（iOS 固有）、UD-08（OQ-01 を解決） |
 | FR-INT-03 | 入力経路が変わったとき（AirPods の切断など）は、OS が選んだ次の入力で録音を継続し、経路変更を記録する。どの入力も使えなくなったときは保存済みの音声を確定可能な状態にして録音を停止し、停止理由を記録する | MVP | P1 `mic_ended` の読み替え |
 | FR-INT-04 | オーディオのメディアサービスがリセットされたら、録音パイプラインを再構築して再開を試みる。失敗したら FR-INT-02 と同じく停止を明示する | MVP | 新規（iOS 固有） |
 | FR-INT-05 | 停止理由（`manual` / `interruption_unresumed` / `no_input` / `disk_full` / `terminated` など）と検出時刻を会議メタデータに記録する | MVP | Minutes README の停止理由確認（`stopReason`）の読み替え |
@@ -159,6 +159,8 @@ stateDiagram-v2
     finalized --> transcribing: 文字起こしジョブ開始
     transcribing --> transcribed: 全 Chunk 処理 + 統合完了
     transcribing --> transcribing: 一部失敗（再試行待ち）
+    transcribed --> transcribing: 再文字起こし（新しい版を作る。以前の版は保持。FR-STT-05）
+    completed --> transcribing: 再文字起こし（P2。AI 議事録は保持。FR-STT-05）
     transcribed --> summarizing: AI 要約（P2）
     summarizing --> completed: 要約保存（P2）
     summarizing --> transcribed: 要約失敗（文字起こしは保持）
@@ -181,9 +183,9 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | FR-STT-01 | 確定済みの会議を、端末内の音声認識（第一候補: OS 標準の SpeechAnalyzer / SpeechTranscriber）で日本語の文字起こしにする。録音ファイルは読むだけで、変更・削除しない | MVP | P2 §10.1、UD-01 |
 | FR-STT-02 | 文字起こしは Chunk 単位のジョブとして実行し、ジョブの状態（`pending` / `processing` / `succeeded` / `failed` / `skipped`）・試行回数・エラー分類を永続化する。途中で中断しても、未完了の Chunk から再開できる | MVP | P2 §9 |
-| FR-STT-03 | Chunk 境界で切れる発話を拾うため、前の Chunk の末尾（既定 3 秒）を重ねて認識し、重なりで生じた重複を統合時に除外する。除外の判定は記録し、UI で確認できる | MVP | P1 §3.10、P2 §10.3、§11.3 |
+| FR-STT-03 | Chunk 境界で切れる発話を拾うため、前の Chunk の末尾（既定 3 秒）を重ねて認識し、重なりで生じた重複を統合時に除外する。除外の判定は記録し、UI で確認できる。①Overlap は、直前の連番の Chunk が利用でき（欠番・ファイル欠損・ハッシュ不一致でない）、かつ両 Chunk の間に空白区間がない（時刻が連続している）場合だけ行う。②条件を満たさない場合は Overlap を付けず、後続 Chunk は先頭から通常どおり認識する（後続 Chunk 自体の先頭区間は正常な原音なので空白として扱わない。空白として扱うのは欠落した Chunk の区間だけ。FR-FIN-02 ③・FR-TRV-03）。③重複除外の判定は境界ごとに記録し、Overlap を行わなかった境界も「Overlap なし」とその理由（`missing` / `file_missing` / `hash_mismatch` / `gap` / `first_chunk`）を記録する（除外したセグメントは 0 件） | MVP | P1 §3.10、P2 §10.3、§11.3 |
 | FR-STT-04 | セグメントは `(chunk, segmentIndex)` で一意にし、同じジョブを再実行しても重複しない | MVP | P2 §10.5 |
-| FR-STT-05 | 統合した確定文字起こしは版番号付きで保存し、再実行で新しい版を作る。以前の版は保持する | MVP | P2 §11 |
+| FR-STT-05 | 統合した確定文字起こしは版番号付きで保存し、再実行で新しい版を作る。以前の版は保持する。再文字起こしは `transcribed` または `completed`（P2）から `transcribing` へ遷移して行い（FR-FIN-03）、新しい版が完成するまでは以前の版を表示し続ける。完了すると `transcribed` へ戻る。`completed` から再実行した場合も既存の AI 議事録は削除せず、各 AI 議事録はもとにした文字起こしの版番号を記録する | MVP | P2 §11 |
 | FR-STT-06 | 音声認識が使えない状態（言語アセット未取得・非対応端末・OS 側の一時的な失敗）では、会議を `finalized` のまま待たせ、理由を表示する。録音と確定には影響させない | MVP | P2 §5.3、Invariant 3 |
 | FR-STT-07 | 日本語の言語アセットが端末にない場合、OS 標準の取得手順を利用者の明示操作で開始する。開始前に「OS が音声認識モデルをダウンロードします。会議データは送信されません」と説明する（SEC-NET-03） | MVP | P2 §7.4 の読み替え |
 | FR-STT-08 | セグメントごとに信頼度（取得できる場合）を保存し、低信頼度のセグメントを UI で区別して表示する | MVP | P1 §3.8、P2 §18 |
@@ -338,7 +340,7 @@ Minutes P2 §25 の Invariant 1〜10 を変更せずに継承し、iOS での読
 
 ## 8. Minutes（PC/Web）→ MinutesMobile（iOS）対応表
 
-基本設計で技術を選ぶときの出発点。iOS 側は**候補**であり、最終決定は基本設計書で行う。
+基本設計で技術を選ぶときの出発点。iOS 側は**候補**であり、最終決定は基本設計書で行う。決定の結果は [../02-basic-design/README.md](../02-basic-design/README.md) §2・§3 と、各基本設計書の設計決定（`BD-xxx-nn`）を参照する。
 
 | 領域 | Minutes（PC/Web） | MinutesMobile（iOS）候補 | 注意点 |
 | --- | --- | --- | --- |
@@ -430,22 +432,33 @@ Minutes P1 §5・P2 §6 と同じく、環境に依存する事項は保証値�
   - [GitHub: argmaxinc/WhisperKit](https://github.com/argmaxinc/WhisperKit)
 - 注意: 採用前にリポジトリの LICENSE を直接確認する（dependencies-and-costs.md §4）。
 
+### 11.4 基本設計での再確認（確認日 2026-11-14）
+
+基本設計の着手時に、手元の iOS 27.2 SDK（Xcode 27.2 同梱）と Apple の公式ページで再確認した。結果は [../02-basic-design/architecture.md](../02-basic-design/architecture.md) §1 にまとめてある。要点は次のとおり。
+
+- §11.1 の API（`SpeechAnalyzer`・`SpeechTranscriber`・`AssetInventory`）は SDK に存在し、iOS 27 で音声入力の変換・供給の型が追加されている。日本語の対応は API から実行時に問い合わせる設計にした（OQ-05）。
+- §11.2 のとおり、端末外のモデル（`PrivateCloudComputeLanguageModel`）が同じフレームワークにある。静的解析で使用を禁止する（SEC-NET-02）。
+- 継続処理タスク（`BGContinuedProcessingTaskRequest`）は iOS 26 以降で、GPU 資源の要求には専用の entitlement が要る。
+- 無償アカウント（Personal Team）で使える capability は 9 項目で、Background modes と Data protection を含む。Push notifications・Time Sensitive Notifications・Siri は使えない。
+
 ---
 
 ## 12. 未解決事項（OQ）
 
-| ID | 事項 | 決める場所 | 備考 |
-| --- | --- | --- | --- |
-| OQ-01 | 割り込み後の自動再開を、既定動作として確定してよいか。会議を分割するか、1 会議として続けるか | 基本設計（録音） | FR-INT-02 は「1 会議の続き + 空白区間の記録」を仮置き |
-| OQ-02 | メタデータの保存方式（SwiftData か SQLite 直接か） | 基本設計（データ） | 一意制約・トランザクション・移行・ファイルからの再構築のしやすさで比較する |
-| OQ-03 | 長時間の文字起こしに使う OS のバックグラウンド実行の仕組み（継続処理タスクなど）と、その制約 | 基本設計（ジョブ） | Personal Team で使えるかも確認する |
-| OQ-04 | Live Activity（ロック画面の録音状態表示）を Personal Team で使えるか | 基本設計（UI） | 使えない場合はアプリ内表示と OS の録音インジケータで代替 |
-| OQ-05 | iOS 27 の SpeechTranscriber の日本語ロケールの提供状況と、言語アセット取得の挙動 | 基本設計（STT） | §11.1 |
-| OQ-06 | Foundation Models の日本語要約品質、コンテキスト長、外部モデルを確実に使わないための設定方法 | P2 基本設計 | §11.2、SEC-NET-02 |
-| OQ-07 | 書き出しのアーカイブ形式（ZIP を OS 標準機能だけで作れるか） | 基本設計（書き出し） | サードパーティー製品を入れずに実現したい（UD-05） |
-| OQ-08 | 空き容量の警告閾値（何分ぶんの録音で警告するか） | 基本設計（保存） | NFR-CAP-01 を基準に決める |
-| OQ-09 | 書きかけ Chunk の逐次追記で、強制終了時の損失上限を 30 秒より短くできるか | 基本設計（保存） | NFR-REL-04 |
-| OQ-10 | ファイル保護クラスと、ロック中のバックグラウンド文字起こし・起動時の復旧をどう両立させるか（保護クラスを強めるタイミング、強めた後の再処理） | 基本設計（保存・文字起こし） | SEC-DAT-01・02、FR-STT-12、NFR-PWR-03 |
+「状態」の列は基本設計（2026-11-15）での結論を示す。結論の要約は [../02-basic-design/README.md](../02-basic-design/README.md) §3 にある。「実機で確定」は、設計は決めたが実機試験の結果で確定または見直すことを意味する。
+
+| ID | 事項 | 決める場所 | 備考 | 状態 |
+| --- | --- | --- | --- | --- |
+| OQ-01 | 割り込み後の自動再開を、既定動作として確定してよいか。会議を分割するか、1 会議として続けるか | 基本設計（録音） | FR-INT-02 は「1 会議の続き + 空白区間の記録」を仮置き | 解決（UD-08。[recording.md](../02-basic-design/recording.md) §5） |
+| OQ-02 | メタデータの保存方式（SwiftData か SQLite 直接か） | 基本設計（データ） | 一意制約・トランザクション・移行・ファイルからの再構築のしやすさで比較する | 解決（UD-09。[storage.md](../02-basic-design/storage.md) §3） |
+| OQ-03 | 長時間の文字起こしに使う OS のバックグラウンド実行の仕組み（継続処理タスクなど）と、その制約 | 基本設計（ジョブ） | Personal Team で使えるかも確認する | 解決・実機で確定（[transcription.md](../02-basic-design/transcription.md) §9、TST-DEV-11） |
+| OQ-04 | Live Activity（ロック画面の録音状態表示）を Personal Team で使えるか | 基本設計（UI） | 使えない場合はアプリ内表示と OS の録音インジケータで代替 | 解決・実機で確定（[ui.md](../02-basic-design/ui.md) §8、TST-DEV-12） |
+| OQ-05 | iOS 27 の SpeechTranscriber の日本語ロケールの提供状況と、言語アセット取得の挙動 | 基本設計（STT） | §11.1 | 解決・実機で確定（[transcription.md](../02-basic-design/transcription.md) §3、TST-STT-07） |
+| OQ-06 | Foundation Models の日本語要約品質、コンテキスト長、外部モデルを確実に使わないための設定方法 | P2 基本設計 | §11.2、SEC-NET-02 | 持ち越し（P2。UD-07） |
+| OQ-07 | 書き出しのアーカイブ形式（ZIP を OS 標準機能だけで作れるか） | 基本設計（書き出し） | サードパーティー製品を入れずに実現したい（UD-05） | 解決（[export.md](../02-basic-design/export.md) §4） |
+| OQ-08 | 空き容量の警告閾値（何分ぶんの録音で警告するか） | 基本設計（保存） | NFR-CAP-01 を基準に決める | 解決・実機で確定（[storage.md](../02-basic-design/storage.md) §6、TST-DEV-06） |
+| OQ-09 | 書きかけ Chunk の逐次追記で、強制終了時の損失上限を 30 秒より短くできるか | 基本設計（保存） | NFR-REL-04 | 解決・実機で確定（[storage.md](../02-basic-design/storage.md) §4、TST-DEV-05） |
+| OQ-10 | ファイル保護クラスと、ロック中のバックグラウンド文字起こし・起動時の復旧をどう両立させるか（保護クラスを強めるタイミング、強めた後の再処理） | 基本設計（保存・文字起こし） | SEC-DAT-01・02、FR-STT-12、NFR-PWR-03 | 解決・実機で確定（[storage.md](../02-basic-design/storage.md) §7、TST-DEV-03・10） |
 
 ---
 
