@@ -22,6 +22,8 @@
 
 確認の記録: オーナーが承認したら、この表の「状態」を「承認（日付・範囲）」に更新し、[../README.md](../README.md) §5 に UD として記録する。
 
+**基本設計（2026-11-15）での確認結果:** 新たに費用が発生する項目はなかった。MVP でアプリに組み込むサードパーティー製品は 0 件で、開発ツール 3 種（§3）はすべて無償である。Push 通知や GPU を使うバックグラウンド処理など、Personal Team で使えず COST-01 が必要になる機能は設計に採用していない（[../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5.3）。
+
 ---
 
 ## 2. OS 標準のフレームワーク（無償・追加の依存なし）
@@ -34,10 +36,12 @@
 | AVFoundation（AVAudioEngine / AVAudioSession / AVAudioConverter / AVAudioFile） | 録音・変換・再生・WAV の読み書き | MVP | 割り込み・経路変更の通知に対応する（FR-INT 群） |
 | Speech（SpeechAnalyzer / SpeechTranscriber） | 端末内の文字起こし | MVP | 言語アセットは OS が取得する（SEC-NET-03） |
 | CryptoKit | SHA-256 | MVP | — |
-| SwiftData または SQLite（OS 同梱） | メタデータ・ジョブ表 | MVP | どちらにするかは OQ-02 |
+| SQLite（OS 同梱。iOS 27.2 SDK で 3.54.0） | メタデータ・ジョブ表 | MVP | UD-09 で決定。薄い自作ラッパー経由で直接使う。SwiftData は使わない（[storage.md](../02-basic-design/storage.md) BD-STO-01） |
+| zlib（OS 同梱） | 書き出しの ZIP の CRC-32 | MVP | 無圧縮の ZIP を自作する（[export.md](../02-basic-design/export.md) BD-EXP-01） |
 | OSLog | ログ | MVP | privacy の指定（SEC-LOG 群） |
-| BackgroundTasks | 長時間の文字起こし | MVP | OQ-03 |
-| ActivityKit | ロック画面の録音状態表示 | MVP | Personal Team で使えるか確認する（OQ-04） |
+| BackgroundTasks | 長時間の文字起こし（継続処理タスク） | MVP | GPU 資源は要求しない。Personal Team での動作は実機で確認する（TST-DEV-11） |
+| ActivityKit | ロック画面の録音状態表示（Live Activity） | MVP | Push を使わない形で使う。Personal Team での動作は実機で確認する（TST-DEV-12） |
+| UserNotifications | 録音の中断を知らせるローカル通知 | MVP | Push 通知は Personal Team で使えないため、ローカル通知だけを使う |
 | FoundationModels | 端末内の要約 | P2 | オンデバイスモデルだけを使う（SEC-NET-02） |
 | LocalAuthentication | アプリのロック | P2 | — |
 | Swift Testing / XCTest / XCUITest | テスト | MVP | — |
@@ -50,9 +54,9 @@
 
 | 製品 | 用途 | ライセンス | 調査時点の版（2026-11-14） | 組み込み方 | フェーズ | 状態 |
 | --- | --- | --- | --- | --- | --- | --- |
-| SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65 系（二次情報。公式の releases で確定する） | 開発ツール（アプリに組み込まない） | MVP | 採用候補 |
-| SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64 系（二次情報。公式の releases で確定する） | 開発ツール | MVP | 採用候補 |
-| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30 系（二次情報。公式の releases で確定する） | 開発ツール（コミット前のフック） | MVP | 採用候補 |
+| SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65.1（2026-08-21 公開。公式の releases と Homebrew で確認） | 開発ツール（アプリに組み込まない）。Homebrew の `swiftlint` | MVP | 採用（基本設計で決定。導入時に入れた版をこの行に記録する） |
+| SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64.7（2026-11-14 公開。公式の releases で確認。Homebrew は確認時点で 0.64.6） | 開発ツール。Homebrew の `swiftformat` | MVP | 採用（同上） |
+| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開。公式の releases と Homebrew で確認） | 開発ツール（コミット前のフック）。Homebrew の `gitleaks` | MVP | 採用（同上） |
 | WhisperKit（argmaxinc/argmax-oss-swift） | 代替の端末内 STT（OS 標準が使えない端末向け） | MIT（同梱の一部は Apache-2.0） | v1.1.0（2026-08-06） | アプリに組み込む（SPM） | P2 | 条件付き候補（FR-STT-11）。モデルの取得は SEC-NET-04 に従う |
 | SpeakerKit（同上の SDK に同梱） | 話者分離 | MIT | v1.1.0 に同梱 | アプリに組み込む（SPM） | P3 | 検討候補 |
 
@@ -64,6 +68,8 @@
 | WhisperKit Pro / Argmax Pro SDK | 有償・独自ライセンス（COST-04） |
 | 解析・広告・クラッシュ報告の SDK（Firebase Analytics・Crashlytics など） | 外部へ通信する（SEC-NET-06） |
 | 音声認識・要約のクラウド API | Zero External Data Egress に反する（SEC-NET-01） |
+
+開発ツール 3 種の版とライセンス（MIT）は、2026-11-14 に GitHub の公式 API（releases と license）と Homebrew の formula 情報で確認した。導入時に、リポジトリの LICENSE ファイルを直接読む（§4 の手順 3）。使い方は [../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5〜§7 にある。
 
 出典（確認日 2026-11-14）:
 
