@@ -11,7 +11,7 @@ MinutesMobile（iPhone 向け・端末内完結の議事録アプリ）の設計
 | 要件定義 | [01-requirements/security-requirements.md](01-requirements/security-requirements.md) | 初版（2026-11-14） | セキュリティ・プライバシー要件（SEC）。OWASP MASVS 対応表付き |
 | 要件定義 | [01-requirements/test-requirements.md](01-requirements/test-requirements.md) | 初版（2026-11-14） | シフトレフトのテスト要件（TST）・必須異常系シナリオ・CI ゲート |
 | 要件定義 | [01-requirements/dependencies-and-costs.md](01-requirements/dependencies-and-costs.md) | 初版（2026-11-14） | 依存・ライセンス・費用の台帳（COST）。有償項目の確認状況 |
-| 基本設計 | [02-basic-design/README.md](02-basic-design/README.md) | 未着手 | 作成予定の基本設計書一覧 |
+| 基本設計 | [02-basic-design/README.md](02-basic-design/README.md) | 初版（2026-11-15） | 基本設計書の索引。MVP の 7 文書（アーキテクチャ・録音・保存・文字起こし・画面・書き出し・開発環境）と、未解決事項の解決状況 |
 | 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 未着手 | 作成予定の詳細設計書一覧 |
 
 参照元（別リポジトリ・読み取り専用）: 別リポジトリ `Minutes` の `docs/design-local-phase*.md`（PC/Web 版 Minutes の設計書）。
@@ -44,6 +44,7 @@ docs/
 | `COST-nn` | 費用が発生しうる項目（要確認台帳） | dependencies-and-costs.md |
 | `UD-nn` | 利用者（オーナー）の決定事項 | 本書 §5 |
 | `OQ-nn` | 未解決事項（Open Question） | requirements.md |
+| `BD-xxx-nn` | 基本設計での設計決定（`xxx` は領域。例: `BD-STO-04`）。決定・理由・退けた代替案を持つ | 02-basic-design の各文書 §1（architecture.md は §3） |
 
 規則:
 
@@ -69,3 +70,6 @@ docs/
 | UD-04 | 2026-11-14 | MVP は **録音保存 + 確定後の文字起こし**。AI 要約・手動ノートは Phase 2 | 要件表の「フェーズ」列で区別 |
 | UD-05 | 2026-11-14 | ライブラリは最新安定版、サードパーティーは無償で使えるものに限定。費用が発生するものは必ずオーナーに確認する | dependencies-and-costs.md の運用ルール |
 | UD-06 | 2026-11-14 | テストとセキュリティは初期段階からシフトレフトで扱う | security-requirements.md / test-requirements.md |
+| UD-07 | 2026-11-14 | 基本設計は **MVP の 7 文書**を先に作る。P2 の `summary-and-notes.md` は MVP の実装後に作る | 02-basic-design/README.md。P2 の接続点だけ architecture.md §10 に記述 |
+| UD-08 | 2026-11-14 | 割り込み後は**同じ会議の続きとして自動で再開**し、中断中は空白区間として記録する | OQ-01 を解決。FR-INT-02 の仮置きを確定。recording.md §5 |
+| UD-09 | 2026-11-14 | メタデータの保存は **iOS 同梱の SQLite を薄い自作ラッパー経由で直接使う**（追加の依存なし） | OQ-02 を解決。storage.md §3 |
