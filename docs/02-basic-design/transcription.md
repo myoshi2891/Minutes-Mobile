@@ -100,7 +100,7 @@ OQ-05 の結論: 日本語の提供状況と言語アセットの有無は**実�
 | 種類 | 単位 | 作る時点 |
 | --- | --- | --- |
 | `transcribe_chunk` | Chunk ごと | 文字起こしの開始時に全 Chunk 分。利用できない Chunk（欠番・ファイル欠損・ハッシュ不一致・不正なヘッダ）には作らず、理由を記録する |
-| `merge_transcript` | 会議ごと | 全 `transcribe_chunk` が終わりになったとき |
+| `merge_transcript` | 実行番号ごとに 1 件 | 全 `transcribe_chunk` が終わりになったとき。同じ実行番号で失敗区間を再試行した場合は、新しいジョブを作らず、既存の `merge_transcript` を `pending` に戻し、再試行した `transcribe_chunk` がすべて終わりになってから実行する（統合のたびに新しい版を保存する） |
 
 状態は FR-STT-02 の 5 種。`skipped` は P2 の VAD スキップ用で、MVP では使わない。
 
@@ -114,6 +114,7 @@ stateDiagram-v2
     processing --> pending: 起動時の回収（回数が残っている）
     processing --> failed: 起動時の回収（回数切れ）
     failed --> pending: 利用者の再試行（回数を戻す）
+    succeeded --> pending: 失敗区間の再試行（merge_transcript だけ。回数を戻す）
     pending --> skipped: P2（VAD）
     succeeded --> [*]
     skipped --> [*]
@@ -240,7 +241,7 @@ SQLite の `transcript_versions` には、版・実行番号・件数・ファ�
 | 操作 | 実行番号 | 版 | 状態の遷移 |
 | --- | --- | --- | --- |
 | 最初の文字起こし | 1 | 1 | `finalized` → `transcribing` → `transcribed` |
-| 失敗区間の再試行 | 同じ番号で、失敗した Chunk のジョブだけを `pending` に戻す | 完了時に +1 | `transcribed` → `transcribing` → `transcribed` |
+| 失敗区間の再試行 | 同じ番号で、失敗した Chunk のジョブと、その実行番号の `merge_transcript` を `pending` に戻す（§4.1） | 完了時に +1 | `transcribed` → `transcribing` → `transcribed` |
 | 再文字起こし（全体） | +1（全 Chunk のジョブを新しく作る） | 完了時に +1 | 同上 |
 
 - 新しい版ができるまで、以前の版を表示し続ける。表示が読むのは版のファイルだけなので、処理の途中の結果が画面に混ざらない。
