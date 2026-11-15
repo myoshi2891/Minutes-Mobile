@@ -188,7 +188,7 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 | --- | --- | --- |
 | `print(`・`NSLog(`・`debugPrint(` | なし | SEC-LOG-01 |
 | `Logger(` の直接の利用 | ログの型 | [architecture.md](architecture.md) BD-ARC-06 |
-| `URLSession`・`URLRequest`・`NWConnection`・`import Network`・WebSocket | なし（MVP） | SEC-NET-01 |
+| `URLSession`・`URLRequest`・`NWConnection`・`import Network`・WebSocket・BSD ソケット（`socket(`・`connect(`）・CFNetwork（`import CFNetwork`）・CFStream（`CFStreamCreatePairWithSocket` 系） | なし（MVP） | SEC-NET-01 |
 | `SFSpeechRecognizer` | なし | [transcription.md](transcription.md) BD-STT-10 |
 | `PrivateCloudComputeLanguageModel` | なし | SEC-NET-02 |
 | `try!`・`as!`・強制アンラップ | テストコード | SEC-INP-03 |
