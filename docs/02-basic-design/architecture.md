@@ -17,6 +17,8 @@
 
 ## 1. 設計の前提として確認した事実
 
+満たす要件: CON-01・02・08
+
 記憶ではなく一次情報で確認した（確認日 2026-11-14）。3 か月を過ぎたら再確認する。
 
 | 事項 | 確認結果 | 出典 |
@@ -125,6 +127,8 @@ scripts/  .githooks/           # ローカル検査（dev-environment.md）
 ---
 
 ## 3. 主要な設計決定
+
+満たす要件: FR-REC-04、NFR-MNT-03、NFR-PWR-02、SEC-NET-01・04、SEC-DAT-01・02、SEC-LOG-03、TST-GEN-06、TST-SEC-07、INV-01・08・10
 
 | ID | 決定 | 理由 | 退けた代替案 |
 | --- | --- | --- | --- |
@@ -245,6 +249,8 @@ func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> (next: MeetingStat
 
 ## 9. Minutes から引き継ぐもの・不要になるもの
 
+満たす要件: INV-01〜10、FR-REC-01、FR-SAV-04、FR-FIN-01、FR-STT-02・03
+
 | Minutes の要素 | MinutesMobile での扱い |
 | --- | --- |
 | Recording is Source of Truth、Invariant 1〜10 | そのまま継承する |
@@ -262,6 +268,8 @@ func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> (next: MeetingStat
 
 ## 10. P2・P3 の拡張点
 
+満たす要件: FR-SUM-01、FR-NOT-05、FR-RCV-03、FR-MTG-04、FR-STT-10・11、FR-SET-04、SEC-NET-02、INV-01（P2・P3 の接続点の確保）
+
 今回は設計しない（UD-07）。MVP の設計が妨げにならないよう、接続点だけ確保する。
 
 | 機能 | 接続点 |
@@ -277,6 +285,8 @@ func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> (next: MeetingStat
 ---
 
 ## 11. 断定しない事項
+
+満たす要件: NFR-UX-03、NFR-PWR-03、SEC-DAT-01、TST-DEV-03・10〜12、TST-CI-02
 
 | 事項 | 断定しない理由 | 担保の方法 |
 | --- | --- | --- |
@@ -363,6 +373,8 @@ T-08（プロンプトインジェクション）と T-11（秘密情報）は P
 
 ## 14. 詳細設計への申し送り
 
+満たす要件: —（詳細設計への引き継ぎ事項。満たす要件はない）
+
 - 型・protocol の名称と、Package のターゲット分割を確定する。
 - 録音パイプラインを起こす合図の方式を確定する（§4）。
 - エラー分類の列挙と、利用者向けの文言への写像を確定する（§8）。
@@ -372,6 +384,8 @@ T-08（プロンプトインジェクション）と T-11（秘密情報）は P
 ---
 
 ## 15. 出典
+
+満たす要件: —（出典の一覧。満たす要件はない）
 
 - iOS 27.2 SDK（Xcode 27.2 同梱）の `Speech.swiftinterface`・`FoundationModels.swiftinterface`・`BGTaskRequest.h`・`BGTask.h`・`sqlite3.h`（確認日 2026-11-14）
 - [Apple: Supported capabilities (iOS)](https://developer.apple.com/help/account/reference/supported-capabilities-ios/)（確認日 2026-11-14）
