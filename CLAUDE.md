@@ -18,7 +18,7 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 
 ## ビルド・テスト
 
-Xcode プロジェクトは JSON 形式の `MinutesMobile.xcodeproj/project.xcproj` を使う（`project.pbxproj` は存在しない）。ビルド設定はこの JSON を直接読む。
+Xcode プロジェクトは JSON 形式の `MinutesMobile.xcodeproj/project.xcproj` を使う（`project.pbxproj` は存在しない）。ビルド設定はこの JSON を直接読む。ただし末尾カンマを含むため、標準の JSON パーサー（`json.load`・`jq`・`JSONSerialization` など）では解析できない。スクリプトで読む場合は JSON5 対応のパーサーを使う。
 
 `xcode-select` が Command Line Tools を指しているため、`xcodebuild` には `DEVELOPER_DIR` を付ける（または `sudo xcode-select -s /Applications/Xcode.app` を一度実行する）。
 
@@ -37,7 +37,9 @@ xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile \
   -destination 'platform=iOS Simulator,name=iPhone 17' test
 
 # 単一テスト（Swift Testing: -only-testing:<TestTarget>/<Suite>/<test>）
-xcodebuild ... test -only-testing:MinutesMobileTests/RecordingStateMachineTests/startFromIdle
+xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile \
+  -destination 'platform=iOS Simulator,name=iPhone 17' \
+  test -only-testing:MinutesMobileTests/RecordingStateMachineTests/startFromIdle
 ```
 
 テストフレームワークは Swift Testing（単体・結合）、XCUITest（UI）、XCTest 計測 API（性能）。SwiftLint / SwiftFormat / gitleaks は CI ゲート（TST-CI 群）として導入予定で、現時点では未設定。
