@@ -2,9 +2,11 @@
 
 要件定義書（[../01-requirements/](../01-requirements/)）を受けて、アーキテクチャ・データの持ち方・状態遷移・画面構成・技術の選定を確定する。MVP の 7 文書を作成済み（2026-11-15。UD-07）。
 
-各文書は冒頭に「満たす要件 ID」を列挙し、「セキュリティ」節と「テスト観点」節を持つ（[../README.md](../README.md) §3、[../01-requirements/security-requirements.md](../01-requirements/security-requirements.md) §2）。設計決定には `BD-<領域>-nn` の ID を振っている。
+各文書は冒頭（文書全体）と各節の冒頭（その節）の両方に「満たす要件 ID」を列挙し、「セキュリティ」節と「テスト観点」節を持つ（[../README.md](../README.md) §3、[../01-requirements/security-requirements.md](../01-requirements/security-requirements.md) §2）。設計決定には `BD-<領域>-nn` の ID を振っている。
 
 ## 1. 文書一覧（読む順）
+
+満たす要件: NFR-MNT 群、TST-GEN 群、TST-CI 群、SEC 全般、FR-CNS・REC・INT・SAV・FIN・RCV・MTG・SET・STT・TRV・EXP 群、NFR-PRF-01、NFR-UX 群（P2 は FR-SUM・NOT 群、SEC-AI 群）。文書ごとの一覧は各文書の冒頭にある
 
 | 順 | 文書 | 内容 | 主な要件 | 状態 |
 | --- | --- | --- | --- | --- |
@@ -19,6 +21,8 @@
 
 ## 2. 設計の要点
 
+満たす要件: SEC-DAT-02、SEC-NET-01、NFR-MNT-03、INV-08 ／ 制約: CON-02・07
+
 | 要点 | 内容 | 文書 |
 | --- | --- | --- |
 | 原本はファイル、SQLite は索引 | 音声・文字起こし本文（D1・D2）は会議ディレクトリのファイルにだけ置く。SQLite には D3 と処理状態だけを置く。処理が終わった会議を丸ごと最も強い保護クラスへ上げられる | architecture.md BD-ARC-03、storage.md |
@@ -29,6 +33,8 @@
 | Personal Team の制約 | Push 通知は使えないのでローカル通知で設計する。Live Activity と継続処理タスクは実機で確かめ、動かない場合の代替を用意している | architecture.md §1 |
 
 ## 3. 未解決事項（OQ）の解決状況
+
+満たす要件: —（未解決事項の索引） ／ 解決: OQ-01〜05・07〜10（OQ-06 は持ち越し）
 
 | ID | 結論 | 文書 | 実機での確認 |
 | --- | --- | --- | --- |
@@ -45,12 +51,16 @@
 
 ## 4. オーナーの確認が必要な事項
 
+満たす要件: — ／ 制約: CON-07・09 ／ 決定: UD-05
+
 | 事項 | 内容 | 期限 |
 | --- | --- | --- |
 | Bundle Identifier | 確定後は変更できない（CON-09）。決まるまで実機で実際の会議を録音しない | 最初の実録音の前 |
 | 費用 | 基本設計で新たに費用が発生する項目はなかった。費用が必要になる場面は [dev-environment.md](dev-environment.md) §5.3 に列挙した | 該当したとき |
 
 ## 5. 詳細設計へ進む前に
+
+満たす要件: NFR-MNT-04 ／ 参照: security-requirements.md §2（工程表）
 
 - 各文書の末尾に「詳細設計への申し送り」がある。詳細設計は基本設計と 1 対 1 で対応させる（[../03-detailed-design/README.md](../03-detailed-design/README.md)）。
 - 実装の最初の作業単位は [dev-environment.md](dev-environment.md) の内容（設定の変更・検査・`.gitignore`）で、機能の実装より先に行う。
