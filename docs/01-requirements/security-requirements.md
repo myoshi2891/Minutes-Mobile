@@ -91,8 +91,8 @@
 | ID | 要件 | フェーズ | 作り込み / 検証 | MASVS |
 | --- | --- | --- | --- | --- |
 | SEC-LOG-01 | ログは `os.Logger` に一本化する。`print` / `NSLog` / `debugPrint` は使わない | MVP | 実装 / 静的解析（§10.1） | STORAGE |
-| SEC-LOG-02 | ログに埋め込む値の privacy は private（既定）のまま使う。public にしてよいのは、件数・状態名・エラー分類・連番など、D1〜D3 を含まない値だけとする | MVP | 実装 / レビュー | STORAGE、PRIVACY |
-| SEC-LOG-03 | 文字起こし本文・要約・ノート・会議タイトル・ファイルの絶対パス・トークンは、privacy の指定にかかわらずログに出さない | MVP | 実装 / レビュー・単体（ログ出力の検査） | STORAGE |
+| SEC-LOG-02 | D1〜D3 の値（会議タイトル・会議の日時・長さなどのメタデータを含む）は、privacy の指定にかかわらず（private の指定でも）ログに埋め込まない（D5 は D1〜D3 を一切含めない。§1.1）。ログに埋め込んでよいのは、件数・状態名・エラー分類・連番など D1〜D3 を含まない値だけとし、その privacy も private（既定）のまま使う。public にしてよいのも、これらの値に限る | MVP | 実装 / レビュー | STORAGE、PRIVACY |
+| SEC-LOG-03 | D1〜D3（文字起こし本文・要約・ノート・会議タイトル・会議の日時などのメタデータ）と、ファイルの絶対パス・トークンは、privacy の指定にかかわらず（private の指定でも）ログに出さない（SEC-LOG-02） | MVP | 実装 / レビュー・単体（ログ出力の検査） | STORAGE |
 | SEC-LOG-04 | エラーを握りつぶさない。エラーは分類（例: `diskFull` / `interrupted` / `assetMissing`）してログと画面に出し、D1〜D3 を含む値はエラーメッセージに含めない | MVP | 実装 / レビュー | CODE |
 | SEC-LOG-05 | クラッシュ報告の SDK を組み込まない（SEC-NET-06）。クラッシュの調査は Xcode の Organizer と端末の解析データ（利用者が共有を許可した場合）を使う | MVP | 設計 | PRIVACY |
 
@@ -146,7 +146,7 @@
 
 | ID | 要件 | フェーズ | 作り込み / 検証 | MASVS |
 | --- | --- | --- | --- | --- |
-| SEC-SUP-01 | すべての依存（ライブラリ・開発ツール・モデル）の版を固定し、更新は PR で差分を見て行う。版は「最新安定版を確認日付きで固定」する。固定の方法は区分ごとに定める。アプリに組み込むライブラリは Swift Package Manager で管理し、`Package.resolved` をコミットする。SPM 以外の開発ツール（Homebrew で導入する gitleaks CLI など）とモデルは、版・取得元（必要に応じて SHA-256）を台帳に記録し、検査スクリプトで照合する（[dependencies-and-costs.md](dependencies-and-costs.md) §4 手順 5） | MVP | 実装 / CI | CODE |
+| SEC-SUP-01 | すべての依存（ライブラリ・開発ツール・モデル）の版を固定し、更新は PR で差分を見て行う。版は「最新安定版を確認日付きで固定」する。固定の方法は区分ごとに定める。アプリに組み込むライブラリは Swift Package Manager で管理し、`Package.resolved` をコミットする。SPM 以外の開発ツール（公式のリリースページから取得する gitleaks CLI など）とモデルは、版・取得元・SHA-256 を台帳に記録し、記録した版を導入スクリプトで再現して導入し、検査スクリプトで照合する（[dependencies-and-costs.md](dependencies-and-costs.md) §4 手順 5） | MVP | 実装 / CI | CODE |
 | SEC-SUP-02 | 依存を追加する前に、ライセンス（許可: MIT / Apache-2.0 / BSD 系。その他はオーナーに確認）、有償要素、通信の有無、保守状況を確認し、[dependencies-and-costs.md](dependencies-and-costs.md) に記録する | MVP | 設計 / レビュー・CI（ライセンス確認） | CODE |
 | SEC-SUP-03 | 秘密情報の検出（gitleaks）をコミット前（pre-commit）と CI で実行する | MVP | CI | CODE |
 | SEC-SUP-04 | `.gitignore` で、録音データ（`*.wav` など）・個人の Xcode 設定（`xcuserdata`）・ビルド成果物・`.env` を管理対象から外す | MVP | 実装 / レビュー | CODE |

@@ -54,9 +54,9 @@
 
 | 製品 | 用途 | ライセンス | 調査時点の版（2026-11-14） | 組み込み方 | フェーズ | 状態 |
 | --- | --- | --- | --- | --- | --- | --- |
-| SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65.1（2026-08-21 公開。公式の releases と Homebrew で確認） | 開発ツール（アプリに組み込まない）。Homebrew の `swiftlint` | MVP | 採用（基本設計で決定。導入時に入れた版をこの行に記録する） |
-| SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64.7（2026-11-14 公開。公式の releases で確認。Homebrew は確認時点で 0.64.6） | 開発ツール。Homebrew の `swiftformat` | MVP | 採用（同上） |
-| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開。公式の releases と Homebrew で確認） | 開発ツール（コミット前のフック）。Homebrew の `gitleaks` | MVP | 採用（同上） |
+| SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65.1（2026-08-21 公開。公式の releases と Homebrew で確認） | 開発ツール（アプリに組み込まない）。GitHub releases の `portable_swiftlint.zip`（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2） | MVP | 採用（基本設計で決定。導入時に入れた版をこの行に記録する） |
+| SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64.7（2026-11-14 公開。公式の releases で確認。Homebrew は確認時点で 0.64.6） | 開発ツール。GitHub releases の `swiftformat.zip` | MVP | 採用（同上） |
+| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開。公式の releases と Homebrew で確認） | 開発ツール（コミット前のフック）。GitHub releases の `gitleaks_{版}_darwin_arm64.tar.gz` | MVP | 採用（同上） |
 | WhisperKit（argmaxinc/argmax-oss-swift） | 代替の端末内 STT（OS 標準が使えない端末向け） | MIT（同梱の一部は Apache-2.0） | v1.1.0（2026-08-06） | アプリに組み込む（SPM） | P2 | 条件付き候補（FR-STT-11）。モデルの取得は SEC-NET-04 に従う |
 | SpeakerKit（同上の SDK に同梱） | 話者分離 | MIT | v1.1.0 に同梱 | アプリに組み込む（SPM） | P3 | 検討候補 |
 
@@ -93,7 +93,7 @@
 4. **通信**: そのライブラリが外部へ通信しないか（解析・テレメトリ・自動更新・モデルの自動取得を含む）。通信する場合は SEC-NET-04 の条件を満たすか。
 5. **最新安定版と版の固定**: 公式のリリースページで最新の安定版（プレリリースではない）を確認し、確認日とともに記録する。版の固定は依存の区分ごとに次のとおり行う（SEC-SUP-01）。
    - **SPM で組み込む依存**（アプリに組み込むライブラリ）: `Package.resolved` をコミットして版を固定する。
-   - **SPM 以外の開発ツール**（Homebrew で導入する gitleaks CLI・SwiftLint・SwiftFormat など）: 版と取得元（Homebrew の formula 名と tap、またはリリースページの URL）を §3 に記録する。検査スクリプトは実行時の版（`gitleaks version` など）を確かめ、記録と一致しなければ失敗する。Homebrew は過去の版に固定しにくいため、更新で版が変わったら台帳を直す PR を出してから使う。リリースページから直接取得する場合は、配布ファイルの SHA-256 も記録して検証する。
+   - **SPM 以外の開発ツール**（gitleaks CLI・SwiftLint・SwiftFormat など）: 公式のリリースページの配布ファイルを使い、版・取得元（リリースページの URL と配布ファイルの名前）・配布ファイルの SHA-256 を §3 と機械可読の写し（`tools/versions`）に記録する。導入スクリプトは記録した版を取得し、SHA-256 が一致した場合だけ展開する（どの環境でも同じ版を再現する）。検査スクリプトは実行時の版（`gitleaks version` など）を確かめ、記録と一致しなければ失敗する。Homebrew は過去の版に固定できないため使わない。版を変えるときは、§3 と `tools/versions` を同じ PR で直す（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2）。
    - **モデル**（代替 STT のモデル重みなど。P2）: 版・取得元の URL・SHA-256 を記録し、ハッシュを検証してから使う（SEC-NET-04）。
 6. **保守状況**: 直近の更新・未対応の脆弱性・iOS と Swift の最新版への対応。
 7. **記録**: この台帳の §3 に 1 行追加し、PR の説明にも書く。
