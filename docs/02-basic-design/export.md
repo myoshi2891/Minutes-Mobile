@@ -4,7 +4,7 @@
 | --- | --- |
 | 版 | 1.0（初版） |
 | 作成日 | 2026-11-15（技術情報の確認日 2026-11-14） |
-| 満たす要件 ID | FR-EXP-01〜04、SEC-DAT-06、SEC-INP-02、SEC-INT-01 |
+| 満たす要件 ID | FR-EXP-01〜04、SEC-DAT-06、SEC-INP-02、SEC-INT-01・03 |
 | 解決する未解決事項 | OQ-07 |
 | 参照元 | Minutes P1 §3.4・§3.9・§4.5、Minutes `src/export/zip.ts` |
 | 関連文書 | [architecture.md](architecture.md)・[storage.md](storage.md)・[ui.md](ui.md) |
@@ -66,6 +66,7 @@ sequenceDiagram
     V->>E: 書き出しを要求
     E->>E: 空き容量を確認・保護クラスを処理中へ
     E->>E: 各 Chunk のヘッダとハッシュを検証
+    E->>E: 文字起こしを含む場合、版のファイルのハッシュを transcript_versions と照合（SEC-INT-03）
     E->>T: 一時ファイルを作成（順に書く・進み具合を通知）
     E->>V: 一時ファイルの場所
     V->>S: 共有シートを表示
@@ -76,6 +77,7 @@ sequenceDiagram
 ```
 
 - 検証で合わない Chunk があった場合は、作成の前に件数を表示し、続けるか利用者が選ぶ。続ける場合はそのまま含め、目録に印を付ける（BD-EXP-05）。
+- 文字起こしの版のファイルがハッシュの記録と合わない場合は、その版を書き出さない（含めて続ける選択肢も出さない）。破損していることと再文字起こしの操作を示す。録音だけの書き出しは続けられる（[transcription.md](transcription.md) §6.2、SEC-INT-03）。
 - 書き出しの途中で失敗・中止した場合も、一時ファイルを削除する。
 - 共有シートの完了が届かなかった場合（アプリが終了したなど）は、次の起動の復旧で `tmp/export/` を丸ごと削除する（[storage.md](storage.md) §8）。
 
