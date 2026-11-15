@@ -22,7 +22,7 @@
 | --- | --- | --- | --- |
 | BD-DEV-01 | 自動検査はローカルの Mac で実行する（検査スクリプトと Git のフック）。クラウドの CI は使わない | GitHub Actions の macOS ランナーと Xcode Cloud は費用が発生しうる（COST-02・03）。オーナーの承認があるまで採用しない | クラウドの CI を先に組む |
 | BD-DEV-02 | プロジェクト設定の変更・検査スクリプト・静的解析の規則・`.gitignore` を、最初の作業単位として機能の実装より前に入れる | 規則がない状態で書いたコードは、後から規則に合わせ直す手間が大きい | 機能ができてから検査を足す |
-| BD-DEV-03 | 開発ツール（SwiftLint・SwiftFormat・gitleaks）は Homebrew で導入し、版を台帳に記録する。検査スクリプトは実行時の版を台帳と照合し、違えば失敗する | SPM の外のツールは版を固定しにくい。照合で食い違いを検出する（SEC-SUP-01） | 版を確かめずに使う |
+| BD-DEV-03 | 開発ツール（SwiftLint・SwiftFormat・gitleaks）は、台帳に記録した版の配布ファイルを公式の GitHub releases から取得し、台帳の SHA-256 と照合してからリポジトリ内の `.tools/`（Git の管理外）に展開する。どの環境でも同じ導入スクリプトで同じ版を入れる。検査スクリプトは `.tools/` のツールだけを使い、実行時の版を台帳と照合し、違えば失敗する | 台帳の版をどの環境でも再現できる。Homebrew は formula の最新版を入れるため、過去の版に固定できない（SEC-SUP-01） | Homebrew で導入する（版を再現できない）。`brew extract` で過去の formula を自前の tap に取り出す（開発者向けの機能で、ツールごとに tap の保守が要る） |
 | BD-DEV-04 | 中核ロジックの Package は Mac 上の `swift test` で回し、同じテストをシミュレータでも実行する | 速さ（数秒）と、実行環境の違いの検出を両立する（[architecture.md](architecture.md) BD-ARC-02） | シミュレータだけで実行する |
 | BD-DEV-05 | 静的解析の独自ルールには、違反例のファイルを使った試験を付ける | 規則が実際に検出することを確かめないと、効いていない規則に気づけない | 規則を書くだけ |
 | BD-DEV-06 | Bundle Identifier は、最初の実録音の前にオーナーが決める。決まるまで実機で実際の会議を録音しない | 変えるとアプリのデータ領域が別物になり、既存の録音を読めなくなる（CON-09） | 仮の値のまま使い始める |
@@ -118,14 +118,16 @@
 
 ### 5.2 開発ツール
 
-| ツール | 用途 | ライセンス | 最新の安定版（確認日 2026-11-14） | 導入 |
+| ツール | 用途 | ライセンス | 最新の安定版（確認日 2026-11-14） | 導入（GitHub releases の配布ファイル。確認日 2026-11-16） |
 | --- | --- | --- | --- | --- |
-| SwiftLint | 静的解析 | MIT | 0.65.1（2026-08-21 公開） | Homebrew（`swiftlint`） |
-| SwiftFormat | 整形 | MIT | 0.64.7（2026-11-14 公開。Homebrew は確認時点で 0.64.6） | Homebrew（`swiftformat`） |
-| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開） | Homebrew（`gitleaks`） |
+| SwiftLint | 静的解析 | MIT | 0.65.1（2026-08-21 公開） | `portable_swiftlint.zip`（チェックサムの配布なし） |
+| SwiftFormat | 整形 | MIT | 0.64.7（2026-11-14 公開。Homebrew は確認時点で 0.64.6） | `swiftformat.zip`（チェックサムの配布なし） |
+| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開） | `gitleaks_{版}_darwin_arm64.tar.gz`（Intel の Mac は `darwin_x64`）。`gitleaks_{版}_checksums.txt` が配布されている |
 
 - いずれも無償で、アプリには組み込まない。費用は発生しない。
-- 導入するときに、その時点で Homebrew が配布している最新の安定版を入れ、版を台帳（[dependencies-and-costs.md](../01-requirements/dependencies-and-costs.md) §3）に記録する。リポジトリの LICENSE も直接読む（台帳 §4 の手順 3）。
+- **導入（台帳の版の再現）:** 導入スクリプト（`scripts/setup-tools.sh`。中身は詳細設計）が、台帳の機械可読の写し（`tools/versions`。ツールごとの版・配布ファイルの名前・SHA-256。パスと形式は詳細設計で確定する）を読み、その版の配布ファイルを `gh release download` で取得する。SHA-256 が台帳と一致した場合だけ `.tools/` に展開し、一致しなければ展開せずに失敗する。Homebrew の版は使わない（PATH にあっても検査スクリプトは `.tools/` のものだけを呼ぶ）。
+- **最初の記録:** チェックサムが配布されていないツール（SwiftLint・SwiftFormat）は、最初の導入の PR で配布ファイルの SHA-256 を計算して記録し、レビューで公式の releases の配布ファイルであることを確かめる。gitleaks は配布されたチェックサムと一致することも確かめる。リポジトリの LICENSE も直接読む（台帳 §4 の手順 3）。
+- **版の更新（全環境で一括）:** 版を上げるときは、1 つの PR で ①台帳（[dependencies-and-costs.md](../01-requirements/dependencies-and-costs.md) §3）の版・SHA-256・確認日、②`tools/versions`、③版の変更で必要になった規則や整形の差分を同時に直す。導入スクリプトは `tools/versions` を読むだけなので、導入手順を別に直す必要はない。統合の後、各環境で導入スクリプトを実行し直す。実行し直していない環境では §6.1 の手順 0 が失敗するので、古い版のまま検査が通ることはない。
 - gitleaks の GitHub Action は使わない（独自の条件に変わっている。台帳 §3）。
 
 ### 5.3 基本設計で見つかった費用の有無
@@ -220,6 +222,7 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 | 対象 | 理由 |
 | --- | --- |
 | `xcuserdata/`・`DerivedData/`・`.build/`・`build/`・`*.xcresult` | 個人の設定とビルドの成果物 |
+| `.tools/` | 導入スクリプトが展開した開発ツール（§5.2）。版は `tools/versions` で管理する |
 | `*.wav`・`*.m4a`・`*.caf`・`*.zip` | 録音データを誤って入れない（SEC-SUP-04・05） |
 | `*.sqlite`・`*.sqlite-wal`・`*.sqlite-shm` | 試験で作った DB |
 | `.env`・`.env.*` | 秘密情報 |
@@ -266,7 +269,8 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 
 | 事項 | 断定しない理由 | 担保の方法 |
 | --- | --- | --- |
-| Homebrew が配布する版が、公式の最新の安定版と一致する | 反映に時間差がある（SwiftFormat で確認した） | 導入時に両方を確かめ、入れた版を台帳に記録する |
+| 台帳の版の配布ファイルを取得して、この Mac で起動できる | 公式の releases に各版の macOS 向けの配布ファイルがあることは確認した（2026-11-16）。取得して起動するところまでは確かめていない | 最初の導入の作業で、3 つのツールを導入スクリプトで入れて版を表示させ、結果を PR に記録する。起動できないツールがあれば、導入の方法を選び直してから台帳に記録する |
+| 過去の版の配布ファイルが取得できなくなる | 公開側が削除しうる | SHA-256 を台帳に記録しているので、取得できた場合の改変は検出できる。取得できなければ版を上げる PR で対応する |
 | 独自ルールが違反をすべて検出する | 正規表現の限界 | 規則の試験（BD-DEV-05）と PR のチェックリスト |
 | ローカルの検査が毎回実行される | フックは飛ばせる | PR の説明に結果を貼ることを統合の条件にする |
 | 入れ直しでアプリのデータが残る | 実機で確かめていない | 失効の前に定期的に書き出す運用にする。失効後に削除せず上書きで復旧する手順を実機で確認して記録する |
@@ -320,6 +324,7 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 ## 14. 詳細設計への申し送り
 
 - 検査スクリプトとフックの中身、独自ルールの正規表現と試験用のファイル。
+- 開発ツールの導入スクリプト（`scripts/setup-tools.sh`）と、台帳の機械可読の写し（`tools/versions`）の置き場所と形式（§5.2）。
 - 依存の許可リストの置き場所と形式（TST-CI-05）。
 - Package の構成（プラットフォームの指定、ターゲット）。
 - 差し替え用の起動の引数の一覧。
@@ -337,4 +342,5 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 - [GitHub: nicklockwood/SwiftFormat releases](https://github.com/nicklockwood/SwiftFormat/releases)（0.64.7、MIT）
 - [GitHub: gitleaks/gitleaks releases](https://github.com/gitleaks/gitleaks/releases)（v8.30.1、MIT）
 - Homebrew の formula 情報（`brew info`。swiftlint 0.65.1・swiftformat 0.64.6・gitleaks 8.30.1）
+- 各版の配布ファイルの一覧（`gh release view`。gitleaks v8.30.1・SwiftLint 0.65.1・SwiftFormat 0.64.7。確認日 2026-11-16）
 - [Apple: Supported capabilities (iOS)](https://developer.apple.com/help/account/reference/supported-capabilities-ios/)
