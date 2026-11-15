@@ -63,7 +63,7 @@ xcodebuild ... test -only-testing:MinutesMobileTests/RecordingStateMachineTests/
 - **Zero External Data Egress**: 音声・文字起こし・要約・ノートはどの段階でも端末外へ出ない。アプリコードはネットワーク API を使わない（例外は SEC-NET-03 / 04 のみで、通信コードは 1 つの型に集約する）
 - **Recording-First**: 録音の継続を他の全機能より優先する。文字起こし・UI・保存の不調で録音を止めない
 - **At-Least-Once + 冪等**: 処理の再実行を前提とし、二重実行しても成果物が重複しない
-- **Device-Aware Degradation**: Apple Intelligence 対応・言語アセット・温度・空き容量に応じて縮退するが、録音は止めない
+- **Device-Aware Degradation**: Apple Intelligence 対応・言語アセット・温度・空き容量に応じて縮退するが、録音は止めない。例外は物理的に続けられない場合だけ（使える入力がない、書き込み先がなく未保存 Chunk をメモリにも保持できない、など。NFR-REL-05）で、そのときは保存済みの音声を確定可能な状態で守ってから停止し、停止理由を利用者に通知する
 - **断定しない**: 精度・速度・電池消費は保証値にせず実測して記録する
 - 不変条件 INV-01〜10（`requirements.md` §7）を破る設計・実装は行わない。特に INV-08: 時刻はサンプル数で数え、タイマーに依存しない
 
