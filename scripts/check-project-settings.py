@@ -206,6 +206,35 @@ def load_plist(path: Path) -> dict:
     return data
 
 
+def info_plist_files(
+    project_path: Path, target: str, own: dict, shared: dict, configurations: List[str]
+) -> List[Path]:
+    """ビルド設定の INFOPLIST_FILE が指すファイルを返す（ファイル名が Info.plist で終わらないものも検査するため）。
+
+    相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
+    """
+    parent = project_path.parent
+    source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
+    known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
+    effective, _ = resolve(own, shared, "INFOPLIST_FILE", configurations)
+    paths: List[Path] = []
+    for (key, value), _ in effective.items():
+        text = value.strip()
+        if not text:
+            continue
+
+        def expand(found: "re.Match[str]") -> str:
+            name = found.group(1) or found.group(2)
+            if name not in known:
+                raise Unreadable(f"{project_path}: {key} = {value} の変数 {name} を展開できない")
+            return known[name]
+
+        expanded = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", expand, text)
+        path = Path(expanded)
+        paths.append((path if path.is_absolute() else source_root / path).resolve())
+    return paths
+
+
 def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
@@ -218,6 +247,7 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
     if not isinstance(configurations, list) or not configurations or not all(isinstance(c, str) for c in configurations):
         raise Unreadable(f"{project_path}: configurations の形式が違う")
     check_build_settings("プロジェクト", shared, errors)
+    referenced: List[Path] = []
     for target in targets:
         if not isinstance(target, dict) or not isinstance(target.get("build-settings"), dict):
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
@@ -228,12 +258,16 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
             check_nonempty(name, own, shared, configurations, REQUIRED_NONEMPTY_APPLICATION, errors)
         check_build_settings(name, own, errors)
+        referenced.extend(info_plist_files(project_path, str(target.get("name", "")), own, shared, configurations))
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")
-    for path in find_files(root, ("Info.plist",)):
+    found = [path.resolve() for path in find_files(root, ("Info.plist",))]
+    # INFOPLIST_FILE が指すファイルも読む。ないファイル・読めないファイルは load_plist が Unreadable にする
+    for path in found + [path for path in dict.fromkeys(referenced) if path not in found]:
+        source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         for key, value in load_plist(path).items():
-            check_plist_entry(str(path.relative_to(root)), str(key), value, errors)
+            check_plist_entry(source, str(key), value, errors)
     for path in find_files(root, (".entitlements",)):
         for key in load_plist(path):
             source = str(path.relative_to(root))

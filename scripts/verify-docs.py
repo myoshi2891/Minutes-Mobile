@@ -247,6 +247,9 @@ class Checker:
                 elif first.startswith("満たす要件:") and not self.names_requirements(first):
                     self.error(name, f"節「{heading}」の「満たす要件:」に要件 ID も「—」の指定もない", number)
             if name.endswith("/README.md"):
+                # 索引には必須の節と申し送りを求めないが、コード片は照合する
+                if directory == DETAILED:
+                    self.check_snippets(name, text)
                 continue
             headings = [heading for _, heading, _ in sections]
             required = ["セキュリティ", "テスト観点"]

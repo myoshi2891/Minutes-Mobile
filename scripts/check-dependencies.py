@@ -3,6 +3,7 @@
 
 Package.resolved・Package.swift・project.xcproj に現れる外部のパッケージが、
 許可リスト（tools/dependency-allowlist.json）にあることを確かめる。MVP の許可リストは空（依存 0 件）。
+Package.swift の依存は、版の指定を同じディレクトリの Package.resolved の確定版と照合する。
 
 使い方: scripts/check-dependencies.py [--root <探す起点>] [--allowlist <許可リスト>]
 終了コード: 0 = 問題なし / 1 = 許可リスト外の依存あり / 2 = 読めない（読めないものを合格にしない）
@@ -12,7 +13,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from xcproj import Unreadable, load_project
 
@@ -119,6 +120,49 @@ def call_arguments(text: str, start: int) -> str:
     return text[start + 1:]
 
 
+# 版の指定（文字列リテラルだけ）。ブランチ・コミットの指定は版で固定していないものとして認めない
+VERSION = r'"(\d+\.\d+\.\d+)"'
+UNPINNED = re.compile(r"\b(branch|revision)\s*:|\.(branch|revision)\s*\(")
+REQUIREMENTS = (
+    ("exact", re.compile(rf"(?:\bexact:\s*|\.exact\(\s*){VERSION}")),
+    ("minor", re.compile(rf"\.upToNextMinor\(\s*from:\s*{VERSION}")),
+    ("major", re.compile(rf"(?:\.upToNextMajor\(\s*from:\s*|(?<![.\w])from:\s*){VERSION}")),
+    ("closed", re.compile(rf"{VERSION}\s*\.\.\.\s*{VERSION}")),
+    ("half-open", re.compile(rf"{VERSION}\s*\.\.<\s*{VERSION}")),
+)
+Version = Tuple[int, int, int]
+
+
+def parse_version(text: object) -> Optional[Version]:
+    found = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", text) if isinstance(text, str) else None
+    return (int(found.group(1)), int(found.group(2)), int(found.group(3))) if found else None
+
+
+def requirement(arguments: str) -> Optional[Tuple[Version, Version, bool]]:
+    """.package の版の指定を（下限, 上限, 上限を含むか）で返す。判定できなければ None。"""
+    for kind, pattern in REQUIREMENTS:
+        found = pattern.search(arguments)
+        if not found:
+            continue
+        low = parse_version(found.group(1))
+        assert low is not None
+        if kind == "exact":
+            return low, low, True
+        if kind == "minor":
+            return low, (low[0], low[1] + 1, 0), False
+        if kind == "major":
+            return low, (low[0] + 1, 0, 0), False
+        high = parse_version(found.group(2))
+        assert high is not None
+        return low, high, kind == "closed"
+    return None
+
+
+def satisfies(version: Version, rule: Tuple[Version, Version, bool]) -> bool:
+    low, high, inclusive = rule
+    return low <= version and (version <= high if inclusive else version < high)
+
+
 # 取得元を持つ宣言（Package の依存と、バイナリのターゲット）
 SOURCE_DECLARATION = re.compile(r"\.(package|binaryTarget)\s*\(")
 # 文字列リテラルだけの引数（連結・補間・変数を含まない）。引数の終わりは「,」か末尾
@@ -126,8 +170,35 @@ LITERAL_URL = re.compile(r'\burl:\s*"[^"\\]*"\s*(?:,|$)')
 LITERAL_PATH = re.compile(r'\bpath:\s*"[^"\\]*"\s*(?:,|$)')
 
 
-def manifest_errors(manifest: str, by_url: Dict[str, dict]) -> List[str]:
-    """Package.swift の取得元を調べる。取得元を文字列リテラルから判定できない宣言は合格にしない。"""
+def version_errors(arguments: str, summary: str, approved: Set[str], pinned: Optional[List[object]]) -> List[str]:
+    """.package(url:) の版の指定を、承認した版と、同じディレクトリの Package.resolved の確定版で照合する。"""
+    if UNPINNED.search(arguments):
+        return [f"版で固定されていない（ブランチやコミットの指定は認めない）: .package({summary})"]
+    rule = requirement(arguments)
+    if rule is None:
+        return [f"版の指定を判定できない（版を文字列リテラルで書く）: .package({summary})"]
+    if not pinned:
+        return [f"確定版がない（同じディレクトリの Package.resolved に記録する）: .package({summary})"]
+    errors: List[str] = []
+    for version in pinned:
+        parsed = parse_version(version)
+        if parsed is None or not satisfies(parsed, rule):
+            errors.append(f"宣言の版の指定と確定版 {version} が合わない: .package({summary})")
+        elif version not in approved:
+            errors.append(f"確定版 {version} は許可リストにない: .package({summary})")
+    return errors
+
+
+def manifest_errors(
+    manifest: str, by_url: Dict[str, dict], approved: Optional[Dict[str, Set[str]]] = None,
+    pins: Optional[Dict[str, List[object]]] = None
+) -> List[str]:
+    """Package.swift の取得元と版を調べる。取得元・版を文字列リテラルから判定できない宣言は合格にしない。
+
+    approved は URL → 承認した版、pins は URL → 同じディレクトリの Package.resolved の確定版。
+    """
+    approved = approved or {}
+    pins = pins or {}
     errors: List[str] = []
     for url in re.findall(r'\burl:\s*"([^"]+)"', manifest):
         if normalize(url) not in by_url:
@@ -141,6 +212,10 @@ def manifest_errors(manifest: str, by_url: Dict[str, dict]) -> List[str]:
         elif re.search(r"\burl:", arguments):
             if not LITERAL_URL.search(arguments):
                 errors.append(f"取得元の URL を判定できない（文字列リテラルで書く）: .{kind}({summary})")
+            elif kind == "package":
+                url = normalize(re.findall(r'\burl:\s*"([^"\\]*)"', arguments)[0])
+                if url in by_url:  # 許可リストにない URL は上で報告済み
+                    errors.extend(version_errors(arguments, summary, approved.get(url, set()), pins.get(url)))
         elif not LITERAL_PATH.search(arguments):
             errors.append(f"取得元を判定できない（url: か path: を文字列リテラルで書く）: .{kind}({summary})")
     return errors
@@ -148,10 +223,21 @@ def manifest_errors(manifest: str, by_url: Dict[str, dict]) -> List[str]:
 
 def check(root: Path, allowlist: Path) -> List[str]:
     by_pin, by_url = load_allowlist(allowlist)
+    # by_url は URL ごとに 1 項目しか持たないので、版の照合には by_pin から作った URL → 承認した版を使う
+    approved_versions: Dict[str, Set[str]] = {}
+    for package in by_pin.values():
+        approved_versions.setdefault(normalize(package["url"]), set()).add(package["version"])
+    # ディレクトリ → URL → 確定版（Package.swift と同じディレクトリの Package.resolved とだけ照合する）
+    pins_by_directory: Dict[Path, Dict[str, List[object]]] = {}
     errors: List[str] = []
     for path in find_files(root, "Package.resolved"):
         source = path.relative_to(root)
         for pin in resolved_pins(path):
+            pin_location = pin.get("location") or pin.get("repositoryURL")
+            pin_state = pin.get("state") if isinstance(pin.get("state"), dict) else {}
+            if isinstance(pin_location, str):
+                pins_by_directory.setdefault(path.parent, {}).setdefault(normalize(pin_location), []).append(
+                    pin_state.get("version"))
             identity = str(pin.get("identity") or pin.get("package") or "").lower()
             state = pin.get("state") if isinstance(pin.get("state"), dict) else {}
             version = state.get("version")
@@ -172,7 +258,8 @@ def check(root: Path, allowlist: Path) -> List[str]:
             manifest = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise Unreadable(f"{path}: {error}") from error
-        errors.extend(f"{path.relative_to(root)}: {message}" for message in manifest_errors(manifest, by_url))
+        pins = pins_by_directory.get(path.parent, {})
+        errors.extend(f"{path.relative_to(root)}: {message}" for message in manifest_errors(manifest, by_url, approved_versions, pins))
     for path in find_files(root, "project.xcproj"):
         for text in strings(load_project(path)):
             if REMOTE_URL.search(text) and normalize(text) not in by_url:

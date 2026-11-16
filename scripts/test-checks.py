@@ -210,6 +210,22 @@ def test_settings() -> None:
                   plists={"App/App.entitlements": {"com.apple.developer.icloud-services": ["CloudKit"]}})
     settings_case("仮の Bundle Identifier は警告にとどめる", 0, "CON-09",
                   project=lambda t: replaced(t, "com.example.sample", "devplaceholder.sample"))
+    # INFOPLIST_FILE が指すファイルは、名前が Info.plist で終わらなくても検査する
+    def info_plist_file(value: str) -> Callable[[str], str]:
+        return lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",',
+                                  f'"GENERATE_INFOPLIST_FILE": "YES",\n        "INFOPLIST_FILE": "{value}",')
+    settings_case("INFOPLIST_FILE が指すファイルの違反", 1, "NSAppTransportSecurity",
+                  project=info_plist_file("Config/App-Settings.plist"),
+                  plists={"Config/App-Settings.plist": {"NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True}}})
+    settings_case("INFOPLIST_FILE の変数を展開する", 1, "UIFileSharingEnabled",
+                  project=info_plist_file("$(SRCROOT)/$(TARGET_NAME)/Settings.plist"),
+                  plists={"Sample/Settings.plist": {"UIFileSharingEnabled": True}})
+    settings_case("INFOPLIST_FILE が指す合格のファイル", 0, "OK",
+                  project=info_plist_file("Config/App-Settings.plist"), plists={"Config/App-Settings.plist": OK_INFO_PLIST})
+    settings_case("INFOPLIST_FILE が指すファイルがない", 2, "読めない", project=info_plist_file("Config/Missing.plist"))
+    settings_case("INFOPLIST_FILE が指すファイルが壊れている", 2, "読めない",
+                  project=info_plist_file("Config/Broken.plist"), raw={"Config/Broken.plist": b"<plist"})
+    settings_case("INFOPLIST_FILE の展開できない変数", 2, "展開できない", project=info_plist_file("$(UNKNOWN)/Info.plist"))
     settings_case("読めない設定は合格にしない", 2, "読めない", project=lambda t: t + "{")
     settings_case("ターゲットがない設定は合格にしない", 2, "読めない", project=lambda t: '{"build-settings": {}, "targets": []}')
 
@@ -277,7 +293,40 @@ def test_dependencies() -> None:
     dependencies_case("レジストリの依存は認めない", 1, "レジストリ",
                       {"Package.swift": declare.format('.package(id: "owner.sample-lib", from: "1.2.3")')}, [approved])
     dependencies_case("製品の参照（package:）は宣言として数えない", 0, "OK",
-                      {"Package.swift": manifest + '.target(name: "T", dependencies: [.product(name: "S", package: "sample-lib")])\n'},
+                      {"Package.resolved": resolved,
+                       "Package.swift": manifest + '.target(name: "T", dependencies: [.product(name: "S", package: "sample-lib")])\n'},
+                      [approved])
+    # Package.swift の版の指定は、同じディレクトリの Package.resolved の確定版と照合する
+    dependencies_case("Package.resolved がない依存は合格にしない", 1, "確定版がない", {"Package.swift": manifest}, [approved])
+    dependencies_case("別のディレクトリの Package.resolved とは照合しない", 1, "確定版がない",
+                      {"Package.resolved": resolved, "Sub/Package.swift": manifest}, [approved])
+    url = "https://example.com/owner/sample-lib.git"
+    for label, declaration in {
+        "branch 指定": f'.package(url: "{url}", branch: "main")',
+        "revision 指定": f'.package(url: "{url}", revision: "{"0" * 40}")',
+        "branch の関数": f'.package(url: "{url}", .branch("main"))',
+    }.items():
+        dependencies_case(f"版で固定していない宣言（{label}）", 1, "版で固定されていない",
+                          {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
+    dependencies_case("宣言の版と承認済みの確定版が違う", 1, "合わない",
+                      {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", exact: "2.0.0")')},
+                      [approved])
+    dependencies_case("宣言の下限が確定版より新しい", 1, "合わない",
+                      {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", from: "1.3.0")')},
+                      [approved])
+    dependencies_case("版の指定を判定できない宣言", 1, "版の指定を判定できない",
+                      {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", from: version)')},
+                      [approved])
+    for label, declaration in {
+        "exact": f'.package(url: "{url}", exact: "1.2.3")',
+        "upToNextMinor": f'.package(url: "{url}", .upToNextMinor(from: "1.2.0"))',
+        "半開区間": f'.package(url: "{url}", "1.0.0"..<"2.0.0")',
+        "閉区間": f'.package(url: "{url}", "1.0.0"..."1.2.3")',
+    }.items():
+        dependencies_case(f"確定版を含む版の指定（{label}）", 0, "OK",
+                          {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
+    dependencies_case("区間の上限は含まない", 1, "合わない",
+                      {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", "1.0.0"..<"1.2.3")')},
                       [approved])
 
 
@@ -362,6 +411,11 @@ DOCS = {
         "## 5. 基本設計の申し送りの解決\n\n満たす要件: —\n\n| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n"
     ),
     "scripts/sample.sh": "echo one\necho two\necho three\n",
+    # 詳細設計の索引。必須の節はないが、コード片は照合する
+    "docs/03-detailed-design/README.md": (
+        "# 詳細設計の索引\n\n## 1. 一覧\n\n満たす要件: —\n\n"
+        f"<!-- excerpt: scripts/sample.sh -->\n\n{FENCE}bash\necho one\n{FENCE}\n"
+    ),
 }
 
 
@@ -413,6 +467,8 @@ def test_docs() -> None:
         docs_case("全文のコード片が実ファイルと違う", 1, "コード片が scripts/sample.sh と一致しない", detailed, "echo one\necho two\necho three", "echo one\necho two"),
         docs_case("一部のコード片が実ファイルと違う", 1, "コード片が scripts/sample.sh と一致しない", detailed, f"bash\necho two\necho three\n{FENCE}", f"bash\necho two\necho four\n{FENCE}"),
         docs_case("コード片の元のファイルがない", 1, "元のファイルがない", detailed, "<!-- file: scripts/sample.sh -->", "<!-- file: scripts/missing.sh -->"),
+        docs_case("詳細設計の索引のコード片も照合する", 1, "README.md:7: コード片が scripts/sample.sh と一致しない",
+                  "docs/03-detailed-design/README.md", f"bash\necho one\n{FENCE}", f"bash\necho nine\n{FENCE}"),
     ]
     # --update-snippets は、全文のコード片を実ファイルに合わせて書き直す
     fixed = docs_case("全文のコード片の書き直し", 0, "コード片を書き直した", detailed, "echo one\necho two\necho three", "echo old",
