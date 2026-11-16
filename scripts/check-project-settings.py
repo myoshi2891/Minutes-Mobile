@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-"""プロジェクト設定・Info.plist・entitlements の検査（TST-CI-06、TST-SEC-03）。
+"""プロジェクト設定・Info.plist・entitlements・プライバシーマニフェストの検査（TST-CI-06、TST-SEC-03）。
 
 基本設計 dev-environment.md §3 の「変更後の値」になっていること、
-「設定しないもの」が入っていないことを確かめる。
+「設定しないもの」が入っていないこと、プライバシーマニフェストの申告が決めたとおりであることを確かめる。
 
 使い方: scripts/check-project-settings.py [--project <project.xcproj>] [--root <探す起点>]
 終了コード: 0 = 問題なし / 1 = 違反あり / 2 = 読めない（読めないものを合格にしない）
@@ -68,6 +68,17 @@ FORBIDDEN_ENTITLEMENTS = {
 FORBIDDEN_ENTITLEMENT_PREFIXES = {
     "com.apple.developer.icloud": "SEC-NET-01（iCloud）",
     "com.apple.developer.ubiquity": "SEC-NET-01（iCloud）",
+}
+
+# プライバシーマニフェスト（SEC-PRV-03）。アプリのターゲットは <ターゲット名>/PrivacyInfo.xcprivacy に置く
+PRIVACY_MANIFEST_NAME = "PrivacyInfo.xcprivacy"
+# 空の配列で明示する申告（トラッキングのドメイン・収集するデータ）
+PRIVACY_EMPTY_KEYS = ("NSPrivacyTrackingDomains", "NSPrivacyCollectedDataTypes")
+# 申告してよい API の種類 → 理由コード。アプリのマニフェストは、この全部をちょうど申告する
+PRIVACY_ACCESSED_API_REASONS: Dict[str, Tuple[str, ...]] = {
+    "NSPrivacyAccessedAPICategoryFileTimestamp": ("C617.1",),
+    "NSPrivacyAccessedAPICategoryDiskSpace": ("E174.1",),
+    "NSPrivacyAccessedAPICategoryUserDefaults": ("CA92.1",),
 }
 
 
@@ -206,6 +217,51 @@ def load_plist(path: Path) -> dict:
     return data
 
 
+def declared_api_reasons(path: Path, manifest: dict) -> Dict[str, List[str]]:
+    """マニフェストの申告を「API の種類 → 理由コードの一覧」にする。形式が違うものは合格にしない。"""
+    entries = manifest.get("NSPrivacyAccessedAPITypes", [])
+    if not isinstance(entries, list):
+        raise Unreadable(f"{path}: NSPrivacyAccessedAPITypes が配列でない")
+    declared: Dict[str, List[str]] = {}
+    for entry in entries:
+        category = entry.get("NSPrivacyAccessedAPIType") if isinstance(entry, dict) else None
+        reasons = entry.get("NSPrivacyAccessedAPITypeReasons") if isinstance(entry, dict) else None
+        if not isinstance(category, str) or not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+            raise Unreadable(f"{path}: NSPrivacyAccessedAPITypes の要素の形式が違う")
+        declared.setdefault(category, []).extend(reasons)
+    return declared
+
+
+def check_privacy_manifest(source: str, path: Path, complete: bool, errors: List[str]) -> None:
+    """プライバシーマニフェストの申告を調べる。complete（アプリのマニフェスト）なら、決めた申告がすべてあることも確かめる。"""
+    manifest = load_plist(path)
+    if manifest.get("NSPrivacyTracking") is not False:
+        errors.append(f"[SEC-PRV-03] {source}: NSPrivacyTracking を false にする")
+    for key in PRIVACY_EMPTY_KEYS:
+        if manifest.get(key) != []:
+            errors.append(f"[SEC-PRV-03] {source}: {key} を空の配列にする")
+    declared = declared_api_reasons(path, manifest)
+    for category, reasons in declared.items():
+        allowed = PRIVACY_ACCESSED_API_REASONS.get(category)
+        if allowed is None:
+            errors.append(f"[SEC-PRV-03] {source}: 決めていない API の種類 {category} を申告しない（使うなら設計書と検査を同じ作業で直す）")
+            continue
+        for reason in reasons:
+            if reason not in allowed:
+                errors.append(f"[SEC-PRV-03] {source}: {category} の理由コード {reason} は、決めたもの（{'・'.join(allowed)}）と違う")
+    if complete:
+        for category, allowed in PRIVACY_ACCESSED_API_REASONS.items():
+            missing = [reason for reason in allowed if reason not in declared.get(category, [])]
+            if missing:
+                errors.append(f"[SEC-PRV-03] {source}: {category} の申告（理由コード {'・'.join(missing)}）がない")
+
+
+def source_root_of(project_path: Path) -> Path:
+    """SRCROOT（.xcodeproj のあるディレクトリ）を返す。"""
+    parent = project_path.parent
+    return parent.parent if parent.suffix == ".xcodeproj" else parent
+
+
 def info_plist_files(
     project_path: Path, target: str, own: dict, shared: dict, configurations: List[str]
 ) -> List[Path]:
@@ -213,8 +269,7 @@ def info_plist_files(
 
     相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
     """
-    parent = project_path.parent
-    source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
+    source_root = source_root_of(project_path)
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
     effective, _ = resolve(own, shared, "INFOPLIST_FILE", configurations)
     paths: List[Path] = []
@@ -248,6 +303,7 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         raise Unreadable(f"{project_path}: configurations の形式が違う")
     check_build_settings("プロジェクト", shared, errors)
     referenced: List[Path] = []
+    application_manifests: List[Path] = []
     for target in targets:
         if not isinstance(target, dict) or not isinstance(target.get("build-settings"), dict):
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
@@ -257,6 +313,11 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         if target.get("product-type") == "application":
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
             check_nonempty(name, own, shared, configurations, REQUIRED_NONEMPTY_APPLICATION, errors)
+            manifest = (source_root_of(project_path) / str(target.get("name", "")) / PRIVACY_MANIFEST_NAME).resolve()
+            if manifest.is_file():
+                application_manifests.append(manifest)
+            else:
+                errors.append(f"[SEC-PRV-03] {name}: {target.get('name', '?')}/{PRIVACY_MANIFEST_NAME} がない")
         check_build_settings(name, own, errors)
         referenced.extend(info_plist_files(project_path, str(target.get("name", "")), own, shared, configurations))
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
@@ -268,6 +329,11 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         for key, value in load_plist(path).items():
             check_plist_entry(source, str(key), value, errors)
+    # プライバシーマニフェストは、アプリのもの以外（拡張など）も調べる。アプリのものだけ、決めた申告がすべてあることを求める
+    manifests = [path.resolve() for path in find_files(root, (".xcprivacy",))]
+    for path in manifests + [path for path in application_manifests if path not in manifests]:
+        source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+        check_privacy_manifest(source, path, path in application_manifests, errors)
     for path in find_files(root, (".entitlements",)):
         for key in load_plist(path):
             source = str(path.relative_to(root))
@@ -280,7 +346,7 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="プロジェクト設定・Info.plist・entitlements の検査")
+    parser = argparse.ArgumentParser(description="プロジェクト設定・Info.plist・entitlements・プライバシーマニフェストの検査")
     parser.add_argument("--project", type=Path, default=ROOT / "MinutesMobile.xcodeproj" / "project.xcproj")
     parser.add_argument("--root", type=Path, default=ROOT)
     arguments = parser.parse_args()
@@ -296,7 +362,7 @@ def main() -> int:
     if errors:
         print(f"NG: 設定の違反 {len(errors)} 件")
         return 1
-    print("OK: プロジェクト設定・Info.plist・entitlements に違反なし")
+    print("OK: プロジェクト設定・Info.plist・entitlements・プライバシーマニフェストに違反なし")
     return 0
 
 

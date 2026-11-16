@@ -135,8 +135,8 @@ custom_rules:
     severity: error
 
   no_spotlight_user_activity:
-    name: "Spotlight と NSUserActivity の禁止"
-    regex: '\bimport\s+(\w+\s+)?CoreSpotlight\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
+    name: "Spotlight・NSUserActivity・App Intents の禁止"
+    regex: '\bimport\s+(\w+\s+)?(CoreSpotlight|AppIntents)\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
     match_kinds: *code
     message: "Spotlight・Siri にデータを渡さない（SEC-PLT-02）"
     severity: error

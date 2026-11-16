@@ -5,7 +5,7 @@
 試験用の設定はこのスクリプトの中で組み立て、一時ディレクトリに置く
 （リポジトリに「検査の対象外にするディレクトリ」を作らないため）。
 
-使い方: scripts/test-checks.py [settings] [dependencies] [versions] [gitleaks] [docs]   （省略時は全部）
+使い方: scripts/test-checks.py [settings] [dependencies] [versions] [gitleaks] [tracked] [docs]   （省略時は全部）
 終了コード: 0 = 全件が期待どおり / 1 = 期待と違う結果あり / 2 = 使い方の誤り
 """
 import json
@@ -58,6 +58,18 @@ OK_PROJECT = """{
 }
 """
 OK_INFO_PLIST = {"UIBackgroundModes": ["audio", "processing"], "BGTaskSchedulerPermittedIdentifiers": ["a.b"]}
+# 合格するプライバシーマニフェスト（アプリのターゲット Sample のもの。SEC-PRV-03）
+PRIVACY_MANIFEST = "Sample/PrivacyInfo.xcprivacy"
+OK_PRIVACY_MANIFEST = {
+    "NSPrivacyTracking": False,
+    "NSPrivacyTrackingDomains": [],
+    "NSPrivacyCollectedDataTypes": [],
+    "NSPrivacyAccessedAPITypes": [
+        {"NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryFileTimestamp", "NSPrivacyAccessedAPITypeReasons": ["C617.1"]},
+        {"NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryDiskSpace", "NSPrivacyAccessedAPITypeReasons": ["E174.1"]},
+        {"NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults", "NSPrivacyAccessedAPITypeReasons": ["CA92.1"]},
+    ],
+}
 
 
 def run(command: List[str]) -> Tuple[int, str]:
@@ -88,14 +100,17 @@ def settings_case(
     project: Optional[Callable[[str], str]] = None,
     plists: Optional[Dict[str, dict]] = None,
     raw: Optional[Dict[str, bytes]] = None,
+    without: Tuple[str, ...] = (),
 ) -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         text = project(OK_PROJECT) if project else OK_PROJECT
         (root / "project.xcproj").write_text(text, encoding="utf-8")
-        files = {"App/Info.plist": OK_INFO_PLIST}
+        files = {"App/Info.plist": OK_INFO_PLIST, PRIVACY_MANIFEST: OK_PRIVACY_MANIFEST}
         files.update(plists or {})
         for name, content in files.items():
+            if name in without:
+                continue
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             with (root / name).open("wb") as handle:
                 plistlib.dump(content, handle)
@@ -227,6 +242,38 @@ def test_settings() -> None:
                   project=info_plist_file("Config/Broken.plist"), raw={"Config/Broken.plist": b"<plist"})
     settings_case("INFOPLIST_FILE の展開できない変数", 2, "展開できない", project=info_plist_file("$(UNKNOWN)/Info.plist"))
     settings_case("読めない設定は合格にしない", 2, "読めない", project=lambda t: t + "{")
+    # プライバシーマニフェスト（SEC-PRV-03）
+    def manifest(**changes: object) -> Dict[str, dict]:
+        content = dict(OK_PRIVACY_MANIFEST, **changes)
+        return {PRIVACY_MANIFEST: {key: value for key, value in content.items() if value is not None}}
+
+    def accessed(category: str, *reasons: str) -> dict:
+        return {"NSPrivacyAccessedAPIType": f"NSPrivacyAccessedAPICategory{category}", "NSPrivacyAccessedAPITypeReasons": list(reasons)}
+
+    declared = OK_PRIVACY_MANIFEST["NSPrivacyAccessedAPITypes"]
+    settings_case("アプリのプライバシーマニフェストがない", 1, "Sample/PrivacyInfo.xcprivacy がない", without=(PRIVACY_MANIFEST,))
+    settings_case("トラッキングをすると申告している", 1, "NSPrivacyTracking を false", plists=manifest(NSPrivacyTracking=True))
+    settings_case("トラッキングの申告がない", 1, "NSPrivacyTracking を false", plists=manifest(NSPrivacyTracking=None))
+    settings_case("トラッキングのドメインがある", 1, "NSPrivacyTrackingDomains を空",
+                  plists=manifest(NSPrivacyTrackingDomains=["example.com"]))
+    settings_case("収集するデータの申告がある", 1, "NSPrivacyCollectedDataTypes を空",
+                  plists=manifest(NSPrivacyCollectedDataTypes=[{"NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeAudioData"}]))
+    settings_case("収集するデータの申告の鍵がない", 1, "NSPrivacyCollectedDataTypes を空", plists=manifest(NSPrivacyCollectedDataTypes=None))
+    settings_case("決めていない API の種類を申告している", 1, "NSPrivacyAccessedAPICategorySystemBootTime",
+                  plists=manifest(NSPrivacyAccessedAPITypes=declared + [accessed("SystemBootTime", "35F9.1")]))
+    settings_case("理由コードが決めたものと違う", 1, "理由コード 1C8F.1",
+                  plists=manifest(NSPrivacyAccessedAPITypes=declared[:2] + [accessed("UserDefaults", "CA92.1", "1C8F.1")]))
+    settings_case("決めた申告が足りない", 1, "NSPrivacyAccessedAPICategoryDiskSpace の申告",
+                  plists=manifest(NSPrivacyAccessedAPITypes=[declared[0], declared[2]]))
+    settings_case("申告の一覧がない", 1, "NSPrivacyAccessedAPICategoryFileTimestamp の申告", plists=manifest(NSPrivacyAccessedAPITypes=None))
+    settings_case("申告の形式が違うマニフェストは合格にしない", 2, "読めない", plists=manifest(NSPrivacyAccessedAPITypes=["C617.1"]))
+    settings_case("壊れたマニフェストは合格にしない", 2, "読めない", raw={PRIVACY_MANIFEST: b"<plist"}, without=(PRIVACY_MANIFEST,))
+    extension = dict(OK_PRIVACY_MANIFEST, NSPrivacyAccessedAPITypes=[])
+    settings_case("拡張のマニフェストは、決めた申告の一部だけでよい", 0, "OK", plists={"Widgets/PrivacyInfo.xcprivacy": extension})
+    settings_case("拡張のマニフェストのトラッキング", 1, "Widgets/PrivacyInfo.xcprivacy: NSPrivacyTracking",
+                  plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyTracking=True)})
+    settings_case("拡張のマニフェストの決めていない申告", 1, "NSPrivacyAccessedAPICategoryActiveKeyboards",
+                  plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyAccessedAPITypes=[accessed("ActiveKeyboards", "3EC4.1")])})
     settings_case("ターゲットがない設定は合格にしない", 2, "読めない", project=lambda t: '{"build-settings": {}, "targets": []}')
 
 
@@ -383,6 +430,55 @@ def test_gitleaks() -> None:
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
 
 
+# 合格する .gitignore（check-tracked-files.py が求める行。SEC-SUP-04）
+OK_GITIGNORE = "\n".join([
+    "# 録音データ", "*.wav", "*.m4a", "*.caf", "*.zip", "", "*.sqlite", "*.sqlite-wal", "*.sqlite-shm",
+    ".env", ".env.*", "xcuserdata/", "DerivedData/", ".build/", "build/", ".DS_Store",
+]) + "\n"
+
+
+def tracked_case(label: str, want_code: int, want_text: str, ignore: Optional[str] = OK_GITIGNORE,
+                 files: Optional[Dict[str, str]] = None, repository: bool = True) -> None:
+    """一時ディレクトリに Git のリポジトリを作り、.gitignore を越えて（--force）ファイルをインデックスに入れてから検査する。"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        contents = {"Sources/App.swift": "let a = 1\n"}
+        contents.update(files or {})
+        if ignore is not None:
+            contents[".gitignore"] = ignore
+        for name, content in contents.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text(content, encoding="utf-8")
+        if repository:
+            subprocess.run(["git", "init", "--quiet", directory], check=True, capture_output=True)
+            subprocess.run(["git", "-C", directory, "add", "--force", "--all"], check=True, capture_output=True)
+        expect(f"tracked: {label}", [str(SCRIPTS / "check-tracked-files.py"), "--root", directory], want_code, want_text)
+
+
+def test_tracked() -> None:
+    tracked_case("合格するリポジトリ", 0, "OK")
+    tracked_case("似た名前のファイルは通る", 0, "OK",
+                 files={"Sources/wave.swift": "", "docs/notes.wav.md": "", "docs/environment.md": "", ".envrc": "", "docs/builds.md": ""})
+    tracked_case(".gitignore がない", 1, ".gitignore がない", ignore=None)
+    tracked_case("録音データの行がない", 1, "*.wav", ignore=replaced(OK_GITIGNORE, "*.wav\n", ""))
+    tracked_case("行がコメントになっている", 1, "*.m4a", ignore=replaced(OK_GITIGNORE, "*.m4a\n", "# *.m4a\n"))
+    tracked_case("DB の行がない", 1, "*.sqlite-wal", ignore=replaced(OK_GITIGNORE, "*.sqlite-wal\n", ""))
+    tracked_case("秘密情報の行がない", 1, ".env.*", ignore=replaced(OK_GITIGNORE, ".env.*\n", ""))
+    tracked_case("個人の設定の行がない", 1, "xcuserdata/", ignore=replaced(OK_GITIGNORE, "xcuserdata/\n", ""))
+    tracked_case("除外を取り消す行", 1, "除外を取り消す行", ignore=OK_GITIGNORE + "!sample.wav\n")
+    tracked_case("入れ子の .gitignore の取り消し", 1, "Tests/.gitignore", files={"Tests/.gitignore": "!*.wav\n"})
+    tracked_case("入れ子の .gitignore に取り消しがなければ通る", 0, "OK", files={"Tests/.gitignore": "*.tmp\n"})
+    tracked_case("追跡されている録音データ", 1, "Tests/Fixtures/meeting.wav", files={"Tests/Fixtures/meeting.wav": "RIFF"})
+    tracked_case("大文字の拡張子", 1, "REC.WAV", files={"REC.WAV": "RIFF"})
+    tracked_case("空白と日本語を含む名前", 1, "録音 1.m4a", files={"docs/録音 1.m4a": "x"})
+    tracked_case("追跡されているアーカイブ", 1, "export.zip", files={"export.zip": "PK"})
+    tracked_case("追跡されている DB", 1, "db/minutes.sqlite-wal", files={"db/minutes.sqlite-wal": "x"})
+    tracked_case("追跡されている .env", 1, "config/.env", files={"config/.env": "TOKEN=x\n"})
+    tracked_case("追跡されている .env.local", 1, ".env.local", files={".env.local": "TOKEN=x\n"})
+    tracked_case("追跡されている個人の設定", 1, "xcuserdata", files={"App.xcodeproj/xcuserdata/me/state.plist": "x"})
+    tracked_case("Git の管理下でない場所は合格にしない", 2, "読めない", repository=False)
+
+
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）
 FENCE = "`" * 3
 DOCS = {
@@ -481,7 +577,7 @@ def test_docs() -> None:
 
 
 TESTS = {"settings": test_settings, "dependencies": test_dependencies, "versions": test_versions, "gitleaks": test_gitleaks,
-         "docs": test_docs}
+         "tracked": test_tracked, "docs": test_docs}
 
 
 def main() -> int:

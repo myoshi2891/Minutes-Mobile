@@ -95,8 +95,8 @@ title() {
     0) echo "開発ツールの版" ;;
     1) echo "整形（SwiftFormat）" ;;
     2) echo "静的解析（SwiftLint）" ;;
-    3) echo "秘密情報の検出（gitleaks）" ;;
-    4) echo "プロジェクト設定と Info.plist" ;;
+    3) echo "秘密情報の検出（gitleaks）と、録音データの混入" ;;
+    4) echo "プロジェクト設定・Info.plist・プライバシーマニフェスト" ;;
     5) echo "依存" ;;
     6) echo "ビルド" ;;
     7) echo "単体・結合テスト" ;;
@@ -142,8 +142,10 @@ step_3() {
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --pre-commit --staged .
   else
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml .
-    scripts/test-checks.py gitleaks
+    scripts/test-checks.py gitleaks tracked
   fi
+  # 録音データ・試験の DB・秘密情報のファイルが、インデックス（ステージした分を含む）に入っていないこと（SEC-SUP-04）
+  scripts/check-tracked-files.py
 }
 
 step_4() {
