@@ -691,7 +691,7 @@ echo "OK: フックを有効にした（core.hooksPath = $(git config core.hooks
 | `Logger(` の直接の利用 | `no_direct_logger`（`os_log(` も含む） | ログの型 |
 | 通信 API・WebSocket・CFStream | `no_network_api` | なし |
 | `import Network`・`import CFNetwork` | `no_network_import` | なし |
-| BSD ソケット（`socket(`・`connect(`） | `no_bsd_socket` | なし |
+| BSD ソケット（`socket(`・`connect(`。`Darwin.` で修飾した呼び出しを含む） | `no_bsd_socket` | なし |
 | `SFSpeechRecognizer` | `no_legacy_speech_recognizer` | なし |
 | `PrivateCloudComputeLanguageModel` | `no_private_cloud_model` | なし |
 | `try!`・`as!`・強制アンラップ | 組み込みの `force_try`・`force_cast`・`force_unwrapping` | テストコード（§6.4） |
@@ -787,7 +787,7 @@ custom_rules:
 
   no_bsd_socket:
     name: "BSD ソケットの禁止"
-    regex: '(?<![.\w])(?<!func\s)(socket|connect)\s*\('
+    regex: '(?:\bDarwin\s*\.\s*|(?<![.\w])(?<!func\s))(socket|connect)\s*\('
     match_kinds: *code
     message: "ソケットを直接使わない（SEC-NET-01）"
     severity: error
@@ -1003,6 +1003,7 @@ useDefault = true
 | `MinutesMobile.xcodeproj/project.xcproj` | JSON 形式だが末尾カンマを含む。文字列の外にある、閉じ括弧の直前のカンマだけを除いてから標準の JSON パーサーで読む（`scripts/xcproj.py`） |
 | ビルド設定の `INFOPLIST_KEY_…` | 自動生成の Info.plist に入る項目。接頭辞を外して Info.plist の規則を当てる |
 | `…Info.plist`・`….entitlements` | リポジトリ内のすべて（成果物と導入したツールのディレクトリを除く）。`plistlib` で読む |
+| ビルド設定の `INFOPLIST_FILE` | 各ターゲット・各構成で効く値が指すファイル（名前が `Info.plist` で終わらなくても検査する）。`$(SRCROOT)`・`$(PROJECT_DIR)`・`$(TARGET_NAME)` を展開し、相対パスは `.xcodeproj` のあるディレクトリから解決する。ほかの変数を含む・ファイルが読めない場合は、読めないものとして失敗する |
 
 - 条件付きの設定（`SWIFT_VERSION[config=Debug]` など）は、構成（`configurations` の各要素）ごとに効く値を求めて検査する。効く値は、ターゲットの構成の条件が一致する書き方 → ターゲットの条件のない書き方 → プロジェクトの構成の条件が一致する書き方 → プロジェクトの条件のない書き方、の順で最初に見つかったもの。ターゲットにある書き方だけを見ると、ターゲットに Debug だけ、プロジェクトに Release だけがある場合に Release の値を見落とすためである。構成以外の条件（`sdk=`・`arch=`）の書き方は、そのビルドで効きうるのですべて検査する。どの段にも値がない構成は「設定されていない」とする。
 - 空でない値が要る設定（マイクの利用目的）は、各構成で効く書き方が**すべて**空でないこと（条件のない値に説明文があっても、Release の条件付きの値が空なら違反）。
@@ -1101,7 +1102,7 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | 対象 | 規則 |
 | --- | --- |
 | `Package.resolved`（すべて） | 各依存の名前と版が、承認済みの要素と一致する。名前と版が一致しても、取得元（`location`。古い形式は `repositoryURL`）を正規化して承認済みの URL と比べ、違う・ない場合は認めない。版で固定していない依存（ブランチ・コミットの指定）は認めない |
-| `Package.swift`（すべて） | `url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`path:`）は認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない** |
+| `Package.swift`（すべて） | `url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`path:`）は認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない**。`url:` の依存は、版の指定（`from:`・`exact:`・`.upToNextMajor`・`.upToNextMinor`・`..<`・`...`）を、**同じディレクトリの** `Package.resolved` の確定版と照合する。確定版がない、ブランチ・コミットの指定、版の指定を文字列リテラルから判定できない、確定版が宣言の版の指定を満たさない（古い承認済みの確定版が残った場合を含む）、確定版が承認した版でない、のいずれも認めない |
 | `project.xcproj` | リモートの URL の形をした文字列が、承認済みの URL と一致する |
 
 - 許可リスト自体も検査する。`allowedLicenses` にないライセンスで `ownerDecision` がない要素、承認日のない要素があれば、終了コード 2 で失敗する。
