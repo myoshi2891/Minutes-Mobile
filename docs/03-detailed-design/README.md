@@ -4,29 +4,35 @@
 
 ## 1. 文書一覧（作る順）
 
-満たす要件: NFR-MNT-04 ／ 決定: BD-DEV-02、UD-07
+満たす要件: NFR-MNT-04 ／ 決定: BD-DEV-02、UD-07、UD-10
 
-基本設計書と 1 対 1 で対応させる。上流から順に作り、前の単位の実装とテストが通ってから次に着手する。
+基本設計書と 1 対 1 で対応させる。文書は上流から順に、実装より先にすべて作った（UD-10）。実装は同じ順に単位ごとに進め、各単位の実装の直前に該当する文書を再確認して改訂する（§2）。
 
 | 順 | 文書 | 対応する基本設計 | 状態 |
 | --- | --- | --- | --- |
 | 1 | [dev-environment.md](dev-environment.md) | [dev-environment.md](../02-basic-design/dev-environment.md) | 初版（2026-11-16）。検査基盤は実装し、動かして確かめた。プロジェクト設定の変更は次の作業単位 |
-| 2 | `architecture.md` | [architecture.md](../02-basic-design/architecture.md) | 未着手 |
-| 3 | `recording.md` | [recording.md](../02-basic-design/recording.md) | 未着手 |
-| 4 | `storage.md` | [storage.md](../02-basic-design/storage.md) | 未着手 |
-| 5 | `transcription.md` | [transcription.md](../02-basic-design/transcription.md) | 未着手 |
-| 6 | `ui.md` | [ui.md](../02-basic-design/ui.md) | 未着手 |
-| 7 | `export.md` | [export.md](../02-basic-design/export.md) | 未着手 |
+| 2 | [architecture.md](architecture.md) | [architecture.md](../02-basic-design/architecture.md) | 初版（2026-11-16。実装前） |
+| 3 | [recording.md](recording.md) | [recording.md](../02-basic-design/recording.md) | 初版（2026-11-16。実装前） |
+| 4 | [storage.md](storage.md) | [storage.md](../02-basic-design/storage.md) | 初版（2026-11-16。実装前） |
+| 5 | [transcription.md](transcription.md) | [transcription.md](../02-basic-design/transcription.md) | 初版（2026-11-16。実装前） |
+| 6 | [ui.md](ui.md) | [ui.md](../02-basic-design/ui.md) | 初版（2026-11-16。実装前） |
+| 7 | [export.md](export.md) | [export.md](../02-basic-design/export.md) | 初版（2026-11-16。実装前） |
+
+「実装前」の文書のコード片は、リポジトリの外に置いた一時の Package でビルドできた範囲を各文書に書いてある。実ファイルはまだないので、照合の印（§3）は付いていない。
 
 ## 2. 方針
 
-満たす要件: NFR-MNT-04、TST-GEN-03 ／ 決定: UD-06
+満たす要件: NFR-MNT-04、TST-GEN-03 ／ 決定: UD-06、UD-10
 
 - 基本設計の設計決定（`BD-<領域>-nn`）を引用し、各文書の末尾にある「詳細設計への申し送り」をすべて解決する。解決は「申し送り」の節の表に、項目ごとに 1 行で書く。
 - 最初に作るのは `dev-environment.md`（検査スクリプト・静的解析の規則・プロジェクト設定）とする。機能の実装より先に検査の仕組みを入れるため（BD-DEV-02）。
 - 詳細設計書のコード片は、実装ファイルと一致させる。どちらかを変えたら、同じ作業でもう一方と本文を直す（NFR-MNT-04）。
 - 各文書に「セキュリティ」節・「テスト観点」節・「要件 ID ↔ テスト」の対応表を置く（[../01-requirements/test-requirements.md](../01-requirements/test-requirements.md) §6）。
 - 実装の順序は、上流（録音 → 保存 → 確定 → 復旧）から下流（文字起こし → 表示 → 書き出し）へ進める。前の単位のテストが通ってから次に着手する。
+- 文書は実装より先にすべて作る（UD-10）。そのため、後ろの単位の文書ほど、書いた時点から実装までの間に前提が変わりうる。各単位の実装の直前に、該当する文書を読み直して次を確かめ、食い違いは実装を始める前に文書の側で直す（基本設計と食い違う結論になったら、基本設計も同じ作業で直す）。
+  - 前の単位の実装で確定した型・名前・節番号と合っている
+  - その文書の「断定しない事項・確かめていない事項」のうち、前の単位の実装や実機試験で分かったことを反映している
+  - 技術情報の確認日が古くない（[../README.md](../README.md) §4）。使う OS の API を、その時点の SDK で確かめ直す
 
 ## 3. 文書の検査
 

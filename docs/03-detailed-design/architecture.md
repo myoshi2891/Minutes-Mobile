@@ -1339,6 +1339,7 @@ struct MeetingStateMachineTests {
 | TST-GEN-06 | 状態遷移の表形式のテスト（本書・[recording.md](recording.md)・[transcription.md](transcription.md)） | MinutesDomainTests | 未実装 |
 | TST-GEN-08 | 合成音声の生成（[recording.md](recording.md) §11） | MinutesAudioTests | 未実装 |
 | SEC-NET-01、TST-SEC-01 | 通信 / TST-SEC-01 全工程を通しても通信の要求が 0 件 | MinutesMobileTests | 未実装 |
+| SEC-NET-01・03 | 実機試験 TST-SEC-02・TST-DEV-07（App プライバシーレポートで本アプリの通信先が 0 件。§13.2） | 実機 | 未実施 |
 | TST-CI-08 | 起動の引数 / TST-CI-08 Release では引数があっても本番の構成になる | MinutesApplicationTests | 未実装 |
 | SEC-LOG-01 | 規則 `no_print_logging`・`no_direct_logger`（[dev-environment.md](dev-environment.md) §6） | 静的解析 | 通過 |
 | SEC-NET-05・06、SEC-PLT-04・05、SEC-DAT-07 | 設定の検査・依存の検査・規則 `no_webkit`・`no_direct_user_defaults`（[dev-environment.md](dev-environment.md) §6・§8・§9） | 静的解析 | 通過（自己試験） |

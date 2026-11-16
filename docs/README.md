@@ -12,7 +12,7 @@ MinutesMobile（iPhone 向け・端末内完結の議事録アプリ）の設計
 | 要件定義 | [01-requirements/test-requirements.md](01-requirements/test-requirements.md) | 初版（2026-11-14） | シフトレフトのテスト要件（TST）・必須異常系シナリオ・CI ゲート |
 | 要件定義 | [01-requirements/dependencies-and-costs.md](01-requirements/dependencies-and-costs.md) | 初版（2026-11-14） | 依存・ライセンス・費用の台帳（COST）。有償項目の確認状況 |
 | 基本設計 | [02-basic-design/README.md](02-basic-design/README.md) | 初版（2026-11-15） | 基本設計書の索引。MVP の 7 文書（アーキテクチャ・録音・保存・文字起こし・画面・書き出し・開発環境）と、未解決事項の解決状況 |
-| 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 作成中（2026-11-16） | 詳細設計書の索引。1 文書目の [dev-environment.md](03-detailed-design/dev-environment.md)（開発環境と検査）を作成済み。残り 6 文書は未着手 |
+| 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 初版（2026-11-16。実装前） | 詳細設計書の索引。MVP の 7 文書（開発環境と検査・アーキテクチャ・録音・保存・文字起こし・画面・書き出し）。[dev-environment.md](03-detailed-design/dev-environment.md) の検査基盤だけ実装済みで、残り 6 文書は実装より先に作った（UD-10）。各作業単位の実装の直前に、該当する文書を再確認して改訂する |
 | 試験記録 | [04-test-records/README.md](04-test-records/README.md) | 様式のみ（2026-11-16） | 実機試験の記録の規則と様式。記録はまだない |
 
 参照元（別リポジトリ・読み取り専用）: 別リポジトリ `Minutes` の `docs/design-local-phase*.md`（PC/Web 版 Minutes の設計書）。
@@ -76,3 +76,4 @@ docs/
 | UD-07 | 2026-11-14 | 基本設計は **MVP の 7 文書**を先に作る。P2 の `summary-and-notes.md` は MVP の実装後に作る | 02-basic-design/README.md。P2 の接続点だけ architecture.md §10 に記述 |
 | UD-08 | 2026-11-14 | 割り込み後は**同じ会議の続きとして自動で再開**し、中断中は空白区間として記録する | OQ-01 を解決。FR-INT-02 の仮置きを確定。recording.md §5 |
 | UD-09 | 2026-11-14 | メタデータの保存は **iOS 同梱の SQLite を薄い自作ラッパー経由で直接使う**（追加の依存なし） | OQ-02 を解決。storage.md §3 |
+| UD-10 | 2026-11-16 | 詳細設計の残り 6 文書（architecture・recording・storage・transcription・ui・export）は、**実装より先にすべて作る**。各作業単位の実装の直前に、該当する文書を再確認して改訂する | 「1 文書書く → 実装 → 次の文書」の順をやめる。実装の順序（上流から）は変えない。03-detailed-design/README.md §1・§2、PROGRESS.md §1 |
