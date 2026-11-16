@@ -161,14 +161,14 @@ Packages/MinutesKit/
     MinutesDomain/
       Identifiers.swift  AudioTimeline.swift  MeetingStateMachine.swift
       Ports.swift  Failures.swift  Logging.swift          # 本書
-      Recording/  Storage/  Transcription/  Export/        # 各文書の純粋ロジック
+      Recording/  Storage/  Transcription/  Export/  Interface/   # 各文書の純粋ロジック
     MinutesApplication/
       RecordingService.swift  FinalizationService.swift  RecoveryService.swift
       DeletionService.swift  TranscriptionService.swift  ExportService.swift
       LaunchConfiguration.swift
     MinutesStorage/
       Storage/StorageRoot.swift                            # ディレクトリを作ってよい唯一の型
-      SQLite/  Chunks/  Meetings/  Archive/
+      Files/  SQLite/  Chunks/  Meetings/  Jobs/  Archive/
     MinutesAudio/
     MinutesTranscription/
     MinutesSystem/
@@ -334,7 +334,7 @@ public enum AudioConstants {
 /// 空白区間。位置は「空白の直後に来るサンプルの番号」（基本設計 architecture.md §6）
 public struct RecordingGap: Equatable, Sendable {
     public let position: Int64
-    /// ミリ秒。長さが分からない空白（割り込み中に終了した会議の末尾）は nil（storage.md §8）
+    /// ミリ秒。長さが分からない空白（割り込み中に終了した会議の末尾）は nil（storage.md §9）
     public let durationMs: Int64?
 
     public init(position: Int64, durationMs: Int64?) {
@@ -392,7 +392,7 @@ public struct AudioTimeline: Equatable, Sendable {
 | `endTimeMs(ofSample: 160_001)` | 130,000 | 空白をまたいで終わる区間 |
 
 - 位置・サンプル数は `Int64` で持つ。120 分は 115,200,000 サンプルで 32 bit にも収まるが、バイト数との積で桁あふれを起こさないよう 64 bit に統一する。
-- 長さが分からない空白は 0 として数える。この空白は録音の末尾にしかないので、どのセグメントの時刻も変わらない（[storage.md](storage.md) §8）。
+- 長さが分からない空白は 0 として数える。この空白は録音の末尾にしかないので、どのセグメントの時刻も変わらない（[storage.md](storage.md) §9）。
 - 画面の時刻表示（`hh:mm:ss`）への整形は UI の関数で、この型は ms までを扱う。
 
 ---
@@ -635,7 +635,7 @@ public struct SystemMonotonicClock: MonotonicClock {
 | 決めたこと | 理由 |
 | --- | --- |
 | 単調時計は `ContinuousClock`（スリープ中も進む）を使う。`SuspendingClock`・`ProcessInfo.systemUptime` は使わない | 割り込み中はアプリがサスペンドされ、端末がスリープしうる。スリープで止まる時計では、空白区間の長さが実際より短くなる |
-| 単調時計の値を永続化しない | 起点がプロセスごとに違う。再起動をまたぐと比べられない。強制終了で開いたままになった空白区間の長さは「不明」にする（[storage.md](storage.md) §8） |
+| 単調時計の値を永続化しない | 起点がプロセスごとに違う。再起動をまたぐと比べられない。強制終了で開いたままになった空白区間の長さは「不明」にする（[storage.md](storage.md) §9） |
 | プライバシーマニフェストから「システムの起動時間」（`35F9.1`）の申告を外す | Apple の一覧で対象になっているのは `systemUptime` と `mach_absolute_time()` で、どちらも呼ばない（[dev-environment.md](dev-environment.md) §14.1 を同じ作業で直した）。`no_direct_clock` がこの 2 つを `SystemDependencies/` の外で禁止している |
 | 待ち合わせは `Scheduler.sleep(for:)` の 1 つだけ。本番の実装（`SystemScheduler`）は `Task.sleep` を呼ぶ（`no_direct_sleep_timer` の例外の場所に置く） | 最初のバッファの時間切れ（[recording.md](recording.md) §3.4）と、ジョブの再試行の間隔・時間切れ（[transcription.md](transcription.md)）に使う。待った時間を時刻として数えない（INV-08） |
 | ID は `makeUUID()` の 1 つだけ | 会議 ID・書き出し ID・ジョブの実行世代のどれも UUID で足りる。用途ごとの型（`MeetingID` など）へは呼び出し側で包む |
@@ -825,7 +825,7 @@ public actor RecordingPipelineSkeleton {
 | 録音の開始 | `RecordingStartFailure` | 録音中・権限なし・文字起こしの中止の時間切れ・会議の作成の失敗・セッションの有効化の失敗・入力の開始の失敗・最初のバッファの時間切れ | 下のコード |
 | 録音中 | `RecordingIssue` | 再開できない・再構築の失敗・入力の喪失・取りこぼし・通知の予約の失敗。**録音を止める理由にしない**（`inputLost` だけは物理的に続けられない） | 下のコード |
 | 保存 | `StorageFailure` | 種類（`StorageFailureKind` 11 種）・段（`StorageStage` 16 種）・OS の結果コード | 下のコード |
-| 確定 | `FinalizationBlocker` | 欄番・ファイル欠損・不正なヘッダ・隔離・ハッシュ不一致・メモリ上の未保存・失われた未保存 | [storage.md](storage.md) §6 |
+| 確定 | `FinalizationBlocker` | 欠番・ファイル欠損・不正なヘッダ・隔離・ハッシュ不一致・メモリ上の未保存・失われた未保存 | [storage.md](storage.md) §6 |
 | 文字起こし | `TranscriptionFailureClass` | 基本設計 transcription.md §4.2 の 7 分類 | [transcription.md](transcription.md) §5 |
 | 書き出し | `ExportFailure` | 録音中・削除中・容量不足・上限超過・長さが不明な欠落・範囲の不整合・版の破損・中止・保存の失敗 | [export.md](export.md) §3 |
 | 永続データ | `PersistedDataError` | 形式の版・不正な値・欠けた項目・壊れた形式 | §3.2 |
@@ -1123,7 +1123,7 @@ public struct AppLogger: LogSink {
 | --- | --- |
 | 1 | 起動の引数から構成を決める（§10.2。純粋関数） |
 | 2 | 注入点の実装を作る（本番、または UI テスト用の差し替え） |
-| 3 | `StorageRoot` を作り、属性を検証する（[storage.md](storage.md) §3） |
+| 3 | `StorageRoot` を作り、属性を検証する（[storage.md](storage.md) §2） |
 | 4 | `MeetingStore`（SQLite）を開く。開けなければ退避して作り直す |
 | 5 | サービスを作る |
 | 6 | 起動時の復旧を実行する（[storage.md](storage.md) §9）。**完了するまで、録音の開始を受け付けない** |
@@ -1252,7 +1252,7 @@ struct MeetingStateMachineTests {
 | NS-A-05 | 本番の実装（`System…`）を作るのは `AppEnvironment` だけにする。サービスの中で `SystemWallClock()` などを作らない | レビュー。作ると、そのコードは時刻を固定できずテストが書けない |
 | NS-A-06 | 状態を直接書き換える入口を作らない。状態の変更は `reduce` を通す（§5.3） | レビュー、単体（表にない遷移の拒否） |
 | NS-A-07 | actor の外へ参照型（`AVAudioPCMBuffer`・SQLite の接続・`FileHandle`）を渡さない | Swift 6 の検査（`Sendable` でない値は渡せない）。`@unchecked Sendable` を足す PR は理由をレビューする |
-| NS-A-08 | `@unchecked Sendable`・`nonisolated(unsafe)` を使うのは、リングバッファ（[recording.md](recording.md) §4）と SQLite の接続（[storage.md](storage.md) §4）の 2 か所に限る | レビュー。`grep` で数える |
+| NS-A-08 | `@unchecked Sendable`・`nonisolated(unsafe)` を使うのは、リングバッファ（[recording.md](recording.md) §4）と、継続処理タスクの受け渡し（[transcription.md](transcription.md) §9）の 2 か所に限る。SQLite の接続には付けない（actor の中だけで持てることを確かめた。[storage.md](storage.md) §4.2） | レビュー。`grep` で数える |
 | NS-A-09 | UI テスト用の差し替えを Release に含めない。`#if DEBUG` の外で `-uiTest…` の引数を読まない | 単体（`isDebugBuild: false` で本番の構成になること） |
 | NS-A-10 | 永続データの `Codable` を自動生成に任せない。値の範囲を持つ型（ID・連番・状態・サンプルの範囲）は、検証つきの初期化を書く | 単体（範囲外・未知の値の拒否。TST-RCV-04） |
 
@@ -1334,7 +1334,7 @@ struct MeetingStateMachineTests {
 | TST-GEN-01 | 差し替え / TST-GEN-01 手動の時計は進めた分だけ進む | MinutesDomainTests | 未実装 |
 | TST-GEN-05 | 共通の型 / TST-GEN-05 世代を進めると前の世代と一致しない | MinutesDomainTests | 未実装 |
 | TST-GEN-07 | 差し替え / TST-GEN-07 連番の ID は同じ順序で同じ値を返す | MinutesDomainTests | 未実装 |
-| TST-GEN-02 | 各結合テストが `TemporaryDirectory` を使う（[storage.md](storage.md) §13） | MinutesStorageTests | 未実装 |
+| TST-GEN-02 | 各結合テストが `TemporaryDirectory` を使う（[storage.md](storage.md) §12） | MinutesStorageTests | 未実装 |
 | TST-GEN-04 | 各サービスのテストが差し替えだけで動く（各文書） | MinutesApplicationTests | 未実装 |
 | TST-GEN-06 | 状態遷移の表形式のテスト（本書・[recording.md](recording.md)・[transcription.md](transcription.md)） | MinutesDomainTests | 未実装 |
 | TST-GEN-08 | 合成音声の生成（[recording.md](recording.md) §11） | MinutesAudioTests | 未実装 |

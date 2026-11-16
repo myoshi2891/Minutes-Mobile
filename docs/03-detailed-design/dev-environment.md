@@ -904,11 +904,11 @@ custom_rules:
     severity: error
 ```
 
-### 6.3 例外を認める場所（仮のパス）
+### 6.3 例外を認める場所
 
-例外は、規則ごとの `excluded`（パスの正規表現）で指定する。**型とファイルの名前は architecture の詳細設計で確定する。** 下のパスは仮のもので、確定したら、同じ作業で `.swiftlint.yml` と `tools/lint-fixtures/<規則名>/allowed/` を直す。
+例外は、規則ごとの `excluded`（パスの正規表現）で指定する。**型とファイルの名前は、architecture の詳細設計（[architecture.md](architecture.md) §2.4）で、下のパスのまま確定した**（2026-11-16）。変える場合は、同じ作業で `.swiftlint.yml` と `tools/lint-fixtures/<規則名>/allowed/` を直す。
 
-| 例外の場所 | 仮のパス | 対象の規則 |
+| 例外の場所 | パス | 対象の規則 |
 | --- | --- | --- |
 | ログの型 | `…/Logging/AppLogger.swift` | `no_direct_logger` |
 | 設定の型 | `…/Settings/SettingsStore.swift` | `no_direct_user_defaults` |
@@ -1143,11 +1143,13 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 
 ### 11.1 `Packages/MinutesKit/Package.swift`（作業単位 2 で作成）
 
-中核ロジックの Package（BD-ARC-02）。下の内容を一時ディレクトリに置き、Swift 6.4.2 でビルドとテストが通ること、未使用の値の警告がエラーになることを確かめた（2026-11-16）。
+中核ロジックの Package（BD-ARC-02）。ターゲットの分割は、architecture の詳細設計で確定した（[architecture.md](architecture.md) §2。2026-11-16）。下の内容を一時ディレクトリに置き、Swift 6.4.2 でビルドとテストが通ること、未使用の値の警告がエラーになることを確かめた。
 
 ```swift
 // swift-tools-version: 6.4
 import PackageDescription
+
+let strict: [SwiftSetting] = [.treatAllWarnings(as: .error)]
 
 let package = Package(
     name: "MinutesKit",
@@ -1156,17 +1158,47 @@ let package = Package(
         .macOS("27.2"),
     ],
     products: [
-        .library(name: "MinutesKit", targets: ["MinutesKit"]),
+        .library(
+            name: "MinutesKit",
+            targets: [
+                "MinutesDomain", "MinutesApplication", "MinutesStorage",
+                "MinutesAudio", "MinutesTranscription", "MinutesSystem",
+            ]
+        ),
+        .library(name: "MinutesTestSupport", targets: ["MinutesTestSupport"]),
     ],
     targets: [
-        .target(
-            name: "MinutesKit",
-            swiftSettings: [.treatAllWarnings(as: .error)]
+        .target(name: "MinutesDomain", swiftSettings: strict),
+        .target(name: "MinutesApplication", dependencies: ["MinutesDomain"], swiftSettings: strict),
+        .target(name: "MinutesStorage", dependencies: ["MinutesDomain"], swiftSettings: strict),
+        .target(name: "MinutesAudio", dependencies: ["MinutesDomain"], swiftSettings: strict),
+        .target(name: "MinutesTranscription", dependencies: ["MinutesDomain"], swiftSettings: strict),
+        .target(name: "MinutesSystem", dependencies: ["MinutesDomain"], swiftSettings: strict),
+        .target(name: "MinutesTestSupport", dependencies: ["MinutesDomain"], swiftSettings: strict),
+        .testTarget(
+            name: "MinutesDomainTests",
+            dependencies: ["MinutesDomain", "MinutesTestSupport"],
+            swiftSettings: strict
         ),
         .testTarget(
-            name: "MinutesKitTests",
-            dependencies: ["MinutesKit"],
-            swiftSettings: [.treatAllWarnings(as: .error)]
+            name: "MinutesApplicationTests",
+            dependencies: ["MinutesApplication", "MinutesTestSupport"],
+            swiftSettings: strict
+        ),
+        .testTarget(
+            name: "MinutesStorageTests",
+            dependencies: ["MinutesStorage", "MinutesTestSupport"],
+            swiftSettings: strict
+        ),
+        .testTarget(
+            name: "MinutesAudioTests",
+            dependencies: ["MinutesAudio", "MinutesTestSupport"],
+            swiftSettings: strict
+        ),
+        .testTarget(
+            name: "MinutesTranscriptionTests",
+            dependencies: ["MinutesTranscription", "MinutesTestSupport"],
+            swiftSettings: strict
         ),
     ],
     swiftLanguageModes: [.v6]
@@ -1179,18 +1211,18 @@ let package = Package(
 | 言語モード | Swift 6 | CON-04 |
 | 警告 | エラーとして扱う | TST-CI-01 |
 | 外部の依存 | なし | BD-ARC-07 |
-| ターゲット | 当面は `MinutesKit` と `MinutesKitTests` の 2 つ | Package の中の分割（層ごとのターゲット）は architecture の詳細設計で確定する |
+| ターゲット | 7 つ（`MinutesDomain`・`MinutesApplication`・`MinutesStorage`・`MinutesAudio`・`MinutesTranscription`・`MinutesSystem`・`MinutesTestSupport`）と、テストターゲット 5 つ | 層の依存の向きを、ビルドで強制するため（[architecture.md](architecture.md) §2.1）。`MinutesTestSupport` は、製品 `MinutesKit` に含めない |
 
 ### 11.2 ターゲット
 
 | ターゲット | 追加する時期 | 入れ子の設定（§6.4） |
 | --- | --- | --- |
-| `Packages/MinutesKit`（`MinutesKit`・`MinutesKitTests`） | 作業単位 2 | `Packages/MinutesKit/Tests/.swiftlint.yml` |
+| `Packages/MinutesKit`（7 つのターゲットと、テストターゲット 5 つ。§11.1） | 作業単位 2 | `Packages/MinutesKit/Tests/.swiftlint.yml`（1 つで、5 つのテストターゲットに効く） |
 | `MinutesMobileTests`（Swift Testing） | 作業単位 2 | `MinutesMobileTests/.swiftlint.yml` |
 | `MinutesMobileUITests`（XCUITest） | 作業単位 2 | `MinutesMobileUITests/.swiftlint.yml` |
 | `MinutesMobileWidgets`（Live Activity） | ui の実装時 | — |
 
-- アプリのスキームのテストに `MinutesKitTests` も入れ、同じテストをシミュレータでも実行する（BD-DEV-04）。
+- アプリのスキームのテストに、Package の 5 つのテストターゲットも入れ、同じテストをシミュレータでも実行する（BD-DEV-04）。
 - テストは並列で実行する。順序と共有の状態に依存したテストを早く見つけるためである（基本設計 §4）。
 
 ---
@@ -1224,8 +1256,9 @@ let package = Package(
 
 | 鍵 | 値 | 根拠 |
 | --- | --- | --- |
-| `UIBackgroundModes` | `audio`（継続処理タスクに必要なら `processing` も） | FR-REC-05 |
-| `BGTaskSchedulerPermittedIdentifiers` | 継続処理タスクの識別子（transcription の詳細設計で確定） | NFR-PWR-03 |
+| `UIBackgroundModes` | `audio` と `processing`（`processing` は継続処理タスクのため。[transcription.md](transcription.md) §9。足りるかは TST-DEV-11 で確かめる） | FR-REC-05、NFR-PWR-03 |
+| `BGTaskSchedulerPermittedIdentifiers` | `$(PRODUCT_BUNDLE_IDENTIFIER).transcription.*`（[transcription.md](transcription.md) §9 で確定） | NFR-PWR-03 |
+| `NSSupportsLiveActivities` | 真（Live Activity のターゲットを足すときに設定する。[ui.md](ui.md) §8） | NFR-UX-03 |
 
 ### 12.3 変更の後に通るようになる検査
 
@@ -1243,13 +1276,13 @@ let package = Package(
 
 満たす要件: TST-CI-08、TST-GEN-04 ／ 決定: BD-DEV-04
 
-UI テストは、録音・音声認識・空き容量・保存ルートを差し替えた構成でアプリを起動する（基本設計 §4）。引数の名前は仮のもので、ui と architecture の詳細設計で確定する。
+UI テストは、録音・音声認識・空き容量・保存ルートを差し替えた構成でアプリを起動する（基本設計 §4）。引数の名前は、architecture の詳細設計（[architecture.md](architecture.md) §10.2）で、下のまま確定した（2026-11-16）。値の意味は ui の詳細設計（[ui.md](ui.md) §11.2）にある。
 
 | 引数 | 値 | 差し替えるもの |
 | --- | --- | --- |
 | `-uiTestMode` | `1` | 差し替え全体を有効にする。これがなければ、下の引数はすべて無視する |
 | `-uiTestStorageRoot` | 一時ディレクトリのパス | 保存ルート（テストごとに一意。TST-GEN-02） |
-| `-uiTestConsent` | `none`・`accepted` | 同意確認の状態 |
+| `-uiTestConsent` | `none`・`accepted` | 初回説明を読了済みにするか（`accepted` で読了済み）。**録音ごとの同意確認は、どちらの値でも省略しない**（FR-CNS-01） |
 | `-uiTestMicrophone` | `granted`・`denied`・`undetermined` | マイクの権限（TST-INT-06） |
 | `-uiTestAudioInput` | `sine`・`silence`・`none` | 録音の入力（合成した音声。TST-GEN-08） |
 | `-uiTestSpeechEngine` | `fake`・`unavailable` | 音声認識エンジン |
@@ -1276,7 +1309,6 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | ファイルの日時（`NSPrivacyAccessedAPICategoryFileTimestamp`） | `C617.1` | アプリのコンテナ内のファイルの日時・大きさなどのメタデータを読む | 自分のファイルの確認 |
 | ディスクの空き容量（`NSPrivacyAccessedAPICategoryDiskSpace`） | `E174.1` | 書き込めるだけの空きがあるかを確かめる。空き容量に応じた動作が利用者に見える | 空き容量の 3 段階の縮退 |
 | `UserDefaults`（`NSPrivacyAccessedAPICategoryUserDefaults`） | `CA92.1` | アプリ自身だけが読み書きする情報 | アプリの設定 |
-| システムの起動時間（`NSPrivacyAccessedAPICategorySystemBootTime`） | `35F9.1` | アプリ内の事象の間の経過時間を測る | 単調時計 |
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1315,20 +1347,12 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
                 <string>CA92.1</string>
             </array>
         </dict>
-        <dict>
-            <key>NSPrivacyAccessedAPIType</key>
-            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
-            <key>NSPrivacyAccessedAPITypeReasons</key>
-            <array>
-                <string>35F9.1</string>
-            </array>
-        </dict>
     </array>
 </dict>
 </plist>
 ```
 
-- 申告は、実際に使う API に合わせる。Apple の一覧でシステムの起動時間の対象になっているのは `ProcessInfo.systemUptime` と `mach_absolute_time()` である。単調時計の実装がこれらを使わない場合は、`35F9.1` の項目を外す（architecture の詳細設計で実装を決めた時点で確定する）。
+- 申告は、実際に使う API に合わせる。**システムの起動時間（理由コード `35F9.1`）は申告しない。** Apple の一覧で対象になっているのは `ProcessInfo.systemUptime` と `mach_absolute_time()` で、単調時計の実装（`ContinuousClock`。[architecture.md](architecture.md) §6.2）はどちらも呼ばない（2026-11-16 に確定）。静的解析の `no_direct_clock` が、この 2 つを例外の場所の外で禁止している。
 - 実装が進んで、理由の申告が必要な API を新しく使うことになったら、同じ作業でこのファイルと本節を直す。
 
 ### 14.2 音声認識の利用目的
@@ -1479,9 +1503,9 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 開発ツールの導入スクリプトと、版の写しの置き場所と形式 | `scripts/setup-tools.sh`、`tools/versions`（空白区切りの行形式） | §3 |
 | 依存の許可リストの置き場所と形式 | `tools/dependency-allowlist.json` | §9 |
 | Package の構成（プラットフォームの指定、ターゲット） | `Packages/MinutesKit/Package.swift` の内容を確定し、ビルドして確かめた。ファイルの作成は作業単位 2 | §11 |
-| 差し替え用の起動の引数の一覧 | 7 つの引数と、本番のビルドで無効にする方法（名前は仮） | §13 |
+| 差し替え用の起動の引数の一覧 | 7 つの引数と、本番のビルドで無効にする方法（名前は architecture の詳細設計 §10.2 で確定） | §13 |
 | 実機試験の記録の置き場所と様式 | `docs/04-test-records/` | §15 |
-| 音声認識の利用目的の文言の要否、プライバシーマニフェストの理由コード | 利用目的は置かない。理由コードは 4 つとも Apple の一覧と照合して確定した | §14 |
+| 音声認識の利用目的の文言の要否、プライバシーマニフェストの理由コード | 利用目的は置かない。理由コードは Apple の一覧と照合して、3 つに確定した（システムの起動時間は、対象の API を使わないので申告しない） | §14 |
 
 ---
 
@@ -1494,10 +1518,10 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 手順 7 のシミュレータでのテスト、手順 9、アプリ側のカバレッジ | テストターゲットがないので実行していない。コマンドは書いたが、通ることは確かめていない | 作業単位 2 |
 | Intel の Mac での開発ツールの導入 | 行と SHA-256 は記録したが、実行していない | Intel の Mac を使うことになったとき |
 | `Package.resolved` の形式と、`project.xcproj` でのパッケージの参照の書き方 | 依存が 0 件で実物がない。一般に知られた形式で検査を書いた。形式が違えば「読めない」で失敗する | 最初の依存を足すとき（MVP では足さない） |
-| 例外を認める場所のパス、起動の引数の名前 | 仮のもの | architecture・ui の詳細設計 |
+| 例外を認める場所のパス、起動の引数の名前 | 確定した（変更なし。2026-11-16） | [architecture.md](architecture.md) §2.4・§10.2 |
 | Xcode が書き出す `SWIFT_VERSION` の値 | 定義ファイルでは `6.0`。検査は `6.0` と `6` を認める | 作業単位 2（Xcode の画面で設定して確かめる） |
 | 音声認識の許可が要らないこと | Apple の文書と SDK で確かめた。実機では確かめていない | TST-STT-07 |
-| システムの起動時間の理由コード（`35F9.1`）の要否 | 単調時計の実装による | architecture の詳細設計 |
+| システムの起動時間の理由コード（`35F9.1`）の要否 | 申告しない（単調時計は `ContinuousClock` を使う。2026-11-16 に確定） | [architecture.md](architecture.md) §6.2 |
 | 独自ルールが違反をすべて検出すること | 正規表現の限界がある（§6.6） | 規則の試験、PR のチェックリスト |
 | フックが毎回実行されること | フックは飛ばせる。作業単位 1 では有効にしていない | 作業単位 2 の最後に有効にする。PR の説明の検査結果を統合の条件にする |
 
