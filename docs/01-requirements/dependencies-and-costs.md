@@ -24,6 +24,8 @@
 
 **基本設計（2026-11-15）での確認結果:** 新たに費用が発生する項目はなかった。MVP でアプリに組み込むサードパーティー製品は 0 件で、開発ツール 3 種（§3）はすべて無償である。Push 通知や GPU を使うバックグラウンド処理など、Personal Team で使えず COST-01 が必要になる機能は設計に採用していない（[../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5.3）。
 
+**詳細設計（2026-11-16）での確認結果:** 新たに費用が発生する項目はなかった。詳細設計の 7 文書を通して、アプリに組み込むサードパーティー製品は 0 件のままで、Package の外部の依存も 0 件である（[../03-detailed-design/architecture.md](../03-detailed-design/architecture.md) §2.2）。開発ツールは §3 の 4 種（導入済み・すべて無償）から増えていない。詳細設計で新しく名前が挙がったのは、OS と SDK に含まれるものだけである（Synchronization・UIKit・WidgetKit。§2 に追記した）。
+
 ---
 
 ## 2. OS 標準のフレームワーク（無償・追加の依存なし）
@@ -40,7 +42,9 @@
 | zlib（OS 同梱） | 書き出しの ZIP の CRC-32 | MVP | 無圧縮の ZIP を自作する（[export.md](../02-basic-design/export.md) BD-EXP-01） |
 | OSLog | ログ | MVP | privacy の指定（SEC-LOG 群） |
 | BackgroundTasks | 長時間の文字起こし（継続処理タスク） | MVP | GPU 資源は要求しない。Personal Team での動作は実機で確認する（TST-DEV-11） |
-| ActivityKit | ロック画面の録音状態表示（Live Activity） | MVP | Push を使わない形で使う。Personal Team での動作は実機で確認する（TST-DEV-12） |
+| ActivityKit / WidgetKit | ロック画面の録音状態表示（Live Activity）。見た目はウィジェット拡張に置く（`ActivityConfiguration` は WidgetKit の型。iOS 27.2 SDK で 2026-11-17 に確認） | MVP | Push を使わない形で使う。Personal Team での動作は実機で確認する（TST-DEV-12） |
+| Synchronization（Swift 標準ライブラリ。iOS 18 以降） | 録音のリングバッファの原子操作（`Atomic`）、テストの差し替えの排他（`Mutex`） | MVP | [recording.md](../03-detailed-design/recording.md) §4 |
+| UIKit | サードパーティー製キーボードの拒否（アプリのデリゲート）、共有シート、ペーストボード | MVP | 画面は SwiftUI で作り、SwiftUI にない部品だけに使う（[ui.md](../03-detailed-design/ui.md)・[export.md](../03-detailed-design/export.md)） |
 | UserNotifications | 録音の中断を知らせるローカル通知 | MVP | Push 通知は Personal Team で使えないため、ローカル通知だけを使う |
 | FoundationModels | 端末内の要約 | P2 | オンデバイスモデルだけを使う（SEC-NET-02） |
 | LocalAuthentication | アプリのロック | P2 | — |
