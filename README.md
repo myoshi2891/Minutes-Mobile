@@ -15,6 +15,9 @@ iPhone だけで会議を録音し、端末の外へデータを送らずに文�
 - [基本設計書](docs/02-basic-design/README.md)（[アーキテクチャ](docs/02-basic-design/architecture.md)・[録音](docs/02-basic-design/recording.md)・[保存](docs/02-basic-design/storage.md)・[文字起こし](docs/02-basic-design/transcription.md)・[画面](docs/02-basic-design/ui.md)・[書き出し](docs/02-basic-design/export.md)・[開発環境](docs/02-basic-design/dev-environment.md)）
 - [詳細設計書](docs/03-detailed-design/README.md)（[開発環境と検査](docs/03-detailed-design/dev-environment.md)・[アーキテクチャ](docs/03-detailed-design/architecture.md)・[録音](docs/03-detailed-design/recording.md)・[保存](docs/03-detailed-design/storage.md)・[文字起こし](docs/03-detailed-design/transcription.md)・[画面](docs/03-detailed-design/ui.md)・[書き出し](docs/03-detailed-design/export.md)）
 - [実機試験の記録](docs/04-test-records/README.md)（様式のみ）
+- [実機手動試験のテスト設計書](docs/04-test-records/device-test-design.md)（土台。観点の一覧と試験ケースの骨子）
+- [機能・結合テスト項目書](docs/04-test-records/integration-test-items.md)・[E2E テスト項目書](docs/04-test-records/e2e-test-items.md)（初版。自動テストの項目と要件からの逆引き）
+- [セキュリティ確認項目書](docs/04-test-records/security-check-items.md)（初版。セキュリティの観点ごとの確認項目と、SEC ID・脅威からの逆引き）
 
 ## 検査
 

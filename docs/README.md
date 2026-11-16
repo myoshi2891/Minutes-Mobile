@@ -14,6 +14,10 @@ MinutesMobile（iPhone 向け・端末内完結の議事録アプリ）の設計
 | 基本設計 | [02-basic-design/README.md](02-basic-design/README.md) | 初版（2026-11-15） | 基本設計書の索引。MVP の 7 文書（アーキテクチャ・録音・保存・文字起こし・画面・書き出し・開発環境）と、未解決事項の解決状況 |
 | 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 初版（2026-11-16。実装前） | 詳細設計書の索引。MVP の 7 文書（開発環境と検査・アーキテクチャ・録音・保存・文字起こし・画面・書き出し）。[dev-environment.md](03-detailed-design/dev-environment.md) の検査基盤だけ実装済みで、残り 6 文書は実装より先に作った（UD-10）。各作業単位の実装の直前に、該当する文書を再確認して改訂する |
 | 試験記録 | [04-test-records/README.md](04-test-records/README.md) | 様式のみ（2026-11-16） | 実機試験の記録の規則と様式。記録はまだない |
+| 試験記録 | [04-test-records/device-test-design.md](04-test-records/device-test-design.md) | 土台（2026-11-17。実装前） | 実機手動試験のテスト設計書。プログラムで確かめられない観点の一覧・機材・試験ケースの骨子・実施の順序。手順の細部は各作業単位の実装の後に足す |
+| 試験記録 | [04-test-records/integration-test-items.md](04-test-records/integration-test-items.md) | 初版（2026-11-17。実装前） | 機能・結合テスト項目書。複数の部品をまたぐ自動テストの項目（定義済み 54・候補 13）と、MVP の機能要件からの逆引き |
+| 試験記録 | [04-test-records/e2e-test-items.md](04-test-records/e2e-test-items.md) | 初版（2026-11-17。実装前） | E2E テスト項目書。利用者の操作から成果物までを通すシナリオ（定義済み 8・候補 13）と、画面・起動の引数からの逆引き |
+| 試験記録 | [04-test-records/security-check-items.md](04-test-records/security-check-items.md) | 初版（2026-11-17。実装前） | セキュリティ確認項目書。10 領域の確認項目（定義済み 148・候補 10。うち本書で初めて挙げた候補 2。3 件は採用済み）と、SEC ID 48 件・脅威・設計書の注意点 73 件からの逆引き。P2・P3 は行だけ |
 
 参照元（別リポジトリ・読み取り専用）: 別リポジトリ `Minutes` の `docs/design-local-phase*.md`（PC/Web 版 Minutes の設計書）。
 本書群で「Minutes P1 §n」は `design-local-phase1.md` の §n、「Minutes P2 §n」は `design-local-phase2.md` の §n を指す。Minutes の `archive/` は参照しない。
@@ -26,7 +30,7 @@ docs/
 ├── 01-requirements/          # 何を満たすか（WHAT）。実装技術は「候補」までに留める
 ├── 02-basic-design/          # どう構成するか（アーキテクチャ・データモデル・状態遷移・画面）
 ├── 03-detailed-design/       # どう実装するか（型・アルゴリズム・テストコード・設定値）
-└── 04-test-records/          # 実機試験の記録（録音データそのものは置かない）
+└── 04-test-records/          # 試験の設計・項目書と、実機試験の記録（録音データそのものは置かない）
 ```
 
 - ファイル名は英小文字のケバブケース、本文は日本語。
