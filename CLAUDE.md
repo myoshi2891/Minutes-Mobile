@@ -8,6 +8,7 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 
 **アプリの実装は未着手**。`MinutesMobile/` は Xcode テンプレートの Hello World のまま。検査の仕組み（`scripts/`・静的解析の規則・フックのファイル）だけを先に入れてある。リポジトリの正は `docs/` の要件定義書であり、コードを書く前に必ず該当する要件 ID を確認する。
 
+- **進捗・次のアクション: `PROGRESS.md`**（作業を始める前に §2 を読み、終えたら必ず書き換える）。仕様書の更新はスキル `update-specs`、Swift の実装はスキル `tdd-implement` の手順で行う
 - 文書索引・規約・オーナー決定事項（UD）: `docs/README.md`
 - 要件定義（FR / NFR / CON / INV / OQ）: `docs/01-requirements/requirements.md`
 - セキュリティ要件（SEC）と静的解析の禁止事項: `docs/01-requirements/security-requirements.md`
