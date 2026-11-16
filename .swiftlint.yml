@@ -62,7 +62,7 @@ custom_rules:
 
   no_bsd_socket:
     name: "BSD ソケットの禁止"
-    regex: '(?<![.\w])(?<!func\s)(socket|connect)\s*\('
+    regex: '(?:\bDarwin\s*\.\s*|(?<![.\w])(?<!func\s))(socket|connect)\s*\('
     match_kinds: *code
     message: "ソケットを直接使わない（SEC-NET-01）"
     severity: error
