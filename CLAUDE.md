@@ -15,7 +15,7 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 - テスト要件（TST）と CI ゲート: `docs/01-requirements/test-requirements.md`
 - 依存・費用台帳（COST）と依存追加手順: `docs/01-requirements/dependencies-and-costs.md`
 - 基本設計（MVP の 7 文書。設計決定は `BD-<領域>-nn`）: `docs/02-basic-design/`。入口は `README.md`（索引・OQ の解決状況）と `architecture.md`（全体構成・セキュリティとテストの注意点の総覧）
-- 詳細設計: `docs/03-detailed-design/`。1 文書目の `dev-environment.md`（検査スクリプト・静的解析の規則・プロジェクト設定の変更手順）だけ作成済み。残り 6 文書は未着手で、作る順は README にある
+- 詳細設計: `docs/03-detailed-design/`。MVP の 7 文書の初版を作成済み（`dev-environment.md` は検査スクリプト・静的解析の規則・プロジェクト設定の変更手順。残り 6 文書は基本設計と同じ名前で、実装より先に作った。UD-10）。**各作業単位の実装の直前に、該当する文書を再確認して改訂する**（確かめる内容は README §2）
 - 実機試験の記録: `docs/04-test-records/`（様式のみ）
 
 ## ビルド・テスト
