@@ -12,7 +12,8 @@ MinutesMobile（iPhone 向け・端末内完結の議事録アプリ）の設計
 | 要件定義 | [01-requirements/test-requirements.md](01-requirements/test-requirements.md) | 初版（2026-11-14） | シフトレフトのテスト要件（TST）・必須異常系シナリオ・CI ゲート |
 | 要件定義 | [01-requirements/dependencies-and-costs.md](01-requirements/dependencies-and-costs.md) | 初版（2026-11-14） | 依存・ライセンス・費用の台帳（COST）。有償項目の確認状況 |
 | 基本設計 | [02-basic-design/README.md](02-basic-design/README.md) | 初版（2026-11-15） | 基本設計書の索引。MVP の 7 文書（アーキテクチャ・録音・保存・文字起こし・画面・書き出し・開発環境）と、未解決事項の解決状況 |
-| 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 未着手 | 作成予定の詳細設計書一覧 |
+| 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 作成中（2026-11-16） | 詳細設計書の索引。1 文書目の [dev-environment.md](03-detailed-design/dev-environment.md)（開発環境と検査）を作成済み。残り 6 文書は未着手 |
+| 試験記録 | [04-test-records/README.md](04-test-records/README.md) | 様式のみ（2026-11-16） | 実機試験の記録の規則と様式。記録はまだない |
 
 参照元（別リポジトリ・読み取り専用）: 別リポジトリ `Minutes` の `docs/design-local-phase*.md`（PC/Web 版 Minutes の設計書）。
 本書群で「Minutes P1 §n」は `design-local-phase1.md` の §n、「Minutes P2 §n」は `design-local-phase2.md` の §n を指す。Minutes の `archive/` は参照しない。
@@ -24,7 +25,8 @@ docs/
 ├── README.md                 # 本書（索引・規約）
 ├── 01-requirements/          # 何を満たすか（WHAT）。実装技術は「候補」までに留める
 ├── 02-basic-design/          # どう構成するか（アーキテクチャ・データモデル・状態遷移・画面）
-└── 03-detailed-design/       # どう実装するか（型・アルゴリズム・テストコード・設定値）
+├── 03-detailed-design/       # どう実装するか（型・アルゴリズム・テストコード・設定値）
+└── 04-test-records/          # 実機試験の記録（録音データそのものは置かない）
 ```
 
 - ファイル名は英小文字のケバブケース、本文は日本語。
@@ -59,6 +61,7 @@ docs/
 - 要件を変更したら、同じ作業の中で影響を受ける設計書・テスト要件も更新する（Minutes CLAUDE.md §3 の流儀）。
 - 技術の版数・提供状況は記憶で書かず、確認日と出典 URL を添える。確認日から 3 か月以上経った記述は、設計着手時に再確認する。
 - 費用が発生しうる項目は、オーナーの承認が記録されるまで採用しない（[dependencies-and-costs.md](01-requirements/dependencies-and-costs.md)）。
+- ID の参照・リンク・節の構成・詳細設計のコード片と実ファイルの一致は、`scripts/verify-docs.py` で検査する（[03-detailed-design/dev-environment.md](03-detailed-design/dev-environment.md) §10）。文書を変えたら実行する。
 
 ## 5. オーナー決定事項（UD）
 

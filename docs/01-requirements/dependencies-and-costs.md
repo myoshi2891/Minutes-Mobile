@@ -54,9 +54,10 @@
 
 | 製品 | 用途 | ライセンス | 調査時点の版（2026-11-14） | 組み込み方 | フェーズ | 状態 |
 | --- | --- | --- | --- | --- | --- | --- |
-| SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65.1（2026-08-21 公開。公式の releases と Homebrew で確認） | 開発ツール（アプリに組み込まない）。GitHub releases の `portable_swiftlint.zip`（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2） | MVP | 採用（基本設計で決定。導入時に入れた版をこの行に記録する） |
-| SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64.7（2026-11-14 公開。公式の releases で確認。Homebrew は確認時点で 0.64.6） | 開発ツール。GitHub releases の `swiftformat.zip` | MVP | 採用（同上） |
-| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開。公式の releases と Homebrew で確認） | 開発ツール（コミット前のフック）。GitHub releases の `gitleaks_{版}_darwin_arm64.tar.gz` | MVP | 採用（同上） |
+| SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65.1（2026-08-21 公開。公式の releases と Homebrew で確認） | 開発ツール（アプリに組み込まない）。GitHub releases の `portable_swiftlint.zip`（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2） | MVP | **導入済み**（2026-11-16。0.65.1。SHA-256 は `tools/versions`） |
+| SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64.7（2026-11-14 公開。公式の releases で確認。Homebrew は確認時点で 0.64.6） | 開発ツール。GitHub releases の `swiftformat.zip` | MVP | **導入済み**（2026-11-16。0.64.7。同上） |
+| gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開。公式の releases と Homebrew で確認） | 開発ツール（コミット前のフック）。GitHub releases の `gitleaks_{版}_darwin_arm64.tar.gz` | MVP | **導入済み**（2026-11-16。8.30.1。同上） |
+| GitHub CLI（cli/cli。`gh`） | 開発ツールの配布ファイルの取得（`gh release download`）だけ | MIT | 版は固定しない（開発機に導入済みのものを使う。2026-11-16 の確認時は 2.101.0） | 開発ツール（アプリに組み込まない）。取得したファイルは SHA-256 で照合するので、`gh` の版に依存しない | MVP | 前提ツール（2026-11-16 記録） |
 | WhisperKit（argmaxinc/argmax-oss-swift） | 代替の端末内 STT（OS 標準が使えない端末向け） | MIT（同梱の一部は Apache-2.0） | v1.1.0（2026-08-06） | アプリに組み込む（SPM） | P2 | 条件付き候補（FR-STT-11）。モデルの取得は SEC-NET-04 に従う |
 | SpeakerKit（同上の SDK に同梱） | 話者分離 | MIT | v1.1.0 に同梱 | アプリに組み込む（SPM） | P3 | 検討候補 |
 
@@ -69,7 +70,9 @@
 | 解析・広告・クラッシュ報告の SDK（Firebase Analytics・Crashlytics など） | 外部へ通信する（SEC-NET-06） |
 | 音声認識・要約のクラウド API | Zero External Data Egress に反する（SEC-NET-01） |
 
-開発ツール 3 種の版とライセンス（MIT）は、2026-11-14 に GitHub の公式 API（releases と license）と Homebrew の formula 情報で確認した。導入時に、リポジトリの LICENSE ファイルを直接読む（§4 の手順 3）。使い方は [../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5〜§7 にある。
+開発ツール 3 種の版とライセンス（MIT）は、2026-11-14 に GitHub の公式 API（releases と license）と Homebrew の formula 情報で確認した。使い方は [../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5〜§7 にある。
+
+**導入の記録（2026-11-16）:** 3 種とも、確認時点の最新の安定版（上の表の版と同じ）を導入した。各タグの LICENSE ファイルを直接読み、MIT であることを確かめた（§4 の手順 3）。配布ファイルの SHA-256 は、自分で計算した値が GitHub の release API の `digest` と一致し、gitleaks は配布の `checksums.txt` とも一致した。値は `tools/versions` に記録している。新たな費用は発生していない。検査スクリプトは、これらと OS・Xcode に同梱のもの（bash・python3 など）だけで動く（[../03-detailed-design/dev-environment.md](../03-detailed-design/dev-environment.md) §2・§3）。
 
 出典（確認日 2026-11-14）:
 

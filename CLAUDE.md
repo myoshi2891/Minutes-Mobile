@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文字起こし → Phase 2 で端末内 LLM 要約）。PC/Web 版 Minutes（別リポジトリ `Minutes` の `docs/design-local-phase*.md`、読み取り専用）の原則を iOS へ移植する。
 
-**実装は未着手**。`MinutesMobile/` は Xcode テンプレートの Hello World のまま。リポジトリの正は `docs/` の要件定義書であり、コードを書く前に必ず該当する要件 ID を確認する。
+**アプリの実装は未着手**。`MinutesMobile/` は Xcode テンプレートの Hello World のまま。検査の仕組み（`scripts/`・静的解析の規則・フックのファイル）だけを先に入れてある。リポジトリの正は `docs/` の要件定義書であり、コードを書く前に必ず該当する要件 ID を確認する。
 
 - 文書索引・規約・オーナー決定事項（UD）: `docs/README.md`
 - 要件定義（FR / NFR / CON / INV / OQ）: `docs/01-requirements/requirements.md`
@@ -14,7 +14,8 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 - テスト要件（TST）と CI ゲート: `docs/01-requirements/test-requirements.md`
 - 依存・費用台帳（COST）と依存追加手順: `docs/01-requirements/dependencies-and-costs.md`
 - 基本設計（MVP の 7 文書。設計決定は `BD-<領域>-nn`）: `docs/02-basic-design/`。入口は `README.md`（索引・OQ の解決状況）と `architecture.md`（全体構成・セキュリティとテストの注意点の総覧）
-- 詳細設計: `docs/03-detailed-design/`（未着手。方針は README にある）
+- 詳細設計: `docs/03-detailed-design/`。1 文書目の `dev-environment.md`（検査スクリプト・静的解析の規則・プロジェクト設定の変更手順）だけ作成済み。残り 6 文書は未着手で、作る順は README にある
+- 実機試験の記録: `docs/04-test-records/`（様式のみ）
 
 ## ビルド・テスト
 
@@ -28,21 +29,41 @@ export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 # スキーム・ターゲット一覧
 xcodebuild -list -project MinutesMobile.xcodeproj
 
-# ビルド（シミュレータ）
+# ビルド（シミュレータ。機種を特定しない）
 xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile \
-  -destination 'platform=iOS Simulator,name=iPhone 17' build
+  -destination 'generic/platform=iOS Simulator' build
 
-# テスト全件（テストターゲット追加後）
-xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile \
-  -destination 'platform=iOS Simulator,name=iPhone 17' test
+# テスト全件（テストターゲット追加後）。シミュレータは最低 OS（iOS 27.2）以上の iPhone を選ぶ
+SIM="platform=iOS Simulator,id=$(scripts/find-simulator.py)"
+xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile -destination "$SIM" test
 
 # 単一テスト（Swift Testing: -only-testing:<TestTarget>/<Suite>/<test>）
-xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile \
-  -destination 'platform=iOS Simulator,name=iPhone 17' \
+xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile -destination "$SIM" \
   test -only-testing:MinutesMobileTests/RecordingStateMachineTests/startFromIdle
 ```
 
-テストフレームワークは Swift Testing（単体・結合）、XCUITest（UI）、XCTest 計測 API（性能）。SwiftLint / SwiftFormat / gitleaks は CI ゲート（TST-CI 群）として導入予定で、現時点では未設定。
+シミュレータの機種名を決め打ちにしない（`name=iPhone 17` など）。導入済みのランタイムは Mac ごとに違い、最低 OS より古いランタイムの機種を指定すると「destination が見つからない」で失敗する。
+
+テストフレームワークは Swift Testing（単体・結合）、XCUITest（UI）、XCTest 計測 API（性能）。
+
+## 検査（`scripts/`）
+
+詳細は `docs/03-detailed-design/dev-environment.md`。SwiftLint 0.65.1・SwiftFormat 0.64.7・gitleaks 8.30.1 は `tools/versions` の版を `.tools/`（Git の管理外）に入れて使う。Homebrew や PATH の版は使わない。
+
+```bash
+scripts/setup-tools.sh            # 開発ツールを導入する（SHA-256 が一致した配布ファイルだけを展開する）
+scripts/check.sh                  # 手順 0〜10 を順に実行する（1 つでも失敗したら止まる）
+scripts/check.sh --steps 2        # 指定した手順だけ（例: 静的解析と規則の試験）
+scripts/check.sh --staged         # コミット前の範囲（ステージしたファイルの整形・静的解析・秘密情報と、文書の整合）
+scripts/test-lint-rules.py        # 静的解析の規則の試験（違反例・正常例）
+scripts/test-checks.py            # 検査スクリプトの自己試験
+scripts/verify-docs.py            # 文書の整合（--update-snippets で詳細設計のコード片を実ファイルから書き直す）
+```
+
+- **現在、手順 1・4・7〜9 は失敗する**（テンプレートの import の並び順、プロジェクト設定が未変更、Package とテストターゲットがない）。次の作業単位（プロジェクト設定の変更。詳細設計 §12）で解消する。検査を弱めて通さない。
+- Git のフック（`.githooks/`）はまだ有効にしていない。上の失敗が解消したら `scripts/setup.sh` で有効にする。
+- 規則を足す・変えるときは、`tools/lint-fixtures/<規則名>/` の違反例（`// expect: <規則名>` の印）と正常例も同じ作業で直す。検査を足したら、自己試験に加えて、検査の側をわざと壊して自己試験が失敗することも確かめる。
+- スクリプトは macOS 同梱の bash 3.2 と Xcode 同梱の python3（標準ライブラリだけ）で動かす。bash の注意点（全角文字の直前の変数は `${name}`、手順の関数を条件の中で呼ばない、EXIT の trap で明示的に `exit` する）は詳細設計 §2.3 にある。
 
 ## 実装着手時に必ず行うプロジェクト設定変更（CON-03 / 04 / 09）
 
@@ -78,7 +99,7 @@ xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile \
 - テスト名またはタグに対応する要件 ID を含める（TST-GEN-03）。テストごとに一意の一時ディレクトリを使う（Swift Testing は並列実行）
 - 試験用音声は合成する。実際の会議録音をリポジトリに入れない
 
-### 静的解析で禁止するもの（SEC §10.1。SwiftLint 独自ルールで検出予定）
+### 静的解析で禁止するもの（SEC §10.1。`.swiftlint.yml` の独自ルールで検出する。全件は詳細設計 dev-environment.md §6）
 
 - `print(` / `NSLog(` / `debugPrint(` → ログは `os.Logger` に一本化（privacy 指定必須）
 - 通信集約型の外での `URLSession` / `NWConnection` / `URLRequest` / `import Network`
@@ -96,7 +117,8 @@ OS 標準フレームワーク優先。サードパーティーは無償・MIT /
 - 要件 ID は再利用しない。廃止は行を残して「廃止（理由・日付）」と書く
 - FR / NFR / CON / INV には「出典」、FR / NFR / SEC には「フェーズ」（MVP / P2 / P3）を付ける
 - 基本設計・詳細設計の各節冒頭に満たす要件 ID を列挙し、各文書に「セキュリティ」節と「テスト観点」節を置く
-- 詳細設計書の Swift コード片は実装ファイルと一致させる。どちらかを変えたら同じ作業でもう一方も直す（NFR-MNT-04）
+- 詳細設計書のコード片は実装ファイルと一致させる。どちらかを変えたら同じ作業でもう一方も直す（NFR-MNT-04）。コード片の直前の `<!-- file: パス -->`（全文）・`<!-- excerpt: パス -->`（一部）の印を `scripts/verify-docs.py` が照合する
+- 基本設計・詳細設計の各節（`##`）の冒頭に「満たす要件:」の行を置く（満たす要件がない節は「満たす要件: —」）。文書を変えたら `scripts/verify-docs.py` を実行する
 - 要件を変えたら、影響する設計書・テスト要件も同じ作業で更新する
 - 技術の版数・提供状況は記憶で書かず、確認日と出典 URL を添える。確認日から 3 か月以上経った記述は再確認する
 - 実装順序は上流から: 録音 → 保存 → 確定 → 復旧 → 文字起こし → 表示 → 書き出し。前の単位のテストが通ってから次に着手する
