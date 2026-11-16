@@ -48,7 +48,7 @@ xcodebuild -project MinutesMobile.xcodeproj -scheme MinutesMobile -destination "
 
 ## 検査（`scripts/`）
 
-詳細は `docs/03-detailed-design/dev-environment.md`。SwiftLint 0.65.1・SwiftFormat 0.64.7・gitleaks 8.30.1 は `tools/versions` の版を `.tools/`（Git の管理外）に入れて使う。Homebrew や PATH の版は使わない。
+詳細は `docs/03-detailed-design/dev-environment.md`。SwiftLint 0.65.1・SwiftFormat 0.64.7・gitleaks 8.30.1、およびそれらの取得に使う gh 2.104.0 は `tools/versions` の版を `.tools/`（Git の管理外）に入れて使う。Homebrew や PATH の版は使わない。
 
 ```bash
 scripts/setup-tools.sh            # 開発ツールを導入する（SHA-256 が一致した配布ファイルだけを展開する）

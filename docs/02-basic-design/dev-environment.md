@@ -123,9 +123,10 @@
 | SwiftLint | 静的解析 | MIT | 0.65.1（2026-08-21 公開） | `portable_swiftlint.zip`（チェックサムのファイルの配布はない。release API の `digest` と照合できる） |
 | SwiftFormat | 整形 | MIT | 0.64.7（2026-11-14 公開。Homebrew は確認時点で 0.64.6） | `swiftformat.zip`（同上） |
 | gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開） | `gitleaks_{版}_darwin_arm64.tar.gz`（Intel の Mac は `darwin_x64`）。`gitleaks_{版}_checksums.txt` が配布されている |
+| GitHub CLI（`gh`） | 上の 3 つの配布ファイルの取得だけ | MIT | 2.104.0（2026-11-12 公開。確認日 2026-11-16） | `gh_{版}_macOS_arm64.zip`（Intel の Mac は `macOS_amd64`）。`gh_{版}_checksums.txt` が配布されている |
 
 - いずれも無償で、アプリには組み込まない。費用は発生しない。
-- **導入（台帳の版の再現）:** 導入スクリプト（`scripts/setup-tools.sh`。中身は [詳細設計](../03-detailed-design/dev-environment.md) §3）が、台帳の機械可読の写し（`tools/versions`。ツールごとの版・配布ファイルの名前・SHA-256）を読み、その版の配布ファイルを `gh release download` で取得する。SHA-256 が台帳と一致した場合だけ `.tools/` に展開し、一致しなければ展開せずに失敗する。Homebrew の版は使わない（PATH にあっても検査スクリプトは `.tools/` のものだけを呼ぶ）。
+- **導入（台帳の版の再現）:** 導入スクリプト（`scripts/setup-tools.sh`。中身は [詳細設計](../03-detailed-design/dev-environment.md) §3）が、台帳の機械可読の写し（`tools/versions`。ツールごとの版・配布ファイルの名前・SHA-256）を読み、その版の配布ファイルを取得する。取得に使う `gh` も台帳で版を固定し、導入スクリプトが `curl` で公式のリリースから取得・照合して `.tools/` に入れ、ほかのツールはその `gh`（`gh release download`）だけで取得する（PATH や Homebrew の `gh` は使わない。版は §6.1 の手順 0 で照合する）。SHA-256 が台帳と一致した場合だけ `.tools/` に展開し、一致しなければ展開せずに失敗する。Homebrew の版は使わない（PATH にあっても検査スクリプトは `.tools/` のものだけを呼ぶ）。
 - **最初の記録:** チェックサムのファイルが配布されていないツール（SwiftLint・SwiftFormat）は、最初の導入の PR で配布ファイルの SHA-256 を計算して記録し、レビューで公式の releases の配布ファイルであることを確かめる。gitleaks は配布されたチェックサムと一致することも確かめる。リポジトリの LICENSE も直接読む（台帳 §4 の手順 3）。**2026-11-16 に実施した**: 3 つとも、計算した値が release API の `digest` と一致した（詳細設計 §3.3）。
 - **版の更新（全環境で一括）:** 版を上げるときは、1 つの PR で ①台帳（[dependencies-and-costs.md](../01-requirements/dependencies-and-costs.md) §3）の版・SHA-256・確認日、②`tools/versions`、③版の変更で必要になった規則や整形の差分を同時に直す。導入スクリプトは `tools/versions` を読むだけなので、導入手順を別に直す必要はない。統合の後、各環境で導入スクリプトを実行し直す。実行し直していない環境では §6.1 の手順 0 が失敗するので、古い版のまま検査が通ることはない。
 - gitleaks の GitHub Action は使わない（独自の条件に変わっている。台帳 §3）。
@@ -170,7 +171,7 @@
 
 | 時点 | 実行する範囲 | 仕組み |
 | --- | --- | --- |
-| コミット前 | 変更したファイルに対する 1〜3 と、10（数秒） | Git のフック（`.githooks/pre-commit`） |
+| コミット前 | ステージしたファイルに対する 1〜3 と、10（数秒）。1・2 は作業ツリーではなく、ステージした内容（インデックス）を検査する | Git のフック（`.githooks/pre-commit`） |
 | プッシュ前 | 0〜8 と 10 | Git のフック（`.githooks/pre-push`） |
 | PR の作成前 | 0〜10。結果を PR の説明に貼る | 手動 |
 | PR の更新後（PR の作成後に push した場合） | 統合の対象になる最新のコミットに対して 0〜10 を再実行し、結果と対象のコミットのハッシュを PR の説明に記録し直す | 手動 |

@@ -62,15 +62,15 @@ docs/04-test-records/         実機試験の記録（§15）
 
 ### 2.2 前提ツール
 
-スクリプトは、OS と Xcode に同梱のものと `gh` だけで動く。検査のために依存を増やさない（NFR-MNT-03）。
+スクリプトは、OS と Xcode に同梱のものと、導入スクリプトが `.tools/` に入れる固定版のツール（`gh` を含む。§3）だけで動く。検査のために依存を増やさない（NFR-MNT-03）。
 
 | ツール | 版（この Mac での確認値） | 入手 | 使う場所 |
 | --- | --- | --- | --- |
 | `/bin/bash` | 3.2.57 | macOS 同梱 | `scripts/*.sh`、フック |
 | `/usr/bin/python3` | 3.9.6 | Xcode（Command Line Tools）同梱 | `scripts/*.py`。標準ライブラリだけを使う |
-| `shasum`・`unzip`・`tar`・`plutil` | — | macOS 同梱 | 導入スクリプト |
+| `curl`・`shasum`・`unzip`・`tar`・`plutil` | — | macOS 同梱 | 導入スクリプト（`curl` は固定版の `gh` の取得だけに使う） |
 | `xcodebuild`・`swift`・`xcrun simctl` | Xcode 27.2 | Xcode | 手順 6〜9 |
-| `gh`（GitHub CLI） | — | 利用者が導入済み（MIT） | 開発ツールの配布ファイルの取得だけ。版は固定しない（取得したファイルを SHA-256 で照合するため。§3） |
+| `gh`（GitHub CLI） | 2.104.0（`tools/versions` で固定） | 導入スクリプトが公式のリリースの配布ファイルを取得し、SHA-256 を照合して `.tools/` に入れる（MIT） | 開発ツールの配布ファイルの取得だけ。使うのは `.tools/bin/gh` だけで、PATH や Homebrew の `gh` は使わない。版は手順 0 で照合する（§3） |
 
 ### 2.3 bash 3.2 で守ること
 
@@ -103,12 +103,16 @@ macOS 同梱の bash は 3.2 で、実装中に次の落とし穴を実際に踏
 # 版を変えるときは、台帳とこのファイルを同じ PR で直す（SEC-SUP-01）。
 # 列（空白区切り）: 名前 版 アーキテクチャ リポジトリ タグ 配布ファイル 実行ファイル 配布ファイルのSHA-256
 # アーキテクチャは any（どの Mac でも同じ配布ファイル）・arm64・x86_64 のいずれか（uname -m の値）。
+# gh はほかのツールの取得に使うので、ほかのツールより前に置く（gh 自身は curl で公式のリリースから取得する）。
+gh          2.104.0 arm64  cli/cli                 v2.104.0 gh_2.104.0_macOS_arm64.zip         gh          23b12706219b9892e44236f988444a24adcf29284e16b35e03ba5b863fb6eb8e
+gh          2.104.0 x86_64 cli/cli                 v2.104.0 gh_2.104.0_macOS_amd64.zip         gh          a8c2a708dbae89dc7c05ba7b0beafc95bd8d09ab4a3505467b77d32ebf364dc6
 swiftlint   0.65.1 any    realm/SwiftLint          0.65.1  portable_swiftlint.zip              swiftlint   c1e429b0599cf1b516f369a2d9ec04eaf0e436f3c12b637df8851fa52ff694d0
 swiftformat 0.64.7 any    nicklockwood/SwiftFormat 0.64.7  swiftformat.zip                     swiftformat e82e224325cbd3403fc7b68caf6c917926dc106de3af875fca4b87e3c4634038
 gitleaks    8.30.1 arm64  gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwin_arm64.tar.gz gitleaks    b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
 gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwin_x64.tar.gz   gitleaks    dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709
 ```
 
+- `gh` の行は、ほかのツールの行より前に置く（ほかのツールの取得に、先に導入・照合した `gh` を使うため。順序が違えば失敗する）。`gh` の配布ファイルはアーキテクチャごとに別で、`x86_64` の Mac には `amd64` の配布ファイルを使う。
 - アーキテクチャが `any` の行はどの Mac でも使う。`arm64`・`x86_64` の行は `uname -m` と一致する Mac でだけ使う。ツールごとに、その Mac 向けの行がちょうど 1 つ必要である（0 行でも 2 行でも失敗する）。
 - 各列は導入スクリプトが形式を確かめてから使う（名前・版・リポジトリ・タグ・ファイル名に使える文字を限り、SHA-256 は 16 進 64 桁）。
 
@@ -118,19 +122,19 @@ gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwi
 | --- | --- |
 | 1 | `tools/versions` を 1 行ずつ読み、形式を確かめる |
 | 2 | 版のディレクトリに実行ファイルと導入記録（配布ファイルの SHA-256）があり、記録が写しと一致すれば取得しない |
-| 3 | `gh release download` で、記録したタグの配布ファイルを一時ディレクトリへ取得する |
+| 3 | 記録したタグの配布ファイルを一時ディレクトリへ取得する。`gh` 自身は `curl` で公式のリリースの固定の URL（`https://github.com/<リポジトリ>/releases/download/<タグ>/<配布ファイル>`。HTTPS だけ）から、ほかのツールは手順 7 まで済ませた `.tools/bin/gh` の `gh release download` で取得する |
 | 4 | `shasum -a 256` の結果を写しと照合する。**一致しなければ展開せずに失敗する** |
-| 5 | 一時ディレクトリに展開し、実行ファイルと LICENSE だけを `.tools/<名前>/<版>/` へ移す |
+| 5 | 一時ディレクトリに展開し、実行ファイルと LICENSE だけを `.tools/<名前>/<版>/` へ移す（実行ファイルが最上位にない配布ファイルは、中にちょうど 1 つあるものを使う。`gh` は `gh_<版>_macOS_<arch>/bin/gh`） |
 | 6 | `.tools/bin/<名前>` から版のディレクトリへシンボリックリンクを張る |
 | 7 | 実行して版を表示させ、写しと一致することを確かめる |
 
-`--verify` を付けると、取得せずに手順 2・7 の照合だけを行う（`check.sh` の手順 0）。版の文字列だけでなく導入記録の SHA-256 も照合するので、「版は同じで中身が違う配布ファイル」に写しを差し替えた場合も、導入し直すまで失敗する。
+`--verify` を付けると、取得せずに手順 2・7 の照合だけを行う（`check.sh` の手順 0）。`gh` も同じく照合するので、取得に使う `gh` が記録した版であることを、取得のたびと手順 0 で確かめる（取得したファイルの SHA-256 の照合は、`gh` の版の固定の代わりにしない）。版の文字列だけでなく導入記録の SHA-256 も照合するので、「版は同じで中身が違う配布ファイル」に写しを差し替えた場合も、導入し直すまで失敗する。
 
 <!-- file: scripts/setup-tools.sh -->
 
 ```bash
 #!/bin/bash
-# 開発ツール（SwiftLint・SwiftFormat・gitleaks）を tools/versions の版で .tools/ に導入する（BD-DEV-03、SEC-SUP-01）。
+# 開発ツール（gh・SwiftLint・SwiftFormat・gitleaks）を tools/versions の版で .tools/ に導入する（BD-DEV-03、SEC-SUP-01）。
 #
 # 使い方:
 #   scripts/setup-tools.sh            導入する（導入済みで版と SHA-256 が一致するものは取得しない）
@@ -138,7 +142,8 @@ gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwi
 # 試験用の指定（検査の自己試験が使う）: --versions <ファイル>  --dest <ディレクトリ>
 #
 # 終了コード: 0 = 一致 / 1 = 不一致・取得や照合の失敗 / 2 = 使い方の誤り
-# 前提: gh（配布ファイルの取得だけに使う）、shasum・unzip・tar（OS 同梱）
+# 前提: curl・shasum・unzip・tar（OS 同梱）。gh は記録した版を curl で取得して .tools/ に入れ、
+# ほかのツールの取得には、その版の gh（.tools/bin/gh）だけを使う（PATH や Homebrew の gh は使わない）
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -174,6 +179,7 @@ runtime_version() {
     swiftlint) out=$("$binary" version) ;;
     swiftformat) out=$("$binary" --version) ;;
     gitleaks) out=$("$binary" version) ;;
+    gh) out=$("$binary" --version); out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
     *) fail "版の確認方法が未定義のツール: $name" ;;
   esac
   printf '%s\n' "${out#v}"
@@ -199,15 +205,22 @@ verify_tool() {
 
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
-  local target="$DEST/$name/$version" work="$WORK/$name" actual
+  local target="$DEST/$name/$version" work="$WORK/$name" actual found license
   if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
     echo "導入済み: $name $version"
   else
     echo "取得: $name ${version}（$repo $tag ${asset}）"
     mkdir -p "$work/download" "$work/extract" "$work/out"
-    # 標準入力は版の写しを読んでいる途中なので、gh に渡さない
-    gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$work/download" </dev/null \
-      || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
+    # 標準入力は版の写しを読んでいる途中なので、取得のコマンドに渡さない
+    if [ "$name" = gh ]; then
+      # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）
+      curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
+        || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
+    else
+      "$DEST/bin/gh" release download "$tag" --repo "$repo" --pattern "$asset" --dir "$work/download" </dev/null \
+        || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
+    fi
     actual=$(shasum -a 256 "$work/download/$asset" | awk '{print $1}')
     # 一致しない配布ファイルは展開しない
     [ "$actual" = "$sha" ] \
@@ -217,10 +230,17 @@ install_tool() {
       *.tar.gz) tar -xzf "$work/download/$asset" -C "$work/extract" ;;
       *) fail "$name の配布ファイルの形式に対応していない: $asset" ;;
     esac
-    [ -f "$work/extract/$binary" ] || fail "$name の配布ファイルに実行ファイル $binary がない"
-    cp "$work/extract/$binary" "$work/out/$binary"
+    # 実行ファイルは最上位か、配布ファイルの中のどこか 1 か所（gh は gh_{版}_macOS_{arch}/bin/gh）
+    found="$work/extract/$binary"
+    if [ ! -f "$found" ]; then
+      found=$(find "$work/extract" -type f -name "$binary")
+      [ -n "$found" ] || fail "$name の配布ファイルに実行ファイル $binary がない"
+      [ "$(printf '%s\n' "$found" | wc -l | tr -d ' ')" = 1 ] || fail "$name の配布ファイルに $binary が複数ある"
+    fi
+    cp "$found" "$work/out/$binary"
     chmod 755 "$work/out/$binary"
-    if [ -f "$work/extract/LICENSE" ]; then cp "$work/extract/LICENSE" "$work/out/LICENSE"; fi
+    license=$(find "$work/extract" -maxdepth 2 -type f -name LICENSE)
+    if [ -n "$license" ] && [ "$(printf '%s\n' "$license" | wc -l | tr -d ' ')" = 1 ]; then cp "$license" "$work/out/LICENSE"; fi
     printf '%s\n' "$sha" > "$work/out/.archive-sha256"
     mkdir -p "$DEST/$name"
     rm -rf -- "${target:?}"
@@ -231,7 +251,6 @@ install_tool() {
 }
 
 if [ "$MODE" = install ]; then
-  command -v gh >/dev/null 2>&1 || fail "gh が見つからない（配布ファイルの取得に使う）"
   WORK=$(mktemp -d)
   cleanup() {
     local status=$?
@@ -261,6 +280,10 @@ while read -r name version arch repo tag asset binary sha extra; do
   case "$seen" in *" $name "*) ;; *) seen="$seen$name " ;; esac
   if [ "$arch" != any ] && [ "$arch" != "$ARCH" ]; then continue; fi
   case "$matched" in *" $name "*) fail "tools/versions に $name の行が重複している（$ARCH 向け）" ;; esac
+  # ほかのツールは、記録した版の gh で取得する。そのため gh の行を先に置き、先に導入・照合する
+  if [ "$name" != gh ]; then
+    case "$matched" in *" gh "*) ;; *) fail "tools/versions で、$ARCH 向けの gh の行が $name の行より前にない" ;; esac
+  fi
   matched="$matched$name "
   if [ "$MODE" = install ]; then
     install_tool "$name" "$version" "$repo" "$tag" "$asset" "$binary" "$sha"
@@ -345,11 +368,12 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 
 | 手順 | `--staged` での動作 |
 | --- | --- |
-| 1・2 | ステージした Swift ファイルだけを見る（規則の試験用のファイルは除く）。SwiftLint には `--force-exclude` を付け、明示したファイルにも除外の指定を効かせる |
+| 1・2 | ステージした Swift ファイルだけを見る（規則の試験用のファイルは除く）。**作業ツリーではなく、ステージした内容（インデックス）を検査する。** `git checkout-index --prefix` で、ステージした Swift ファイルと、インデックスにある設定（`.swiftformat`・各階層の `.swiftlint.yml`）を、元の相対位置のまま一時ディレクトリへ書き出し、そこを起点に実行する（入れ子の設定と、パスで指定した除外が作業ツリーと同じに解決される）。SwiftLint には `--force-exclude` を付け、明示したファイルにも除外の指定を効かせる。一時ディレクトリは終了時に消す |
 | 2 | 規則・試験用のファイル・入れ子の設定をステージしたときだけ、規則の試験を回す |
 | 3 | `gitleaks git --pre-commit --staged`（ステージした差分だけ） |
 
-- 整形と静的解析は作業ツリーのファイルを読む。ファイルの一部だけをステージした場合は、ステージしていない部分も見ることになる。厳密な確認はプッシュ前の全体の検査が受け持つ。
+- ファイルの一部だけをステージした場合も、コミットされる内容（インデックス）だけを検査する。作業ツリーで直しただけでステージしていない違反は、コミットを止める。
+- 違反の表示は一時ディレクトリのパスになる（末尾の相対パスは元の位置と同じ）。
 - 成功すると、対象のコミットのハッシュと、未コミットの変更の有無を表示する。PR の説明にはこの行を貼る（基本設計 §6.2）。
 
 <!-- file: scripts/check.sh -->
@@ -361,7 +385,8 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 # 使い方:
 #   scripts/check.sh                手順 0〜10 を順に実行する（PR の作成前）
 #   scripts/check.sh --steps 0-8,10 指定した手順だけを実行する（プッシュ前のフックが使う）
-#   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）
+#   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
+#                                   手順 1・2 は作業ツリーではなくステージした内容（インデックス）を検査する
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -382,6 +407,7 @@ PACKAGE_COVERAGE_TARGET=90
 LAST_STEP=10
 STAGED=0
 STEPS=""
+STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
@@ -435,6 +461,16 @@ if [ "$STAGED" = 1 ]; then
   done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift')
 fi
 
+# ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
+# 設定（.swiftformat・各階層の .swiftlint.yml）もインデックスから同じ位置へ書き出し、入れ子の設定を作業ツリーと同じに解決させる
+prepare_staged_tree() {
+  STAGED_TREE=$(mktemp -d)
+  {
+    git ls-files -z -- ':(glob)**/.swiftformat' ':(glob)**/.swiftlint.yml' ':(glob)**/.swift-version'
+    printf '%s\0' "${STAGED_SWIFT[@]}"
+  } | git checkout-index -z --stdin --prefix="$STAGED_TREE/"
+}
+
 title() {
   case "$1" in
     0) echo "開発ツールの版" ;;
@@ -459,7 +495,7 @@ step_0() {
 step_1() {
   if [ "$STAGED" = 1 ]; then
     if [ ${#STAGED_SWIFT[@]} -eq 0 ]; then echo "ステージした Swift ファイルはない"; return 0; fi
-    "$TOOLS/swiftformat" --lint --cache ignore "${STAGED_SWIFT[@]}"
+    (cd "$STAGED_TREE" && "$TOOLS/swiftformat" --lint --cache ignore "${STAGED_SWIFT[@]}")
   else
     "$TOOLS/swiftformat" --lint --cache ignore .
   fi
@@ -469,7 +505,7 @@ step_2() {
   # --config を付けない（付けると、テストコード用の入れ子の設定が無効になる）
   if [ "$STAGED" = 1 ]; then
     if [ ${#STAGED_SWIFT[@]} -gt 0 ]; then
-      "$TOOLS/swiftlint" lint --quiet --no-cache --force-exclude "${STAGED_SWIFT[@]}"
+      (cd "$STAGED_TREE" && "$TOOLS/swiftlint" lint --quiet --no-cache --force-exclude "${STAGED_SWIFT[@]}")
     else
       echo "ステージした Swift ファイルはない"
     fi
@@ -549,6 +585,7 @@ step_10() {
 current=""
 on_exit() {
   local status=$?
+  if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
@@ -557,6 +594,7 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
 
 for step in $STEPS; do
   echo "== 手順 $step: $(title "$step")"
@@ -966,7 +1004,8 @@ useDefault = true
 | ビルド設定の `INFOPLIST_KEY_…` | 自動生成の Info.plist に入る項目。接頭辞を外して Info.plist の規則を当てる |
 | `…Info.plist`・`….entitlements` | リポジトリ内のすべて（成果物と導入したツールのディレクトリを除く）。`plistlib` で読む |
 
-- 条件付きの設定（`SWIFT_VERSION[config=Debug]` など）も、すべての書き方が規則を満たす必要がある。
+- 条件付きの設定（`SWIFT_VERSION[config=Debug]` など）は、構成（`configurations` の各要素）ごとに効く値を求めて検査する。効く値は、ターゲットの構成の条件が一致する書き方 → ターゲットの条件のない書き方 → プロジェクトの構成の条件が一致する書き方 → プロジェクトの条件のない書き方、の順で最初に見つかったもの。ターゲットにある書き方だけを見ると、ターゲットに Debug だけ、プロジェクトに Release だけがある場合に Release の値を見落とすためである。構成以外の条件（`sdk=`・`arch=`）の書き方は、そのビルドで効きうるのですべて検査する。どの段にも値がない構成は「設定されていない」とする。
+- 空でない値が要る設定（マイクの利用目的）は、各構成で効く書き方が**すべて**空でないこと（条件のない値に説明文があっても、Release の条件付きの値が空なら違反）。
 - **読めないものを合格にしない。** 形式が違う・壊れているファイルは、終了コード 2 で失敗する。
 
 ### 8.2 規則
@@ -1061,8 +1100,8 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 
 | 対象 | 規則 |
 | --- | --- |
-| `Package.resolved`（すべて） | 各依存の名前と版が、承認済みの要素と一致する。版で固定していない依存（ブランチ・コミットの指定）は認めない |
-| `Package.swift`（すべて） | `url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`path:`）は認める。レジストリの依存（`id:`）は認めない |
+| `Package.resolved`（すべて） | 各依存の名前と版が、承認済みの要素と一致する。名前と版が一致しても、取得元（`location`。古い形式は `repositoryURL`）を正規化して承認済みの URL と比べ、違う・ない場合は認めない。版で固定していない依存（ブランチ・コミットの指定）は認めない |
+| `Package.swift`（すべて） | `url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`path:`）は認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない** |
 | `project.xcproj` | リモートの URL の形をした文字列が、承認済みの URL と一致する |
 
 - 許可リスト自体も検査する。`allowedLicenses` にないライセンスで `ownerDecision` がない要素、承認日のない要素があれば、終了コード 2 で失敗する。
@@ -1079,8 +1118,8 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | ID の定義 | 定義文書の表から ID を集める。定義の重複を失敗にする |
 | ID の参照 | すべての文書（`docs/`・`README.md`・`CLAUDE.md`）が参照する ID が定義されている。`SEC-SUP-01〜05`・`NFR-MNT-01・03`・`FR-REC 群` のような省略した書き方も展開して調べる |
 | MVP の網羅 | フェーズが MVP の FR / NFR / SEC が、基本設計の「満たす要件」のどこかに現れる |
-| 書式 | 相対リンクの先がある。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である |
-| 節の構成 | 基本設計・詳細設計の各節の冒頭に「満たす要件:」（または「制約:」）がある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もある |
+| 書式 | 相対リンクの先がある。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である。フェンスは開始行の文字（バッククォートかチルダ）と長さを覚え、同じ文字が開始以上の長さで並び、その後が空白だけの行でだけ閉じる（長いフェンスの中の短いフェンスで切り替わらない）。この判定は ID の走査・節の区切り・コード片の照合と書き直しで共通に使う |
+| 節の構成 | 基本設計・詳細設計の各節の冒頭に「満たす要件:」（または「制約:」）がある。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もある |
 | 申し送りの解決 | 詳細設計の「申し送り」の節の表の行数が、対応する基本設計の「詳細設計への申し送り」の項目数と一致する |
 | コード片 | 印の直後のコード片が実ファイルと一致する（下） |
 | 確認日 | 確認日から 3 か月を過ぎた記述のある文書を警告する（失敗にはしない） |
@@ -1336,7 +1375,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 - 自己試験が通っただけでは足りない。検査の側をわざと壊して、自己試験が失敗することを確かめる（§17.2）。壊した後は必ず元に戻し、元に戻した状態で通ることも確かめる。
 - 偽の鍵は、試験のときに実行時に組み立てる。リポジトリに文字列として置かない（gitleaks が検出する。除外の指定も増やさない）。
 - 開発ツールを更新するときは、ライセンスが変わっていないかも確かめる。
-- `gh` は配布ファイルの取得にだけ使う。取得したファイルは SHA-256 で照合するので、`gh` の版には依存しない。
+- `gh` は配布ファイルの取得にだけ使い、`tools/versions` で版を固定する。取得したファイルの SHA-256 の照合は `gh` の版の固定の代わりにならないので、`gh` もほかのツールと同じく版と SHA-256 を記録し、`.tools/bin/gh` の実行時の版を照合する。
 
 ---
 
@@ -1349,11 +1388,11 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
 | 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 21 規則・55 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない |
-| 設定の検査 | `scripts/test-checks.py settings` | 37 件 | 合格する設定で通り、項目ごとの違反で失敗する。読めない設定は終了コード 2 |
-| 依存の検査 | `scripts/test-checks.py dependencies` | 12 件 | 許可リストにない依存・版の不一致・版で固定していない依存・対象外のライセンスで失敗する |
-| 版の照合 | `scripts/test-checks.py versions` | 6 件 | 版・SHA-256・形式・行の不足で失敗する |
+| 設定の検査 | `scripts/test-checks.py settings` | 45 件 | 合格する設定で通り、項目ごとの違反で失敗する。読めない設定は終了コード 2 |
+| 依存の検査 | `scripts/test-checks.py dependencies` | 23 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する |
+| 版の照合 | `scripts/test-checks.py versions` | 8 件 | 版・SHA-256・形式・行の不足・`gh` の行の順序で失敗する |
 | 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 2 件 | 実行時に組み立てた偽の鍵を検出する |
-| 文書の検査 | `scripts/test-checks.py docs` | 19 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・食い違うコード片などで失敗する |
+| 文書の検査 | `scripts/test-checks.py docs` | 28 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
@@ -1367,6 +1406,8 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 設定の検査の表（禁止・必須の一覧を 1 行ずつ消す、許す値を広げる） | 25 | すべて失敗した |
 | 検査スクリプトの処理（条件付きの設定を見ない、文字列の中のカンマを区別しない、依存の照合を無効にする、導入記録の SHA-256 を照合しない など） | 7 | すべて失敗した |
 | `check.sh`（手順の先頭に失敗するコマンドを入れる、手順の外で未定義の変数を使う） | 2 | どちらも終了コード 1 |
+| 2026-11-16 の追加分（`check-dependencies.py`・`check-project-settings.py`・`verify-docs.py`・`setup-tools.sh` を変更前の版に戻す。`setup-tools.sh` の `gh` の行の順序の照合だけを外す、実行時の版の比較だけを外す） | 6 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
+| `check.sh` を変更前の版に戻し、`print` を含む内容をステージして作業ツリーだけを直す | 1 | 変更前は手順 2 が通過し、変更後は失敗した（作業ツリーではなくインデックスを検査している） |
 | 文書の検査（未定義の ID を報告しない、範囲の省略を展開しない、MVP の網羅を調べない、コード片の不一致を報告しない など） | 15 | すべて失敗した |
 
 この確認で見つけて直した不具合:

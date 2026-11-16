@@ -57,7 +57,7 @@
 | SwiftLint（realm/SwiftLint） | 静的解析・独自ルール（security-requirements.md §10.1） | MIT | 0.65.1（2026-08-21 公開。公式の releases と Homebrew で確認） | 開発ツール（アプリに組み込まない）。GitHub releases の `portable_swiftlint.zip`（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2） | MVP | **導入済み**（2026-11-16。0.65.1。SHA-256 は `tools/versions`） |
 | SwiftFormat（nicklockwood/SwiftFormat） | 整形 | MIT | 0.64.7（2026-11-14 公開。公式の releases で確認。Homebrew は確認時点で 0.64.6） | 開発ツール。GitHub releases の `swiftformat.zip` | MVP | **導入済み**（2026-11-16。0.64.7。同上） |
 | gitleaks（CLI） | 秘密情報の検出 | MIT | 8.30.1（2026-03-21 公開。公式の releases と Homebrew で確認） | 開発ツール（コミット前のフック）。GitHub releases の `gitleaks_{版}_darwin_arm64.tar.gz` | MVP | **導入済み**（2026-11-16。8.30.1。同上） |
-| GitHub CLI（cli/cli。`gh`） | 開発ツールの配布ファイルの取得（`gh release download`）だけ | MIT | 版は固定しない（開発機に導入済みのものを使う。2026-11-16 の確認時は 2.101.0） | 開発ツール（アプリに組み込まない）。取得したファイルは SHA-256 で照合するので、`gh` の版に依存しない | MVP | 前提ツール（2026-11-16 記録） |
+| GitHub CLI（cli/cli。`gh`） | 開発ツールの配布ファイルの取得（`gh release download`）だけ | MIT | 2.104.0（2026-11-12 公開。公式の releases で確認） | 開発ツール（アプリに組み込まない）。GitHub releases の `gh_{版}_macOS_arm64.zip`（Intel の Mac は `macOS_amd64.zip`）を、導入スクリプトが `curl` で公式のリリースの固定の URL から取得し、SHA-256 が `tools/versions` と一致した場合だけ `.tools/` に入れる。ほかのツールの取得には、この `.tools/bin/gh` だけを使う（開発機に導入済みの `gh`・Homebrew の `gh` は使わない）。実行時の版（`gh --version`）は、取得の前と `check.sh` の手順 0（`setup-tools.sh --verify`）で `tools/versions` と照合し、一致しなければ失敗する | MVP | **導入済み**（2026-11-16。2.104.0。SHA-256 は `tools/versions`。取得したファイルの SHA-256 の照合は、`gh` の版の固定の代わりにしない） |
 | WhisperKit（argmaxinc/argmax-oss-swift） | 代替の端末内 STT（OS 標準が使えない端末向け） | MIT（同梱の一部は Apache-2.0） | v1.1.0（2026-08-06） | アプリに組み込む（SPM） | P2 | 条件付き候補（FR-STT-11）。モデルの取得は SEC-NET-04 に従う |
 | SpeakerKit（同上の SDK に同梱） | 話者分離 | MIT | v1.1.0 に同梱 | アプリに組み込む（SPM） | P3 | 検討候補 |
 
@@ -72,13 +72,16 @@
 
 開発ツール 3 種の版とライセンス（MIT）は、2026-11-14 に GitHub の公式 API（releases と license）と Homebrew の formula 情報で確認した。使い方は [../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5〜§7 にある。
 
-**導入の記録（2026-11-16）:** 3 種とも、確認時点の最新の安定版（上の表の版と同じ）を導入した。各タグの LICENSE ファイルを直接読み、MIT であることを確かめた（§4 の手順 3）。配布ファイルの SHA-256 は、自分で計算した値が GitHub の release API の `digest` と一致し、gitleaks は配布の `checksums.txt` とも一致した。値は `tools/versions` に記録している。新たな費用は発生していない。検査スクリプトは、これらと OS・Xcode に同梱のもの（bash・python3 など）だけで動く（[../03-detailed-design/dev-environment.md](../03-detailed-design/dev-environment.md) §2・§3）。
+**導入の記録（2026-11-16）:** 3 種とも、確認時点の最新の安定版（上の表の版と同じ）を導入した。各タグの LICENSE ファイルを直接読み、MIT であることを確かめた（§4 の手順 3）。配布ファイルの SHA-256 は、自分で計算した値が GitHub の release API の `digest` と一致し、gitleaks は配布の `checksums.txt` とも一致した。値は `tools/versions` に記録している。新たな費用は発生していない。
+
+**`gh` の版の固定（2026-11-16）:** それまで版を固定せず開発機の `gh` を使っていたが、SEC-SUP-01 に合わせて版を固定した。確認時点の最新の安定版 2.104.0（プレリリースではない）を選び、タグ `v2.104.0` の LICENSE を直接読んで MIT であることを確かめた。配布ファイル（`gh_2.104.0_macOS_arm64.zip`・`gh_2.104.0_macOS_amd64.zip`）の SHA-256 は、自分で計算した値が release API の `digest` と配布の `gh_2.104.0_checksums.txt` の両方と一致した。新たな費用は発生していない。検査スクリプトは、これらと OS・Xcode に同梱のもの（bash・python3 など）だけで動く（[../03-detailed-design/dev-environment.md](../03-detailed-design/dev-environment.md) §2・§3）。
 
 出典（確認日 2026-11-14）:
 
 - [GitHub: realm/SwiftLint releases](https://github.com/realm/SwiftLint/releases)
 - [GitHub: nicklockwood/SwiftFormat releases](https://github.com/nicklockwood/SwiftFormat/releases)
 - [GitHub: gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)
+- [GitHub: cli/cli releases v2.104.0](https://github.com/cli/cli/releases/tag/v2.104.0)（確認日 2026-11-16）
 - [GitHub Marketplace: Gitleaks Action](https://github.com/marketplace/actions/gitleaks)
 - [Swift Package Registry: argmax-oss-swift](https://swiftpackageregistry.com/argmaxinc/argmax-oss-swift)
 - [Apple Developer Program のメンバーシップ内容](https://developer.apple.com/programs/whats-included/jp)
@@ -96,7 +99,7 @@
 4. **通信**: そのライブラリが外部へ通信しないか（解析・テレメトリ・自動更新・モデルの自動取得を含む）。通信する場合は SEC-NET-04 の条件を満たすか。
 5. **最新安定版と版の固定**: 公式のリリースページで最新の安定版（プレリリースではない）を確認し、確認日とともに記録する。版の固定は依存の区分ごとに次のとおり行う（SEC-SUP-01）。
    - **SPM で組み込む依存**（アプリに組み込むライブラリ）: `Package.resolved` をコミットして版を固定する。
-   - **SPM 以外の開発ツール**（gitleaks CLI・SwiftLint・SwiftFormat など）: 公式のリリースページの配布ファイルを使い、版・取得元（リリースページの URL と配布ファイルの名前）・配布ファイルの SHA-256 を §3 と機械可読の写し（`tools/versions`）に記録する。導入スクリプトは記録した版を取得し、SHA-256 が一致した場合だけ展開する（どの環境でも同じ版を再現する）。検査スクリプトは実行時の版（`gitleaks version` など）を確かめ、記録と一致しなければ失敗する。Homebrew は過去の版に固定できないため使わない。版を変えるときは、§3 と `tools/versions` を同じ PR で直す（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2）。
+   - **SPM 以外の開発ツール**（gitleaks CLI・SwiftLint・SwiftFormat、およびそれらの取得に使う `gh` など）: 公式のリリースページの配布ファイルを使い、版・取得元（リリースページの URL と配布ファイルの名前）・配布ファイルの SHA-256 を §3 と機械可読の写し（`tools/versions`）に記録する。導入スクリプトは記録した版を取得し、SHA-256 が一致した場合だけ展開する（どの環境でも同じ版を再現する）。検査スクリプトは実行時の版（`gitleaks version` など）を確かめ、記録と一致しなければ失敗する。Homebrew は過去の版に固定できないため使わない。版を変えるときは、§3 と `tools/versions` を同じ PR で直す（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2）。
    - **モデル**（代替 STT のモデル重みなど。P2）: 版・取得元の URL・SHA-256 を記録し、ハッシュを検証してから使う（SEC-NET-04）。
 6. **保守状況**: 直近の更新・未対応の脆弱性・iOS と Swift の最新版への対応。
 7. **記録**: この台帳の §3 に 1 行追加し、PR の説明にも書く。
