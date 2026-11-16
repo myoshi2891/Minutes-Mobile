@@ -1,0 +1,46 @@
+#!/usr/bin/python3
+"""Package のカバレッジを集計する（TST-CI-07）。初期は警告だけで、失敗にしない。
+
+swift test --enable-code-coverage が出す JSON から、指定したディレクトリ配下のファイルだけを数える
+（合計にはテストコードと自動生成のファイルが混ざるため）。
+
+使い方: scripts/coverage-report.py <codecov の JSON> --sources <数える対象のディレクトリ> --target <目標の %>
+終了コード: 0 = 集計できた（目標未満は警告を出す） / 2 = 読めない・対象のファイルがない
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Package のカバレッジの集計")
+    parser.add_argument("report", type=Path)
+    parser.add_argument("--sources", type=Path, required=True)
+    parser.add_argument("--target", type=float, required=True)
+    arguments = parser.parse_args()
+    try:
+        files = json.loads(arguments.report.read_text(encoding="utf-8"))["data"][0]["files"]
+        prefix = os.path.realpath(arguments.sources) + os.sep
+        lines = [
+            (int(item["summary"]["lines"]["count"]), int(item["summary"]["lines"]["covered"]))
+            for item in files
+            if os.path.realpath(item["filename"]).startswith(prefix)
+        ]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
+        print(f"NG: カバレッジの記録を読めない: {error!r}", file=sys.stderr)
+        return 2
+    total = sum(count for count, _ in lines)
+    if total == 0:
+        print(f"NG: {arguments.sources} 配下に数える行がない", file=sys.stderr)
+        return 2
+    percent = 100.0 * sum(covered for _, covered in lines) / total
+    print(f"カバレッジ（{arguments.sources}）: 行 {percent:.1f}%（{len(lines)} ファイル・目標 {arguments.target:.0f}%）")
+    if percent < arguments.target:
+        print(f"警告: カバレッジが目標の {arguments.target:.0f}% に届いていない（TST-CI-07。初期は警告のみ）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
