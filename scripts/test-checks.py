@@ -123,6 +123,22 @@ def test_settings() -> None:
     settings_case("条件付きの設定だけが Swift 5", 1, "SWIFT_VERSION[config=Debug]",
                   project=lambda t: replaced(t, '"SWIFT_VERSION": "6.0",',
                                              '"SWIFT_VERSION": "6.0",\n        "SWIFT_VERSION[config=Debug]": "5.0",'))
+    settings_case("ターゲットの Debug は Swift 6、共有の Release は Swift 5", 1, "SWIFT_VERSION[config=Release] = 5.0",
+                  project=lambda t: replaced(replaced(t, '        "SWIFT_VERSION": "6.0",\n', '        "SWIFT_VERSION[config=Debug]": "6.0",\n'),
+                                             '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
+                                             '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n    "SWIFT_VERSION[config=Release]": "5.0",'))
+    settings_case("ターゲットの Debug と共有の Release がどちらも Swift 6", 0, "OK",
+                  project=lambda t: replaced(replaced(t, '        "SWIFT_VERSION": "6.0",\n', '        "SWIFT_VERSION[config=Debug]": "6.0",\n'),
+                                             '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
+                                             '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n    "SWIFT_VERSION[config=Release]": "6.0",'))
+    settings_case("ターゲットの条件のない値は共有の条件付きの値を上書きする", 0, "OK",
+                  project=lambda t: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
+                                             '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n    "SWIFT_VERSION[config=Release]": "5.0",'))
+    settings_case("Release だけ設定がない", 1, "構成 Release",
+                  project=lambda t: replaced(t, '        "SWIFT_VERSION": "6.0",\n', '        "SWIFT_VERSION[config=Debug]": "6.0",\n'))
+    settings_case("SDK の条件付きの値も検査する", 1, "SWIFT_VERSION[sdk=iphoneos*] = 5.0",
+                  project=lambda t: replaced(t, '"SWIFT_VERSION": "6.0",',
+                                             '"SWIFT_VERSION": "6.0",\n        "SWIFT_VERSION[sdk=iphoneos*]": "5.0",'))
     settings_case("警告をエラーにする設定がない", 1, "SWIFT_TREAT_WARNINGS_AS_ERRORS",
                   project=lambda t: replaced(t, '        "SWIFT_TREAT_WARNINGS_AS_ERRORS": "YES",\n', ""))
     settings_case("最低 OS が違う", 1, "IPHONEOS_DEPLOYMENT_TARGET",
@@ -136,6 +152,15 @@ def test_settings() -> None:
                                              '"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad": "UIInterfaceOrientationPortrait",'))
     settings_case("マイクの利用目的がない", 1, "NSMicrophoneUsageDescription",
                   project=lambda t: replaced(t, '        "INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n', ""))
+    settings_case("マイクの利用目的が Release だけ空", 1, "NSMicrophoneUsageDescription[config=Release] が空",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n'
+                                             '        "INFOPLIST_KEY_NSMicrophoneUsageDescription[config=Release]": "",'))
+    settings_case("マイクの利用目的が空の配列", 1, "NSMicrophoneUsageDescription が空",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": [],'))
+    settings_case("構成の一覧がない設定は合格にしない", 2, "configurations",
+                  project=lambda t: replaced(t, '"configurations": [\n    "Debug",\n    "Release",\n  ],', '"configurations": [],'))
     settings_case("ファイル共有を有効にしている（ビルド設定）", 1, "UIFileSharingEnabled",
                   project=lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",',
                                              '"GENERATE_INFOPLIST_FILE": "YES",\n        "INFOPLIST_KEY_UIFileSharingEnabled": "YES",'))
@@ -231,6 +256,29 @@ def test_dependencies() -> None:
                       {"Package.resolved": resolved}, [dict(approved, license="GPL-3.0", ownerDecision="UD-99")])
     dependencies_case("承認日のない項目は読まない", 2, "approvedOn", {}, [{k: v for k, v in approved.items() if k != "approvedOn"}])
     dependencies_case("読めない Package.resolved は合格にしない", 2, "読めない", {"Package.resolved": "{"})
+    moved = json.dumps({"pins": [dict(pin, location="https://example.org/other/sample-lib.git")], "version": 3})
+    dependencies_case("identity と版が同じでも取得元が違う", 1, "取得元", {"Package.resolved": moved}, [approved])
+    unknown_source = json.dumps({"pins": [{k: v for k, v in pin.items() if k != "location"}], "version": 3})
+    dependencies_case("取得元のない pin は合格にしない", 1, "取得元", {"Package.resolved": unknown_source}, [approved])
+    legacy = json.dumps({"object": {"pins": [{"package": "sample-lib", "repositoryURL": "https://example.com/owner/sample-lib",
+                                              "state": {"version": "1.2.3"}}]}, "version": 1})
+    dependencies_case("古い形式の取得元（repositoryURL）", 0, "OK", {"Package.resolved": legacy}, [approved])
+    declare = 'let package = Package(name: "A", dependencies: [{}])\n'
+    for label, declaration in {
+        "URL が変数": "let u = \"https://example.com/owner/sample-lib\"\n.package(url: u, from: \"1.2.3\")",
+        "URL が連結": '.package(url: "https://example.com/owner/sample-lib" + suffix, from: "1.2.3")',
+        "URL が補間": '.package(url: "https://\\(host)/owner/sample-lib", from: "1.2.3")',
+        "名前つきの URL が変数": '.package(name: "sample-lib", url: u, from: "1.2.3")',
+        "バイナリのターゲットの URL が変数": '.binaryTarget(name: "B", url: u, checksum: "0")',
+        "path が変数": ".package(path: local)",
+    }.items():
+        dependencies_case(f"取得元を判定できない宣言（{label}）", 1, "判定できない",
+                          {"Package.swift": declare.format(declaration)}, [approved])
+    dependencies_case("レジストリの依存は認めない", 1, "レジストリ",
+                      {"Package.swift": declare.format('.package(id: "owner.sample-lib", from: "1.2.3")')}, [approved])
+    dependencies_case("製品の参照（package:）は宣言として数えない", 0, "OK",
+                      {"Package.swift": manifest + '.target(name: "T", dependencies: [.product(name: "S", package: "sample-lib")])\n'},
+                      [approved])
 
 
 def test_versions() -> None:
@@ -243,6 +291,9 @@ def test_versions() -> None:
         "SHA-256 が違う": (lambda t: replaced(t, "c1e429b0", "00000000"), "SHA-256"),
         "形式が不正": (lambda t: replaced(t, "c1e429b0", "zzzzzzzz"), "不正"),
         "ツールの行がない": (lambda t: "\n".join(line for line in t.splitlines() if line.startswith("#")) + "\n", "1 つもない"),
+        "gh の行がほかのツールより後": (lambda t: "\n".join(
+            [line for line in t.splitlines() if not line.startswith("gh ")] + [line for line in t.splitlines() if line.startswith("gh ")]
+        ) + "\n", "gh の行が"),
         "この Mac 向けの行がない": (lambda t: "\n".join(
             line for line in t.splitlines() if not (line.startswith("gitleaks") and f" {platform.machine()} " in line)
         ) + "\n", "向けの行がない"),
@@ -252,6 +303,22 @@ def test_versions() -> None:
             versions = Path(directory) / "versions"
             versions.write_text(change(original), encoding="utf-8")
             expect(f"versions: {label}", [setup, "--verify", "--versions", str(versions), "--dest", tools], 1, want_text)
+    # 導入記録は一致するが、実行時の gh が別の版を名乗る（取得に使う gh の版を実行して確かめていること）
+    gh_rows = [line for line in original.splitlines() if line.startswith("gh ") and f" {platform.machine()} " in line]
+    with tempfile.TemporaryDirectory() as directory:
+        dest = Path(directory) / "tools"
+        version, sha = gh_rows[0].split()[1], gh_rows[0].split()[-1]
+        stub = dest / "gh" / version / "gh"
+        stub.parent.mkdir(parents=True)
+        stub.write_text("#!/bin/sh\necho 'gh version 2.0.0 (2000-01-01)'\n", encoding="utf-8")
+        stub.chmod(0o755)
+        (stub.parent / ".archive-sha256").write_text(sha + "\n", encoding="utf-8")
+        (dest / "bin").mkdir()
+        (dest / "bin" / "gh").symlink_to(f"../gh/{version}/gh")
+        versions = Path(directory) / "versions"
+        versions.write_text("\n".join(gh_rows) + "\n", encoding="utf-8")
+        expect("versions: 実行時の gh の版が違う", [setup, "--verify", "--versions", str(versions), "--dest", str(dest)], 1,
+               "実行時: 2.0.0")
 
 
 def test_gitleaks() -> None:
@@ -328,6 +395,20 @@ def test_docs() -> None:
         docs_case("セキュリティ節がない", 1, "「セキュリティ」の節がない", detailed, "## 2. セキュリティ", "## 2. その他"),
         docs_case("テスト観点の節がない", 1, "「テスト観点」の節がない", basic, "## 3. テスト観点", "## 3. その他"),
         docs_case("節の冒頭に要件 ID がない", 1, "冒頭に「満たす要件:」", basic, "満たす要件: TST-AAA-01\n\n", "本文\n\n"),
+        docs_case("満たす要件の行に ID がない", 1, "要件 ID も「—」の指定もない", basic, "満たす要件: TST-AAA-01\n", "満たす要件: 未定\n"),
+        docs_case("満たす要件の行が空", 1, "要件 ID も「—」の指定もない", basic, "満たす要件: TST-AAA-01\n", "満たす要件:\n"),
+        docs_case("満たす要件が設計決定だけ", 1, "要件 ID も「—」の指定もない", basic, "満たす要件: TST-AAA-01\n", "満たす要件: BD-SMP-01\n"),
+        docs_case("満たす要件に要件の群", 0, "OK", basic, "満たす要件: TST-AAA-01\n", "満たす要件: TST-AAA 群\n"),
+        docs_case("長いフェンスの中の短いフェンスで切り替わらない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
+                  f"満たす要件: TST-AAA-01\n\n{FENCE}`markdown\n{FENCE}\n## 9. フェンスの中の見出し\n{FENCE}\n{FENCE}`\n\n"),
+        docs_case("チルダのフェンス", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
+                  "満たす要件: TST-AAA-01\n\n~~~text\n## 9. フェンスの中の見出し\n~~~\n\n"),
+        docs_case("後ろに文字がある行はフェンスを閉じない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
+                  f"満たす要件: TST-AAA-01\n\n{FENCE}text\n{FENCE} 末尾に文字\n## 9. フェンスの中の見出し\n{FENCE}\n\n"),
+        docs_case("閉じていないフェンス", 1, "閉じていない", basic, "満たす要件: TST-AAA-01\n\n",
+                  f"満たす要件: TST-AAA-01\n\n{FENCE}`text\n{FENCE}\n\n"),
+        docs_case("チルダのフェンスのコード片", 0, "OK", detailed, f"{FENCE}bash\necho two\necho three\n{FENCE}",
+                  "~~~bash\necho two\necho three\n~~~"),
         docs_case("申し送りの解決が足りない", 1, "申し送りの解決の表が 1 行", detailed, "| 二つ目 | 済 |\n", ""),
         docs_case("全文のコード片が実ファイルと違う", 1, "コード片が scripts/sample.sh と一致しない", detailed, "echo one\necho two\necho three", "echo one\necho two"),
         docs_case("一部のコード片が実ファイルと違う", 1, "コード片が scripts/sample.sh と一致しない", detailed, f"bash\necho two\necho three\n{FENCE}", f"bash\necho two\necho four\n{FENCE}"),

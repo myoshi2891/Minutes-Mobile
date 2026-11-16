@@ -4,7 +4,8 @@
 # 使い方:
 #   scripts/check.sh                手順 0〜10 を順に実行する（PR の作成前）
 #   scripts/check.sh --steps 0-8,10 指定した手順だけを実行する（プッシュ前のフックが使う）
-#   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）
+#   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
+#                                   手順 1・2 は作業ツリーではなくステージした内容（インデックス）を検査する
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -25,6 +26,7 @@ PACKAGE_COVERAGE_TARGET=90
 LAST_STEP=10
 STAGED=0
 STEPS=""
+STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
@@ -78,6 +80,16 @@ if [ "$STAGED" = 1 ]; then
   done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift')
 fi
 
+# ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
+# 設定（.swiftformat・各階層の .swiftlint.yml）もインデックスから同じ位置へ書き出し、入れ子の設定を作業ツリーと同じに解決させる
+prepare_staged_tree() {
+  STAGED_TREE=$(mktemp -d)
+  {
+    git ls-files -z -- ':(glob)**/.swiftformat' ':(glob)**/.swiftlint.yml' ':(glob)**/.swift-version'
+    printf '%s\0' "${STAGED_SWIFT[@]}"
+  } | git checkout-index -z --stdin --prefix="$STAGED_TREE/"
+}
+
 title() {
   case "$1" in
     0) echo "開発ツールの版" ;;
@@ -102,7 +114,7 @@ step_0() {
 step_1() {
   if [ "$STAGED" = 1 ]; then
     if [ ${#STAGED_SWIFT[@]} -eq 0 ]; then echo "ステージした Swift ファイルはない"; return 0; fi
-    "$TOOLS/swiftformat" --lint --cache ignore "${STAGED_SWIFT[@]}"
+    (cd "$STAGED_TREE" && "$TOOLS/swiftformat" --lint --cache ignore "${STAGED_SWIFT[@]}")
   else
     "$TOOLS/swiftformat" --lint --cache ignore .
   fi
@@ -112,7 +124,7 @@ step_2() {
   # --config を付けない（付けると、テストコード用の入れ子の設定が無効になる）
   if [ "$STAGED" = 1 ]; then
     if [ ${#STAGED_SWIFT[@]} -gt 0 ]; then
-      "$TOOLS/swiftlint" lint --quiet --no-cache --force-exclude "${STAGED_SWIFT[@]}"
+      (cd "$STAGED_TREE" && "$TOOLS/swiftlint" lint --quiet --no-cache --force-exclude "${STAGED_SWIFT[@]}")
     else
       echo "ステージした Swift ファイルはない"
     fi
@@ -192,6 +204,7 @@ step_10() {
 current=""
 on_exit() {
   local status=$?
+  if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
@@ -200,6 +213,7 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
 
 for step in $STEPS; do
   echo "== 手順 $step: $(title "$step")"

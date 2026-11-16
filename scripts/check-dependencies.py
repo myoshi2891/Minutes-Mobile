@@ -95,6 +95,57 @@ def strings(node: object) -> Iterator[str]:
             yield from strings(item)
 
 
+def call_arguments(text: str, start: int) -> str:
+    """start の位置の「(」に対応する「)」までの引数を返す。文字列リテラルの中の括弧は数えない。閉じていなければ末尾まで。"""
+    depth = 0
+    index = start
+    in_string = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            if char == "\\":
+                index += 1
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:index]
+        index += 1
+    return text[start + 1:]
+
+
+# 取得元を持つ宣言（Package の依存と、バイナリのターゲット）
+SOURCE_DECLARATION = re.compile(r"\.(package|binaryTarget)\s*\(")
+# 文字列リテラルだけの引数（連結・補間・変数を含まない）。引数の終わりは「,」か末尾
+LITERAL_URL = re.compile(r'\burl:\s*"[^"\\]*"\s*(?:,|$)')
+LITERAL_PATH = re.compile(r'\bpath:\s*"[^"\\]*"\s*(?:,|$)')
+
+
+def manifest_errors(manifest: str, by_url: Dict[str, dict]) -> List[str]:
+    """Package.swift の取得元を調べる。取得元を文字列リテラルから判定できない宣言は合格にしない。"""
+    errors: List[str] = []
+    for url in re.findall(r'\burl:\s*"([^"]+)"', manifest):
+        if normalize(url) not in by_url:
+            errors.append(f"{url} は許可リストにない")
+    for match in SOURCE_DECLARATION.finditer(manifest):
+        kind = match.group(1)
+        arguments = call_arguments(manifest, match.end() - 1)
+        summary = " ".join(arguments.split())[:80]
+        if kind == "package" and re.match(r"\s*id:", arguments):
+            errors.append(f"レジストリの依存は認めない: .package({summary})")
+        elif re.search(r"\burl:", arguments):
+            if not LITERAL_URL.search(arguments):
+                errors.append(f"取得元の URL を判定できない（文字列リテラルで書く）: .{kind}({summary})")
+        elif not LITERAL_PATH.search(arguments):
+            errors.append(f"取得元を判定できない（url: か path: を文字列リテラルで書く）: .{kind}({summary})")
+    return errors
+
+
 def check(root: Path, allowlist: Path) -> List[str]:
     by_pin, by_url = load_allowlist(allowlist)
     errors: List[str] = []
@@ -110,16 +161,18 @@ def check(root: Path, allowlist: Path) -> List[str]:
                 errors.append(f"{source}: {identity} は版で固定されていない（ブランチやコミットの指定は認めない）")
             elif (identity, version) not in by_pin:
                 errors.append(f"{source}: {identity} {version} は許可リストにない")
+            else:
+                # identity と版が同じでも、取得元が承認したものと違えば認めない
+                location = pin.get("location") or pin.get("repositoryURL")  # repositoryURL は古い形式（version 1）
+                approved = by_pin[(identity, version)]["url"]
+                if not isinstance(location, str) or normalize(location) != normalize(approved):
+                    errors.append(f"{source}: {identity} {version} の取得元 {location} が許可リスト（{approved}）と違う")
     for path in find_files(root, "Package.swift"):
         try:
             manifest = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise Unreadable(f"{path}: {error}") from error
-        for url in re.findall(r'\burl:\s*"([^"]+)"', manifest):
-            if normalize(url) not in by_url:
-                errors.append(f"{path.relative_to(root)}: {url} は許可リストにない")
-        for identifier in re.findall(r'\.package\s*\(\s*id:\s*"([^"]+)"', manifest):
-            errors.append(f"{path.relative_to(root)}: レジストリの依存 {identifier} は認めない")
+        errors.extend(f"{path.relative_to(root)}: {message}" for message in manifest_errors(manifest, by_url))
     for path in find_files(root, "project.xcproj"):
         for text in strings(load_project(path)):
             if REMOTE_URL.search(text) and normalize(text) not in by_url:

@@ -41,18 +41,62 @@ DEFINED_IN = {
     "COST": "docs/01-requirements/dependencies-and-costs.md",
     "UD": "docs/README.md",
 }
+# 「満たす要件:」に書ける要件 ID の接頭辞（設計決定・未解決事項・オーナー決定は要件ではない）
+REQUIREMENT_PREFIX = r"(FR|NFR|SEC|TST|CON|INV)-"
 BASIC = "docs/02-basic-design"
 DETAILED = "docs/03-detailed-design"
 
 
+Fence = Tuple[str, int]  # フェンスの文字（` か ~）と長さ
+FENCE_OPEN = re.compile(r"^(`{3,}|~{3,})(.*)$")
+
+
+def fence_open(line: str) -> Optional[Tuple[Fence, str]]:
+    """フェンスの開始行なら（フェンス, 情報文字列）を返す。バッククォートのフェンスの情報文字列にはバッククォートを含められない。"""
+    found = FENCE_OPEN.match(line.lstrip())
+    if not found:
+        return None
+    marker, info = found.group(1), found.group(2)
+    if marker[0] == "`" and "`" in info:
+        return None
+    return (marker[0], len(marker)), info.strip()
+
+
+def fence_closes(line: str, fence: Fence) -> bool:
+    """開始と同じ文字が開始以上の長さで並び、その後が空白だけの行だけが、フェンスを閉じる。"""
+    char, length = fence
+    return re.fullmatch(rf"{re.escape(char)}{{{length},}}\s*", line.lstrip()) is not None
+
+
+def fence_end(lines: List[str], start: int) -> int:
+    """lines[start] で開いたフェンスを閉じる行の位置を返す。閉じていなければ len(lines)。"""
+    opened = fence_open(lines[start])
+    assert opened is not None
+    end = start + 1
+    while end < len(lines) and not fence_closes(lines[end], opened[0]):
+        end += 1
+    return end
+
+
+def fenced_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]]]]:
+    """各行を（行番号, 行, フェンスの中か, この行で開いたフェンス）で返す。フェンスの開始・終了の行は「中」とする。"""
+    fence: Optional[Fence] = None
+    for number, line in enumerate(text.splitlines(), start=1):
+        if fence is not None:
+            if fence_closes(line, fence):
+                fence = None
+            yield number, line, True, None
+            continue
+        opened = fence_open(line)
+        if opened:
+            fence = opened[0]
+        yield number, line, opened is not None, opened
+
+
 def prose_lines(text: str) -> Iterator[Tuple[int, str]]:
     """コードフェンスの外の行を、行番号つきで返す。"""
-    in_fence = False
-    for number, line in enumerate(text.splitlines(), start=1):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if not in_fence:
+    for number, line, inside, _ in fenced_lines(text):
+        if not inside:
             yield number, line
 
 
@@ -164,16 +208,13 @@ class Checker:
             lines = text.splitlines()
             if len(lines) >= MAX_LINES:
                 self.error(name, f"{len(lines)} 行ある（{MAX_LINES} 行未満に分割する）")
-            in_fence = False
-            for number, line in enumerate(lines, start=1):
-                stripped = line.lstrip()
-                if not stripped.startswith("```"):
+            for number, _, _, opened in fenced_lines(text):
+                if opened is None:
                     continue
-                if not in_fence and not stripped[3:].strip():
+                if not opened[1]:
                     self.error(name, "コードフェンスに言語の指定がない", number)
-                in_fence = not in_fence
-            if in_fence:
-                self.error(name, "コードフェンスが閉じていない")
+                if fence_end(lines, number - 1) >= len(lines):
+                    self.error(name, "コードフェンスが閉じていない", number)
             for number, line in prose_lines(text):
                 for target in re.findall(r"\]\(([^)\s]+)\)", line):
                     if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
@@ -203,6 +244,8 @@ class Checker:
                 first = next((line for line in body if line.strip() and not line.startswith("### ")), "")
                 if not re.match(r"^(満たす要件|制約):", first):
                     self.error(name, f"節「{heading}」の冒頭に「満たす要件:」（または「制約:」）の行がない", number)
+                elif first.startswith("満たす要件:") and not self.names_requirements(first):
+                    self.error(name, f"節「{heading}」の「満たす要件:」に要件 ID も「—」の指定もない", number)
             if name.endswith("/README.md"):
                 continue
             headings = [heading for _, heading, _ in sections]
@@ -215,6 +258,19 @@ class Checker:
             if directory == DETAILED:
                 self.check_handover(name, sections)
                 self.check_snippets(name, text)
+
+    def names_requirements(self, line: str) -> bool:
+        """「満たす要件:」の後（「／」の前まで）に、定義済みの要件 ID・要件の群・「SEC 全般」・「—」（満たす要件なし）のどれかがあるか。"""
+        spec = line.split(":", 1)[1].split("／", 1)[0].strip()
+        if spec.startswith("—") or "SEC 全般" in spec:
+            return True
+        for match in ID_PATTERN.finditer(spec):
+            if any(identifier in self.defined and re.match(REQUIREMENT_PREFIX, identifier) for identifier in expand(match)):
+                return True
+        prefixes = {identifier.rsplit("-", 1)[0] for identifier in self.defined}
+        return any(
+            f"{match.group(1)}-{area}" in prefixes for match in GROUP_PATTERN.finditer(spec) for area in match.group(2).split("・")
+        )
 
     def check_handover(self, name: str, sections: List[Tuple[int, str, List[str]]]) -> None:
         """基本設計の申し送りの項目数と、詳細設計の解決の表の行数が一致すること。"""
@@ -243,12 +299,10 @@ class Checker:
             start = index + 1
             while start < len(lines) and not lines[start].strip():
                 start += 1
-            if start >= len(lines) or not lines[start].startswith("```"):
+            if start >= len(lines) or not fence_open(lines[start]):
                 self.error(name, "印の直後にコードフェンスがない", index + 1)
                 continue
-            end = start + 1
-            while end < len(lines) and not lines[end].startswith("```"):
-                end += 1
+            end = fence_end(lines, start)
             snippet = lines[start + 1:end]
             path = self.root / marker.group(2)
             if not path.is_file():
@@ -281,13 +335,13 @@ class Checker:
                 while start < len(lines) and not lines[start].strip():
                     start += 1
                 path = self.root / marker.group(1)
-                if start >= len(lines) or not lines[start].startswith("```") or not path.is_file():
+                opened = fence_open(lines[start]) if start < len(lines) else None
+                if not opened or not path.is_file():
                     continue  # 不備は検査の側で報告する
-                end = start + 1
-                while end < len(lines) and not lines[end].startswith("```"):
-                    end += 1
+                end = fence_end(lines, start)
                 content = path.read_text(encoding="utf-8").splitlines()
-                if end >= len(lines) or any(line.startswith("```") for line in content):
+                # このフェンスを閉じてしまう行を含む内容は書き込まない（長いフェンスに手で直す）
+                if end >= len(lines) or any(fence_closes(line, opened[0]) for line in content):
                     continue
                 out.extend(lines[index:start + 1] + content + [lines[end]])
                 index = end + 1

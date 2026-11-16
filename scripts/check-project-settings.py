@@ -8,6 +8,7 @@
 終了コード: 0 = 問題なし / 1 = 違反あり / 2 = 読めない（読めないものを合格にしない）
 """
 import argparse
+import fnmatch
 import plistlib
 import re
 import sys
@@ -87,17 +88,65 @@ def enabled(value: object) -> bool:
     return str(value).strip().lower() in {"yes", "true", "1"}
 
 
+def conditions(key: str) -> Dict[str, str]:
+    """NAME[config=Debug][sdk=iphoneos*] の条件を辞書で返す。"""
+    return dict(re.findall(r"\[(\w+)=([^\]]*)\]", key))
+
+
+def resolve(own: dict, shared: dict, name: str, configurations: List[str]) -> Tuple[Dict[Tuple[str, str], List[str]], List[str]]:
+    """構成ごとに効く書き方を求める。戻り値は（鍵, 値）→ 構成の一覧 と、どの段でも決まらない構成の一覧。
+
+    ターゲットの設定がプロジェクトの設定を上書きし、同じ段では構成の条件が一致する書き方が条件のない書き方を上書きする。
+    構成以外の条件（sdk・arch）の書き方は、その条件のビルドで効きうるので、すべて検査の対象にする。
+    """
+    effective: Dict[Tuple[str, str], List[str]] = {}
+    missing: List[str] = []
+    for configuration in configurations:
+        covered = False
+        for level in (own, shared):
+            applicable = []
+            for key, value in variants(level, name):
+                condition = conditions(key)
+                if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
+                    continue
+                applicable.append((key, value, condition))
+            if any(set(condition) == {"config"} for _, _, condition in applicable):
+                applicable = [item for item in applicable if item[2]]  # 条件のない書き方は、この構成では効かない
+            for key, value, _ in applicable:
+                effective.setdefault((key, value), []).append(configuration)
+            # 構成以外の条件を持たない書き方があれば、この段で決まる（下の段は効かない）
+            if any(set(condition) <= {"config"} for _, _, condition in applicable):
+                covered = True
+                break
+        if not covered:
+            missing.append(configuration)
+    return effective, missing
+
+
 def check_required(
-    target: str, own: dict, shared: dict, rules: Dict[str, Tuple[Tuple[str, ...], str]], errors: List[str]
+    target: str, own: dict, shared: dict, configurations: List[str],
+    rules: Dict[str, Tuple[Tuple[str, ...], str]], errors: List[str]
 ) -> None:
     for name, (allowed, reason) in rules.items():
-        found = variants(own, name) or variants(shared, name)
-        if not found:
-            errors.append(f"[{reason}] {target}: {name} が設定されていない（必要な値: {allowed[0]}）")
-            continue
-        for key, value in found:
+        effective, missing = resolve(own, shared, name, configurations)
+        if missing:
+            errors.append(f"[{reason}] {target}: {name} が設定されていない（構成 {'・'.join(missing)}。必要な値: {allowed[0]}）")
+        for (key, value), used in effective.items():
             if value not in allowed:
-                errors.append(f"[{reason}] {target}: {key} = {value}（必要な値: {allowed[0]}）")
+                errors.append(f"[{reason}] {target}: {key} = {value}（構成 {'・'.join(used)}。必要な値: {allowed[0]}）")
+
+
+def check_nonempty(
+    target: str, own: dict, shared: dict, configurations: List[str], rules: Dict[str, str], errors: List[str]
+) -> None:
+    """すべての構成で、効く書き方がすべて空でないこと（条件付きの書き方が空なら違反）。"""
+    for name, reason in rules.items():
+        effective, missing = resolve(own, shared, name, configurations)
+        if missing:
+            errors.append(f"[{reason}] {target}: {name} が設定されていない（構成 {'・'.join(missing)}）")
+        for (key, value), used in effective.items():
+            if not value.replace("$(inherited)", "").strip():
+                errors.append(f"[{reason}] {target}: {key} が空（構成 {'・'.join(used)}）")
 
 
 def check_plist_entry(source: str, key: str, value: object, errors: List[str]) -> None:
@@ -165,18 +214,19 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
     targets = project.get("targets", [])
     if not isinstance(shared, dict) or not isinstance(targets, list) or not targets:
         raise Unreadable(f"{project_path}: build-settings または targets の形式が違う")
+    configurations = project.get("configurations")
+    if not isinstance(configurations, list) or not configurations or not all(isinstance(c, str) for c in configurations):
+        raise Unreadable(f"{project_path}: configurations の形式が違う")
     check_build_settings("プロジェクト", shared, errors)
     for target in targets:
         if not isinstance(target, dict) or not isinstance(target.get("build-settings"), dict):
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
         name = f"ターゲット {target.get('name', '?')}"
         own = target["build-settings"]
-        check_required(name, own, shared, REQUIRED_ALL_TARGETS, errors)
+        check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
         if target.get("product-type") == "application":
-            check_required(name, own, shared, REQUIRED_APPLICATION, errors)
-            for setting, reason in REQUIRED_NONEMPTY_APPLICATION.items():
-                if not any(value.strip() for _, value in variants(own, setting)):
-                    errors.append(f"[{reason}] {name}: {setting} が設定されていない")
+            check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
+            check_nonempty(name, own, shared, configurations, REQUIRED_NONEMPTY_APPLICATION, errors)
         check_build_settings(name, own, errors)
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:

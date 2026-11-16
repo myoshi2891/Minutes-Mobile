@@ -1,5 +1,5 @@
 #!/bin/bash
-# 開発ツール（SwiftLint・SwiftFormat・gitleaks）を tools/versions の版で .tools/ に導入する（BD-DEV-03、SEC-SUP-01）。
+# 開発ツール（gh・SwiftLint・SwiftFormat・gitleaks）を tools/versions の版で .tools/ に導入する（BD-DEV-03、SEC-SUP-01）。
 #
 # 使い方:
 #   scripts/setup-tools.sh            導入する（導入済みで版と SHA-256 が一致するものは取得しない）
@@ -7,7 +7,8 @@
 # 試験用の指定（検査の自己試験が使う）: --versions <ファイル>  --dest <ディレクトリ>
 #
 # 終了コード: 0 = 一致 / 1 = 不一致・取得や照合の失敗 / 2 = 使い方の誤り
-# 前提: gh（配布ファイルの取得だけに使う）、shasum・unzip・tar（OS 同梱）
+# 前提: curl・shasum・unzip・tar（OS 同梱）。gh は記録した版を curl で取得して .tools/ に入れ、
+# ほかのツールの取得には、その版の gh（.tools/bin/gh）だけを使う（PATH や Homebrew の gh は使わない）
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -43,6 +44,7 @@ runtime_version() {
     swiftlint) out=$("$binary" version) ;;
     swiftformat) out=$("$binary" --version) ;;
     gitleaks) out=$("$binary" version) ;;
+    gh) out=$("$binary" --version); out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
     *) fail "版の確認方法が未定義のツール: $name" ;;
   esac
   printf '%s\n' "${out#v}"
@@ -68,15 +70,22 @@ verify_tool() {
 
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
-  local target="$DEST/$name/$version" work="$WORK/$name" actual
+  local target="$DEST/$name/$version" work="$WORK/$name" actual found license
   if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
     echo "導入済み: $name $version"
   else
     echo "取得: $name ${version}（$repo $tag ${asset}）"
     mkdir -p "$work/download" "$work/extract" "$work/out"
-    # 標準入力は版の写しを読んでいる途中なので、gh に渡さない
-    gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$work/download" </dev/null \
-      || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
+    # 標準入力は版の写しを読んでいる途中なので、取得のコマンドに渡さない
+    if [ "$name" = gh ]; then
+      # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）
+      curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
+        || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
+    else
+      "$DEST/bin/gh" release download "$tag" --repo "$repo" --pattern "$asset" --dir "$work/download" </dev/null \
+        || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
+    fi
     actual=$(shasum -a 256 "$work/download/$asset" | awk '{print $1}')
     # 一致しない配布ファイルは展開しない
     [ "$actual" = "$sha" ] \
@@ -86,10 +95,17 @@ install_tool() {
       *.tar.gz) tar -xzf "$work/download/$asset" -C "$work/extract" ;;
       *) fail "$name の配布ファイルの形式に対応していない: $asset" ;;
     esac
-    [ -f "$work/extract/$binary" ] || fail "$name の配布ファイルに実行ファイル $binary がない"
-    cp "$work/extract/$binary" "$work/out/$binary"
+    # 実行ファイルは最上位か、配布ファイルの中のどこか 1 か所（gh は gh_{版}_macOS_{arch}/bin/gh）
+    found="$work/extract/$binary"
+    if [ ! -f "$found" ]; then
+      found=$(find "$work/extract" -type f -name "$binary")
+      [ -n "$found" ] || fail "$name の配布ファイルに実行ファイル $binary がない"
+      [ "$(printf '%s\n' "$found" | wc -l | tr -d ' ')" = 1 ] || fail "$name の配布ファイルに $binary が複数ある"
+    fi
+    cp "$found" "$work/out/$binary"
     chmod 755 "$work/out/$binary"
-    if [ -f "$work/extract/LICENSE" ]; then cp "$work/extract/LICENSE" "$work/out/LICENSE"; fi
+    license=$(find "$work/extract" -maxdepth 2 -type f -name LICENSE)
+    if [ -n "$license" ] && [ "$(printf '%s\n' "$license" | wc -l | tr -d ' ')" = 1 ]; then cp "$license" "$work/out/LICENSE"; fi
     printf '%s\n' "$sha" > "$work/out/.archive-sha256"
     mkdir -p "$DEST/$name"
     rm -rf -- "${target:?}"
@@ -100,7 +116,6 @@ install_tool() {
 }
 
 if [ "$MODE" = install ]; then
-  command -v gh >/dev/null 2>&1 || fail "gh が見つからない（配布ファイルの取得に使う）"
   WORK=$(mktemp -d)
   cleanup() {
     local status=$?
@@ -130,6 +145,10 @@ while read -r name version arch repo tag asset binary sha extra; do
   case "$seen" in *" $name "*) ;; *) seen="$seen$name " ;; esac
   if [ "$arch" != any ] && [ "$arch" != "$ARCH" ]; then continue; fi
   case "$matched" in *" $name "*) fail "tools/versions に $name の行が重複している（$ARCH 向け）" ;; esac
+  # ほかのツールは、記録した版の gh で取得する。そのため gh の行を先に置き、先に導入・照合する
+  if [ "$name" != gh ]; then
+    case "$matched" in *" gh "*) ;; *) fail "tools/versions で、$ARCH 向けの gh の行が $name の行より前にない" ;; esac
+  fi
   matched="$matched$name "
   if [ "$MODE" = install ]; then
     install_tool "$name" "$version" "$repo" "$tag" "$asset" "$binary" "$sha"
