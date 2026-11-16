@@ -1,0 +1,26 @@
+# 個人の設定とビルドの成果物
+xcuserdata/
+DerivedData/
+.build/
+build/
+*.xcresult
+
+# 導入スクリプトが展開した開発ツール（版は tools/versions で管理する）
+.tools/
+
+# 録音データを誤って入れない（SEC-SUP-04・05）
+*.wav
+*.m4a
+*.caf
+*.zip
+
+# 試験で作った DB
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# 秘密情報
+.env
+.env.*
+
+.DS_Store

@@ -1,0 +1,4 @@
+# gitleaks の設定（TST-CI-04、SEC-SUP-03）。既定の規則をそのまま使う。
+# 検出を除外する指定（allowlist）は置かない。必要になったら理由を PR に書いてレビューを受ける。
+[extend]
+useDefault = true

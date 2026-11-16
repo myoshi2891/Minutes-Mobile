@@ -1,0 +1,179 @@
+# SwiftLint の設定（security-requirements.md §10.1、基本設計 dev-environment.md §7）。
+# 規則を足す・変えるときは tools/lint-fixtures/<規則名>/ の違反例と正常例も同じ作業で直す（BD-DEV-05）。
+# 検査はリポジトリ直下から --config を付けずに実行する（付けると、テストコード用の入れ子の設定が無効になる）。
+
+# 警告もエラーとして扱う（TST-CI-03）
+strict: true
+
+excluded:
+  - .tools
+  - .build
+  - build
+  - DerivedData
+  - tools/lint-fixtures
+
+opt_in_rules:
+  - force_unwrapping
+
+# SEC-INP-03。テストコードでは入れ子の設定（tools/lint-fixtures/_test-code/.swiftlint.yml の写し）で外す
+force_try: error
+force_cast: error
+force_unwrapping: error
+
+# match_kinds はコメントと文字列の中の一致を除くために指定する（コードとして現れた場合だけ検出する）
+custom_rules:
+  no_print_logging:
+    name: "print / NSLog / debugPrint の禁止"
+    regex: '\b(print|debugPrint|NSLog)\s*\('
+    match_kinds: &code
+      - identifier
+      - typeidentifier
+      - keyword
+      - attribute.id
+      - attribute.builtin
+      - argument
+      - parameter
+      - number
+    message: "ログはログの型を経由する（SEC-LOG-01）"
+    severity: error
+
+  no_direct_logger:
+    name: "Logger の直接の利用の禁止"
+    regex: '\b(Logger|os_log)\s*\('
+    excluded:
+      - '.*/Logging/AppLogger\.swift'
+    match_kinds: *code
+    message: "Logger はログの型の中だけで使う（BD-ARC-06、SEC-LOG-03）"
+    severity: error
+
+  no_network_api:
+    name: "通信 API の禁止"
+    regex: '\b(URLSession\w*|URLRequest|NSURLConnection|NW(Connection|Listener|Browser|PathMonitor|ProtocolWebSocket)\w*|CFStreamCreatePairWith\w+|CFSocket\w*)\b'
+    match_kinds: *code
+    message: "アプリのコードは通信 API を持たない（SEC-NET-01、BD-ARC-05）"
+    severity: error
+
+  no_network_import:
+    name: "通信フレームワークの import の禁止"
+    regex: '\bimport\s+(\w+\s+)?(Network|CFNetwork)\b'
+    match_kinds: *code
+    message: "Network / CFNetwork を import しない（SEC-NET-01）"
+    severity: error
+
+  no_bsd_socket:
+    name: "BSD ソケットの禁止"
+    regex: '(?<![.\w])(?<!func\s)(socket|connect)\s*\('
+    match_kinds: *code
+    message: "ソケットを直接使わない（SEC-NET-01）"
+    severity: error
+
+  no_legacy_speech_recognizer:
+    name: "SFSpeechRecognizer の禁止"
+    regex: '\bSFSpeechRecognizer\b'
+    match_kinds: *code
+    message: "旧来の音声認識は使わない。SpeechAnalyzer を使う（SEC-NET-01、BD-STT-10）"
+    severity: error
+
+  no_private_cloud_model:
+    name: "端末外のモデルの禁止"
+    regex: '\bPrivateCloudComputeLanguageModel\b'
+    match_kinds: *code
+    message: "オンデバイスのモデルだけを使う（SEC-NET-02）"
+    severity: error
+
+  no_empty_catch:
+    name: "空の catch の禁止"
+    regex: '\bcatch\b[^{\n]*\{\s*(//[^\n]*\s*|/\*.*?\*/\s*)*\}'
+    match_kinds:
+      - identifier
+      - typeidentifier
+      - keyword
+      - comment
+    message: "エラーを握りつぶさない（SEC-LOG-04）"
+    severity: error
+
+  no_direct_user_defaults:
+    name: "UserDefaults の直接の利用の禁止"
+    regex: '\b(UserDefaults|NSUserDefaults|AppStorage)\b'
+    excluded:
+      - '.*/Settings/SettingsStore\.swift'
+    match_kinds: *code
+    message: "UserDefaults は設定の型の中だけで使う（SEC-DAT-07）"
+    severity: error
+
+  no_direct_directory_access:
+    name: "保存先の直接の指定とディレクトリの直接の作成の禁止"
+    regex: '\.documentDirectory\b|\bdocumentsDirectory\b|\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
+    excluded:
+      - '.*/Storage/StorageRoot\.swift'
+      - '.*/TestSupport/TemporaryDirectory\.swift'
+    match_kinds: *code
+    message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03・04）"
+    severity: error
+
+  no_direct_pasteboard:
+    name: "UIPasteboard と textSelection の直接の利用の禁止"
+    regex: '\bUIPasteboard\b|\.textSelection\s*\('
+    excluded:
+      - '.*/Clipboard/ClipboardWriter\.swift'
+    match_kinds: *code
+    message: "コピーはコピーの型を経由する（SEC-PLT-01）"
+    severity: error
+
+  no_share_link:
+    name: "ShareLink の禁止"
+    regex: '\bShareLink\b'
+    match_kinds: *code
+    message: "共有は完了を受け取れる部品で行う（SEC-DAT-06）"
+    severity: error
+
+  no_webkit:
+    name: "WebView の禁止"
+    regex: '\bWKWebView\b|\bimport\s+(\w+\s+)?WebKit\b'
+    match_kinds: *code
+    message: "WebView を使わない（SEC-PLT-05）"
+    severity: error
+
+  no_spotlight_user_activity:
+    name: "Spotlight と NSUserActivity の禁止"
+    regex: '\bimport\s+(\w+\s+)?CoreSpotlight\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
+    match_kinds: *code
+    message: "Spotlight・Siri にデータを渡さない（SEC-PLT-02）"
+    severity: error
+
+  no_direct_clock:
+    name: "時計の直接の利用の禁止"
+    regex: '\bDate\s*\(\s*\)|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\bsystemUptime\b'
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+    match_kinds: *code
+    message: "時刻は注入した時計から得る（TST-GEN-01・07）"
+    severity: error
+
+  no_direct_uuid:
+    name: "UUID の直接の生成の禁止"
+    regex: '\bUUID\s*\(\s*\)'
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+      - '.*/TestSupport/TemporaryDirectory\.swift'
+    match_kinds: *code
+    message: "UUID は注入した生成器から得る（TST-GEN-04・07）"
+    severity: error
+
+  no_direct_sleep_timer:
+    name: "待機とタイマーの直接の利用の禁止"
+    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+    match_kinds: *code
+    message: "待機とタイマーは注入した型を経由する。実時間を待つテストは書かない（TST-GEN-01）"
+    severity: error
+
+  no_direct_random:
+    name: "乱数の直接の利用の禁止"
+    regex: '\.random\s*\(|\.randomElement\s*\(|\.shuffled\s*\(|\.shuffle\s*\(|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+    match_kinds: *code
+    message: "乱数は注入した型から得る（TST-GEN-07）"
+    severity: error
