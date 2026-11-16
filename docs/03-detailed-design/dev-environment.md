@@ -47,6 +47,7 @@ scripts/
   check.sh                    検査の本体（手順 0〜10）
   check-project-settings.py   プロジェクト設定・Info.plist・entitlements の検査
   check-dependencies.py       依存の検査
+  check-tracked-files.py      録音データ・DB・秘密情報のファイルが Git の管理に入っていないことの検査
   coverage-report.py          Package のカバレッジの集計
   find-simulator.py           テストに使うシミュレータの選択
   verify-docs.py              文書の整合の検査
@@ -343,8 +344,8 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 | 0 | 開発ツールの版 | `setup-tools.sh --verify` | `test-checks.py versions` | 通過（1 秒） |
 | 1 | 整形 | `swiftformat --lint`（書き換えない） | — | **失敗**: テンプレートの `ContentView.swift` の import の並び順（`sortImports`） |
 | 2 | 静的解析 | `swiftlint lint`（警告もエラー） | `test-lint-rules.py` | 通過（3 秒） |
-| 3 | 秘密情報 | `gitleaks git`（全履歴。検出した値は伏せる） | `test-checks.py gitleaks` | 通過（1 秒。67 コミット） |
-| 4 | プロジェクト設定 | `check-project-settings.py` | `test-checks.py settings` | **失敗**: 違反 7 件（§12 の変更で解消する） |
+| 3 | 秘密情報と、録音データの混入 | `gitleaks git`（全履歴。検出した値は伏せる）と `check-tracked-files.py`（§7.1） | `test-checks.py gitleaks tracked` | 通過（4 秒。92 コミット。2026-11-17） |
+| 4 | プロジェクト設定とプライバシーマニフェスト | `check-project-settings.py` | `test-checks.py settings` | **失敗**: 違反 8 件（§12 の変更と、§14.1 のマニフェストの作成で解消する。2026-11-17） |
 | 5 | 依存 | `check-dependencies.py` | `test-checks.py dependencies` | 通過（1 秒） |
 | 6 | ビルド | `xcodebuild build`（機種を特定しないシミュレータ向け） | — | 通過（15 秒） |
 | 7 | 単体・結合テスト | `swift test`（Package）と `xcodebuild test`（UI テストを除く） | — | **失敗**: Package とテストターゲットがない |
@@ -476,8 +477,8 @@ title() {
     0) echo "開発ツールの版" ;;
     1) echo "整形（SwiftFormat）" ;;
     2) echo "静的解析（SwiftLint）" ;;
-    3) echo "秘密情報の検出（gitleaks）" ;;
-    4) echo "プロジェクト設定と Info.plist" ;;
+    3) echo "秘密情報の検出（gitleaks）と、録音データの混入" ;;
+    4) echo "プロジェクト設定・Info.plist・プライバシーマニフェスト" ;;
     5) echo "依存" ;;
     6) echo "ビルド" ;;
     7) echo "単体・結合テスト" ;;
@@ -523,8 +524,10 @@ step_3() {
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --pre-commit --staged .
   else
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml .
-    scripts/test-checks.py gitleaks
+    scripts/test-checks.py gitleaks tracked
   fi
+  # 録音データ・試験の DB・秘密情報のファイルが、インデックス（ステージした分を含む）に入っていないこと（SEC-SUP-04）
+  scripts/check-tracked-files.py
 }
 
 step_4() {
@@ -701,7 +704,7 @@ echo "OK: フックを有効にした（core.hooksPath = $(git config core.hooks
 | `UIPasteboard`、`.textSelection(` | `no_direct_pasteboard` | コピーの型 |
 | `ShareLink` | `no_share_link` | なし |
 | `WKWebView`・`import WebKit` | `no_webkit` | なし |
-| `CoreSpotlight`・`NSUserActivity` | `no_spotlight_user_activity` | なし |
+| `CoreSpotlight`・`NSUserActivity`・`import AppIntents` | `no_spotlight_user_activity` | なし |
 | `Date()`・`Date.now`・`UUID()`・`Task.sleep`・乱数 | `no_direct_clock`・`no_direct_uuid`・`no_direct_sleep_timer`・`no_direct_random` | 注入用の本番実装（UUID はテスト用の一時ディレクトリの型も） |
 
 詳細設計で、基本設計の文言より広げた点:
@@ -713,6 +716,7 @@ echo "OK: フックを有効にした（core.hooksPath = $(git config core.hooks
 | `no_direct_clock` | `ContinuousClock`・`SuspendingClock`・`CFAbsoluteTimeGetCurrent`・`DispatchTime.now`・`systemUptime` など | 単調時計も注入の対象である（TST-GEN-01） |
 | `no_direct_sleep_timer` | `Thread.sleep`・`sleep(`・`Timer.scheduledTimer`・`asyncAfter` など | タイマーも注入の対象である（TST-GEN-01） |
 | `no_spotlight_user_activity` | `.userActivity(`・`.onContinueUserActivity(` | SwiftUI から `NSUserActivity` を提供する経路になる（SEC-PLT-02） |
+| `no_spotlight_user_activity` | `import AppIntents`（2026-11-17 に追加） | App Intents も、Siri・ショートカット・Spotlight へデータを渡す経路になる。SEC-PLT-02 が名前を挙げているのに、規則の対象に入っていなかった |
 
 ### 6.2 設定（`.swiftlint.yml`）
 
@@ -860,8 +864,8 @@ custom_rules:
     severity: error
 
   no_spotlight_user_activity:
-    name: "Spotlight と NSUserActivity の禁止"
-    regex: '\bimport\s+(\w+\s+)?CoreSpotlight\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
+    name: "Spotlight・NSUserActivity・App Intents の禁止"
+    regex: '\bimport\s+(\w+\s+)?(CoreSpotlight|AppIntents)\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
     match_kinds: *code
     message: "Spotlight・Siri にデータを渡さない（SEC-PLT-02）"
     severity: error
@@ -966,7 +970,7 @@ disabled_rules:
 
 ## 7. 整形と秘密情報の検出
 
-満たす要件: TST-CI-03・04、SEC-SUP-03
+満たす要件: TST-CI-03・04、SEC-SUP-03・04
 
 <!-- file: .swiftformat -->
 
@@ -990,11 +994,26 @@ useDefault = true
 - gitleaks は既定の規則をそのまま使い、除外の指定を置かない。`--redact` を付け、検出した値そのものを出力に残さない（出力を PR に貼っても漏れない）。
 - gitleaks の全体の検査はコミット済みの履歴を対象にする。未コミットの変更は、コミット前のフック（ステージした差分）が受け持つ。
 
+### 7.1 録音データの混入の検査（`scripts/check-tracked-files.py`）
+
+録音データ・試験の DB・秘密情報のファイルが Git の管理に入っていないことを、手順 3 の中で確かめる（SEC-SUP-04。2026-11-17 に追加）。`.gitignore` だけでは、行が消えた場合と、`git add --force` で除外を越えた場合に気づけないためである。
+
+| 規則 | 内容 |
+| --- | --- |
+| 必須の行 | リポジトリ直下の `.gitignore` に、次の 13 行がある: `*.wav`・`*.m4a`・`*.caf`・`*.zip`（録音データと書き出したアーカイブ）、`*.sqlite`・`*.sqlite-wal`・`*.sqlite-shm`（試験で作った DB）、`.env`・`.env.*`（秘密情報）、`xcuserdata/`・`DerivedData/`・`.build/`・`build/`（個人の設定とビルドの成果物）。コメントにした行は、ないものとして扱う |
+| 取り消しの禁止 | どの階層の `.gitignore` にも、除外を取り消す行（`!` で始まる行）を置かない |
+| インデックスの中身 | 追跡しているファイルとステージしたファイル（`git ls-files`）に、必須の行が除外する対象がない。ファイル名は大文字と小文字を区別しない（`REC.WAV` も違反） |
+
+- インデックスを見るので、コミット前（`--staged`）でも同じ検査がそのまま効く。録音データをステージすると、コミット前の検査が手順 3 で止まる。
+- ファイルの一覧は NUL 区切りで受け取る（空白・日本語を含む名前を、そのまま扱うため）。
+- **読めないものを合格にしない。** Git の管理下でない場所・`git` の失敗は、終了コード 2 で失敗する。
+- 必須の行を変えるときは、`.gitignore`・スクリプトの表（`REQUIRED_IGNORE_LINES`）・本節・基本設計 §8 を同じ作業で直す。
+
 ---
 
 ## 8. プロジェクト設定の検査（`scripts/check-project-settings.py`）
 
-満たす要件: TST-CI-06、SEC-NET-05、SEC-DAT-04、SEC-PRV-01 ／ 制約: CON-01・03・04
+満たす要件: TST-CI-06、SEC-NET-05、SEC-DAT-04、SEC-PRV-01・03 ／ 制約: CON-01・03・04
 
 ### 8.1 読むもの
 
@@ -1061,11 +1080,27 @@ FORBIDDEN_ENTITLEMENT_PREFIXES = {
     "com.apple.developer.icloud": "SEC-NET-01（iCloud）",
     "com.apple.developer.ubiquity": "SEC-NET-01（iCloud）",
 }
+
+# プライバシーマニフェスト（SEC-PRV-03）。アプリのターゲットは <ターゲット名>/PrivacyInfo.xcprivacy に置く
+PRIVACY_MANIFEST_NAME = "PrivacyInfo.xcprivacy"
+# 空の配列で明示する申告（トラッキングのドメイン・収集するデータ）
+PRIVACY_EMPTY_KEYS = ("NSPrivacyTrackingDomains", "NSPrivacyCollectedDataTypes")
+# 申告してよい API の種類 → 理由コード。アプリのマニフェストは、この全部をちょうど申告する
+PRIVACY_ACCESSED_API_REASONS: Dict[str, Tuple[str, ...]] = {
+    "NSPrivacyAccessedAPICategoryFileTimestamp": ("C617.1",),
+    "NSPrivacyAccessedAPICategoryDiskSpace": ("E174.1",),
+    "NSPrivacyAccessedAPICategoryUserDefaults": ("CA92.1",),
+}
 ```
 
 - 利用目的の文言は `NSMicrophoneUsageDescription` だけを認める。音声認識の利用目的は置かない（§14.2）。
 - Bundle Identifier が仮の値（`devplaceholder`）のままの場合は、失敗ではなく警告にする。確定はオーナーの判断で、最初の実録音の前に行う（CON-09、BD-DEV-06）。
 - 共有拡張かどうかは、Info.plist の拡張の種類で判定する。ウィジェット（Live Activity）だけを認める。
+- プライバシーマニフェスト（2026-11-17 に追加。SEC-PRV-03）は、リポジトリ内のすべての `.xcprivacy` を読む。
+  - どのマニフェストも、`NSPrivacyTracking` が `false`、`NSPrivacyTrackingDomains` と `NSPrivacyCollectedDataTypes` が空の配列であること（鍵がない場合も違反。申告を明示させる）。
+  - どのマニフェストも、申告する API の種類と理由コードが、上の表（`PRIVACY_ACCESSED_API_REASONS`）にあるものだけであること。
+  - アプリのターゲットは、`<ターゲット名>/PrivacyInfo.xcprivacy` があり、表の 3 つをすべて申告していること。拡張のマニフェスト（置く場合）は、表の一部だけでよい。
+  - 検査が確かめるのは「申告が設計どおりか」までである。実際に使っている API と申告が合っているかは確かめられないので、理由の申告が必要な API を新しく使うときは、§14.1 とこの表を同じ作業で直す（レビューで確かめる）。
 
 ---
 
@@ -1265,7 +1300,7 @@ let package = Package(
 | 手順 | 条件 |
 | --- | --- |
 | 1 | `ContentView.swift` の import を並べ替える（テンプレートのコードを置き換える時点で解消する） |
-| 4 | §12.1 の変更（Bundle Identifier を除く） |
+| 4 | §12.1 の変更（Bundle Identifier を除く）と、§14.1 のプライバシーマニフェストの作成 |
 | 7・9 | §11 の Package とテストターゲット |
 
 すべて通ったら、`scripts/setup.sh` でフックを有効にする（§5）。
@@ -1354,6 +1389,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 
 - 申告は、実際に使う API に合わせる。**システムの起動時間（理由コード `35F9.1`）は申告しない。** Apple の一覧で対象になっているのは `ProcessInfo.systemUptime` と `mach_absolute_time()` で、単調時計の実装（`ContinuousClock`。[architecture.md](architecture.md) §6.2）はどちらも呼ばない（2026-11-16 に確定）。静的解析の `no_direct_clock` が、この 2 つを例外の場所の外で禁止している。
 - 実装が進んで、理由の申告が必要な API を新しく使うことになったら、同じ作業でこのファイルと本節を直す。
+- 申告の内容は、設定の検査が照合する（§8.2。2026-11-17 に追加）。上の XML は、この検査を通ることを確かめてある。ファイルがない間は、手順 4 が「マニフェストがない」で失敗する。
 
 ### 14.2 音声認識の利用目的
 
@@ -1372,8 +1408,9 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 
 - 置き場所: [../04-test-records/](../04-test-records/README.md)。試験 1 回を 1 行で記録する。
 - 様式は test-requirements.md §3.7 のとおり（日付・ビルドのコミット・端末機種・OS 版・試験 ID・結果・観測値・不合格の理由）。
-- 録音データそのものは置かない。置くのは件数・結果・ハッシュだけである（SEC-SUP-05）。`.gitignore` が音声ファイルを除外する。
+- 録音データそのものは置かない。置くのは件数・結果・ハッシュだけである（SEC-SUP-05）。`.gitignore` が音声ファイルを除外し、検査（§7.1）が、除外の行と追跡しているファイルを照合する。
 - 「検査が通った」ことと「実機試験が済んだ」ことは別に記録する（test-requirements.md §6）。
+- 試験の観点・機材・試験ケースの骨子は [../04-test-records/device-test-design.md](../04-test-records/device-test-design.md) にある（土台。手順の細部は各作業単位の実装の後に足す）。実機で値を読む手段が決まっていないもの（計測値・保護クラスの属性など）は、同書 §4 に挙げてある。
 
 ---
 
@@ -1388,9 +1425,9 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 外部入力の検証 | `tools/versions`・許可リスト・`project.xcproj`・Info.plist は形式を確かめてから使う。読めないものは合格にしない | SEC-SUP-01・02 |
 | 依存の混入 | 許可リストにない依存、版で固定していない依存を失敗にする | SEC-SUP-02、T-10 |
 | 秘密情報 | コミット前と全体の検査で gitleaks。検出した値は出力に残さない | SEC-SUP-03、T-11 |
-| 録音データの混入 | `.gitignore` と運用（§15） | SEC-SUP-04・05 |
+| 録音データの混入 | `.gitignore`、追跡するファイルの検査（§7.1）、運用（§15） | SEC-SUP-04・05 |
 | 意図しない通信 | 静的解析（§6）と通信ゼロの自動テスト（TST-SEC-01） | SEC-NET-01、T-03 |
-| 設定の逸脱 | 設定の検査（§8） | SEC-NET-05、SEC-DAT-04 |
+| 設定の逸脱 | 設定の検査（§8）。プライバシーマニフェストの申告も照合する | SEC-NET-05、SEC-DAT-04、SEC-PRV-03 |
 | 検査の迂回 | 検査の自己試験を検査の中で回す。入れ子の設定は決めた場所と内容だけを認める。検査の対象外にするディレクトリを作らない（自己試験の入力は実行時に一時ディレクトリへ作る） | TST-CI-05 |
 
 **実装・レビュー時の注意点:**
@@ -1413,11 +1450,12 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
 | 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 21 規則・55 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない |
-| 設定の検査 | `scripts/test-checks.py settings` | 45 件 | 合格する設定で通り、項目ごとの違反で失敗する。読めない設定は終了コード 2 |
-| 依存の検査 | `scripts/test-checks.py dependencies` | 23 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する |
+| 設定の検査 | `scripts/test-checks.py settings` | 66 件 | 合格する設定で通り、項目ごとの違反で失敗する。読めない設定は終了コード 2。プライバシーマニフェストの 15 件を含む |
+| 依存の検査 | `scripts/test-checks.py dependencies` | 36 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する |
 | 版の照合 | `scripts/test-checks.py versions` | 8 件 | 版・SHA-256・形式・行の不足・`gh` の行の順序で失敗する |
 | 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 2 件 | 実行時に組み立てた偽の鍵を検出する |
-| 文書の検査 | `scripts/test-checks.py docs` | 28 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない |
+| 録音データの混入の検査 | `scripts/test-checks.py tracked` | 20 件 | 一時ディレクトリに Git のリポジトリを作り、除外を越えて（`--force`）ファイルをインデックスに入れる。必須の行の不足・コメントにした行・除外の取り消し・追跡されている録音データ（大文字の拡張子、空白と日本語を含む名前）・DB・`.env`・個人の設定で失敗する。似た名前のファイルは通る |
+| 文書の検査 | `scripts/test-checks.py docs` | 29 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
@@ -1434,6 +1472,16 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 2026-11-16 の追加分（`check-dependencies.py`・`check-project-settings.py`・`verify-docs.py`・`setup-tools.sh` を変更前の版に戻す。`setup-tools.sh` の `gh` の行の順序の照合だけを外す、実行時の版の比較だけを外す） | 6 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
 | `check.sh` を変更前の版に戻し、`print` を含む内容をステージして作業ツリーだけを直す | 1 | 変更前は手順 2 が通過し、変更後は失敗した（作業ツリーではなくインデックスを検査している） |
 | 文書の検査（未定義の ID を報告しない、範囲の省略を展開しない、MVP の網羅を調べない、コード片の不一致を報告しない など） | 15 | すべて失敗した |
+
+2026-11-17 に足した検査（App Intents の規則・プライバシーマニフェストの検査・録音データの混入の検査）でも、同じ確認を行った。
+
+| 壊したもの | 件数 | 結果 |
+| --- | --- | --- |
+| 規則 `no_spotlight_user_activity` から `AppIntents` を外す | 1 | 規則の試験が失敗した |
+| マニフェストの検査（決めた申告の不足を見ない、トラッキングの申告を緩める、マニフェストがないことを見ない、決めていない申告を見ない） | 4 | すべて失敗した |
+| 録音データの混入の検査（大文字の拡張子を見ない、除外の取り消しを見ない、必須の行から `*.wav` を外す、ディレクトリの行を見ない） | 4 | すべて失敗した |
+
+あわせて、検査を足す前の状態で自己試験が失敗すること（規則の試験 1 件、マニフェストの 14 件、録音データの混入は検査がなく実行できない）を、実装の前に確かめた。録音データ（`.wav`）を `--force` でステージすると、コミット前の検査が手順 3 で止まることも確かめた。
 
 この確認で見つけて直した不具合:
 
@@ -1481,10 +1529,11 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | SEC-SUP-01 | `check.sh` 手順 0、`test-checks.py versions` | プッシュ前 | 通過 |
 | SEC-SUP-02 | `check.sh` 手順 5 | プッシュ前 | 通過 |
 | SEC-SUP-03 | `check.sh` 手順 3 | コミット前・プッシュ前 | 通過 |
-| SEC-SUP-04・05 | `.gitignore`、実機試験の記録の様式（§15） | レビュー | 設定済み |
+| SEC-SUP-04 | `check.sh` 手順 3（`check-tracked-files.py`。§7.1）、`test-checks.py tracked` | コミット前・プッシュ前 | 通過 |
+| SEC-SUP-05 | 実機試験の記録の様式（§15） | レビュー | 設定済み |
 | SEC-NET-05、SEC-DAT-04、SEC-PRV-01 | `check-project-settings.py` の規則（§8.2） | プッシュ前 | 自己試験は通過 |
 | SEC-LOG-01 | 規則 `no_print_logging`・`no_direct_logger` | コミット前・プッシュ前 | 通過 |
-| SEC-PRV-03 | `PrivacyInfo.xcprivacy`（§14.1） | レビュー | 作業単位 2 で作成 |
+| SEC-PRV-03 | `check-project-settings.py` のマニフェストの規則（§8.2）、`PrivacyInfo.xcprivacy`（§14.1） | プッシュ前 | 自己試験は通過。実物は作業単位 2 で作成 |
 | NFR-MNT-04 | `check.sh` 手順 10、`test-checks.py docs` | コミット前・プッシュ前 | 通過 |
 | NFR-MNT-01 | `check.sh` 手順 4・6、`Package.swift` の言語モード | プッシュ前 | 作業単位 2 の後 |
 | NFR-MNT-03 | `check.sh` 手順 5（依存 0 件） | プッシュ前 | 通過 |
