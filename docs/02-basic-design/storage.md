@@ -281,7 +281,7 @@ stateDiagram-v2
 | 4 | `recording` / `stop_requested` / `finalizing` の会議を照合する。`transcribing` / `transcribed` の会議も対象にし、会議の状態を DB と `meeting.json` で比べ、`meeting.json` の状態が DB と異なる（古い）場合は DB の状態で `meeting.json` を原子的に書き直す | `recording` / `stop_requested` / `finalizing` の照合は下の表のとおり（変更しない）。`transcribing` / `transcribed` の会議で行うのは状態の比較と `meeting.json` の書き直しだけで（書き直しで失敗区間の再試行の実行番号の記録を消さない）、Chunk の照合は印がある場合（手順 2）を除いて行わない。DB を作り直した場合は DB が `meeting.json` から作られているので、書き直しは起きない（§3.1） |
 | 5 | `recording` のまま残っていた会議を `stop_requested` にする | 停止理由は、開いたままの空白区間があれば `interruption_unresumed`、なければ `terminated`。検出時刻は起動の時刻。開いたままの空白区間は下の「開いたままの空白区間」の規則で閉じる |
 | 6 | Barrier を評価し、通れば `finalized` にする。通らなければ確定待ちとして残す | 例外確定は利用者の操作に限る |
-| 7 | `processing` のまま残ったジョブを回収する。続けて、**起動のたびに**（DB を作り直したかどうかによらず）`transcribing` の会議の不足したジョブを作る。現在の実行番号（`meeting.json` に失敗区間の再試行の実行番号の記録があればその番号）で利用できる Chunk のうちジョブ行がないものだけに作り（再利用できる成功済みの結果ファイルがあれば `succeeded`、なければ `pending`。再利用の条件は Chunk のハッシュと Overlap の条件の一致。[transcription.md](transcription.md) §4.3）、既存のジョブ行は変更しない。DB の作り直しや不足分の作成の途中で落ちて、ジョブ行が一部だけ作られた状態からも、次の起動で同じ処理によって回復する | [transcription.md](transcription.md) §4.3 |
+| 7 | `processing` のまま残ったジョブを回収する。続けて、**起動のたびに**（DB を作り直したかどうかによらず）`transcribing` の会議の不足したジョブを作る。現在の実行番号（`meeting.json` に失敗区間の再試行の実行番号の記録があればその番号）で利用できる Chunk のうちジョブ行がないものだけに作り（再利用できる成功済みの結果ファイルがあれば `succeeded`、なければ `pending`。再利用の条件は Chunk のハッシュと Overlap の条件の一致。失敗区間の再試行の記録があれば、選んだ連番は `pending`、選ばなかった失敗区間の連番は `failed`。[transcription.md](transcription.md) §4.3）、既存のジョブ行は変更しない。DB の作り直しや不足分の作成の途中で落ちて、ジョブ行が一部だけ作られた状態からも、次の起動で同じ処理によって回復する | [transcription.md](transcription.md) §4.3 |
 | 8 | 書き出しの一時ファイルを削除する | [export.md](export.md) §6 |
 | 9 | 保留中の保護クラスの切り替えを行う（§7.1） | ロック解除中だけ |
 
