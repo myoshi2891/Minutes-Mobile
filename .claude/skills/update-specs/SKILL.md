@@ -49,14 +49,16 @@ description: Use when adding, changing, or retiring anything in the MinutesMobil
 | 完全一致 | `FR-REC-02` | ID そのもので検索する |
 | 群（領域の並びの省略を含む） | `FR-REC 群`、`FR-CNS・REC・INT 群` | 接頭辞（`FR-`）と領域（`REC`）で検索し、`群` の付いた行を読む |
 | 範囲・番号の並びの省略 | `FR-REC-01〜03`、`FR-REC-01・02` | 領域の接頭辞（`FR-REC-`）で検索し、範囲・並びが変える番号を含むかを読む |
+| スラッシュ区切りの番号の省略 | `SEC-NET-03 / 04`、`FR-REC-01/02` | 領域の接頭辞の後ろの `/` で検索し、並びが変える番号を含むかを読む |
 
 ```bash
 grep -rn "FR-REC-02" docs/ CLAUDE.md README.md                          # 完全一致
 grep -rnE "FR-([A-Z0-9]+・)*REC(・[A-Z0-9]+)* ?群" docs/ CLAUDE.md README.md   # 群（並びの省略を含む）
 grep -rnE "FR-REC-[0-9]+(〜|・)" docs/ CLAUDE.md README.md               # 範囲・並び。番号が含まれるかは目で確かめる
+grep -rnE "FR-REC-[0-9]+ ?/ ?[0-9]+" docs/ CLAUDE.md README.md          # スラッシュ区切り。番号が含まれるかは目で確かめる
 ```
 
-`scripts/verify-docs.py` も範囲と群を展開して ID を照合している（展開の規則は同じ）。検索の結果から、参照している文書と節をすべて挙げてから直す。
+`scripts/verify-docs.py` も範囲（〜）・並び（・）と群を展開して ID を照合している（展開の規則は同じ）。**スラッシュ区切りの省略は展開しない**ので、検査が通っても上の検索の結果を目で確かめる。検索の結果から、参照している文書と節をすべて挙げてから直す。
 
 - 要件を変えたら、それを「満たす要件:」に挙げている設計書の節と、それを「対応する要件」に持つ TST を同じ作業で直す。
 - TST を変えたら、詳細設計の「要件 ID ↔ テスト」の対応表と、実装済みならテストコードの表示名（`@Test("TST-…")`）も直す。
