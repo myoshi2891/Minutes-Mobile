@@ -61,6 +61,7 @@
 
 | 日付 | 内容 |
 | --- | --- |
+| 2026-11-18 | レビュー対応（7 件）: `no_empty_catch` が行コメントの中の `{`・`}` を取り違えない、`no_direct_logger` が `Logger.init(` を検出、マイクの利用目的を構成と SDK の組ごとに判定、`check.sh --staged` の規則の試験をインデックスの内容で実行、欠落区間を空白区間と別の区分に（FR-FIN-02 ③・FR-TRV-03・用語集・export.md §2・storage.md・ui.md・transcription.md）、TST-DEV-01 ②の必要サンプル数から記録した空白区間を差し引く、Apple Intelligence の可否を MVP の設定画面に表示（ui.md §4.6・architecture.md §7）。§2 の次のアクションは変わらない |
 | 2026-11-18 | レビュー対応（4 件）: `setup-tools.sh` が末尾に改行のない最終行を読む・導入済みのツールの再利用に実行時の版の一致を追加、`verify-docs.py` が申し送りの解決の列が空の行を解決と見なさない、P2 のノートの編集欄の標準のコピー・切り取りを残る危険として扱う（SEC-PLT-01・ui.md §7.3） |
 | 2026-11-18 | レビュー対応（14 件）: `no_empty_catch` が条件のブロックコメントを読み飛ばす、`no_direct_sleep_timer` が `Darwin.sleep`・`Darwin.usleep`、`no_direct_uuid` が `UUID.init()` を検出、`check-project-settings.py` が生成しない構成の参照先の plist を 1 つずつ判定、`check.sh --staged` の gitleaks がインデックスの設定を使用、`check-dependencies.py` が `project.xcproj` の依存に同じ `.xcodeproj` の確定版を要求（要求条件は書き方が未確認のため判定できないとして失敗させる）、`verify-docs.py` が逆順の範囲を報告、版の自己試験の負例を現在の値から生成。文書: TST-GEN・CI に対応する要件の列、失敗区間の再試行を選んだ区間だけに（transcription.md §4.3・§7、storage.md §8、ui.md）、状態の変化でスナップショットを送る（ui.md BD-UI-02・recording.md §7）、実機試験の完了条件を §6 に合わせる、スキル 2 件を補足 |
 | 2026-11-17 | レビュー対応（8 件。1 件見送り）: `no_empty_catch` が複数行の `where` に対応、`check.sh --staged` で `git diff` の失敗を検出、`setup.sh` は `--hooks` を付けたときだけフックを有効に、`verify-docs.py` の網羅判定を「／」の前に限定・`docs/` と定義文書の欠落を終了コード 2 に、storage.md §9 に削除の開始後の文字起こしの拒否（transcription.md §8 の開始条件にも追加）、スキル 2 件を補足。手順 7・8 を Package がないときに飛ばす案は、検査を弱めるため見送り |
