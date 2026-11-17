@@ -256,6 +256,13 @@ def test_settings() -> None:
     settings_case("生成する場合も参照先の Info.plist のマイクの利用目的が空なら違反", 1, "NSMicrophoneUsageDescription が空",
                   project=info_plist_file("Config/App-Settings.plist"),
                   plists={"Config/App-Settings.plist": {"NSMicrophoneUsageDescription": ""}})
+    # SDK の条件付きの値は、条件に合わない SDK を参照先の Info.plist で補えているかを確かめる
+    settings_case("条件のないマイクの利用目的はすべての SDK で効く", 0, "OK")
+    settings_case("シミュレータの SDK だけにマイクの利用目的があり、実機用が欠ける", 1, "Debug（iphoneos）",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription":', '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]":'))
+    settings_case("シミュレータの SDK だけの値を、参照先の Info.plist が実機用に補う", 0, "OK",
+                  project=lambda t: info_plist_file("Config/App-Settings.plist")((lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription":', '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]":'))(t)),
+                  plists={"Config/App-Settings.plist": microphone})
     # CODE_SIGN_ENTITLEMENTS が指すファイルは、拡張子にかかわらず検査する
     def entitlements_file(value: str) -> Callable[[str], str]:
         return lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",',

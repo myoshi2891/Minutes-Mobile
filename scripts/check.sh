@@ -98,6 +98,22 @@ prepare_staged_tree() {
   } | git checkout-index -z --stdin --prefix="$STAGED_TREE/"
 }
 
+# 規則の試験に使うもの（規則・試験用のファイル・試験のスクリプト）をインデックスから同じ一時ディレクトリへ書き出す。
+# 試験のスクリプトは自身の位置をリポジトリ直下とみなすので、一時ディレクトリの中のスクリプトを実行する。
+# 開発ツールは作業ツリーの .tools を指す（ツールは Git の管理外）
+prepare_rules_tree() {
+  local directory
+  [ -n "$STAGED_TREE" ] || STAGED_TREE=$(mktemp -d)
+  git ls-files -z -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+    | git checkout-index -z -f --stdin --prefix="$STAGED_TREE/"
+  # 入れ子の設定の置き忘れの検査（テストのディレクトリがあるのに設定がない）を、インデックスのディレクトリで行う。
+  # 一覧は scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
+  for directory in MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; do
+    if [ -n "$(git ls-files -- "$directory" | head -n 1)" ]; then mkdir -p "$STAGED_TREE/$directory"; fi
+  done
+  [ -e "$STAGED_TREE/.tools" ] || ln -s "$ROOT/.tools" "$STAGED_TREE/.tools"
+}
+
 title() {
   case "$1" in
     0) echo "開発ツールの版" ;;
@@ -138,6 +154,11 @@ step_2() {
     fi
     # 規則・試験用のファイル・入れ子の設定を変えたときだけ、規則の試験を回す
     if git diff --cached --quiet -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py; then return 0; fi
+    # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
+    prepare_rules_tree
+    (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \
+      "$STAGED_TREE/scripts/test-lint-rules.py")
+    return 0
   else
     "$TOOLS/swiftlint" lint --quiet --no-cache
   fi

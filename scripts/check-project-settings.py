@@ -13,7 +13,7 @@ import plistlib
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
 from xcproj import Unreadable, load_project
@@ -57,6 +57,8 @@ ALLOWED_USAGE_DESCRIPTIONS = {"NSMicrophoneUsageDescription"}
 ALLOWED_BACKGROUND_MODES = {"audio", "processing"}
 # 拡張はウィジェット（Live Activity）だけを認める。共有拡張などは置かない（SEC-PLT-04）
 ALLOWED_EXTENSION_POINTS = {"com.apple.widgetkit-extension"}
+# 利用目的の文言を SDK ごとに確かめるときの SDK（CON-03 の SUPPORTED_PLATFORMS と同じ）
+SDKS = ("iphoneos", "iphonesimulator")
 
 # entitlements: あってはならない鍵（Personal Team で使えない、または使わない capability）
 FORBIDDEN_ENTITLEMENTS = {
@@ -93,12 +95,16 @@ def conditions(key: str) -> Dict[str, str]:
     return dict(re.findall(r"\[(\w+)=([^\]]*)\]", key))
 
 
-def resolve(own: dict, shared: dict, name: str, configurations: List[str]) -> Tuple[Dict[Tuple[str, str], List[str]], List[str]]:
+def resolve(
+    own: dict, shared: dict, name: str, configurations: List[str], sdk: Optional[str] = None
+) -> Tuple[Dict[Tuple[str, str], List[str]], List[str]]:
     """構成ごとに効く書き方を求める。戻り値は（鍵, 値）→ 構成の一覧 と、どの段でも決まらない構成の一覧。
 
     ターゲットの設定がプロジェクトの設定を上書きし、同じ段では構成の条件が一致する書き方が条件のない書き方を上書きする。
-    構成以外の条件（sdk・arch）の書き方は、その条件のビルドで効きうるので、すべて検査の対象にする。
+    sdk を指定しない場合、構成以外の条件（sdk・arch）の書き方は、その条件のビルドで効きうるので、すべて検査の対象にする。
+    sdk を指定した場合は、sdk の条件も構成と同じく一致するものだけを使い、構成と sdk の条件だけを持つ書き方で決まったとみなす。
     """
+    decided = {"config"} if sdk is None else {"config", "sdk"}
     effective: Dict[Tuple[str, str], List[str]] = {}
     missing: List[str] = []
     for configuration in configurations:
@@ -109,13 +115,15 @@ def resolve(own: dict, shared: dict, name: str, configurations: List[str]) -> Tu
                 condition = conditions(key)
                 if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
                     continue
+                if sdk is not None and "sdk" in condition and not fnmatch.fnmatchcase(sdk, condition["sdk"]):
+                    continue
                 applicable.append((key, value, condition))
-            if any(set(condition) == {"config"} for _, _, condition in applicable):
+            if any(condition and set(condition) <= decided for _, _, condition in applicable):
                 applicable = [item for item in applicable if item[2]]  # 条件のない書き方は、この構成では効かない
             for key, value, _ in applicable:
                 effective.setdefault((key, value), []).append(configuration)
-            # 構成以外の条件を持たない書き方があれば、この段で決まる（下の段は効かない）
-            if any(set(condition) <= {"config"} for _, _, condition in applicable):
+            # 決まった条件以外を持たない書き方があれば、この段で決まる（下の段は効かない）
+            if any(set(condition) <= decided for _, _, condition in applicable):
                 covered = True
                 break
         if not covered:
@@ -137,23 +145,25 @@ def check_required(
 
 
 def check_plist_values(
-    target: str, own: dict, shared: dict, configurations: List[str],
-    info_plists: Dict[str, List[Path]], root: Path, errors: List[str]
+    project_path: Path, target: str, target_name: str, own: dict, shared: dict, configurations: List[str],
+    root: Path, errors: List[str]
 ) -> None:
-    """各構成で最終的に生成される Info.plist に、空でない値があること。
+    """各構成・各 SDK で最終的に生成される Info.plist に、空でない値があること。
 
     GENERATE_INFOPLIST_FILE が有効な構成では、ビルド設定の INFOPLIST_KEY_… と INFOPLIST_FILE の参照先が合わさる。
     無効（設定がない場合も無効）な構成では、INFOPLIST_FILE の参照先だけが使われる。
     どちらが優先されるかに頼らないよう、効きうる値はすべて空でないことを求め、どこにもなければ欠落とする。
+    ビルド設定の値が SDK の条件付きだけの場合、条件に合わない SDK では参照先の plist で補われていなければ欠落とする。
     """
     for name, reason in REQUIRED_PLIST_VALUES_APPLICATION.items():
         missing: List[str] = []
         empty: Dict[str, List[str]] = {}
-        for configuration in configurations:
-            generate, _ = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration])
+        for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
+            build = f"{configuration}（{sdk}）"
+            generate, _ = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
             modes = {enabled(value) for (_, value) in generate} or {False}
             from_files: List[Tuple[str, str]] = []
-            plists = info_plists.get(configuration, [])
+            plists = referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)
             lacking = False  # 参照先の plist のうち、鍵を持たないものがある
             for path in plists:
                 data = load_plist(path)
@@ -164,16 +174,19 @@ def check_plist_values(
                 source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
                 from_files.append((f"{source} の {name}", value.strip() if isinstance(value, str) else ""))
             from_settings: List[Tuple[str, str]] = []
+            settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
             if True in modes:
-                effective, _ = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration])
+                effective, undecided = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration], sdk)
                 from_settings = [(key, value.replace("$(inherited)", "").strip()) for (key, value) in effective]
+                settings_cover = bool(from_settings) and not undecided
             # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない。
-            # 参照先が条件（sdk など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ欠落とする
-            if (False in modes and (not plists or lacking)) or (True in modes and not from_files + from_settings):
-                missing.append(configuration)
+            # 参照先が条件（arch など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ補えないとする
+            files_cover = bool(plists) and not lacking
+            if (False in modes and not files_cover) or (True in modes and not (settings_cover or files_cover)):
+                missing.append(build)
             for label, value in from_files + from_settings:
                 if not value:
-                    empty.setdefault(label, []).append(configuration)
+                    empty.setdefault(label, []).append(build)
         if missing:
             errors.append(
                 f"[{reason}] {target}: 生成される Info.plist に {name} がない（構成 {'・'.join(missing)}。"
@@ -241,7 +254,8 @@ def load_plist(path: Path) -> dict:
 
 
 def referenced_files(
-    project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str
+    project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str,
+    sdk: Optional[str] = None
 ) -> List[Path]:
     """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルを返す。
 
@@ -251,7 +265,7 @@ def referenced_files(
     parent = project_path.parent
     source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
-    effective, _ = resolve(own, shared, setting, [configuration])
+    effective, _ = resolve(own, shared, setting, [configuration], sdk)
     paths: List[Path] = []
     for (key, value), _ in effective.items():
         text = value.strip()
@@ -290,18 +304,14 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         name = f"ターゲット {target.get('name', '?')}"
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
-        info_plists = {
-            configuration: referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE")
-            for configuration in configurations
-        }
         for configuration in configurations:
-            referenced.extend(info_plists[configuration])
+            referenced.extend(referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE"))
             entitlements.extend(
                 referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS"))
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
         if target.get("product-type") == "application":
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
-            check_plist_values(name, own, shared, configurations, info_plists, root, errors)
+            check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
         check_build_settings(name, own, errors)
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
