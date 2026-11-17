@@ -33,7 +33,7 @@ description: Use when implementing or changing Swift code in MinutesMobile (the 
 **作業単位 2（プロジェクト設定）の場合。** 設定の作業単位なので、検査の手順を Red / Green として扱う。
 
 - Red: 今失敗している `scripts/check.sh` の手順 4・7〜9（`dev-environment.md` §4.1）。手順 4 の失敗の出力を `PROGRESS.md` §2 の「Red の記録」に貼る。
-- Green: `dev-environment.md` §12.3 の条件どおりに直し、手順 0〜10 がすべて通る。最後に `scripts/setup.sh` でフックを有効にする。
+- Green: `dev-environment.md` §12.3 の条件どおりに直し、手順 0〜10 がすべて通る。最後に `scripts/setup.sh --hooks` でフックを有効にする。
 - 機能の Red → Green → Refactor（下の 1〜3）は、Package ができた後の最初の単位から始める。
 
 ### 1. Red: 失敗するテストを書く
@@ -98,7 +98,12 @@ scripts/check.sh --staged   # コミット前の範囲
 ```
 
 - 作業単位 2 が済んだあとは、全手順が通ることを完了の条件にする。
-- 作業単位 2 が済む前は、手順 1・4・7〜9 が失敗する（`docs/03-detailed-design/dev-environment.md` §4.1）。それ以外の手順が通ることを確かめる。
+- 作業単位 2 が済む前は、手順 1・4・7〜9 が失敗する（`docs/03-detailed-design/dev-environment.md` §4.1）。`check.sh` は最初の失敗で止まるので、全手順の実行では手順 1 より後の結果が分からない。それ以外の手順は `--steps` で指定して実行し、通ることを確かめる。
+
+  ```bash
+  scripts/check.sh --steps 0,2,3,5,6,10   # 作業単位 2 の前に通るはずの手順
+  ```
+
 - **検査を弱めて通さない。** 失敗したらコードか設計を直す。
 - 実機でしか確かめられない要件（割り込み・保護クラス・バックグラウンド継続など）は、試験記録（`docs/04-test-records/`）に「未実施」と理由・予定を書く。シミュレータで通ったことを実機の合格として扱わない。
 
