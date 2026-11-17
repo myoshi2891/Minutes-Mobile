@@ -39,12 +39,12 @@ description: Use when implementing or changing Swift code in MinutesMobile (the 
 ### 1. Red: 失敗するテストを書く
 
 - 1 回に 1 つの振る舞いだけを書く。
-- **要件 ID はテストの表示名に入れる**（TST-GEN-03）。Swift Testing のタグは Swift の識別子なので、`TST-AUD-01` はタグ名にできない。
+- **試験 ID（TST）と、それが対応する要件 ID（FR / NFR / SEC）の両方をテストの表示名に入れる**（TST-GEN-03。対応は `test-requirements.md` の「対応する要件」の列）。Swift Testing のタグは Swift の識別子なので、`TST-AUD-01` はタグ名にできない。
 
   ```swift
   @Suite("WAV ヘッダ")
   struct WAVHeaderTests {
-      @Test("TST-AUD-01 RIFF / fmt / data の各フィールドが 16 kHz・16 bit・モノラルの仕様どおり")
+      @Test("TST-AUD-01 FR-REC-01 RIFF / fmt / data の各フィールドが 16 kHz・16 bit・モノラルの仕様どおり")
       func headerLayout() throws {
           // Arrange
           // Act
