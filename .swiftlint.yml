@@ -84,11 +84,12 @@ custom_rules:
   # 条件（where 句など）と本体（コメントと空白だけ）の判定は先読みに置き、一致範囲をキーワードの「catch」に限る。
   # 一致範囲がキーワードだけになるので、コメントや文字列の中の「catch {}」を検出せず、
   # 条件に文字列を含む空の catch も見逃さない（一致範囲に文字列の種別が入ると match_kinds で外れるため）。
-  # 条件は複数行にわたってよい。条件の中の文字列リテラルと行コメントは読み飛ばす（中の「{」を本体の始まりと取り違えない）。
-  # ブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
+  # 条件は複数行にわたってよい。条件の中の文字列リテラル・行コメント・ブロックコメントは読み飛ばす
+  # （中の「{」「{}」を本体の始まりや空の本体と取り違えない）。
+  # 本体のブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b(?=(?:[^{"/]|/(?!/)|//[^\n]*|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
+    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*|/\*(?:[^*]|\*(?!/))*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
     match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
@@ -153,7 +154,7 @@ custom_rules:
 
   no_direct_uuid:
     name: "UUID の直接の生成の禁止"
-    regex: '\bUUID\s*\(\s*\)'
+    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
       - '.*/TestSupport/TemporaryDirectory\.swift'
@@ -163,7 +164,7 @@ custom_rules:
 
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
