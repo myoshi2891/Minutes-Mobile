@@ -18,4 +18,9 @@ func sample() {
         where error.message == "x"
             && error.code == 5 {
     }
+    do {
+        try work()
+    } catch { // expect: no_empty_catch
+        // 何もしない }
+    }
 }

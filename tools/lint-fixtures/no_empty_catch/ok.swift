@@ -19,4 +19,12 @@ func sample() throws {
         where error.message == "{}" {
         recorder.record(.failed)
     }
+    // 行コメントの中の「{」「}」を本体の始まりや終わりと取り違えない
+    do { try work() } catch // {}
+    { recorder.record(.failed) }
+    do {
+        try work()
+    } catch { // }
+        recorder.record(.failed)
+    }
 }
