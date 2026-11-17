@@ -402,6 +402,8 @@ DOCS = {
         "## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n"
         "## 4. 詳細設計への申し送り\n\n満たす要件: —\n\n- 一つ目\n- 二つ目\n"
     ),
+    # 基本設計の索引。群と「SEC 全般」でまとめて挙げるが、網羅の判定には含めない
+    "docs/02-basic-design/README.md": "# 基本設計の索引\n\n## 1. 一覧\n\n満たす要件: FR-AAA 群、SEC 全般\n",
     "docs/03-detailed-design/sample.md": (
         "# 詳細設計\n\n## 1. 実装\n\n満たす要件: FR-AAA-01〜02 ／ 決定: BD-SMP-01、UD-01\n\n"
         f"<!-- file: scripts/sample.sh -->\n\n{FENCE}bash\necho one\necho two\necho three\n{FENCE}\n\n"

@@ -110,10 +110,17 @@ def check_test_code(errors: List[str]) -> List[Tuple[Path, str, Set[int]]]:
             errors.append(f"{name}/.swiftlint.yml が {TEST_CODE_FIXTURE}/.swiftlint.yml と一致しない")
     # それ以外の場所に入れ子の設定を置かせない（規則を外す抜け道になる）
     allowed = {ROOT / name / ".swiftlint.yml" for name in TEST_CODE_DIRS} | {CONFIG, nested}
-    listed = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/.swiftlint.yml"],
-        cwd=ROOT, capture_output=True, text=True, check=True,
-    ).stdout.splitlines()
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/.swiftlint.yml"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError) as error:
+        # 入れ子の設定を列挙できなければ抜け道を検査できないので、実行できないとして止める
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        print(detail, file=sys.stderr)
+        print("NG: git ls-files を実行できない（入れ子の設定を列挙できない）", file=sys.stderr)
+        sys.exit(2)
     for relative in listed:
         if ROOT / relative not in allowed:
             errors.append(f"許可していない場所に入れ子の設定がある: {relative}")

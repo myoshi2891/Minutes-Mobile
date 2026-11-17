@@ -184,10 +184,14 @@ class Checker:
                             self.error(name, f"定義されていない ID の群: {match.group(1)}-{area}", number)
 
     def check_coverage(self) -> None:
-        """MVP の要件が、基本設計の「満たす要件」の行のどこかに現れること。"""
+        """MVP の要件が、基本設計の「満たす要件」の行のどこかに現れること。
+
+        索引（README.md）は「SEC 全般」や群の表記で全体をまとめて挙げるため、判定に含めると
+        各文書の節で挙げていない要件の欠落を隠す。各文書の節の行だけで判定する。
+        """
         covered: Set[str] = set()
         for name, text in self.texts.items():
-            if not name.startswith(BASIC + "/"):
+            if not name.startswith(BASIC + "/") or name.endswith("/README.md"):
                 continue
             for _, line in prose_lines(text):
                 if not re.match(r"^(\| )?満たす要件", line):
