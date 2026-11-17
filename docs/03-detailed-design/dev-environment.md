@@ -408,6 +408,7 @@ LAST_STEP=10
 STAGED=0
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
+STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
@@ -527,7 +528,11 @@ step_2() {
 step_3() {
   # --redact: 検出した値そのものを出力に残さない
   if [ "$STAGED" = 1 ]; then
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --pre-commit --staged .
+    # 設定も作業ツリーではなくインデックスのものを使う（ステージしていない設定の変更で検査の範囲を変えない）。
+    # 書き出しの失敗は set -e で手順の失敗になる（条件の中で実行しない）
+    STAGED_GITLEAKS_CONFIG=$(mktemp)
+    git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
+    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
   else
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml .
     scripts/test-checks.py gitleaks
@@ -593,6 +598,7 @@ current=""
 on_exit() {
   local status=$?
   if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
+  if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
@@ -831,11 +837,12 @@ custom_rules:
   # 条件（where 句など）と本体（コメントと空白だけ）の判定は先読みに置き、一致範囲をキーワードの「catch」に限る。
   # 一致範囲がキーワードだけになるので、コメントや文字列の中の「catch {}」を検出せず、
   # 条件に文字列を含む空の catch も見逃さない（一致範囲に文字列の種別が入ると match_kinds で外れるため）。
-  # 条件は複数行にわたってよい。条件の中の文字列リテラルと行コメントは読み飛ばす（中の「{」を本体の始まりと取り違えない）。
-  # ブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
+  # 条件は複数行にわたってよい。条件の中の文字列リテラル・行コメント・ブロックコメントは読み飛ばす
+  # （中の「{」「{}」を本体の始まりや空の本体と取り違えない）。
+  # 本体のブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b(?=(?:[^{"/]|/(?!/)|//[^\n]*|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
+    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*|/\*(?:[^*]|\*(?!/))*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
     match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
@@ -900,7 +907,7 @@ custom_rules:
 
   no_direct_uuid:
     name: "UUID の直接の生成の禁止"
-    regex: '\bUUID\s*\(\s*\)'
+    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
       - '.*/TestSupport/TemporaryDirectory\.swift'
@@ -910,7 +917,7 @@ custom_rules:
 
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
@@ -1126,7 +1133,7 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | --- | --- |
 | `Package.resolved`（すべて） | 各依存の名前と版が、承認済みの要素と一致する。名前と版が一致しても、取得元（`location`。古い形式は `repositoryURL`）を正規化して承認済みの URL と比べ、違う・ない場合は認めない。版で固定していない依存（ブランチ・コミットの指定）は認めない |
 | `Package.swift`（すべて） | 先にコメント（`//`・入れ子にできる `/* */`）を空白に置き換え、URL・宣言・版の検索はすべてその内容に対して行う（文字列リテラルの中の `//` は残す。閉じていないブロックコメントは読めないものとして失敗する）。`url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`path:`）は認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない**。`url:` の依存は、版の指定（`from:`・`exact:`・`.upToNextMajor`・`.upToNextMinor`・`..<`・`...`）を、**同じディレクトリの** `Package.resolved` の確定版と照合する。確定版がない、ブランチ・コミットの指定、版の指定を文字列リテラルから判定できない、確定版が宣言の版の指定を満たさない（古い承認済みの確定版が残った場合を含む）、確定版が承認した版でない、のいずれも認めない |
-| `project.xcproj` | リモートの URL の形をした文字列が、承認済みの URL と一致する |
+| `project.xcproj` | リモートの URL の形をした文字列が、承認済みの URL と一致する。承認済みの URL は、**同じ `.xcodeproj` の中の** `Package.resolved` に同じ取得元の確定版がある。要求条件（版の指定）は書き方が未確認（§20 の断定しない事項）なので、確認して検査を実装するまでは判定できないものとして認めない |
 
 - 許可リスト自体も検査する。`allowedLicenses` にないライセンスで `ownerDecision` がない要素、承認日のない要素があれば、終了コード 2 で失敗する。
 - 追加の手順は台帳 §4 の 7 手順による。許可リストへの追加は、台帳 §3 への追記と**同じ PR で**行い、オーナーが PR のレビューで承認する（TST-CI-05）。費用が発生しうるもの・GPL 系・独自のライセンスは、オーナーの確認が記録されるまで足さない。
@@ -1520,7 +1527,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | --- | --- | --- |
 | 手順 7 のシミュレータでのテスト、手順 9、アプリ側のカバレッジ | テストターゲットがないので実行していない。コマンドは書いたが、通ることは確かめていない | 作業単位 2 |
 | Intel の Mac での開発ツールの導入 | 行と SHA-256 は記録したが、実行していない | Intel の Mac を使うことになったとき |
-| `Package.resolved` の形式と、`project.xcproj` でのパッケージの参照の書き方 | 依存が 0 件で実物がない。一般に知られた形式で検査を書いた。形式が違えば「読めない」で失敗する | 最初の依存を足すとき（MVP では足さない） |
+| `Package.resolved` の形式と、`project.xcproj` でのパッケージの参照の書き方 | 依存が 0 件で実物がない。一般に知られた形式で検査を書いた。形式が違えば「読めない」で失敗する。`project.xcproj` の要求条件は書き方が分からないので、承認済みの依存があれば判定できないとして失敗させている | 最初の依存を足すとき（MVP では足さない） |
 | 例外を認める場所のパス、起動の引数の名前 | 仮のもの | architecture・ui の詳細設計 |
 | Xcode が書き出す `SWIFT_VERSION` の値 | 定義ファイルでは `6.0`。検査は `6.0` と `6` を認める | 作業単位 2（Xcode の画面で設定して確かめる） |
 | 音声認識の許可が要らないこと | Apple の文書と SDK で確かめた。実機では確かめていない | TST-STT-07 |
