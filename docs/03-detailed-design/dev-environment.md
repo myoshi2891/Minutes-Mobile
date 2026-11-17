@@ -372,7 +372,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 | 手順 | `--staged` での動作 |
 | --- | --- |
 | 1・2 | ステージした Swift ファイルだけを見る（規則の試験用のファイルは除く）。**作業ツリーではなく、ステージした内容（インデックス）を検査する。** `git checkout-index --prefix` で、ステージした Swift ファイルと、インデックスにある設定（`.swiftformat`・各階層の `.swiftlint.yml`）を、元の相対位置のまま一時ディレクトリへ書き出し、そこを起点に実行する（入れ子の設定と、パスで指定した除外が作業ツリーと同じに解決される）。SwiftLint には `--force-exclude` を付け、明示したファイルにも除外の指定を効かせる。一時ディレクトリは終了時に消す |
-| 2 | 規則・試験用のファイル・入れ子の設定をステージしたときだけ、規則の試験を回す |
+| 2 | 規則・試験用のファイル・入れ子の設定をステージしたときだけ、規則の試験を回す。**規則の試験もステージした内容で行う。** 規則（各階層の `.swiftlint.yml`）・試験用のファイル（`tools/lint-fixtures/`）・試験のスクリプトをインデックスから同じ一時ディレクトリへ書き出し、その中のスクリプトを実行する（スクリプトは自身の位置をリポジトリ直下とみなす）。開発ツールは作業ツリーの `.tools` へのリンクで使い、入れ子の設定の列挙（`git ls-files`）は `GIT_DIR` と `GIT_WORK_TREE` でインデックスに対して行う |
 | 3 | `gitleaks git --pre-commit --staged`（ステージした差分だけ） |
 
 - ファイルの一部だけをステージした場合も、コミットされる内容（インデックス）だけを検査する。作業ツリーで直しただけでステージしていない違反は、コミットを止める。
@@ -482,6 +482,22 @@ prepare_staged_tree() {
   } | git checkout-index -z --stdin --prefix="$STAGED_TREE/"
 }
 
+# 規則の試験に使うもの（規則・試験用のファイル・試験のスクリプト）をインデックスから同じ一時ディレクトリへ書き出す。
+# 試験のスクリプトは自身の位置をリポジトリ直下とみなすので、一時ディレクトリの中のスクリプトを実行する。
+# 開発ツールは作業ツリーの .tools を指す（ツールは Git の管理外）
+prepare_rules_tree() {
+  local directory
+  [ -n "$STAGED_TREE" ] || STAGED_TREE=$(mktemp -d)
+  git ls-files -z -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+    | git checkout-index -z -f --stdin --prefix="$STAGED_TREE/"
+  # 入れ子の設定の置き忘れの検査（テストのディレクトリがあるのに設定がない）を、インデックスのディレクトリで行う。
+  # 一覧は scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
+  for directory in MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; do
+    if [ -n "$(git ls-files -- "$directory" | head -n 1)" ]; then mkdir -p "$STAGED_TREE/$directory"; fi
+  done
+  [ -e "$STAGED_TREE/.tools" ] || ln -s "$ROOT/.tools" "$STAGED_TREE/.tools"
+}
+
 title() {
   case "$1" in
     0) echo "開発ツールの版" ;;
@@ -522,6 +538,11 @@ step_2() {
     fi
     # 規則・試験用のファイル・入れ子の設定を変えたときだけ、規則の試験を回す
     if git diff --cached --quiet -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py; then return 0; fi
+    # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
+    prepare_rules_tree
+    (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \
+      "$STAGED_TREE/scripts/test-lint-rules.py")
+    return 0
   else
     "$TOOLS/swiftlint" lint --quiet --no-cache
   fi
@@ -719,7 +740,7 @@ fi
 | 基本設計 §7 の行 | 規則 | 例外を認める場所 |
 | --- | --- | --- |
 | `print(`・`NSLog(`・`debugPrint(` | `no_print_logging` | なし |
-| `Logger(` の直接の利用 | `no_direct_logger`（`os_log(` も含む） | ログの型 |
+| `Logger(`・`Logger.init(` の直接の利用 | `no_direct_logger`（`os_log(` も含む） | ログの型 |
 | 通信 API・WebSocket・CFStream | `no_network_api` | なし |
 | `import Network`・`import CFNetwork` | `no_network_import` | なし |
 | BSD ソケット（`socket(`・`connect(`。`Darwin.` で修飾した呼び出しを含む） | `no_bsd_socket` | なし |
@@ -795,7 +816,7 @@ custom_rules:
 
   no_direct_logger:
     name: "Logger の直接の利用の禁止"
-    regex: '\b(Logger|os_log)\s*\('
+    regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\('
     excluded:
       - '.*/Logging/AppLogger\.swift'
     match_kinds: *code
@@ -843,9 +864,10 @@ custom_rules:
   # 条件は複数行にわたってよい。条件の中の文字列リテラル・行コメント・ブロックコメントは読み飛ばす
   # （中の「{」「{}」を本体の始まりや空の本体と取り違えない）。
   # 本体のブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
+  # 行コメントは条件側・本体側とも行末まで後戻りせずに読み飛ばす（*+）。コメント内の「{」「}」を本体の始まりや終わりと取り違えない
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*|/\*(?:[^*]|\*(?!/))*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
+    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*+|/\*(?:[^*]|\*(?!/))*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*+\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
     match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
@@ -1039,7 +1061,7 @@ useDefault = true
 | ビルド設定の `INFOPLIST_FILE`・`CODE_SIGN_ENTITLEMENTS` | 各ターゲット・各構成で効く値が指すファイル（名前や拡張子にかかわらず、Info.plist または entitlements として検査する）。`$(SRCROOT)`・`$(PROJECT_DIR)`・`$(TARGET_NAME)` を展開し、相対パスは `.xcodeproj` のあるディレクトリから解決する。ほかの変数を含む・ファイルがない・読めない場合は、読めないものとして失敗する |
 
 - 条件付きの設定（`SWIFT_VERSION[config=Debug]` など）は、構成（`configurations` の各要素）ごとに効く値を求めて検査する。効く値は、ターゲットの構成の条件が一致する書き方 → ターゲットの条件のない書き方 → プロジェクトの構成の条件が一致する書き方 → プロジェクトの条件のない書き方、の順で最初に見つかったもの。ターゲットにある書き方だけを見ると、ターゲットに Debug だけ、プロジェクトに Release だけがある場合に Release の値を見落とすためである。構成以外の条件（`sdk=`・`arch=`）の書き方は、そのビルドで効きうるのですべて検査する。どの段にも値がない構成は「設定されていない」とする。
-- 空でない値が要る鍵（マイクの利用目的）は、ビルド設定の値ではなく、**各構成で最終的に生成される Info.plist** で判定する。`GENERATE_INFOPLIST_FILE` が `YES` の構成では `INFOPLIST_KEY_…` と `INFOPLIST_FILE` の参照先の両方を、`NO`（設定がない場合も `NO`）の構成では参照先だけを見る（`NO` では `INFOPLIST_KEY_…` が使われないため）。どこにも鍵がない構成は欠落として報告する。どちらが優先されるかに頼らないよう、効きうる値は**すべて**空でないこと（条件のない値に説明文があっても、Release の条件付きの値や参照先の値が空なら違反）。
+- 空でない値が要る鍵（マイクの利用目的）は、ビルド設定の値ではなく、**各構成で最終的に生成される Info.plist** で判定する。`GENERATE_INFOPLIST_FILE` が `YES` の構成では `INFOPLIST_KEY_…` と `INFOPLIST_FILE` の参照先の両方を、`NO`（設定がない場合も `NO`）の構成では参照先だけを見る（`NO` では `INFOPLIST_KEY_…` が使われないため）。判定は構成と SDK（`iphoneos`・`iphonesimulator`）の組ごとに行い、`sdk=` の条件付きの書き方は条件に合う SDK でだけ効くとする。ビルド設定の値が一部の SDK の条件付きだけにある場合（例: `INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]` だけ）、条件に合わない SDK では参照先の Info.plist が鍵を持たなければ欠落とする（`resolve` が返す「決まらない組」を捨てずに使う）。どこにも鍵がない組は欠落として報告する（例: 構成 Debug（iphoneos））。どちらが優先されるかに頼らないよう、効きうる値は**すべて**空でないこと（条件のない値に説明文があっても、Release の条件付きの値や参照先の値が空なら違反）。
 - **読めないものを合格にしない。** 形式が違う・壊れているファイルは、終了コード 2 で失敗する。
 
 ### 8.2 規則
@@ -1082,6 +1104,8 @@ ALLOWED_USAGE_DESCRIPTIONS = {"NSMicrophoneUsageDescription"}
 ALLOWED_BACKGROUND_MODES = {"audio", "processing"}
 # 拡張はウィジェット（Live Activity）だけを認める。共有拡張などは置かない（SEC-PLT-04）
 ALLOWED_EXTENSION_POINTS = {"com.apple.widgetkit-extension"}
+# 利用目的の文言を SDK ごとに確かめるときの SDK（CON-03 の SUPPORTED_PLATFORMS と同じ）
+SDKS = ("iphoneos", "iphonesimulator")
 
 # entitlements: あってはならない鍵（Personal Team で使えない、または使わない capability）
 FORBIDDEN_ENTITLEMENTS = {
@@ -1423,7 +1447,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
 | 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 21 規則・55 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない |
-| 設定の検査 | `scripts/test-checks.py settings` | 61 件 | 合格する設定で通り、項目ごとの違反で失敗する。マイクの利用目的は生成の有無と参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
+| 設定の検査 | `scripts/test-checks.py settings` | 66 件 | 合格する設定で通り、項目ごとの違反で失敗する。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
 | 依存の検査 | `scripts/test-checks.py dependencies` | 45 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
 | 版の照合 | `scripts/test-checks.py versions` | 8 件 | 版・SHA-256・形式・行の不足・`gh` の行の順序で失敗する |
 | 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 2 件 | 実行時に組み立てた偽の鍵を検出する |
@@ -1455,6 +1479,10 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | `check.sh` で手順の関数を `if` の中で呼んでおり、途中の失敗が通過になった | 手順の先頭に失敗するコマンドを入れた |
 | `check.sh` がエラーで終了しても終了コードが 0 だった（EXIT の trap） | 同上の確認の途中で、実際に 0 が返った |
 | `no_empty_catch` の一致範囲をキーワードに限ったとき、条件の文字列の中の `{` を本体の始まりと取り違えた（2026-11-17） | 条件に `"{}"` を含む空でない `catch` を正常例に足した |
+| `no_empty_catch` が行コメントを後戻りして途中で切り、コメントの中の `{`・`}` を本体の始まり・終わりと取り違えた（2026-11-18） | `catch // {}` と `catch { // }` の空でない `catch` を正常例に足した。行コメントを後戻りしない（`*+`）ようにした |
+| `no_direct_logger` が `Logger.init(…)` を検出しなかった（2026-11-18） | 違反例に足した |
+| マイクの利用目的が `sdk=iphonesimulator*` の条件付きだけでも合格した（実機用の欠落を見落とした。2026-11-18） | 構成と SDK の組ごとに判定する試験を足した |
+| `check.sh --staged` の規則の試験が作業ツリーの規則を読み、ステージした内容を試験していなかった（2026-11-18） | 古い規則をステージし、作業ツリーだけを直して手順 2 が失敗することを確かめた |
 | 依存の検査のコメントの除去で、補間の中の文字列で外側の文字列が閉じたと見なし、偽のコメントで後ろの宣言を隠せた（2026-11-17） | 補間の中に `"/*"` を置く試験を足した。補間の中の文字列を読み飛ばさない突然変異が、括弧を含む文字列の試験を足すまで生き残った |
 
 ### 17.3 実行して確かめたこと（2026-11-16）
