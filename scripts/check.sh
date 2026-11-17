@@ -27,6 +27,7 @@ LAST_STEP=10
 STAGED=0
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
+STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
@@ -146,7 +147,11 @@ step_2() {
 step_3() {
   # --redact: 検出した値そのものを出力に残さない
   if [ "$STAGED" = 1 ]; then
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --pre-commit --staged .
+    # 設定も作業ツリーではなくインデックスのものを使う（ステージしていない設定の変更で検査の範囲を変えない）。
+    # 書き出しの失敗は set -e で手順の失敗になる（条件の中で実行しない）
+    STAGED_GITLEAKS_CONFIG=$(mktemp)
+    git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
+    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
   else
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml .
     scripts/test-checks.py gitleaks
@@ -212,6 +217,7 @@ current=""
 on_exit() {
   local status=$?
   if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
+  if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）

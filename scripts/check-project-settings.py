@@ -153,18 +153,23 @@ def check_plist_values(
             generate, _ = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration])
             modes = {enabled(value) for (_, value) in generate} or {False}
             from_files: List[Tuple[str, str]] = []
-            for path in info_plists.get(configuration, []):
+            plists = info_plists.get(configuration, [])
+            lacking = False  # 参照先の plist のうち、鍵を持たないものがある
+            for path in plists:
                 data = load_plist(path)
-                if name in data:
-                    value = data[name]
-                    source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
-                    from_files.append((f"{source} の {name}", value.strip() if isinstance(value, str) else ""))
+                if name not in data:
+                    lacking = True
+                    continue
+                value = data[name]
+                source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+                from_files.append((f"{source} の {name}", value.strip() if isinstance(value, str) else ""))
             from_settings: List[Tuple[str, str]] = []
             if True in modes:
                 effective, _ = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration])
                 from_settings = [(key, value.replace("$(inherited)", "").strip()) for (key, value) in effective]
-            # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない
-            if (False in modes and not from_files) or (True in modes and not from_files + from_settings):
+            # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない。
+            # 参照先が条件（sdk など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ欠落とする
+            if (False in modes and (not plists or lacking)) or (True in modes and not from_files + from_settings):
                 missing.append(configuration)
             for label, value in from_files + from_settings:
                 if not value:

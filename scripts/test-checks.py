@@ -240,6 +240,16 @@ def test_settings() -> None:
     settings_case("生成しない Info.plist のマイクの利用目的が空", 1, "Config/App-Settings.plist の NSMicrophoneUsageDescription が空",
                   project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
                   plists={"Config/App-Settings.plist": {"NSMicrophoneUsageDescription": " "}})
+    settings_case("生成しない構成で、条件付きの参照先の 1 つにマイクの利用目的がない", 1, "NSMicrophoneUsageDescription がない",
+                  project=lambda t: generate_no(replaced(
+                      info_plist_file("Config/App-Settings.plist")(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',
+                      '"INFOPLIST_FILE": "Config/App-Settings.plist",\n        "INFOPLIST_FILE[sdk=iphoneos*]": "Config/Device.plist",')),
+                  plists={"Config/App-Settings.plist": microphone, "Config/Device.plist": OK_INFO_PLIST})
+    settings_case("生成しない構成で、条件付きの参照先のすべてにマイクの利用目的がある", 0, "OK",
+                  project=lambda t: generate_no(replaced(
+                      info_plist_file("Config/App-Settings.plist")(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',
+                      '"INFOPLIST_FILE": "Config/App-Settings.plist",\n        "INFOPLIST_FILE[sdk=iphoneos*]": "Config/Device.plist",')),
+                  plists={"Config/App-Settings.plist": microphone, "Config/Device.plist": microphone})
     settings_case("マイクの利用目的を参照先の Info.plist だけに置く", 0, "OK",
                   project=lambda t: info_plist_file("Config/App-Settings.plist")(without_key(t)),
                   plists={"Config/App-Settings.plist": microphone})
@@ -299,6 +309,15 @@ def test_dependencies() -> None:
     dependencies_case("許可リストにない依存（Package.swift）", 1, "sample-lib.git", {"Sub/Package.swift": manifest})
     dependencies_case("ローカルの Package は認める", 0, "OK", {"Package.swift": local})
     dependencies_case("許可リストにない依存（project.xcproj）", 1, "example.com", {"App.xcodeproj/project.xcproj": project})
+    # project.xcproj の承認済みの依存は、同じ .xcodeproj の中の Package.resolved に確定版が要る
+    workspace_resolved = "App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+    dependencies_case("project.xcproj の依存に確定版がない", 1, "の確定版がない",
+                      {"App.xcodeproj/project.xcproj": project}, [approved])
+    dependencies_case("project.xcproj の依存を別の場所の Package.resolved とは照合しない", 1, "の確定版がない",
+                      {"App.xcodeproj/project.xcproj": project, "Package.resolved": resolved}, [approved])
+    # 確定版があっても、要求条件の書き方が未確認のうちは合格にしない
+    dependencies_case("project.xcproj の依存の要求条件は判定できない", 1, "要求条件を判定できない",
+                      {"App.xcodeproj/project.xcproj": project, workspace_resolved: resolved}, [approved])
     dependencies_case("許可の対象外のライセンスは、オーナーの決定の記録が要る", 2, "ownerDecision",
                       {}, [dict(approved, license="GPL-3.0")])
     dependencies_case("オーナーの決定を記録した依存", 0, "OK",
@@ -388,9 +407,26 @@ def test_versions() -> None:
     tools = str(ROOT / ".tools")
     original = (ROOT / "tools" / "versions").read_text(encoding="utf-8")
     expect("versions: 導入済みの版が一致する", [setup, "--verify"], 0, "OK")
+    # 版と SHA-256 の負例は、現在の swiftlint の行から値を取り出して変える（ツールを更新しても負例を作れるように）
+    row = next(line for line in original.splitlines() if line.split()[:1] == ["swiftlint"])
+    columns = row.split()
+    current_version, current_sha = columns[1], columns[-1]
+    parts = current_version.split(".")
+    other_version = ".".join(parts[:-1] + [str(int(parts[-1]) + 1)])  # 形式は正しいが導入済みと違う版
+    other_sha = ("0" if current_sha[0] != "0" else "1") + current_sha[1:]
+
+    def changed_row(index: int, value: str) -> Callable[[str], str]:
+        def change(text: str) -> str:
+            fields = row.split(" ")
+            # 空白の並びを保ったまま、index 番目の列だけを置き換える
+            positions = [i for i, field in enumerate(fields) if field]
+            fields[positions[index]] = value
+            return replaced(text, row, " ".join(fields))
+        return change
+
     cases = {
-        "版が違う": (lambda t: replaced(t, "swiftlint   0.65.1", "swiftlint   0.65.0"), "swiftlint"),
-        "SHA-256 が違う": (lambda t: replaced(t, "c1e429b0", "00000000"), "SHA-256"),
+        "版が違う": (changed_row(1, other_version), "swiftlint"),
+        "SHA-256 が違う": (changed_row(len(columns) - 1, other_sha), "SHA-256"),
         "形式が不正": (lambda t: replaced(t, "c1e429b0", "zzzzzzzz"), "不正"),
         "ツールの行がない": (lambda t: "\n".join(line for line in t.splitlines() if line.startswith("#")) + "\n", "1 つもない"),
         "gh の行がほかのツールより後": (lambda t: "\n".join(
@@ -508,6 +544,7 @@ def test_docs() -> None:
         docs_case("整合した文書", 0, "MVP の要件 3 件"),
         docs_case("定義されていない ID", 1, "定義されていない ID: FR-AAA-09", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-AAA-09"),
         docs_case("範囲の省略の中に定義されていない ID", 1, "定義されていない ID: FR-AAA-04", detailed, "FR-AAA-01〜02", "FR-AAA-01〜04"),
+        docs_case("逆順の範囲", 1, "逆順の範囲: FR-AAA-01〜00", detailed, "FR-AAA-01〜02", "FR-AAA-01〜00"),
         docs_case("定義されていない ID の群", 1, "定義されていない ID の群: FR-ZZZ", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-ZZZ 群"),
         docs_case("定義されていない設計決定", 1, "定義されていない ID: BD-SMP-02", detailed, "BD-SMP-01", "BD-SMP-02"),
         docs_case("ID の定義の重複", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-01 | 二 | MVP |"),

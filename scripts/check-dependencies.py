@@ -322,15 +322,19 @@ def check(root: Path, allowlist: Path) -> List[str]:
         approved_versions.setdefault(normalize(package["url"]), set()).add(package["version"])
     # ディレクトリ → URL → 確定版（Package.swift と同じディレクトリの Package.resolved とだけ照合する）
     pins_by_directory: Dict[Path, Dict[str, List[object]]] = {}
+    # Package.resolved の位置 → 確定した取得元（project.xcproj の依存の照合に使う）
+    pinned_locations: Dict[Path, Set[str]] = {}
     errors: List[str] = []
     for path in find_files(root, "Package.resolved"):
         source = path.relative_to(root)
+        pinned_locations.setdefault(path, set())
         for pin in resolved_pins(path):
             pin_location = pin.get("location") or pin.get("repositoryURL")
             pin_state = pin.get("state") if isinstance(pin.get("state"), dict) else {}
             if isinstance(pin_location, str):
                 pins_by_directory.setdefault(path.parent, {}).setdefault(normalize(pin_location), []).append(
                     pin_state.get("version"))
+                pinned_locations[path].add(normalize(pin_location))
             identity = str(pin.get("identity") or pin.get("package") or "").lower()
             state = pin.get("state") if isinstance(pin.get("state"), dict) else {}
             version = state.get("version")
@@ -358,9 +362,24 @@ def check(root: Path, allowlist: Path) -> List[str]:
             raise Unreadable(f"{path}: {error}") from error
         errors.extend(f"{path.relative_to(root)}: {message}" for message in found)
     for path in find_files(root, "project.xcproj"):
+        source = path.relative_to(root)
+        # 同じ .xcodeproj の中（project.xcworkspace/xcshareddata/swiftpm など）の Package.resolved だけと照合する
+        pinned: Set[str] = set()
+        for resolved, locations in pinned_locations.items():
+            if resolved.is_relative_to(path.parent):
+                pinned |= locations
         for text in strings(load_project(path)):
-            if REMOTE_URL.search(text) and normalize(text) not in by_url:
-                errors.append(f"{path.relative_to(root)}: {text} は許可リストにない")
+            if not REMOTE_URL.search(text):
+                continue
+            if normalize(text) not in by_url:
+                errors.append(f"{source}: {text} は許可リストにない")
+                continue
+            if normalize(text) not in pinned:
+                errors.append(f"{source}: {text} の確定版がない（{path.parent.name} の中の Package.resolved に記録する）")
+            # 要求条件（版の指定）の書き方は未確認（dev-environment.md の「断定しない事項」）。
+            # 推測で読むと誤って合格にしうるので、確認して検査を実装するまでは合格にしない
+            errors.append(f"{source}: {text} の要求条件を判定できない（project.xcproj での版の指定の書き方が未確認。"
+                          "最初の依存を足すときに書き方を確かめ、確定版の指定であることの検査を実装する）")
     return errors
 
 

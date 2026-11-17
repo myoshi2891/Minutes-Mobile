@@ -100,8 +100,23 @@ def prose_lines(text: str) -> Iterator[Tuple[int, str]]:
             yield number, line
 
 
+def reversed_range(match: "re.Match[str]") -> bool:
+    """「FR-AAA-03〜01」のように、範囲の終点が直前の番号より小さい書き方か。"""
+    previous = int(match.group(1).rsplit("-", 1)[1])
+    for separator, digits in re.findall(r"([・〜])(\d+)", match.group(2)):
+        if separator == "〜" and int(digits) < previous:
+            return True
+        previous = int(digits)
+    return False
+
+
 def expand(match: "re.Match[str]") -> List[str]:
-    """「SEC-SUP-01〜05」「NFR-MNT-01・03」のような省略した書き方を、個々の ID に展開する。"""
+    """「SEC-SUP-01〜05」「NFR-MNT-01・03」のような省略した書き方を、個々の ID に展開する。
+
+    範囲が逆順の書き方は、どの ID も参照したことにしない（空を返す。check_references が不正として報告する）。
+    """
+    if reversed_range(match):
+        return []
     first = match.group(1)
     stem, number = first.rsplit("-", 1)
     width = len(number)
@@ -175,6 +190,9 @@ class Checker:
         for name, text in self.texts.items():
             for number, line in prose_lines(text):
                 for match in ID_PATTERN.finditer(line):
+                    if reversed_range(match):
+                        self.error(name, f"逆順の範囲: {match.group(0)}（終点が直前の番号より小さい）", number)
+                        continue
                     for identifier in expand(match):
                         if identifier not in self.defined:
                             self.error(name, f"定義されていない ID: {identifier}", number)
