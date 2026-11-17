@@ -232,6 +232,7 @@ func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> (next: MeetingStat
 | バックグラウンド実行 | BackgroundTasks | 開始・打ち切りを任意に発火 | 文字起こし |
 | 状態表示（Live Activity・通知） | ActivityKit・ローカル通知 | 呼び出しを記録するだけ | 録音・文字起こし |
 | ログの出力先 | `os.Logger` | メモリに貯めて検査 | 全体 |
+| Apple Intelligence の可否 | OS への問い合わせ（手段は詳細設計で決める） | 任意の値（対応・非対応・無効） | 設定画面（MVP、FR-SET-01） |
 | LLM（P2） | FoundationModels | 決めた応答を返す | 要約 |
 
 ---
