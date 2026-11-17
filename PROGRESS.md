@@ -61,6 +61,7 @@
 
 | 日付 | 内容 |
 | --- | --- |
+| 2026-11-18 | レビュー対応（14 件）: `no_empty_catch` が条件のブロックコメントを読み飛ばす、`no_direct_sleep_timer` が `Darwin.sleep`・`Darwin.usleep`、`no_direct_uuid` が `UUID.init()` を検出、`check-project-settings.py` が生成しない構成の参照先の plist を 1 つずつ判定、`check.sh --staged` の gitleaks がインデックスの設定を使用、`check-dependencies.py` が `project.xcproj` の依存に同じ `.xcodeproj` の確定版を要求（要求条件は書き方が未確認のため判定できないとして失敗させる）、`verify-docs.py` が逆順の範囲を報告、版の自己試験の負例を現在の値から生成。文書: TST-GEN・CI に対応する要件の列、失敗区間の再試行を選んだ区間だけに（transcription.md §4.3・§7、storage.md §8、ui.md）、状態の変化でスナップショットを送る（ui.md BD-UI-02・recording.md §7）、実機試験の完了条件を §6 に合わせる、スキル 2 件を補足 |
 | 2026-11-17 | レビュー対応（8 件。1 件見送り）: `no_empty_catch` が複数行の `where` に対応、`check.sh --staged` で `git diff` の失敗を検出、`setup.sh` は `--hooks` を付けたときだけフックを有効に、`verify-docs.py` の網羅判定を「／」の前に限定・`docs/` と定義文書の欠落を終了コード 2 に、storage.md §9 に削除の開始後の文字起こしの拒否（transcription.md §8 の開始条件にも追加）、スキル 2 件を補足。手順 7・8 を Package がないときに飛ばす案は、検査を弱めるため見送り |
 | 2026-11-17 | レビュー対応（検査 7 件）: `no_empty_catch` の一致範囲を `catch` に限定（条件に文字列を含む空の catch の見逃し）、`check-dependencies.py` で Package.swift のコメントを除外、`check-project-settings.py` でマイクの利用目的を構成ごとの生成後の Info.plist で判定・`CODE_SIGN_ENTITLEMENTS` の参照先を検査、`verify-docs.py` で申し送りを項目名で照合・設計書の配下のディレクトリも検査・フェンスの中の印を無視。dev-environment.md §19 の表の先頭の列を基本設計の項目名に合わせた。突然変異の確認で、条件の文字列の中の `{` の誤検出と、補間の中の文字列による宣言の隠蔽も見つけて直した（§17） |
 | 2026-11-17 | レビュー対応: `no_empty_catch` の誤検出 2 件を修正、MVP の網羅の判定から基本設計の索引を除外、`test-lint-rules.py` の git 失敗を終了コード 2 に、recording.md（割り込みの開始中の停止・④の後の停止）と transcription.md（再試行の失敗区間の結果ファイルを復旧で再利用しない）を修正、スキル 2 件を補足 |
