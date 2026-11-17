@@ -61,6 +61,7 @@
 
 | 日付 | 内容 |
 | --- | --- |
+| 2026-11-17 | レビュー対応（検査 7 件）: `no_empty_catch` の一致範囲を `catch` に限定（条件に文字列を含む空の catch の見逃し）、`check-dependencies.py` で Package.swift のコメントを除外、`check-project-settings.py` でマイクの利用目的を構成ごとの生成後の Info.plist で判定・`CODE_SIGN_ENTITLEMENTS` の参照先を検査、`verify-docs.py` で申し送りを項目名で照合・設計書の配下のディレクトリも検査・フェンスの中の印を無視。dev-environment.md §19 の表の先頭の列を基本設計の項目名に合わせた。突然変異の確認で、条件の文字列の中の `{` の誤検出と、補間の中の文字列による宣言の隠蔽も見つけて直した（§17） |
 | 2026-11-17 | レビュー対応: `no_empty_catch` の誤検出 2 件を修正、MVP の網羅の判定から基本設計の索引を除外、`test-lint-rules.py` の git 失敗を終了コード 2 に、recording.md（割り込みの開始中の停止・④の後の停止）と transcription.md（再試行の失敗区間の結果ファイルを復旧で再利用しない）を修正、スキル 2 件を補足 |
 | 2026-11-16 | 進捗の管理（本書）と、スキル `update-specs`（仕様書の更新）・`tdd-implement`（TDD での実装）を追加 |
 | 2026-11-16 | 作業単位 1（検査基盤）を完了。詳細設計 `dev-environment.md` 初版 |
