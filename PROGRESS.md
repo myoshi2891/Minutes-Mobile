@@ -42,7 +42,7 @@
 **この節は空にしない。** 作業を終えたら、次に手を付ける 1 手を具体的に（ファイル・節・コマンドの単位で）書き換えてからコミットする。止まっているなら、何を待っているかと、その間にできる作業を書く。
 
 - **次の 1 手**: [dev-environment.md](docs/03-detailed-design/dev-environment.md) §12.1 の表のとおり `MinutesMobile.xcodeproj/project.xcproj` の設定を変更し、`scripts/check.sh --steps 4` を通す
-- **その後**: §11 の Package（`Packages/MinutesKit`）とテストターゲットを追加 → §14.1 のプライバシーマニフェスト → `scripts/check.sh` の全手順が通る → `scripts/setup.sh` でフックを有効にする
+- **その後**: §11 の Package（`Packages/MinutesKit`）とテストターゲットを追加 → §14.1 のプライバシーマニフェスト → `scripts/check.sh` の全手順が通る → `scripts/setup.sh --hooks` でフックを有効にする
 - **作業**: 順 2（作業単位 2: プロジェクト設定）
 - **終わりの条件**: `scripts/check.sh` の手順 0〜10 がすべて通る（Bundle Identifier の警告を除く）
 - **Red の記録**: —（PR を作るまで、失敗を確かめたテスト名と失敗の理由をここに書き、PR の説明へ移す。[test-requirements.md](docs/01-requirements/test-requirements.md) §6 の 2）
@@ -61,6 +61,7 @@
 
 | 日付 | 内容 |
 | --- | --- |
+| 2026-11-17 | レビュー対応（8 件。1 件見送り）: `no_empty_catch` が複数行の `where` に対応、`check.sh --staged` で `git diff` の失敗を検出、`setup.sh` は `--hooks` を付けたときだけフックを有効に、`verify-docs.py` の網羅判定を「／」の前に限定・`docs/` と定義文書の欠落を終了コード 2 に、storage.md §9 に削除の開始後の文字起こしの拒否（transcription.md §8 の開始条件にも追加）、スキル 2 件を補足。手順 7・8 を Package がないときに飛ばす案は、検査を弱めるため見送り |
 | 2026-11-17 | レビュー対応（検査 7 件）: `no_empty_catch` の一致範囲を `catch` に限定（条件に文字列を含む空の catch の見逃し）、`check-dependencies.py` で Package.swift のコメントを除外、`check-project-settings.py` でマイクの利用目的を構成ごとの生成後の Info.plist で判定・`CODE_SIGN_ENTITLEMENTS` の参照先を検査、`verify-docs.py` で申し送りを項目名で照合・設計書の配下のディレクトリも検査・フェンスの中の印を無視。dev-environment.md §19 の表の先頭の列を基本設計の項目名に合わせた。突然変異の確認で、条件の文字列の中の `{` の誤検出と、補間の中の文字列による宣言の隠蔽も見つけて直した（§17） |
 | 2026-11-17 | レビュー対応: `no_empty_catch` の誤検出 2 件を修正、MVP の網羅の判定から基本設計の索引を除外、`test-lint-rules.py` の git 失敗を終了コード 2 に、recording.md（割り込みの開始中の停止・④の後の停止）と transcription.md（再試行の失敗区間の結果ファイルを復旧で再利用しない）を修正、スキル 2 件を補足 |
 | 2026-11-16 | 進捗の管理（本書）と、スキル `update-specs`（仕様書の更新）・`tdd-implement`（TDD での実装）を追加 |
