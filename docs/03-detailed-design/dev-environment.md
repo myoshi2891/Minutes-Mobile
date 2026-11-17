@@ -35,14 +35,14 @@
 ### 2.1 配置
 
 ```text
-.githooks/                    Git のフック（pre-commit・pre-push）。scripts/setup.sh で有効にする
+.githooks/                    Git のフック（pre-commit・pre-push）。scripts/setup.sh --hooks で有効にする
 .gitignore
 .gitleaks.toml                gitleaks の設定
 .swiftformat                  SwiftFormat の設定
 .swiftlint.yml                SwiftLint の設定と独自ルール
 .tools/                       導入スクリプトが展開した開発ツール（Git の管理外）
 scripts/
-  setup.sh                    初期設定（ツールの導入とフックの有効化）
+  setup.sh                    初期設定（ツールの導入。--hooks でフックも有効にする）
   setup-tools.sh              開発ツールの導入と版の照合
   check.sh                    検査の本体（手順 0〜10）
   check-project-settings.py   プロジェクト設定・Info.plist・entitlements の検査
@@ -452,13 +452,20 @@ elif [ -z "$STEPS" ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
 fi
 
-# ステージした Swift ファイル（規則の試験用のファイルを除く）
+# ステージした Swift ファイル（規則の試験用のファイルを除く）。
+# 一覧は一時ファイルに書き出し、git の失敗を空の一覧として扱わない（プロセス置換では終了コードを確かめられない）
 STAGED_SWIFT=()
 if [ "$STAGED" = 1 ]; then
+  staged_list=$(mktemp)
+  if ! git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift' > "$staged_list"; then
+    rm -f -- "$staged_list"
+    fail "ステージしたファイルの一覧を取得できない"
+  fi
   while IFS= read -r -d '' file; do
     case "$file" in tools/lint-fixtures/*) continue ;; esac
     STAGED_SWIFT+=("$file")
-  done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift')
+  done < "$staged_list"
+  rm -f -- "$staged_list"
 fi
 
 # ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
@@ -639,7 +646,7 @@ fi
 ```bash
 #!/bin/bash
 # コミット前の検査: ステージしたファイルに対する手順 1〜3 と 10（基本設計 dev-environment.md §6.2）。
-# 有効にする: scripts/setup.sh（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+# 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
 set -euo pipefail
 exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --staged
 ```
@@ -649,7 +656,7 @@ exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --staged
 ```bash
 #!/bin/bash
 # プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
-# 有効にする: scripts/setup.sh（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+# 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
 set -euo pipefail
 # 標準入力（プッシュする参照の一覧）は使わない
 exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 </dev/null
@@ -661,14 +668,29 @@ exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 </dev/nu
 #!/bin/bash
 # 開発環境の初期設定: 開発ツールの導入と、Git のフックの有効化（基本設計 dev-environment.md §5.2・§6.2）。
 # クローンした直後と、tools/versions が変わったときに実行する。
+#
+# 使い方:
+#   scripts/setup.sh          開発ツールを導入する（フックは有効にしない）
+#   scripts/setup.sh --hooks  開発ツールを導入し、フックを有効にする（check.sh の全手順が通るようになってから使う）
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
+HOOKS=0
+case "${1:-}" in
+  "") ;;
+  --hooks) HOOKS=1 ;;
+  *) echo "使い方: $0 [--hooks]" >&2; exit 2 ;;
+esac
+
 scripts/setup-tools.sh
-git config core.hooksPath .githooks
-echo "OK: フックを有効にした（core.hooksPath = $(git config core.hooksPath)）"
+if [ "$HOOKS" = 1 ]; then
+  git config core.hooksPath .githooks
+  echo "OK: フックを有効にした（core.hooksPath = $(git config core.hooksPath)）"
+else
+  echo "OK: 開発ツールを導入した。フックは有効にしていない（有効にするときは --hooks を付ける）"
+fi
 ```
 
 - **有効にする時期: 作業単位 2 の最後。** プッシュ前のフックは手順 0〜8 を回すので、プロジェクト設定とテストターゲットが揃う前に有効にすると、push できなくなる。作業単位 1 ではフックのファイルを置くだけにし、複製したリポジトリで動作を確かめた（§17）。
@@ -809,11 +831,11 @@ custom_rules:
   # 条件（where 句など）と本体（コメントと空白だけ）の判定は先読みに置き、一致範囲をキーワードの「catch」に限る。
   # 一致範囲がキーワードだけになるので、コメントや文字列の中の「catch {}」を検出せず、
   # 条件に文字列を含む空の catch も見逃さない（一致範囲に文字列の種別が入ると match_kinds で外れるため）。
-  # 条件の中の文字列リテラルは読み飛ばす（文字列の中の「{」を本体の始まりと取り違えない）。
+  # 条件は複数行にわたってよい。条件の中の文字列リテラルと行コメントは読み飛ばす（中の「{」を本体の始まりと取り違えない）。
   # ブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b(?=(?:[^{"\n]|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
+    regex: '\bcatch\b(?=(?:[^{"/]|/(?!/)|//[^\n]*|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
     match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
@@ -1119,12 +1141,13 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | --- | --- |
 | ID の定義 | 定義文書の表から ID を集める。定義の重複を失敗にする |
 | ID の参照 | すべての文書（`docs/`・`README.md`・`CLAUDE.md`）が参照する ID が定義されている。`SEC-SUP-01〜05`・`NFR-MNT-01・03`・`FR-REC 群` のような省略した書き方も展開して調べる |
-| MVP の網羅 | フェーズが MVP の FR / NFR / SEC が、基本設計の各文書（索引の README.md を除く）の「満たす要件」のどこかに現れる。索引は「SEC 全般」や群の表記でまとめて挙げるため、判定に含めると欠落を隠す |
+| MVP の網羅 | フェーズが MVP の FR / NFR / SEC が、基本設計の各文書（索引の README.md を除く）の「満たす要件」の、「／」より前（決定・関連などの参照を除く）のどこかに現れる。索引は「SEC 全般」や群の表記でまとめて挙げるため、判定に含めると欠落を隠す |
 | 書式 | 相対リンクの先がある。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である。フェンスは開始行の文字（バッククォートかチルダ）と長さを覚え、同じ文字が開始以上の長さで並び、その後が空白だけの行でだけ閉じる（長いフェンスの中の短いフェンスで切り替わらない）。この判定は ID の走査・節の区切り・コード片の照合と書き直しで共通に使う |
 | 節の構成 | 基本設計・詳細設計（配下のディレクトリの文書を含む）の各節の冒頭に「満たす要件:」（または「制約:」）がある。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もある |
 | 申し送りの解決 | 対応する基本設計（詳細設計からの相対パスが同じ文書）の「詳細設計への申し送り」の各項目が、詳細設計の「申し送り」の節の表の先頭の列に、項目名（前後の空白と末尾の「。」を除く）で一度ずつ現れる。欠落・重複・基本設計にない行を失敗にする（行数だけを比べると、重複した行が欠落を埋めて合格になるため） |
 | コード片 | フェンスの外にある印の直後のコード片が実ファイルと一致する（下）。フェンスの中の印は説明用の例として、照合にも書き直しにも使わない |
 | 確認日 | 確認日から 3 か月を過ぎた記述のある文書を警告する（失敗にはしない） |
+| 読むもの | `--root` の下に `docs/` と定義文書（要件・SEC・TST・COST・`docs/README.md`）がなければ、何も調べずに通らないよう終了コード 2 で失敗する |
 
 コード片の印:
 
@@ -1236,7 +1259,7 @@ let package = Package(
 | 4 | §12.1 の変更（Bundle Identifier を除く） |
 | 7・9 | §11 の Package とテストターゲット |
 
-すべて通ったら、`scripts/setup.sh` でフックを有効にする（§5）。
+すべて通ったら、`scripts/setup.sh --hooks` でフックを有効にする（§5）。
 
 ---
 
@@ -1394,7 +1417,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 依存の検査 | `scripts/test-checks.py dependencies` | 45 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
 | 版の照合 | `scripts/test-checks.py versions` | 8 件 | 版・SHA-256・形式・行の不足・`gh` の行の順序で失敗する |
 | 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 2 件 | 実行時に組み立てた偽の鍵を検出する |
-| 文書の検査 | `scripts/test-checks.py docs` | 38 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない |
+| 文書の検査 | `scripts/test-checks.py docs` | 41 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
