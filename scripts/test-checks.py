@@ -436,6 +436,14 @@ def test_versions() -> None:
             line for line in t.splitlines() if not (line.startswith("gitleaks") and f" {platform.machine()} " in line)
         ) + "\n", "向けの行がない"),
     }
+    # 末尾に改行のない最終行も読む（最終行のツールを読み落とすと「行がない」で失敗する）
+    with tempfile.TemporaryDirectory() as directory:
+        versions = Path(directory) / "versions"
+        # この Mac 向けの gitleaks の行を最終行に移す（読み落とすと、その行だけが照合されなくなる）
+        own = [line for line in original.splitlines() if line.startswith("gitleaks") and f" {platform.machine()} " in line]
+        rest = [line for line in original.splitlines() if line not in own]
+        versions.write_text("\n".join(rest + own), encoding="utf-8")
+        expect("versions: 末尾に改行のない最終行", [setup, "--verify", "--versions", str(versions), "--dest", tools], 0, "OK")
     for label, (change, want_text) in cases.items():
         with tempfile.TemporaryDirectory() as directory:
             versions = Path(directory) / "versions"
@@ -578,6 +586,7 @@ def test_docs() -> None:
         docs_case("申し送りの解決が足りない", 1, "申し送り「二つ目」の解決が表にない", detailed, "| 二つ目 | 済 |\n", ""),
         docs_case("重複した行で欠落した申し送りを埋めても合格にしない", 1, "申し送り「二つ目」の解決が表にない",
                   detailed, "| 二つ目 | 済 |", "| 一つ目 | 済 |"),
+        docs_case("申し送りの解決の列が空", 1, "申し送り「二つ目」の解決の列が空", detailed, "| 二つ目 | 済 |", "| 二つ目 |   |"),
         docs_case("申し送りの解決の重複", 1, "申し送り「一つ目」の解決が表に 2 行ある",
                   detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 一つ目 | 再掲 |"),
         docs_case("基本設計にない申し送りの行", 1, "基本設計にない申し送り「三つ目」", detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 三つ目 | 済 |"),

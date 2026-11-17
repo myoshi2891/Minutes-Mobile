@@ -71,7 +71,9 @@ verify_tool() {
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
   local target="$DEST/$name/$version" work="$WORK/$name" actual found license
-  if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
+  # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）
+  if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ] \
+    && [ "$(runtime_version "$name" "$target/$binary" 2>/dev/null)" = "$version" ]; then
     echo "導入済み: $name $version"
   else
     echo "取得: $name ${version}（$repo $tag ${asset}）"
@@ -131,7 +133,8 @@ ARCH=$(uname -m)
 seen=" "      # 写しに現れたツール名
 matched=" "   # この Mac 向けの行が見つかったツール名
 
-while read -r name version arch repo tag asset binary sha extra; do
+# 末尾に改行のない最終行も読む（read は非ゼロを返すが、値は入っている）。空の最終行は name が空なので読まない
+while read -r name version arch repo tag asset binary sha extra || [ -n "${name:-}" ]; do
   case "$name" in '' | '#'*) continue ;; esac
   [ -z "${extra:-}" ] || fail "tools/versions の列が多い: $name"
   check_field "名前" "$name" '^[a-z][a-z0-9-]*$'

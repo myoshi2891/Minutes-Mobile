@@ -322,7 +322,14 @@ class Checker:
             line for _, heading, body in sections if "申し送り" in heading
             for line in body if line.startswith("|") and not re.match(r"^\|[ :|-]+\|$", line)
         ]
-        resolved = [item_name(table_cells(line)[0]) for line in rows[1:]]  # 見出しの行を除く
+        # 見出しの行を除く。解決の列（2 列目）が空・空白だけの行は、解決したことにしない
+        resolved = []
+        for line in rows[1:]:
+            cells = table_cells(line)
+            if len(cells) < 2 or not cells[1].strip():
+                self.error(name, f"申し送り「{item_name(cells[0])}」の解決の列が空")
+                continue
+            resolved.append(item_name(cells[0]))
         for item in items:
             found = resolved.count(item)
             if found == 0:
