@@ -11,7 +11,7 @@
 使い方: scripts/verify-docs.py [--root <リポジトリの起点>] [--update-snippets]
   --update-snippets  全文のコード片（<!-- file: パス -->）を実ファイルの内容で書き直してから検査する。
                      実ファイルを変えたあと、文書を同じ作業で直すために使う（一部のコード片は手で直す）
-終了コード: 0 = 問題なし / 1 = 不整合あり
+終了コード: 0 = 問題なし / 1 = 不整合あり / 2 = 読むもの（docs/・定義文書）がない
 """
 import argparse
 import datetime
@@ -196,6 +196,8 @@ class Checker:
             for _, line in prose_lines(text):
                 if not re.match(r"^(\| )?満たす要件", line):
                     continue
+                # names_requirements と同じく「／」の前だけを見る（後ろの決定・関連の参照は網羅に数えない）
+                line = line.split("／", 1)[0]
                 for match in ID_PATTERN.finditer(line):
                     covered.update(expand(match))
                 for match in GROUP_PATTERN.finditer(line):
@@ -392,7 +394,18 @@ class Checker:
             if dates and (today - min(dates)).days > STALE_DAYS:
                 self.warnings.append(f"{name}: 確認日 {min(dates)} から 3 か月を過ぎた記述がある。再確認する")
 
+    def missing_inputs(self) -> List[str]:
+        """読むはずの docs/ と定義文書のうち、ないもの。ないまま検査すると、何も調べずに通るため。"""
+        if not (self.root / "docs").is_dir():
+            return [f"{self.root / 'docs'}（docs ディレクトリ）"]
+        return [path for path in sorted(set(DEFINED_IN.values())) if not (self.root / path).is_file()]
+
     def run(self, update: bool = False) -> int:
+        missing = self.missing_inputs()
+        if missing:
+            for path in missing:
+                print(f"NG: 読むものがない: {path}", file=sys.stderr)
+            return 2
         self.load()
         if update:
             self.update_snippets()

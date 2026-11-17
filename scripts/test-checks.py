@@ -481,9 +481,14 @@ EXAMPLE_MARKERS = (
 
 
 def docs_case(label: str, want_code: int, want_text: str, name: str = "", old: str = "", new: str = "",
-              options: Optional[List[str]] = None, extra: Optional[Dict[str, str]] = None) -> Path:
+              options: Optional[List[str]] = None, extra: Optional[Dict[str, Optional[str]]] = None) -> Path:
+    """extra の値が None のファイルは置かない（欠落の試験に使う）。"""
     directory = Path(tempfile.mkdtemp())
-    for path, content in list(DOCS.items()) + list((extra or {}).items()):
+    files = dict(DOCS)
+    files.update(extra or {})
+    for path, content in files.items():
+        if content is None:
+            continue
         if path == name:
             content = replaced(content, old, new)
         (directory / path).parent.mkdir(parents=True, exist_ok=True)
@@ -508,6 +513,12 @@ def test_docs() -> None:
         docs_case("ID の定義の重複", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-01 | 二 | MVP |"),
         docs_case("MVP の要件が基本設計に現れない", 1, "MVP の要件 FR-AAA-02", basic, "FR-AAA-01・02、", "FR-AAA-01、"),
         docs_case("P2 の要件は網羅の対象にしない", 0, "OK", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-02 | 二 | P2 |"),
+        # 「／」の後（決定・関連などの参照）にだけある要件は、網羅したことにしない
+        docs_case("関連の参照だけでは網羅にならない", 1, "MVP の要件 FR-AAA-02", basic,
+                  "FR-AAA-01・02、SEC-AAA-01 |\n\n## 1. 設計決定\n\n満たす要件: FR-AAA-01\n",
+                  "FR-AAA-01、SEC-AAA-01 ／ 関連: FR-AAA-02 |\n\n## 1. 設計決定\n\n満たす要件: FR-AAA-01 ／ 関連: FR-AAA-02\n"),
+        # 読むものがない root・定義文書の欠落は合格にしない
+        docs_case("定義文書がない", 2, "test-requirements.md", extra={"docs/01-requirements/test-requirements.md": None}),
         docs_case("切れたリンク", 1, "リンクの先がない", basic, "../01-requirements/requirements.md", "../01-requirements/missing.md"),
         docs_case("言語のないコードフェンス", 1, "言語の指定がない", detailed, f"{FENCE}bash\necho one", f"{FENCE}\necho one"),
         docs_case("セキュリティ節がない", 1, "「セキュリティ」の節がない", detailed, "## 2. セキュリティ", "## 2. その他"),
@@ -562,6 +573,8 @@ def test_docs() -> None:
     count += 1
     if EXAMPLE_MARKERS not in (example / detailed).read_text(encoding="utf-8"):
         failures.append("docs: フェンスの中の印のコード片が書き直された")
+    with tempfile.TemporaryDirectory() as missing:
+        expect("docs: 存在しない root", [str(SCRIPTS / "verify-docs.py"), "--root", str(Path(missing) / "none")], 2, "docs")
     for directory in created + [fixed, example]:
         shutil.rmtree(directory)
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
-# 有効にする: scripts/setup.sh（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+# 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
 set -euo pipefail
 # 標準入力（プッシュする参照の一覧）は使わない
 exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 </dev/null

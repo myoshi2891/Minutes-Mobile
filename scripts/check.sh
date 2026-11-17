@@ -71,13 +71,20 @@ elif [ -z "$STEPS" ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
 fi
 
-# ステージした Swift ファイル（規則の試験用のファイルを除く）
+# ステージした Swift ファイル（規則の試験用のファイルを除く）。
+# 一覧は一時ファイルに書き出し、git の失敗を空の一覧として扱わない（プロセス置換では終了コードを確かめられない）
 STAGED_SWIFT=()
 if [ "$STAGED" = 1 ]; then
+  staged_list=$(mktemp)
+  if ! git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift' > "$staged_list"; then
+    rm -f -- "$staged_list"
+    fail "ステージしたファイルの一覧を取得できない"
+  fi
   while IFS= read -r -d '' file; do
     case "$file" in tools/lint-fixtures/*) continue ;; esac
     STAGED_SWIFT+=("$file")
-  done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift')
+  done < "$staged_list"
+  rm -f -- "$staged_list"
 fi
 
 # ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
