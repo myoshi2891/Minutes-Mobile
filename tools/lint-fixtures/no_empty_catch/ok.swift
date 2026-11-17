@@ -5,4 +5,8 @@ func sample() throws {
     } catch {
         throw SampleError.wrapped
     }
+    // 説明のコメントの中の catch {} は検出しない
+    /* do { try work() } catch {} */
+    let text = "catch {}"
+    do { try work() } catch { /* 前 */ recorder.record(.failed) /* 後 */ }
 }

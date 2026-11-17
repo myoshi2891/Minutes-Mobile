@@ -81,14 +81,13 @@ custom_rules:
     message: "オンデバイスのモデルだけを使う（SEC-NET-02）"
     severity: error
 
+  # 本体（コメントと空白だけ）の判定は先読みに置き、一致範囲を「catch … {」に限る。
+  # 一致範囲がコードの種別だけになるので、コメントや文字列の中の「catch {}」を検出しない。
+  # ブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b[^{\n]*\{\s*(//[^\n]*\s*|/\*.*?\*/\s*)*\}'
-    match_kinds:
-      - identifier
-      - typeidentifier
-      - keyword
-      - comment
+    regex: '\bcatch\b[^{\n]*\{(?=\s*(?://[^\n]*\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
+    match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
 
