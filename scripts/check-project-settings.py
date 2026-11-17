@@ -34,8 +34,8 @@ REQUIRED_ALL_TARGETS: Dict[str, Tuple[Tuple[str, ...], str]] = {
 REQUIRED_APPLICATION: Dict[str, Tuple[Tuple[str, ...], str]] = {
     "INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone": (("UIInterfaceOrientationPortrait",), "BD-UI-10"),
 }
-# アプリのターゲットで空でない値が要る設定
-REQUIRED_NONEMPTY_APPLICATION = {"INFOPLIST_KEY_NSMicrophoneUsageDescription": "SEC-PRV-01"}
+# アプリのターゲットで、各構成で最終的に生成される Info.plist に空でない文字列が要る鍵
+REQUIRED_PLIST_VALUES_APPLICATION = {"NSMicrophoneUsageDescription": "SEC-PRV-01"}
 # あってはならないビルド設定
 FORBIDDEN_BUILD_SETTINGS = {"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad": "BD-UI-10"}
 
@@ -136,17 +136,46 @@ def check_required(
                 errors.append(f"[{reason}] {target}: {key} = {value}（構成 {'・'.join(used)}。必要な値: {allowed[0]}）")
 
 
-def check_nonempty(
-    target: str, own: dict, shared: dict, configurations: List[str], rules: Dict[str, str], errors: List[str]
+def check_plist_values(
+    target: str, own: dict, shared: dict, configurations: List[str],
+    info_plists: Dict[str, List[Path]], root: Path, errors: List[str]
 ) -> None:
-    """すべての構成で、効く書き方がすべて空でないこと（条件付きの書き方が空なら違反）。"""
-    for name, reason in rules.items():
-        effective, missing = resolve(own, shared, name, configurations)
+    """各構成で最終的に生成される Info.plist に、空でない値があること。
+
+    GENERATE_INFOPLIST_FILE が有効な構成では、ビルド設定の INFOPLIST_KEY_… と INFOPLIST_FILE の参照先が合わさる。
+    無効（設定がない場合も無効）な構成では、INFOPLIST_FILE の参照先だけが使われる。
+    どちらが優先されるかに頼らないよう、効きうる値はすべて空でないことを求め、どこにもなければ欠落とする。
+    """
+    for name, reason in REQUIRED_PLIST_VALUES_APPLICATION.items():
+        missing: List[str] = []
+        empty: Dict[str, List[str]] = {}
+        for configuration in configurations:
+            generate, _ = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration])
+            modes = {enabled(value) for (_, value) in generate} or {False}
+            from_files: List[Tuple[str, str]] = []
+            for path in info_plists.get(configuration, []):
+                data = load_plist(path)
+                if name in data:
+                    value = data[name]
+                    source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+                    from_files.append((f"{source} の {name}", value.strip() if isinstance(value, str) else ""))
+            from_settings: List[Tuple[str, str]] = []
+            if True in modes:
+                effective, _ = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration])
+                from_settings = [(key, value.replace("$(inherited)", "").strip()) for (key, value) in effective]
+            # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない
+            if (False in modes and not from_files) or (True in modes and not from_files + from_settings):
+                missing.append(configuration)
+            for label, value in from_files + from_settings:
+                if not value:
+                    empty.setdefault(label, []).append(configuration)
         if missing:
-            errors.append(f"[{reason}] {target}: {name} が設定されていない（構成 {'・'.join(missing)}）")
-        for (key, value), used in effective.items():
-            if not value.replace("$(inherited)", "").strip():
-                errors.append(f"[{reason}] {target}: {key} が空（構成 {'・'.join(used)}）")
+            errors.append(
+                f"[{reason}] {target}: 生成される Info.plist に {name} がない（構成 {'・'.join(missing)}。"
+                f"GENERATE_INFOPLIST_FILE = YES で INFOPLIST_KEY_{name} に置くか、INFOPLIST_FILE の参照先に置く）"
+            )
+        for label, used in empty.items():
+            errors.append(f"[{reason}] {target}: {label} が空（構成 {'・'.join(used)}）")
 
 
 def check_plist_entry(source: str, key: str, value: object, errors: List[str]) -> None:
@@ -206,17 +235,18 @@ def load_plist(path: Path) -> dict:
     return data
 
 
-def info_plist_files(
-    project_path: Path, target: str, own: dict, shared: dict, configurations: List[str]
+def referenced_files(
+    project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str
 ) -> List[Path]:
-    """ビルド設定の INFOPLIST_FILE が指すファイルを返す（ファイル名が Info.plist で終わらないものも検査するため）。
+    """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルを返す。
 
+    ファイル名や拡張子にかかわらず検査するために使う。
     相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
     """
     parent = project_path.parent
     source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
-    effective, _ = resolve(own, shared, "INFOPLIST_FILE", configurations)
+    effective, _ = resolve(own, shared, setting, [configuration])
     paths: List[Path] = []
     for (key, value), _ in effective.items():
         text = value.strip()
@@ -248,17 +278,26 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         raise Unreadable(f"{project_path}: configurations の形式が違う")
     check_build_settings("プロジェクト", shared, errors)
     referenced: List[Path] = []
+    entitlements: List[Path] = []
     for target in targets:
         if not isinstance(target, dict) or not isinstance(target.get("build-settings"), dict):
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
         name = f"ターゲット {target.get('name', '?')}"
         own = target["build-settings"]
+        target_name = str(target.get("name", ""))
+        info_plists = {
+            configuration: referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE")
+            for configuration in configurations
+        }
+        for configuration in configurations:
+            referenced.extend(info_plists[configuration])
+            entitlements.extend(
+                referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS"))
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
         if target.get("product-type") == "application":
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
-            check_nonempty(name, own, shared, configurations, REQUIRED_NONEMPTY_APPLICATION, errors)
+            check_plist_values(name, own, shared, configurations, info_plists, root, errors)
         check_build_settings(name, own, errors)
-        referenced.extend(info_plist_files(project_path, str(target.get("name", "")), own, shared, configurations))
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")
@@ -268,9 +307,11 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         for key, value in load_plist(path).items():
             check_plist_entry(source, str(key), value, errors)
-    for path in find_files(root, (".entitlements",)):
+    # CODE_SIGN_ENTITLEMENTS が指すファイルも、拡張子にかかわらず読む。ないファイル・読めないファイルは Unreadable
+    scanned = [path.resolve() for path in find_files(root, (".entitlements",))]
+    for path in scanned + [path for path in dict.fromkeys(entitlements) if path not in scanned]:
+        source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         for key in load_plist(path):
-            source = str(path.relative_to(root))
             if key in FORBIDDEN_ENTITLEMENTS:
                 errors.append(f"[{FORBIDDEN_ENTITLEMENTS[key]}] {source}: {key} を設定しない")
             for prefix, reason in FORBIDDEN_ENTITLEMENT_PREFIXES.items():

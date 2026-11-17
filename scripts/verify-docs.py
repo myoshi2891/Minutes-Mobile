@@ -239,8 +239,9 @@ class Checker:
 
     def check_design_documents(self) -> None:
         for name, text in self.texts.items():
-            directory = name.rsplit("/", 1)[0]
-            if directory not in (BASIC, DETAILED):
+            # 配下のディレクトリの文書も対象にする（load は docs/ を再帰的に読む）
+            directory = next((base for base in (BASIC, DETAILED) if name.startswith(base + "/")), "")
+            if not directory:
                 continue
             sections = self.sections(text)
             for number, heading, body in sections:
@@ -280,26 +281,44 @@ class Checker:
         )
 
     def check_handover(self, name: str, sections: List[Tuple[int, str, List[str]]]) -> None:
-        """基本設計の申し送りの項目数と、詳細設計の解決の表の行数が一致すること。"""
-        basic_name = f"{BASIC}/{name.rsplit('/', 1)[1]}"
+        """基本設計の申し送りの各項目が、詳細設計の解決の表の先頭の列に、項目名で一度ずつ現れること。
+
+        行数だけを比べると、重複した行が欠落した項目を埋めて合格になるため、項目名で照合する。
+        項目名は前後の空白と末尾の「。」を除いて比べる。
+        """
+        basic_name = f"{BASIC}/{name[len(DETAILED) + 1:]}"
         if basic_name not in self.texts:
             self.error(name, f"対応する基本設計 {basic_name} がない")
             return
+
+        def item_name(text: str) -> str:
+            return text.strip().rstrip("。").strip()
+
         items = [
-            line for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
+            item_name(line[2:]) for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
             for line in body if line.startswith("- ")
         ]
         rows = [
             line for _, heading, body in sections if "申し送り" in heading
             for line in body if line.startswith("|") and not re.match(r"^\|[ :|-]+\|$", line)
         ]
-        resolved = max(len(rows) - 1, 0)  # 見出しの行を除く
-        if resolved != len(items):
-            self.error(name, f"申し送りの解決の表が {resolved} 行（基本設計の申し送りは {len(items)} 項目）")
+        resolved = [item_name(table_cells(line)[0]) for line in rows[1:]]  # 見出しの行を除く
+        for item in items:
+            found = resolved.count(item)
+            if found == 0:
+                self.error(name, f"申し送り「{item}」の解決が表にない（表の先頭の列に基本設計の項目名をそのまま書く）")
+            elif found > 1:
+                self.error(name, f"申し送り「{item}」の解決が表に {found} 行ある")
+        for row in dict.fromkeys(resolved):
+            if row not in items:
+                self.error(name, f"基本設計にない申し送り「{row}」の行が表にある")
 
     def check_snippets(self, name: str, text: str) -> None:
         lines = text.splitlines()
-        for index, line in enumerate(lines):
+        for number, line, inside, _ in fenced_lines(text):
+            if inside:
+                continue  # フェンスの中の印は説明用の例であり、照合しない
+            index = number - 1
             marker = re.match(r"^<!-- (file|excerpt): (\S+) -->$", line.strip())
             if not marker:
                 continue
@@ -330,11 +349,13 @@ class Checker:
             if not name.startswith(DETAILED + "/"):
                 continue
             lines = text.splitlines()
+            # フェンスの外の行の位置（フェンスの中の印は説明用の例であり、書き直さない）
+            outside = {number - 1 for number, _, inside, _ in fenced_lines(text) if not inside}
             out: List[str] = []
             index = 0
             while index < len(lines):
                 out.append(lines[index])
-                marker = re.match(r"^<!-- file: (\S+) -->$", lines[index].strip())
+                marker = re.match(r"^<!-- file: (\S+) -->$", lines[index].strip()) if index in outside else None
                 index += 1
                 if not marker:
                     continue

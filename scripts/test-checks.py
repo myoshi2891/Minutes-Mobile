@@ -226,6 +226,39 @@ def test_settings() -> None:
     settings_case("INFOPLIST_FILE が指すファイルが壊れている", 2, "読めない",
                   project=info_plist_file("Config/Broken.plist"), raw={"Config/Broken.plist": b"<plist"})
     settings_case("INFOPLIST_FILE の展開できない変数", 2, "展開できない", project=info_plist_file("$(UNKNOWN)/Info.plist"))
+    # マイクの利用目的は、各構成で最終的に生成される Info.plist で判定する
+    generate_no = lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",', '"GENERATE_INFOPLIST_FILE": "NO",')  # noqa: E731
+    without_key = lambda t: replaced(t, '        "INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n', "")  # noqa: E731
+    microphone = {"NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。"}
+    settings_case("Info.plist を生成しないとビルド設定のマイクの利用目的は使われない", 1, "NSMicrophoneUsageDescription がない",
+                  project=generate_no)
+    settings_case("GENERATE_INFOPLIST_FILE がない（既定は生成しない）", 1, "NSMicrophoneUsageDescription がない",
+                  project=lambda t: replaced(t, '        "GENERATE_INFOPLIST_FILE": "YES",\n', ""))
+    settings_case("生成しない Info.plist にマイクの利用目的がある", 0, "OK",
+                  project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
+                  plists={"Config/App-Settings.plist": microphone})
+    settings_case("生成しない Info.plist のマイクの利用目的が空", 1, "Config/App-Settings.plist の NSMicrophoneUsageDescription が空",
+                  project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
+                  plists={"Config/App-Settings.plist": {"NSMicrophoneUsageDescription": " "}})
+    settings_case("マイクの利用目的を参照先の Info.plist だけに置く", 0, "OK",
+                  project=lambda t: info_plist_file("Config/App-Settings.plist")(without_key(t)),
+                  plists={"Config/App-Settings.plist": microphone})
+    settings_case("生成する場合も参照先の Info.plist のマイクの利用目的が空なら違反", 1, "NSMicrophoneUsageDescription が空",
+                  project=info_plist_file("Config/App-Settings.plist"),
+                  plists={"Config/App-Settings.plist": {"NSMicrophoneUsageDescription": ""}})
+    # CODE_SIGN_ENTITLEMENTS が指すファイルは、拡張子にかかわらず検査する
+    def entitlements_file(value: str) -> Callable[[str], str]:
+        return lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",',
+                                  f'"GENERATE_INFOPLIST_FILE": "YES",\n        "CODE_SIGN_ENTITLEMENTS": "{value}",')
+    settings_case("CODE_SIGN_ENTITLEMENTS が指すファイルの違反", 1, "aps-environment",
+                  project=entitlements_file("Config/App-Signing.plist"),
+                  plists={"Config/App-Signing.plist": {"aps-environment": "development"}})
+    settings_case("CODE_SIGN_ENTITLEMENTS が指す合格のファイル", 0, "OK",
+                  project=entitlements_file("$(SRCROOT)/Config/App-Signing.plist"),
+                  plists={"Config/App-Signing.plist": {"com.apple.security.application-groups": ["group.sample"]}})
+    settings_case("CODE_SIGN_ENTITLEMENTS が指すファイルがない", 2, "読めない", project=entitlements_file("Config/Missing.plist"))
+    settings_case("CODE_SIGN_ENTITLEMENTS の展開できない変数", 2, "展開できない",
+                  project=entitlements_file("$(UNKNOWN)/App.entitlements"))
     settings_case("読めない設定は合格にしない", 2, "読めない", project=lambda t: t + "{")
     settings_case("ターゲットがない設定は合格にしない", 2, "読めない", project=lambda t: '{"build-settings": {}, "targets": []}')
 
@@ -325,6 +358,26 @@ def test_dependencies() -> None:
     }.items():
         dependencies_case(f"確定版を含む版の指定（{label}）", 0, "OK",
                           {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
+    # コメントの中の宣言は依存として数えない（文字列の中の「//」はコメントではない）
+    unlisted = '.package(url: "https://example.org/other/unlisted.git", from: "1.0.0")'
+    for label, declaration in {
+        "行コメント": f"// {unlisted}",
+        "ブロックコメント": f"/* {unlisted} */",
+        "入れ子のブロックコメント": f"/* /* 内側 */ {unlisted} */",
+    }.items():
+        dependencies_case(f"コメントだけの依存宣言（{label}）", 0, "OK", {"Package.swift": declare.format(declaration)})
+    dependencies_case("コメントの後ろの宣言は検査する", 1, "unlisted.git", {"Package.swift": declare.format(f"/* x */ {unlisted}")})
+    # 補間の中の文字列で外側の文字列が閉じたと見なすと、補間の中の「/*」「//」がコメントの始まりに見え、宣言を隠す
+    for label, declaration in {
+        "ブロックコメントの記号": f'let s = "\\(f("/*"))"\n{unlisted}\n// */',
+        "行コメントの記号": f'let s = "\\(f("//"))"; {unlisted}',
+        "生の文字列": f'let s = #"\\#(f("/*"))"#\n{unlisted}\n// */',
+        "括弧を含む文字列": f'let s = "\\(g(")") + "/*")"\n{unlisted}\n// */',
+    }.items():
+        dependencies_case(f"補間の中の文字列（{label}）で宣言を隠さない", 1, "unlisted.git",
+                          {"Package.swift": declare.format(declaration)})
+    dependencies_case("閉じていないブロックコメントは合格にしない", 2, "閉じていない",
+                      {"Package.swift": declare.format(f"/* {unlisted}")})
     dependencies_case("区間の上限は含まない", 1, "合わない",
                       {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", "1.0.0"..<"1.2.3")')},
                       [approved])
@@ -419,12 +472,18 @@ DOCS = {
         f"<!-- excerpt: scripts/sample.sh -->\n\n{FENCE}bash\necho one\n{FENCE}\n"
     ),
 }
+# 印の書き方を説明する、長いフェンスの中の例（実ファイルと一致しない内容とない元のファイルを含む）
+EXAMPLE_AFTER = "満たす要件: FR-AAA-01〜02 ／ 決定: BD-SMP-01、UD-01\n\n"
+EXAMPLE_MARKERS = (
+    f"{FENCE}`markdown\n<!-- file: scripts/sample.sh -->\n\n{FENCE}bash\necho example\n{FENCE}\n\n"
+    f"<!-- excerpt: scripts/missing.sh -->\n\n{FENCE}bash\necho example\n{FENCE}\n{FENCE}`\n\n"
+)
 
 
 def docs_case(label: str, want_code: int, want_text: str, name: str = "", old: str = "", new: str = "",
-              options: Optional[List[str]] = None) -> Path:
+              options: Optional[List[str]] = None, extra: Optional[Dict[str, str]] = None) -> Path:
     directory = Path(tempfile.mkdtemp())
-    for path, content in DOCS.items():
+    for path, content in list(DOCS.items()) + list((extra or {}).items()):
         if path == name:
             content = replaced(content, old, new)
         (directory / path).parent.mkdir(parents=True, exist_ok=True)
@@ -437,6 +496,9 @@ def test_docs() -> None:
     global count
     basic, detailed = "docs/02-basic-design/sample.md", "docs/03-detailed-design/sample.md"
     requirements = "docs/01-requirements/requirements.md"
+    # 入れ子の基本設計（設計決定の ID とリンクの相対パスを、入れ子の位置に合わせる）
+    nested_basic = replaced(replaced(DOCS[basic], "| BD-SMP-01 | 決定 |", "| BD-SMP-02 | 決定 |"),
+                            "](../01-requirements/", "](../../01-requirements/")
     created = [
         docs_case("整合した文書", 0, "MVP の要件 3 件"),
         docs_case("定義されていない ID", 1, "定義されていない ID: FR-AAA-09", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-AAA-09"),
@@ -465,7 +527,23 @@ def test_docs() -> None:
                   f"満たす要件: TST-AAA-01\n\n{FENCE}`text\n{FENCE}\n\n"),
         docs_case("チルダのフェンスのコード片", 0, "OK", detailed, f"{FENCE}bash\necho two\necho three\n{FENCE}",
                   "~~~bash\necho two\necho three\n~~~"),
-        docs_case("申し送りの解決が足りない", 1, "申し送りの解決の表が 1 行", detailed, "| 二つ目 | 済 |\n", ""),
+        docs_case("申し送りの解決が足りない", 1, "申し送り「二つ目」の解決が表にない", detailed, "| 二つ目 | 済 |\n", ""),
+        docs_case("重複した行で欠落した申し送りを埋めても合格にしない", 1, "申し送り「二つ目」の解決が表にない",
+                  detailed, "| 二つ目 | 済 |", "| 一つ目 | 済 |"),
+        docs_case("申し送りの解決の重複", 1, "申し送り「一つ目」の解決が表に 2 行ある",
+                  detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 一つ目 | 再掲 |"),
+        docs_case("基本設計にない申し送りの行", 1, "基本設計にない申し送り「三つ目」", detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 三つ目 | 済 |"),
+        # 設計書の配下のディレクトリの文書も検査する。対応する基本設計は詳細設計からの相対パスで決まる
+        docs_case("入れ子の詳細設計に対応する基本設計がない", 1, "対応する基本設計 docs/02-basic-design/sub/nested.md がない",
+                  extra={"docs/03-detailed-design/sub/nested.md": DOCS[detailed]}),
+        docs_case("入れ子の基本設計と詳細設計の組", 0, "OK",
+                  extra={"docs/02-basic-design/sub/nested.md": nested_basic,
+                         "docs/03-detailed-design/sub/nested.md": DOCS[detailed]}),
+        docs_case("入れ子の基本設計の必須の節", 1, "docs/02-basic-design/sub/nested.md: 「テスト観点」の節がない",
+                  extra={"docs/02-basic-design/sub/nested.md": replaced(
+                      nested_basic, "## 3. テスト観点", "## 3. その他")}),
+        # フェンスの中の印は説明用の例であり、照合しない
+        docs_case("フェンスの中の印は照合しない", 0, "OK", detailed, EXAMPLE_AFTER, EXAMPLE_AFTER + EXAMPLE_MARKERS),
         docs_case("全文のコード片が実ファイルと違う", 1, "コード片が scripts/sample.sh と一致しない", detailed, "echo one\necho two\necho three", "echo one\necho two"),
         docs_case("一部のコード片が実ファイルと違う", 1, "コード片が scripts/sample.sh と一致しない", detailed, f"bash\necho two\necho three\n{FENCE}", f"bash\necho two\necho four\n{FENCE}"),
         docs_case("コード片の元のファイルがない", 1, "元のファイルがない", detailed, "<!-- file: scripts/sample.sh -->", "<!-- file: scripts/missing.sh -->"),
@@ -478,7 +556,13 @@ def test_docs() -> None:
     count += 1
     if "echo one\necho two\necho three" not in (fixed / detailed).read_text(encoding="utf-8"):
         failures.append("docs: 書き直した後の文書に、実ファイルの内容がない")
-    for directory in created + [fixed]:
+    # --update-snippets も、フェンスの中の印のコード片を書き直さない
+    example = docs_case("フェンスの中の印は書き直さない", 0, "OK", detailed, EXAMPLE_AFTER, EXAMPLE_AFTER + EXAMPLE_MARKERS,
+                        options=["--update-snippets"])
+    count += 1
+    if EXAMPLE_MARKERS not in (example / detailed).read_text(encoding="utf-8"):
+        failures.append("docs: フェンスの中の印のコード片が書き直された")
+    for directory in created + [fixed, example]:
         shutil.rmtree(directory)
 
 

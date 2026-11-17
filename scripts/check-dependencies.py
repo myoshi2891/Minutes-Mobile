@@ -96,6 +96,97 @@ def strings(node: object) -> Iterator[str]:
             yield from strings(item)
 
 
+def strip_comments(text: str) -> str:
+    """Swift のコメントを空白に置き換える（改行は残し、位置を変えない）。文字列リテラルの中の「//」「/*」は残す。
+
+    ブロックコメントは Swift と同じく入れ子にできる。閉じていないブロックコメントは読めないものとして扱う
+    （以降をすべてコメントと見なすと、宣言を見落として合格にしうるため）。
+    """
+    out: List[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = length if end < 0 else end
+            out.append(" " * (end - index))
+            index = end
+        elif text.startswith("/*", index):
+            depth = 0
+            start = index
+            while index < length:
+                if text.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif text.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                    if depth == 0:
+                        break
+                else:
+                    index += 1
+            if depth != 0:
+                raise Unreadable("ブロックコメントが閉じていない")
+            out.append("".join(char if char == "\n" else " " for char in text[start:index]))
+        elif starts_string(text, index):
+            # 文字列リテラル（"…"・"""…"""・#"…"#）は、閉じるまでそのまま写す
+            end = string_end(text, index)
+            out.append(text[index:end])
+            index = end
+        else:
+            out.append(text[index])
+            index += 1
+    return "".join(out)
+
+
+def starts_string(text: str, index: int) -> bool:
+    return text[index] == '"' or (text[index] == "#" and re.match(r'#+"', text[index:]) is not None)
+
+
+def string_end(text: str, index: int) -> int:
+    """index で始まる文字列リテラルの終わりの次の位置を返す。閉じていなければ末尾。
+
+    補間（\\(…)、生の文字列では \\#(…)）の中は括弧の対応で読み、中の文字列リテラルで外側が閉じたと見なさない
+    （見なすと、補間の中の「/*」「//」をコメントの始まりと取り違え、後ろの宣言を隠すため）。
+    """
+    hashes = len(text[index:]) - len(text[index:].lstrip("#"))
+    quote_at = index + hashes
+    quotes = '"""' if text.startswith('"""', quote_at) else '"'
+    closing = quotes + "#" * hashes
+    escape = "\\" + "#" * hashes
+    cursor = quote_at + len(quotes)
+    while cursor < len(text):
+        if text.startswith(closing, cursor):
+            return cursor + len(closing)
+        if text.startswith(escape, cursor):
+            cursor += len(escape)
+            if cursor < len(text) and text[cursor] == "(":
+                cursor = interpolation_end(text, cursor)
+            else:
+                cursor += 1  # エスケープされた 1 文字
+            continue
+        cursor += 1
+    return len(text)
+
+
+def interpolation_end(text: str, start: int) -> int:
+    """start の位置の「(」に対応する「)」の次の位置を返す。中の文字列リテラルは string_end で読み飛ばす。"""
+    depth = 0
+    cursor = start
+    while cursor < len(text):
+        if starts_string(text, cursor):
+            cursor = string_end(text, cursor)
+            continue
+        if text[cursor] == "(":
+            depth += 1
+        elif text[cursor] == ")":
+            depth -= 1
+            if depth == 0:
+                return cursor + 1
+        cursor += 1
+    return len(text)
+
+
 def call_arguments(text: str, start: int) -> str:
     """start の位置の「(」に対応する「)」までの引数を返す。文字列リテラルの中の括弧は数えない。閉じていなければ末尾まで。"""
     depth = 0
@@ -196,7 +287,9 @@ def manifest_errors(
     """Package.swift の取得元と版を調べる。取得元・版を文字列リテラルから判定できない宣言は合格にしない。
 
     approved は URL → 承認した版、pins は URL → 同じディレクトリの Package.resolved の確定版。
+    コメントは先に除き、URL・宣言・版の検索はすべてコメントを除いた内容に対して行う。
     """
+    manifest = strip_comments(manifest)
     approved = approved or {}
     pins = pins or {}
     errors: List[str] = []
@@ -259,7 +352,11 @@ def check(root: Path, allowlist: Path) -> List[str]:
         except (OSError, UnicodeDecodeError) as error:
             raise Unreadable(f"{path}: {error}") from error
         pins = pins_by_directory.get(path.parent, {})
-        errors.extend(f"{path.relative_to(root)}: {message}" for message in manifest_errors(manifest, by_url, approved_versions, pins))
+        try:
+            found = manifest_errors(manifest, by_url, approved_versions, pins)
+        except Unreadable as error:
+            raise Unreadable(f"{path}: {error}") from error
+        errors.extend(f"{path.relative_to(root)}: {message}" for message in found)
     for path in find_files(root, "project.xcproj"):
         for text in strings(load_project(path)):
             if REMOTE_URL.search(text) and normalize(text) not in by_url:
