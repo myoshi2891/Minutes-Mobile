@@ -1,6 +1,6 @@
 # MinutesMobile
 
-iPhone だけで会議を録音し、端末の外へデータを送らずに文字起こしまで行う議事録アプリ。PC/Web 版 Minutes の原則（Recording is Source of Truth / Zero External Data Egress）を iOS へ移植する。
+iPhone だけで会議を録音し、アプリ自身は端末の外へデータを送らずに文字起こしまで行う議事録アプリ。PC/Web 版 Minutes の原則（Recording is Source of Truth / Zero External Data Egress）を iOS へ移植する。
 
 現在の状態: 要件定義（2026-11-14 初版）と基本設計（2026-11-15 初版・MVP の 7 文書）。詳細設計は 1 文書目（開発環境と検査。2026-11-16）を作成し、検査の仕組み（`scripts/`）を入れた。アプリの実装は未着手。
 
