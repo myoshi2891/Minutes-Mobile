@@ -61,6 +61,7 @@
 
 | 日付 | 内容 |
 | --- | --- |
+| 2026-11-18 | レビュー対応（7 件）: `force_unwrapping` の既定の例外（`URL(string:)`・`UIImage(named:)` など）を空にし違反例を追加。FR-FIN-01 ③に永続化した未保存の記録 0 件を追加し、記録を永続化できない場合（④〜⑥: 自動確定を許容・表示に追記・`lossRecord` に記録しない）を明記（TST-FIN-01・02、storage.md §5.1、ui.md §4 も更新）。NFR-REL-04 に「書き込み失敗でメモリ保持中は 1 Chunk の上限を保証しない」の但し書きを追加し、storage.md §6 に整合の説明を追加。`check.sh --staged` の手順 10 をインデックス全体で照合。依存の検査で補間の中のコメントを読み飛ばし、行コメントを CR・LF・CRLF で終える。設定の検査の除外を root 直下に限り枝刈り。`test_destination` の失敗を伝播 |
 | 2026-11-18 | レビュー対応（3 件）: Documents の検出を例外の場所のない `no_documents_directory` に分離（保存ルートの型の中の指定も違反例 `violation/Storage/StorageRoot.swift` で試験。`test-lint-rules.py` が `violation/` 配下を読む）、`check.sh` は未コミットの変更がある・検査中に HEAD が変わった場合にハッシュ付きの合格を出さない、目的文を「アプリ自身は送信しない」に改め標準のコピー・切り取りのユニバーサルクリップボード同期を SEC-PLT-01 の残る危険に明記。§2 の次のアクションは変わらない |
 | 2026-11-18 | レビュー対応（7 件）: `no_empty_catch` が行コメントの中の `{`・`}` を取り違えない、`no_direct_logger` が `Logger.init(` を検出、マイクの利用目的を構成と SDK の組ごとに判定、`check.sh --staged` の規則の試験をインデックスの内容で実行、欠落区間を空白区間と別の区分に（FR-FIN-02 ③・FR-TRV-03・用語集・export.md §2・storage.md・ui.md・transcription.md）、TST-DEV-01 ②の必要サンプル数から記録した空白区間を差し引く、Apple Intelligence の可否を MVP の設定画面に表示（ui.md §4.6・architecture.md §7）。§2 の次のアクションは変わらない |
 | 2026-11-18 | レビュー対応（4 件）: `setup-tools.sh` が末尾に改行のない最終行を読む・導入済みのツールの再利用に実行時の版の一致を追加、`verify-docs.py` が申し送りの解決の列が空の行を解決と見なさない、P2 のノートの編集欄の標準のコピー・切り取りを残る危険として扱う（SEC-PLT-01・ui.md §7.3） |
