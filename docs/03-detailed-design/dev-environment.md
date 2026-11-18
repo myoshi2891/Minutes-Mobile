@@ -377,7 +377,8 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 
 - ファイルの一部だけをステージした場合も、コミットされる内容（インデックス）だけを検査する。作業ツリーで直しただけでステージしていない違反は、コミットを止める。
 - 違反の表示は一時ディレクトリのパスになる（末尾の相対パスは元の位置と同じ）。
-- 成功すると、対象のコミットのハッシュと、未コミットの変更の有無を表示する。PR の説明にはこの行を貼る（基本設計 §6.2）。
+- 成功すると、検査したツリーが対象のコミットと一致する場合（開始時と終了時のどちらにも未コミットの変更がなく、検査中に HEAD が変わっていない場合）だけ、そのコミットのハッシュを付けて表示する。PR の説明にはこの行を貼る（基本設計 §6.2）。
+- 未コミットの変更（追跡していないファイルを含む）がある作業ツリーを検査した場合は、ハッシュを付けず「コミットの合格としては記録しない」と表示する。作業中の確認には使えるが、PR の説明に貼る結果は、変更をすべてコミットした状態で再実行して得る。
 
 <!-- file: scripts/check.sh -->
 
@@ -632,6 +633,14 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
+# 通常の実行は作業ツリーを検査する。開始時と終了時の HEAD と未コミットの変更を控え、
+# 検査したツリーがコミットと一致する場合だけ、そのコミットの合格として表示する
+START_HEAD=""
+START_CHANGES=""
+if [ "$STAGED" = 0 ]; then
+  START_HEAD=$(git rev-parse HEAD)
+  START_CHANGES=$(git status --porcelain)
+fi
 
 for step in $STEPS; do
   echo "== 手順 $step: $(title "$step")"
@@ -645,9 +654,15 @@ done
 if [ "$STAGED" = 1 ]; then
   echo "OK: コミット前の検査を通過"
 else
-  dirty="なし"
-  [ -z "$(git status --porcelain)" ] || dirty="あり"
-  echo "OK: 手順$STEPS を通過（コミット $(git rev-parse HEAD)、未コミットの変更 ${dirty}）"
+  end_head=$(git rev-parse HEAD)
+  end_changes=$(git status --porcelain)
+  if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
+    # 未コミットの変更を含む作業ツリーを検査した（または検査中にコミットが変わった）。コミットの合格にはしない
+    echo "OK: 手順$STEPS を通過（未コミットの変更あり。コミットの合格としては記録しない）"
+    echo "注意: PR の説明に貼る結果は、変更をすべてコミットした状態で再実行して得る" >&2
+  else
+    echo "OK: 手順$STEPS を通過（コミット ${end_head}、未コミットの変更なし）"
+  fi
 fi
 ```
 
@@ -735,7 +750,7 @@ fi
 
 ### 6.1 基本設計の表との対応
 
-基本設計 §7 の 14 行を、SwiftLint の組み込みの規則 3 つと独自ルール 18 個で実現する。
+基本設計 §7 の 14 行を、SwiftLint の組み込みの規則 3 つと独自ルール 19 個で実現する。
 
 | 基本設計 §7 の行 | 規則 | 例外を認める場所 |
 | --- | --- | --- |
@@ -749,7 +764,7 @@ fi
 | `try!`・`as!`・強制アンラップ | 組み込みの `force_try`・`force_cast`・`force_unwrapping` | テストコード（§6.4） |
 | 空の `catch` | `no_empty_catch`（本体がコメントだけの場合も含む） | なし |
 | `UserDefaults` の直接の利用 | `no_direct_user_defaults` | 設定の型 |
-| `.documentDirectory`・`NSTemporaryDirectory`・ディレクトリの直接の作成 | `no_direct_directory_access` | 保存ルートの型、テスト用の一時ディレクトリの型 |
+| `.documentDirectory`・`NSTemporaryDirectory`・ディレクトリの直接の作成 | `no_documents_directory`（`.documentDirectory`）・`no_direct_directory_access`（一時ディレクトリとディレクトリの作成） | `no_documents_directory` はなし（保存ルートの型の中でも Documents を使わせない）。`no_direct_directory_access` は保存ルートの型、テスト用の一時ディレクトリの型 |
 | `UIPasteboard`、`.textSelection(` | `no_direct_pasteboard` | コピーの型 |
 | `ShareLink` | `no_share_link` | なし |
 | `WKWebView`・`import WebKit` | `no_webkit` | なし |
@@ -761,7 +776,8 @@ fi
 | 規則 | 足したもの | 理由 |
 | --- | --- | --- |
 | `no_direct_user_defaults` | `@AppStorage` | SwiftUI から `UserDefaults` に直接書く経路になる（SEC-DAT-07） |
-| `no_direct_directory_access` | `URL.documentsDirectory`・`temporaryDirectory` | 同じ場所を指す新しい書き方がある |
+| `no_documents_directory` | `URL.documentsDirectory` | 同じ場所を指す新しい書き方がある |
+| `no_direct_directory_access` | `temporaryDirectory` | 同じ場所を指す新しい書き方がある |
 | `no_direct_clock` | `ContinuousClock`・`SuspendingClock`・`CFAbsoluteTimeGetCurrent`・`DispatchTime.now`・`systemUptime` など | 単調時計も注入の対象である（TST-GEN-01） |
 | `no_direct_sleep_timer` | `Thread.sleep`・`sleep(`・`Timer.scheduledTimer`・`asyncAfter` など | タイマーも注入の対象である（TST-GEN-01） |
 | `no_spotlight_user_activity` | `.userActivity(`・`.onContinueUserActivity(` | SwiftUI から `NSUserActivity` を提供する経路になる（SEC-PLT-02） |
@@ -881,14 +897,22 @@ custom_rules:
     message: "UserDefaults は設定の型の中だけで使う（SEC-DAT-07）"
     severity: error
 
+  # Documents は保存ルートの型の中でも使わない（保存先は Application Support に限る）。例外の場所を持たない
+  no_documents_directory:
+    name: "Documents ディレクトリの禁止"
+    regex: '\.documentDirectory\b|\bdocumentsDirectory\b'
+    match_kinds: *code
+    message: "保存先は Application Support に限る（SEC-DAT-04）"
+    severity: error
+
   no_direct_directory_access:
-    name: "保存先の直接の指定とディレクトリの直接の作成の禁止"
-    regex: '\.documentDirectory\b|\bdocumentsDirectory\b|\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
+    name: "一時ディレクトリの直接の指定とディレクトリの直接の作成の禁止"
+    regex: '\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
     excluded:
       - '.*/Storage/StorageRoot\.swift'
       - '.*/TestSupport/TemporaryDirectory\.swift'
     match_kinds: *code
-    message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03・04）"
+    message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03）"
     severity: error
 
   no_direct_pasteboard:
@@ -1001,6 +1025,7 @@ disabled_rules:
 | `violation.swift` | 検出される例。検出されるはずの行の末尾に `// expect: <規則名>` を書く | 印の行の集合と、検出された行の集合が一致する |
 | `ok.swift` | 検出されない例（コメント・文字列の中の名前、似た名前の別の API など） | 検出が 0 件 |
 | `allowed/<例外のパス>` | 例外の場所に置いた違反 | 検出が 0 件 |
+| `violation/<パス>`（任意） | 例外の場所に似たパスに置いた違反。例外を持たない規則で、パスによる抜け道がないことを確かめる（例: `no_documents_directory/violation/Storage/StorageRoot.swift`） | 印の行の集合と、検出された行の集合が一致する |
 
 - 「1 件以上検出する」ではなく行の集合の一致で判定する。規則が弱くなった場合（3 つのうち 1 つしか検出しないなど）を見逃さないためである。
 - 試験のない規則は作れない。規則に試験用のディレクトリがない、例外のある規則に `allowed/` がない、規則のないディレクトリが残っている、のいずれも失敗にする。
@@ -1446,7 +1471,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
-| 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 21 規則・55 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない |
+| 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 22 規則・58 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない |
 | 設定の検査 | `scripts/test-checks.py settings` | 66 件 | 合格する設定で通り、項目ごとの違反で失敗する。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
 | 依存の検査 | `scripts/test-checks.py dependencies` | 45 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
 | 版の照合 | `scripts/test-checks.py versions` | 8 件 | 版・SHA-256・形式・行の不足・`gh` の行の順序で失敗する |
@@ -1466,6 +1491,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 検査スクリプトの処理（条件付きの設定を見ない、文字列の中のカンマを区別しない、依存の照合を無効にする、導入記録の SHA-256 を照合しない など） | 7 | すべて失敗した |
 | `check.sh`（手順の先頭に失敗するコマンドを入れる、手順の外で未定義の変数を使う） | 2 | どちらも終了コード 1 |
 | 2026-11-16 の追加分（`check-dependencies.py`・`check-project-settings.py`・`verify-docs.py`・`setup-tools.sh` を変更前の版に戻す。`setup-tools.sh` の `gh` の行の順序の照合だけを外す、実行時の版の比較だけを外す） | 6 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
+| 2026-11-18 の追加分（`no_documents_directory` に保存ルートの型の除外を戻す） | 1 | 失敗した（例外の場所がないのに `allowed/` がない、`violation/Storage/StorageRoot.swift` の検出行が不一致） |
 | `check.sh` を変更前の版に戻し、`print` を含む内容をステージして作業ツリーだけを直す | 1 | 変更前は手順 2 が通過し、変更後は失敗した（作業ツリーではなくインデックスを検査している） |
 | 文書の検査（未定義の ID を報告しない、範囲の省略を展開しない、MVP の網羅を調べない、コード片の不一致を報告しない など） | 15 | すべて失敗した |
 | 2026-11-17 の追加分（`no_empty_catch` の条件の文字列の読み飛ばしを外す。依存のコメントの除去を呼ばない・文字列を扱わない・入れ子を数えない・補間を追わない・補間の中の文字列を読み飛ばさない。設定の未設定の生成を有効と見なす・生成しない構成でビルド設定を数える・ビルド設定や参照先の Info.plist を見ない・`CODE_SIGN_ENTITLEMENTS` を見ない。文書の申し送りの重複や余分な行を見ない・照合や書き直しでフェンスを無視する・入れ子の文書を見ない） | 16 | すべて失敗した |
