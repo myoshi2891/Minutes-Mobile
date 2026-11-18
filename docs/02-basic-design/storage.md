@@ -186,7 +186,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    A["停止（recording → stop_requested）"] --> B["末尾の Chunk を保存"]
+    A["停止（recording → stop_requested）"] --> B["末尾の Chunk の保存を試みる<br/>（失敗したらメモリに保持。成否にかかわらず次へ）"]
     B --> C["finalizing"]
     C --> D{"Barrier"}
     D -->|"通過"| E["finalized<br/>確定方式 = barrier"]
