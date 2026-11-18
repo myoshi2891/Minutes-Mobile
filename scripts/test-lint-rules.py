@@ -5,6 +5,7 @@ tools/lint-fixtures/<規則名>/ の各ファイルを SwiftLint にかけ、
 「// expect: <規則名>」の付いた行だけがその規則で検出されることを確かめる。
 
   violation.swift  検出される例（印が 1 行以上）
+  violation/**     ほかの規則の例外の場所などのパスに置いた違反（印が 1 行以上。検出されること）
   ok.swift         検出されない例（印なし）
   allowed/**       例外を認める場所のパスに置いた違反（印なし。検出されないこと）
 
@@ -81,6 +82,13 @@ def collect(rules: Dict[str, bool], errors: List[str]) -> List[Tuple[Path, str, 
             errors.append(f"{ok.relative_to(ROOT)}: 正常例に印がある")
         cases.append((violation, rule, violation_lines))
         cases.append((ok, rule, set()))
+        # 例外の場所に似たパスでも検出されることを確かめる例（例外を持たない規則で、パスによる抜け道がないこと）
+        placed = sorted((directory / "violation").rglob("*.swift")) if (directory / "violation").is_dir() else []
+        for path in placed:
+            placed_lines = expected_lines(path, rule, errors)
+            if not placed_lines:
+                errors.append(f"{path.relative_to(ROOT)}: 印（// expect: {rule}）が 1 行もない")
+            cases.append((path, rule, placed_lines))
         allowed = sorted((directory / "allowed").rglob("*.swift")) if (directory / "allowed").is_dir() else []
         if has_exception and not allowed:
             errors.append(f"規則 {rule} には例外の場所があるのに、allowed/ の試験用ファイルがない")

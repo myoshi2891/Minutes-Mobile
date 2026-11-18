@@ -104,14 +104,22 @@ custom_rules:
     message: "UserDefaults は設定の型の中だけで使う（SEC-DAT-07）"
     severity: error
 
+  # Documents は保存ルートの型の中でも使わない（保存先は Application Support に限る）。例外の場所を持たない
+  no_documents_directory:
+    name: "Documents ディレクトリの禁止"
+    regex: '\.documentDirectory\b|\bdocumentsDirectory\b'
+    match_kinds: *code
+    message: "保存先は Application Support に限る（SEC-DAT-04）"
+    severity: error
+
   no_direct_directory_access:
-    name: "保存先の直接の指定とディレクトリの直接の作成の禁止"
-    regex: '\.documentDirectory\b|\bdocumentsDirectory\b|\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
+    name: "一時ディレクトリの直接の指定とディレクトリの直接の作成の禁止"
+    regex: '\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
     excluded:
       - '.*/Storage/StorageRoot\.swift'
       - '.*/TestSupport/TemporaryDirectory\.swift'
     match_kinds: *code
-    message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03・04）"
+    message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03）"
     severity: error
 
   no_direct_pasteboard:
