@@ -248,6 +248,14 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
+# 通常の実行は作業ツリーを検査する。開始時と終了時の HEAD と未コミットの変更を控え、
+# 検査したツリーがコミットと一致する場合だけ、そのコミットの合格として表示する
+START_HEAD=""
+START_CHANGES=""
+if [ "$STAGED" = 0 ]; then
+  START_HEAD=$(git rev-parse HEAD)
+  START_CHANGES=$(git status --porcelain)
+fi
 
 for step in $STEPS; do
   echo "== 手順 $step: $(title "$step")"
@@ -261,7 +269,13 @@ done
 if [ "$STAGED" = 1 ]; then
   echo "OK: コミット前の検査を通過"
 else
-  dirty="なし"
-  [ -z "$(git status --porcelain)" ] || dirty="あり"
-  echo "OK: 手順$STEPS を通過（コミット $(git rev-parse HEAD)、未コミットの変更 ${dirty}）"
+  end_head=$(git rev-parse HEAD)
+  end_changes=$(git status --porcelain)
+  if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
+    # 未コミットの変更を含む作業ツリーを検査した（または検査中にコミットが変わった）。コミットの合格にはしない
+    echo "OK: 手順$STEPS を通過（未コミットの変更あり。コミットの合格としては記録しない）"
+    echo "注意: PR の説明に貼る結果は、変更をすべてコミットした状態で再実行して得る" >&2
+  else
+    echo "OK: 手順$STEPS を通過（コミット ${end_head}、未コミットの変更なし）"
+  fi
 fi
