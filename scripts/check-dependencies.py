@@ -9,6 +9,7 @@ Package.swift の依存は、版の指定を同じディレクトリの Package.
 終了コード: 0 = 問題なし / 1 = 許可リスト外の依存あり / 2 = 読めない（読めないものを合格にしない）
 """
 import argparse
+import hashlib
 import json
 import posixpath
 import re
@@ -21,8 +22,10 @@ from xcproj import Unreadable, load_project
 ROOT = Path(__file__).resolve().parent.parent
 SKIPPED_DIRECTORIES = {".git", ".tools", ".build", "build", "DerivedData", "xcuserdata"}
 PACKAGE_FIELDS = ("identity", "url", "version", "license", "approvedOn", "ledger")
-# ローカルのバイナリ（.binaryTarget(path:)）の承認済みの項目は、url の代わりに path（リポジトリの起点からの相対パス）を持つ
-BINARY_FIELDS = ("identity", "path", "version", "license", "approvedOn", "ledger")
+# ローカルのバイナリ（.binaryTarget(path:)）の承認済みの項目は、url の代わりに path（リポジトリの起点からの相対パス）と、
+# 承認したときの内容のハッシュ sha256（content_digest の値）を持つ
+BINARY_FIELDS = ("identity", "path", "sha256", "version", "license", "approvedOn", "ledger")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 REMOTE_URL = re.compile(r"^(https?|ssh|git)://|^git@")
 
 
@@ -73,6 +76,11 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
         for field in (PACKAGE_FIELDS if "url" in package else BINARY_FIELDS):
             if not isinstance(package.get(field), str) or not package[field].strip():
                 raise Unreadable(f"{path}: 承認済みの依存に {field} がない")
+        # リモートのバイナリ（.binaryTarget(url:checksum:)）を承認する項目は checksum（配布物の SHA-256）を持つ。
+        # ローカルのバイナリの項目は sha256（内容のハッシュ）を持つ。どちらも 64 桁の小文字の 16 進数
+        for field in ("checksum", "sha256"):
+            if field in package and not (isinstance(package[field], str) and SHA256.fullmatch(package[field])):
+                raise Unreadable(f"{path}: {package['identity']} の {field} が 64 桁の小文字の 16 進数でない")
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", package["approvedOn"]):
             raise Unreadable(f"{path}: {package['identity']} の approvedOn が YYYY-MM-DD でない")
         # 許可するライセンス以外は、オーナーの決定（UD-nn）の記録が要る
@@ -322,6 +330,46 @@ SOURCE_DECLARATION = re.compile(r"\.(package|binaryTarget)\s*\(")
 # 文字列リテラルだけの引数（連結・補間・変数を含まない）。引数の終わりは「,」か末尾
 LITERAL_URL = re.compile(r'url:\s*"([^"\\]*)"\s*(?:,|$)')
 LITERAL_PATH = re.compile(r'path:\s*"([^"\\]*)"\s*(?:,|$)')
+LITERAL_CHECKSUM = re.compile(r'checksum:\s*"([^"\\]*)"\s*(?:,|$)')
+
+
+def content_digest(path: Path) -> str:
+    """ローカルのバイナリの内容のハッシュ（SHA-256 の 16 進数）を返す。
+
+    ファイルはその内容から、ディレクトリ（.xcframework など）は配下のすべての項目から決定的に作る。
+    配下の項目は相対パスの順に「種別・相対パス・内容の SHA-256（シンボリックリンクはリンクの先の文字列）」を連ねる。
+    シンボリックリンクはたどらずにリンクの先の文字列を記録する（外のファイルを内容に取り込まない）。
+    ないパス・読めない項目は読めないものとして扱う（承認と照合できないものを合格にしない）。
+    """
+    def file_hash(item: Path) -> str:
+        digest = hashlib.sha256()
+        with item.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    try:
+        if path.is_symlink():
+            raise Unreadable(f"{path}: ローカルのバイナリの起点がシンボリックリンク")
+        if path.is_file():
+            return file_hash(path)
+        if not path.is_dir():
+            raise Unreadable(f"{path}: ローカルのバイナリがない")
+        digest = hashlib.sha256()
+        for item in sorted(path.rglob("*"), key=lambda found: found.relative_to(path).as_posix()):
+            relative = item.relative_to(path).as_posix()
+            if item.is_symlink():
+                entry = f"L\0{relative}\0{item.readlink()}"
+            elif item.is_file():
+                entry = f"F\0{relative}\0{file_hash(item)}"
+            elif item.is_dir():
+                entry = f"D\0{relative}\0"
+            else:
+                raise Unreadable(f"{item}: ローカルのバイナリの中に通常のファイル・ディレクトリ以外の項目がある")
+            digest.update(entry.encode("utf-8") + b"\n")
+        return digest.hexdigest()
+    except OSError as error:
+        raise Unreadable(f"{path}: {error}") from error
 
 
 def literal_argument(arguments: str, masked: str, label: str, pattern: "re.Pattern[str]") -> Tuple[bool, Optional[str]]:
@@ -357,12 +405,14 @@ def version_errors(arguments: str, masked: str, summary: str, approved: Set[str]
 
 def manifest_errors(
     manifest: str, by_url: Dict[str, dict], approved: Optional[Dict[str, Set[str]]] = None,
-    pins: Optional[Dict[str, List[object]]] = None, by_path: Optional[Dict[str, dict]] = None, directory: str = ""
+    pins: Optional[Dict[str, List[object]]] = None, by_path: Optional[Dict[str, dict]] = None, directory: str = "",
+    root: Optional[Path] = None
 ) -> List[str]:
     """Package.swift の取得元と版を調べる。取得元・版を文字列リテラルから判定できない宣言は合格にしない。
 
     approved は URL → 承認した版、pins は URL → 同じディレクトリの Package.resolved の確定版、
-    by_path はローカルのバイナリのパス → 承認済みの項目、directory は Package.swift のディレクトリ（起点からの相対）。
+    by_path はローカルのバイナリのパス → 承認済みの項目、directory は Package.swift のディレクトリ（起点からの相対）、
+    root は探す起点（ローカルのバイナリの内容のハッシュを承認と照合するために読む）。
     コメントは先に除く。宣言とキーワードは文字列リテラルの本文を除いた内容から探し、
     取得元と版は、その宣言の引数の中だけで調べる。
     """
@@ -390,6 +440,18 @@ def manifest_errors(
             elif kind == "package":
                 errors.extend(version_errors(arguments, masked_arguments, summary,
                                              approved.get(normalize(url), set()), pins.get(normalize(url))))
+            else:
+                # リモートのバイナリは URL だけでなく、承認した配布物の checksum と宣言の checksum の一致を求める
+                # （同じ URL の配布物が承認の後に差し替えられても通さない）
+                approved_checksum = by_url[normalize(url)].get("checksum")
+                has_checksum, checksum = literal_argument(arguments, masked_arguments, "checksum", LITERAL_CHECKSUM)
+                if not approved_checksum:
+                    errors.append(f"リモートのバイナリ {url} の承認に checksum がない（承認した配布物の SHA-256 を記録する）: "
+                                  f".binaryTarget({summary})")
+                elif not has_checksum or checksum is None:
+                    errors.append(f"checksum を判定できない（文字列リテラルで書く）: .binaryTarget({summary})")
+                elif checksum != approved_checksum:
+                    errors.append(f"リモートのバイナリ {url} の checksum {checksum} が承認したもの（{approved_checksum}）と違う")
         elif not has_path or path is None:
             errors.append(f"取得元を判定できない（url: か path: を文字列リテラルで書く）: .{kind}({summary})")
         elif kind == "binaryTarget":
@@ -397,6 +459,12 @@ def manifest_errors(
             location = normalize_path(posixpath.join(directory, path))
             if location not in by_path:
                 errors.append(f"ローカルのバイナリ {location} は許可リストにない: .binaryTarget({summary})")
+            elif root is not None:
+                # 場所が一致しても、承認したときの内容と違えば認めない（再承認を求める）
+                actual = content_digest(root / location)
+                if actual != by_path[location]["sha256"]:
+                    errors.append(f"ローカルのバイナリ {location} の内容が承認したものと違う（現在 {actual}）。"
+                                  "確かめてから許可リストの sha256 を更新し、再承認を得る")
     return errors
 
 
@@ -454,7 +522,7 @@ def check(root: Path, allowlist: Path) -> List[str]:
         pins = pins_by_directory.get(path.parent, {})
         try:
             found = manifest_errors(manifest, by_url, approved_versions, pins, by_path,
-                                    path.parent.relative_to(root).as_posix())
+                                    path.parent.relative_to(root).as_posix(), root)
         except Unreadable as error:
             raise Unreadable(f"{path}: {error}") from error
         errors.extend(f"{path.relative_to(root)}: {message}" for message in found)

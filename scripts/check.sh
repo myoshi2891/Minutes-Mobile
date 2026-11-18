@@ -27,8 +27,12 @@ PACKAGE="Packages/MinutesKit"
 UI_TESTS="MinutesMobileUITests"
 MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
-# 手順 7 がカバレッジを測ったコミットの記録（手順 8 が集計の前に現在の HEAD と照合する）
+# 手順 7 がカバレッジを測った入力の記録（手順 8 が集計の前に現在の入力と照合する）。
+# 未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」を書く
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
+# gitleaks の履歴の検査で git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、
+# 既定の 2 つも書く。-m でマージのコミットの差分も検査する（マージの解決で足した行を見落とさない）
+GITLEAKS_LOG_OPTS="--all --full-history -m"
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
@@ -56,7 +60,8 @@ expand_steps() {
       *-*) first=${part%-*}; last=${part#*-} ;;
       *) first=$part; last=$part ;;
     esac
-    [[ $first =~ ^[0-9]+$ && $last =~ ^[0-9]+$ ]] || usage
+    # 番号は先頭に 0 のない正規の形だけを認める（08 などは bash の算術で 8 進数として読まれ、範囲の判定を誤るため）
+    [[ $first =~ ^(0|[1-9][0-9]*)$ && $last =~ ^(0|[1-9][0-9]*)$ ]] || usage
     if [ "$first" -gt "$last" ] || [ "$last" -gt "$LAST_STEP" ]; then usage; fi
     number=$first
     while [ "$number" -le "$last" ]; do
@@ -188,7 +193,7 @@ step_3() {
     git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
   else
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml .
+    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --log-opts="$GITLEAKS_LOG_OPTS" .
     scripts/test-checks.py gitleaks
   fi
 }
@@ -201,6 +206,26 @@ step_4() {
 step_5() {
   scripts/test-checks.py dependencies
   scripts/check-dependencies.py
+}
+
+# カバレッジを測った入力の識別子。未コミットの変更がなければ HEAD のコミット、あれば作業ツリー全体（追跡していない
+# ファイルを含む。無視するファイルは除く）のツリーのハッシュ。作業ツリーの記録はコミットの合格の記録と区別する
+coverage_input() {
+  local index tree
+  if [ -z "$(git status --porcelain --untracked-files=normal)" ]; then
+    printf 'commit %s\n' "$(git rev-parse HEAD)"
+    return 0
+  fi
+  # 一時のインデックスに作業ツリーを写してツリーを作る（本来のインデックスとステージの内容は変えない）
+  index=$(mktemp)
+  rm -f -- "$index"
+  if ! GIT_INDEX_FILE="$index" git read-tree HEAD || ! GIT_INDEX_FILE="$index" git add -A \
+    || ! tree=$(GIT_INDEX_FILE="$index" git write-tree); then
+    rm -f -- "$index"
+    return 1
+  fi
+  rm -f -- "$index"
+  printf 'worktree %s\n' "$tree"
 }
 
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
@@ -221,24 +246,32 @@ step_6() {
 step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
+  local measured
   rm -f -- "$COVERAGE_HEAD"
+  # 測る前の入力を控え、測った後も同じ場合だけ記録する（測定中に変わった入力の結果をどちらにも帰属させない）
+  measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
   swift test --package-path "$PACKAGE" --enable-code-coverage
-  git rev-parse HEAD > "$COVERAGE_HEAD"
+  [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
+  printf '%s\n' "$measured" > "$COVERAGE_HEAD"
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
 }
 
 step_8() {
-  local report measured
+  local report measured current
+  scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
-  # 別のコミットで測った記録を集計しない
-  [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測ったコミットの記録がない。手順 7 を先に実行する"
+  # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
+  [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
   measured=$(cat "$COVERAGE_HEAD")
-  [ "$measured" = "$(git rev-parse HEAD)" ] \
-    || fail "カバレッジは別のコミット（${measured}）で測ったもの。手順 7 を実行し直す"
+  current=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
+  [ "$measured" = "$current" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  case "$measured" in
+    worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
+  esac
   scripts/coverage-report.py "$report" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }

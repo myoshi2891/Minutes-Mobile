@@ -141,6 +141,35 @@ def table_cells(line: str) -> List[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
+TABLE_SEPARATOR = re.compile(r"^\|[ :|-]+\|$")
+
+
+def table_rows(body: List[str]) -> List[str]:
+    """本文の中の表のデータ行を返す。連続した「|」の行のまとまりごとに区切り、見出しの行の直後が区切りの行
+    （| --- |）である表だけを表として扱い、見出しと区切りの行を除いた行を返す。区切りの行のないまとまりは表として数えない。"""
+    rows: List[str] = []
+    block: List[str] = []
+    for line in body + [""]:
+        if line.startswith("|"):
+            block.append(line)
+            continue
+        if len(block) >= 2 and TABLE_SEPARATOR.match(block[1]) and not TABLE_SEPARATOR.match(block[0]):
+            rows.extend(row for row in block[2:] if not TABLE_SEPARATOR.match(row))
+        block = []
+    return rows
+
+
+def fence_indent(line: str) -> int:
+    """フェンスの開始行の字下げ（空白 0〜3 個）。"""
+    return len(line) - len(line.lstrip(" "))
+
+
+def dedent(line: str, indent: int) -> str:
+    """CommonMark と同じく、フェンスの本文の行から開始行の字下げの分だけ（あるだけ）先頭の空白を除く。"""
+    spaces = len(line) - len(line.lstrip(" "))
+    return line[min(spaces, indent):]
+
+
 class Checker:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -270,7 +299,10 @@ class Checker:
                 if fence_end(lines, number - 1) >= len(lines):
                     self.error(name, "コードフェンスが閉じていない", number)
             for number, line in prose_lines(text):
-                for target in re.findall(r"\]\(([^)\s]+)\)", line):
+                for target in re.findall(r"\]\((<[^<>\n]+>|[^)\s]+)\)", line):
+                    # 山括弧で囲んだリンク先（空白を含められる）は、山括弧を除いてから解決する
+                    if target.startswith("<") and target.endswith(">"):
+                        target = target[1:-1]
                     if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
                         continue
                     path = (self.root / name).parent / target.split("#", 1)[0]
@@ -327,22 +359,19 @@ class Checker:
         for number, heading, body in sections:
             if DETAILED_MAPPING not in heading:
                 continue
-            rows: List[str] = []
-            table: List[str] = []
-            for line in body + [""]:
-                if line.startswith("|"):
-                    if not re.match(r"^\|[ :|-]+\|$", line):
-                        table.append(line)
-                    continue
-                rows.extend(table[1:])
-                table = []
-            for line in rows:
+            for line in table_rows(body):
                 cells = table_cells(line)
                 if len(cells) < 2 or not any(cell.strip() for cell in cells[1:]):
                     continue
-                if self.names_requirements("満たす要件: " + cells[0]) and not cells[0].startswith("—"):
+                # 先頭の列は個々の要件 ID を持つこと（群の表記・「SEC 全般」は対応の行として数えない）
+                if self.names_individual_requirement(cells[0]):
                     return
             self.error(name, f"「{heading}」の節に、要件 ID とテストの両方を持つ対応表の行がない", number)
+
+    def names_individual_requirement(self, text: str) -> bool:
+        """定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）を個別に 1 つ以上含むか。省略した書き方は展開して照合する。"""
+        return any(identifier in self.defined and re.match(REQUIREMENT_PREFIX, identifier)
+                   for match in ID_PATTERN.finditer(text) for identifier in self.expand_ids(match))
 
     def names_requirements(self, line: str) -> bool:
         """「満たす要件:」の後（「／」の前まで）に、定義済みの要件 ID・要件の群・「SEC 全般」・「—」（満たす要件なし）のどれかがあるか。"""
@@ -376,19 +405,11 @@ class Checker:
             item_name(line[2:]) for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
             for line in body if line.startswith("- ")
         ]
-        # 表ごとに（連続した「|」の行のまとまりごとに）区切り、各表の見出しの行を除く
+        # 表ごとに（連続した「|」の行のまとまりごとに）区切り、見出しと区切りの行を持つ表のデータ行だけを数える
         rows: List[str] = []
         for _, heading, body in sections:
-            if "申し送り" not in heading:
-                continue
-            table: List[str] = []
-            for line in body + [""]:
-                if line.startswith("|"):
-                    if not re.match(r"^\|[ :|-]+\|$", line):
-                        table.append(line)
-                    continue
-                rows.extend(table[1:])
-                table = []
+            if "申し送り" in heading:
+                rows.extend(table_rows(body))
         # 解決の列（2 列目）が空・空白だけの行は、解決したことにしない
         resolved = []
         for line in rows:
@@ -423,8 +444,13 @@ class Checker:
                 self.error(name, "印の直後にコードフェンスがない", index + 1)
                 continue
             end = fence_end(lines, start)
-            snippet = lines[start + 1:end]
-            path = self.root / marker.group(2)
+            # 字下げしたフェンスの本文は、開始行の字下げの分を除いてから照合する
+            indent = fence_indent(lines[start])
+            snippet = [dedent(line, indent) for line in lines[start + 1:end]]
+            path = self.snippet_source(marker.group(2))
+            if path is None:
+                self.error(name, f"コード片の元のファイルが --root の外にある: {marker.group(2)}", index + 1)
+                continue
             if not path.is_file():
                 self.error(name, f"コード片の元のファイルがない: {marker.group(2)}", index + 1)
                 continue
@@ -436,6 +462,12 @@ class Checker:
                 matches = size > 0 and any(actual[at:at + size] == snippet for at in range(len(actual) - size + 1))
             if not matches:
                 self.error(name, f"コード片が {marker.group(2)} と一致しない", index + 1)
+
+    def snippet_source(self, relative: str) -> Optional[Path]:
+        """コード片の元のファイルのパス。シンボリックリンクを解決した後も --root の中にある場合だけ返す。"""
+        root = self.root.resolve()
+        path = (root / relative).resolve()
+        return path if path.is_relative_to(root) else None
 
     def update_snippets(self) -> None:
         """全文のコード片を、実ファイルの内容で書き直す。"""
@@ -456,12 +488,14 @@ class Checker:
                 start = index
                 while start < len(lines) and not lines[start].strip():
                     start += 1
-                path = self.root / marker.group(1)
+                path = self.snippet_source(marker.group(1))
                 opened = fence_open(lines[start]) if start < len(lines) else None
-                if not opened or not path.is_file():
-                    continue  # 不備は検査の側で報告する
+                if not opened or path is None or not path.is_file():
+                    continue  # 不備（root の外の参照先を含む）は検査の側で報告する
                 end = fence_end(lines, start)
-                content = path.read_text(encoding="utf-8").splitlines()
+                # 字下げしたフェンスには、開始行と同じ字下げを付けて書く（空行には付けない）
+                indent = " " * fence_indent(lines[start])
+                content = [indent + line if line else line for line in path.read_text(encoding="utf-8").splitlines()]
                 # このフェンスを閉じてしまう行を含む内容は書き込まない（長いフェンスに手で直す）
                 if end >= len(lines) or any(fence_closes(line, opened[0]) for line in content):
                     continue

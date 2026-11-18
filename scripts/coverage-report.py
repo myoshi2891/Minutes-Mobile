@@ -23,11 +23,15 @@ def main() -> int:
     try:
         files = json.loads(arguments.report.read_text(encoding="utf-8"))["data"][0]["files"]
         prefix = os.path.realpath(arguments.sources) + os.sep
-        lines = [
-            (int(item["summary"]["lines"]["count"]), int(item["summary"]["lines"]["covered"]))
-            for item in files
-            if os.path.realpath(item["filename"]).startswith(prefix)
-        ]
+        lines = []
+        for item in files:
+            if not os.path.realpath(item["filename"]).startswith(prefix):
+                continue
+            count, covered = item["summary"]["lines"]["count"], item["summary"]["lines"]["covered"]
+            # 整数（bool を除く）で 0 <= covered <= count のものだけを数える。不正な記録を丸めて集計しない
+            if type(count) is not int or type(covered) is not int or not 0 <= covered <= count:
+                raise ValueError(f"{item['filename']}: 行数の記録が不正（count={count!r}, covered={covered!r}）")
+            lines.append((count, covered))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
         print(f"NG: カバレッジの記録を読めない: {error!r}", file=sys.stderr)
         return 2

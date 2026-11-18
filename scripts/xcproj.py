@@ -48,10 +48,15 @@ def strip_trailing_commas(text: str) -> str:
     return "".join(out)
 
 
+def reject_constant(name: str) -> None:
+    """標準の JSON にない数値の定数（NaN・Infinity・-Infinity）を拒否する（json.loads は既定で読んでしまう）。"""
+    raise ValueError(f"標準の JSON にない定数 {name}")
+
+
 def load_project(path: Path) -> dict:
     try:
-        data = json.loads(strip_trailing_commas(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        data = json.loads(strip_trailing_commas(path.read_text(encoding="utf-8")), parse_constant=reject_constant)
+    except (OSError, UnicodeDecodeError, ValueError) as error:  # json.JSONDecodeError は ValueError の派生
         raise Unreadable(f"{path}: {error}") from error
     if not isinstance(data, dict):
         raise Unreadable(f"{path}: 最上位がオブジェクトでない")

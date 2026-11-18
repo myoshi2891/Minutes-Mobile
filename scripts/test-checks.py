@@ -5,9 +5,10 @@
 試験用の設定はこのスクリプトの中で組み立て、一時ディレクトリに置く
 （リポジトリに「検査の対象外にするディレクトリ」を作らないため）。
 
-使い方: scripts/test-checks.py [settings] [dependencies] [versions] [gitleaks] [docs]   （省略時は全部）
+使い方: scripts/test-checks.py [settings] [dependencies] [versions] [gitleaks] [docs] [coverage]   （省略時は全部）
 終了コード: 0 = 全件が期待どおり / 1 = 期待と違う結果あり / 2 = 使い方の誤り
 """
+import importlib.util
 import json
 import platform
 import plistlib
@@ -122,6 +123,11 @@ def test_settings() -> None:
     settings_case("開き括弧の直後のカンマは読めないものとして扱う", 2, "読めない",
                   project=lambda t: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n  },', '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n  },\n  "extra": {,},'))
 
+    # 標準の JSON にない定数（NaN・Infinity）は読めないものとして扱う
+    for constant in ("NaN", "Infinity", "-Infinity"):
+        settings_case(f"標準の JSON にない定数 {constant}", 2, "読めない",
+                      project=lambda t, c=constant: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
+                                                             f'"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n    "X": {c},'))
     settings_case("合格する設定", 0, "OK")
     settings_case("対象デバイスが iPhone 以外を含む", 1, "TARGETED_DEVICE_FAMILY",
                   project=lambda t: replaced(t, '"TARGETED_DEVICE_FAMILY": "1"', '"TARGETED_DEVICE_FAMILY": "1,2,7"'))
@@ -238,7 +244,38 @@ def test_settings() -> None:
     # マイクの利用目的は、各構成で最終的に生成される Info.plist で判定する
     generate_no = lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",', '"GENERATE_INFOPLIST_FILE": "NO",')  # noqa: E731
     without_key = lambda t: replaced(t, '        "INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n', "")  # noqa: E731
-    microphone = {"NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。"}
+    # 生成しない構成で使われる plist は、向きの指定（縦だけ）も持つ（BD-UI-10）
+    microphone = {"NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",
+                  "UISupportedInterfaceOrientations~iphone": ["UIInterfaceOrientationPortrait"]}
+    with_file = lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t))  # noqa: E731
+    # ビルド設定のマイクの利用目的は、文字列化する前の値で型を確かめる（配列を連結した文字列を認めない）
+    settings_case("ビルド設定のマイクの利用目的が配列", 1, "文字列でない",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": ["会議を録音するためにマイクを使用します。"],'))
+    # 空の条件付きの INFOPLIST_FILE は、その条件のビルドに参照先がないことを表す。条件のない参照先で補わない
+    settings_case("arm64 だけ参照先を空にした生成しない構成", 1, "NSMicrophoneUsageDescription がない",
+                  project=lambda t: replaced(with_file(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',
+                                             '"INFOPLIST_FILE": "Config/App-Settings.plist",\n        "INFOPLIST_FILE[arch=arm64]": "",'),
+                  plists={"Config/App-Settings.plist": microphone})
+    # 生成しない構成では、使われる plist に縦だけの向きの指定が要る
+    settings_case("生成しない plist に向きの指定がない", 1, "縦だけの向きの指定がない", project=with_file,
+                  plists={"Config/App-Settings.plist": {"NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。"}})
+    settings_case("参照先の plist の向きが横を含む", 1, "が縦だけでない", project=with_file,
+                  plists={"Config/App-Settings.plist": dict(microphone, UISupportedInterfaceOrientations=[
+                      "UIInterfaceOrientationPortrait", "UIInterfaceOrientationLandscapeLeft"])})
+    # plist の値の変数は、構成・SDK ごとに展開してから判定する
+    mic_variable = dict(microphone, NSMicrophoneUsageDescription="$(MIC_TEXT)")
+    define = lambda value: lambda t: replaced(with_file(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',  # noqa: E731
+                                              f'"INFOPLIST_FILE": "Config/App-Settings.plist",\n        "MIC_TEXT": "{value}",')
+    settings_case("plist の値の変数が空でない値に展開される", 0, "OK", project=define("会議を録音します。"),
+                  plists={"Config/App-Settings.plist": mic_variable})
+    settings_case("plist の値の変数が空に展開される", 1, "NSMicrophoneUsageDescription が空", project=define(""),
+                  plists={"Config/App-Settings.plist": mic_variable})
+    settings_case("plist の値の変数を展開できない", 1, "NSMicrophoneUsageDescription がない", project=with_file,
+                  plists={"Config/App-Settings.plist": mic_variable})
+    settings_case("ビルド設定の値の変数を展開できない", 1, "NSMicrophoneUsageDescription がない",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "$(MIC_TEXT)",'))
     settings_case("Info.plist を生成しないとビルド設定のマイクの利用目的は使われない", 1, "NSMicrophoneUsageDescription がない",
                   project=generate_no)
     settings_case("GENERATE_INFOPLIST_FILE がない（既定は生成しない）", 1, "NSMicrophoneUsageDescription がない",
@@ -339,6 +376,11 @@ def dependencies_case(label: str, want_code: int, want_text: str, files: Dict[st
 
 
 def test_dependencies() -> None:
+    global count
+    spec = importlib.util.spec_from_file_location("check_dependencies", SCRIPTS / "check-dependencies.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     pin = {"identity": "sample-lib", "kind": "remoteSourceControl", "location": "https://example.com/owner/sample-lib.git",
            "state": {"revision": "0000000000000000000000000000000000000000", "version": "1.2.3"}}
     resolved = json.dumps({"pins": [pin], "version": 3})
@@ -458,6 +500,11 @@ def test_dependencies() -> None:
     for label, newline in {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}.items():
         text = declare.format(f"// コメント\n{unlisted}\n").replace("\n", newline)
         dependencies_case(f"行コメントの後ろの宣言は検査する（{label}）", 1, "unlisted.git", {"Package.swift": text})
+    # CR だけの改行で終わる行コメントを、strip_comments に直接渡して確かめる（ファイルの読み書きで改行が変わらないように）
+    count += 1
+    stripped = module.strip_comments(f"// コメント\r{unlisted}\r")
+    if unlisted not in stripped or "コメント" in stripped:
+        failures.append(f"dependencies: CR で終わる行コメントの後ろの宣言が strip_comments の結果に残らない: {stripped!r}")
     dependencies_case("閉じていないブロックコメントは合格にしない", 2, "閉じていない",
                       {"Package.swift": declare.format(f"/* {unlisted}")})
     # URL の正規化は scheme とホストだけ。パスの大文字小文字が違う取得元は別のものとして認めない
@@ -482,11 +529,43 @@ def test_dependencies() -> None:
                       {"Package.swift": declare.format('.package(name: "url: \\"https://example.com/owner/sample-lib\\",", path: local)')})
     # ローカルのバイナリ（.binaryTarget(path:)）は、承認済みの項目がある場合だけ認める
     binary = '.binaryTarget(name: "B", path: "Frameworks/B.xcframework")'
-    approved_binary = {"identity": "b", "path": "Sub/Frameworks/B.xcframework", "version": "1.0.0", "license": "MIT",
-                       "approvedOn": "2026-11-18", "ledger": "dependencies-and-costs.md §3"}
+    # 承認したときの内容（ディレクトリ形式の成果物。配下のファイルも内容のハッシュに入る）
+    binary_files = {"Sub/Frameworks/B.xcframework/Info.plist": "info", "Sub/Frameworks/B.xcframework/ios/B": "bin"}
+    with tempfile.TemporaryDirectory() as directory:
+        for name, content in binary_files.items():
+            (Path(directory) / name).parent.mkdir(parents=True, exist_ok=True)
+            (Path(directory) / name).write_text(content, encoding="utf-8")
+        binary_digest = module.content_digest(Path(directory) / "Sub/Frameworks/B.xcframework")
+    approved_binary = {"identity": "b", "path": "Sub/Frameworks/B.xcframework", "sha256": binary_digest, "version": "1.0.0",
+                       "license": "MIT", "approvedOn": "2026-11-18", "ledger": "dependencies-and-costs.md §3"}
     dependencies_case("記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
                       {"Sub/Package.swift": declare.format(binary)})
-    dependencies_case("承認済みのローカルのバイナリ", 0, "OK", {"Sub/Package.swift": declare.format(binary)}, [approved_binary])
+    dependencies_case("承認済みのローカルのバイナリ", 0, "OK", dict(binary_files, **{"Sub/Package.swift": declare.format(binary)}),
+                      [approved_binary])
+    # 場所が一致しても、承認の後に内容（配下のファイルを含む）が変われば再承認を求める
+    changed = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/B": "replaced", "Sub/Package.swift": declare.format(binary)})
+    dependencies_case("承認の後に内容が変わったローカルのバイナリ", 1, "内容が承認したものと違う", changed, [approved_binary])
+    added = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/extra": "x", "Sub/Package.swift": declare.format(binary)})
+    dependencies_case("承認の後にファイルが増えたローカルのバイナリ", 1, "内容が承認したものと違う", added, [approved_binary])
+    dependencies_case("承認済みのローカルのバイナリがない", 2, "ローカルのバイナリがない",
+                      {"Sub/Package.swift": declare.format(binary)}, [approved_binary])
+    dependencies_case("ローカルのバイナリの項目に sha256 がない", 2, "sha256",
+                      {}, [{k: v for k, v in approved_binary.items() if k != "sha256"}])
+    # リモートのバイナリは、承認した配布物の checksum と宣言の checksum の一致を求める
+    remote = "https://example.com/owner/b-binary/releases/download/1.0.0/B.xcframework.zip"
+    remote_binary = {"identity": "b-binary", "url": remote, "version": "1.0.0", "license": "MIT", "approvedOn": "2026-11-18",
+                     "ledger": "dependencies-and-costs.md §3", "checksum": "a" * 64}
+    remote_declaration = '.binaryTarget(name: "B", url: "' + remote + '", checksum: "{}")'
+    dependencies_case("承認した checksum のリモートのバイナリ", 0, "OK",
+                      {"Package.swift": declare.format(remote_declaration.replace("{}", "a" * 64))}, [remote_binary])
+    dependencies_case("checksum が承認と違うリモートのバイナリ", 1, "承認したもの",
+                      {"Package.swift": declare.format(remote_declaration.replace("{}", "b" * 64))}, [remote_binary])
+    dependencies_case("承認に checksum のないリモートのバイナリ", 1, "checksum がない",
+                      {"Package.swift": declare.format(remote_declaration.replace("{}", "a" * 64))},
+                      [{k: v for k, v in remote_binary.items() if k != "checksum"}])
+    dependencies_case("checksum が変数のリモートのバイナリ", 1, "checksum を判定できない",
+                      {"Package.swift": declare.format('.binaryTarget(name: "B", url: "' + remote + '", checksum: sum)')}, [remote_binary])
+    dependencies_case("checksum の形式が不正な承認", 2, "16 進数", {}, [dict(remote_binary, checksum="xyz")])
     dependencies_case("別のディレクトリのローカルのバイナリは承認と一致しない", 1, "ローカルのバイナリ Frameworks/B.xcframework",
                       {"Package.swift": declare.format(binary)}, [approved_binary])
     dependencies_case("ローカルのバイナリの項目に版がない", 2, "version",
@@ -536,10 +615,10 @@ def test_versions() -> None:
         "形式が不正": (changed_row(len(columns) - 1, "z" * len(current_sha)), "不正"),
         "ツールの行がない": (lambda t: "\n".join(line for line in t.splitlines() if line.startswith("#")) + "\n", "1 つもない"),
         "gh の行がほかのツールより後": (lambda t: "\n".join(
-            [line for line in t.splitlines() if not line.startswith("gh ")] + [line for line in t.splitlines() if line.startswith("gh ")]
+            [line for line in t.splitlines() if line.split()[:1] != ["gh"]] + [line for line in t.splitlines() if line.split()[:1] == ["gh"]]
         ) + "\n", "gh の行が"),
         "この Mac 向けの行がない": (lambda t: "\n".join(
-            line for line in t.splitlines() if not (line.startswith("gitleaks") and f" {platform.machine()} " in line)
+            line for line in t.splitlines() if not (line.split()[:1] == ["gitleaks"] and line.split()[2:3] == [platform.machine()])
         ) + "\n", "向けの行がない"),
         # 台帳からツールの行がすべて消えても、検査が使う必須のツールとして欠落を検出する
         "必須のツールの行がない": (lambda t: "\n".join(
@@ -550,7 +629,8 @@ def test_versions() -> None:
     with tempfile.TemporaryDirectory() as directory:
         versions = Path(directory) / "versions"
         # この Mac 向けの gitleaks の行を最終行に移す（読み落とすと、その行だけが照合されなくなる）
-        own = [line for line in original.splitlines() if line.startswith("gitleaks") and f" {platform.machine()} " in line]
+        own = [line for line in original.splitlines()
+               if line.split()[:1] == ["gitleaks"] and line.split()[2:3] == [platform.machine()]]
         rest = [line for line in original.splitlines() if line not in own]
         versions.write_text("\n".join(rest + own), encoding="utf-8")
         expect("versions: 末尾に改行のない最終行", [setup, "--verify", "--versions", str(versions), "--dest", tools], 0, "OK")
@@ -559,8 +639,19 @@ def test_versions() -> None:
             versions = Path(directory) / "versions"
             versions.write_text(change(original), encoding="utf-8")
             expect(f"versions: {label}", [setup, "--verify", "--versions", str(versions), "--dest", tools], 1, want_text)
+    # タブ区切りの台帳も同じに読む（列を空白文字の種類で決めない）
+    tabbed = "\n".join(line if line.startswith("#") else "\t".join(line.split()) for line in original.splitlines()) + "\n"
+    for label, text, want_code, want_text in (
+        ("タブ区切りの台帳", tabbed, 0, "OK"),
+        ("タブ区切りの台帳で gh の行が後", cases["gh の行がほかのツールより後"][0](tabbed), 1, "gh の行が"),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            versions = Path(directory) / "versions"
+            versions.write_text(text, encoding="utf-8")
+            expect(f"versions: {label}", [setup, "--verify", "--versions", str(versions), "--dest", tools], want_code, want_text)
     # 導入記録は一致するが、実行時の gh が別の版を名乗る（取得に使う gh の版を実行して確かめていること）
-    gh_rows = [line for line in original.splitlines() if line.startswith("gh ") and f" {platform.machine()} " in line]
+    # 列は空白文字（タブを含む）で分けて比べる（名前とアーキテクチャの列）
+    gh_rows = [line for line in original.splitlines() if line.split()[:1] == ["gh"] and line.split()[2:3] == [platform.machine()]]
     with tempfile.TemporaryDirectory() as directory:
         dest = Path(directory) / "tools"
         version, sha = gh_rows[0].split()[1], gh_rows[0].split()[-1]
@@ -580,6 +671,18 @@ def test_versions() -> None:
         stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\nexit 3\n", encoding="utf-8")
         expect("versions: 版の表示が失敗する", [setup, "--verify", "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
                1, "版を表示できない")
+        # リンクの先が導入記録のある版のディレクトリでなければ、実行時の版が合っていても合格にしない
+        stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        expect("versions: 導入記録のある版を指すリンク", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
+                                                 "--require", "gh"], 0, "OK")
+        other = dest / "gh" / "other" / "gh"
+        other.parent.mkdir()
+        other.write_text(stub.read_text(encoding="utf-8"), encoding="utf-8")
+        other.chmod(0o755)
+        (dest / "bin" / "gh").unlink()
+        (dest / "bin" / "gh").symlink_to("../gh/other/gh")
+        expect("versions: リンクが導入記録のない場所を指す", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
+                                                  "--require", "gh"], 1, "導入先を指していない")
 
 
 def test_gitleaks() -> None:
@@ -593,6 +696,81 @@ def test_gitleaks() -> None:
     with tempfile.TemporaryDirectory() as directory:
         (Path(directory) / "config.txt").write_text('name = "sample"\n', encoding="utf-8")
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
+    gitleaks_merge_case()
+
+
+def gitleaks_merge_case() -> None:
+    """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
+
+    マージの解決で足した行（どちらの親にもない行）は、git log の既定ではマージの差分を出さないため見落とされる。
+    check.sh の GITLEAKS_LOG_OPTS と同じ指定で実行し、指定がない場合は見落とすことも確かめる（試験が効いていることの確認）。
+    """
+    global count
+    gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
+    options = "--all --full-history -m"
+    count += 1
+    if f'GITLEAKS_LOG_OPTS="{options}"' not in (SCRIPTS / "check.sh").read_text(encoding="utf-8"):
+        failures.append(f"gitleaks: check.sh の GITLEAKS_LOG_OPTS が試験の指定（{options}）と違う")
+    # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
+    normal_key = "ghp_" + "a8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
+    merge_key = "ghp_" + "b9Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory) / "repository"
+        repository.mkdir()
+
+        def git(*arguments: str) -> None:
+            subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                            *arguments], cwd=repository, check=True, capture_output=True)
+
+        def commit(name: str, content: str, message: str) -> None:
+            (repository / name).write_text(content, encoding="utf-8")
+            git("add", name)
+            git("commit", "-q", "-m", message)
+
+        git("init", "-q", "-b", "main")
+        commit("base.txt", "base\n", "base")
+        git("checkout", "-q", "-b", "side")
+        commit("normal.txt", f'token = "{normal_key}"\n', "side")
+        git("checkout", "-q", "main")
+        commit("main.txt", "main\n", "main")
+        git("merge", "-q", "--no-commit", "side")
+        commit("merge.txt", f'token = "{merge_key}"\n', "merge")  # マージのコミットだけで足した行
+        for label, extra, want in (("指定あり", [f"--log-opts={options}"], {"normal.txt", "merge.txt"}),
+                                   ("指定なし（既定の git log）", [], {"normal.txt"})):
+            count += 1
+            report = Path(directory) / f"report-{len(extra)}.json"
+            subprocess.run([gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config", str(ROOT / ".gitleaks.toml"),
+                            "--report-format", "json", "--report-path", str(report), *extra, str(repository)],
+                           capture_output=True, text=True)
+            try:
+                found = {str(item.get("File", "")) for item in json.loads(report.read_text(encoding="utf-8"))}
+            except (OSError, json.JSONDecodeError) as error:
+                failures.append(f"gitleaks: マージの差分（{label}）の報告を読めない: {error}")
+                continue
+            if found != want:
+                failures.append(f"gitleaks: マージの差分（{label}）で検出したファイルが {sorted(found)}（期待 {sorted(want)}）")
+
+
+def coverage_case(label: str, want_code: int, want_text: str, count_value: object, covered_value: object) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        sources = Path(directory) / "Sources"
+        sources.mkdir()
+        report = Path(directory) / "report.json"
+        report.write_text(json.dumps({"data": [{"files": [{"filename": str(sources / "A.swift"), "summary": {
+            "lines": {"count": count_value, "covered": covered_value}}}]}]}), encoding="utf-8")
+        expect(f"coverage: {label}", [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", "90"],
+               want_code, want_text)
+
+
+def test_coverage() -> None:
+    coverage_case("目標以上", 0, "行 95.0%", 20, 19)
+    coverage_case("目標未満は警告だけ", 0, "警告", 10, 5)
+    # 行数の記録は整数（bool を除く）で 0 <= covered <= count のものだけを数える
+    coverage_case("covered が count を超える", 2, "不正", 10, 11)
+    coverage_case("covered が負", 2, "不正", 10, -1)
+    coverage_case("count が文字列", 2, "不正", "10", 5)
+    coverage_case("count が真偽値", 2, "不正", True, 0)
+    coverage_case("covered が小数", 2, "不正", 10, 5.0)
 
 
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）
@@ -769,7 +947,44 @@ def run_docs_cases() -> None:
                   f"満たす要件: TST-AAA-01\n\n    {FENCE}\n    コードの本文\n\n"),
         docs_case("字下げ 4 個のフェンス状の行は閉じない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
                   f"満たす要件: TST-AAA-01\n\n{FENCE}text\n    {FENCE}\n## 9. フェンスの中の見出し\n{FENCE}\n\n"),
+        # 山括弧で囲んだリンク先（空白を含められる）も、山括弧を除いて解決する
+        docs_case("山括弧のリンク先", 0, "OK", basic, "](../01-requirements/requirements.md)",
+                  "](<../01-requirements/requirements.md>)"),
+        docs_case("山括弧の切れたリンク", 1, "リンクの先がない: ../01-requirements/missing file.md", basic,
+                  "](../01-requirements/requirements.md)", "](<../01-requirements/missing file.md>)"),
+        # 対応表の先頭の列は個々の要件 ID を持つ（群の表記だけの行は数えない）
+        docs_case("対応表の行が群の表記だけ", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| FR-AAA 群 | 試験 |"),
+        # 区切りの行のない「|」の行のまとまりは表として数えない
+        docs_case("対応表に区切りの行がない", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 試験 |\n| FR-AAA-01 | 試験 |"),
+        docs_case("申し送りの表に区切りの行がない", 1, "申し送り「一つ目」の解決が表にない", detailed,
+                  "| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |", "| 申し送り | 解決 |\n| 一つ目 | 済 |"),
+        # 字下げしたフェンスのコード片は、開始行の字下げの分を除いて照合する
+        docs_case("字下げしたフェンスのコード片", 0, "OK", detailed, f"{FENCE}bash\necho two\necho three\n{FENCE}",
+                  f"  {FENCE}bash\n  echo two\n  echo three\n  {FENCE}"),
+        docs_case("字下げしたフェンスのコード片の不一致", 1, "コード片が scripts/sample.sh と一致しない", detailed,
+                  f"{FENCE}bash\necho two\necho three\n{FENCE}", f"  {FENCE}bash\n  echo two\n  echo four\n  {FENCE}"),
+        # コード片の元のファイルは --root の中に限る
+        docs_case("--root の外のコード片の元のファイル", 1, "--root の外にある", detailed,
+                  "<!-- excerpt: scripts/sample.sh -->", "<!-- excerpt: ../outside.sh -->"),
     ]
+    # シンボリックリンクで --root の外を指すコード片の元のファイルも認めない
+    with tempfile.TemporaryDirectory() as outside:
+        (Path(outside) / "sample.sh").write_text(DOCS["scripts/sample.sh"], encoding="utf-8")
+        linked = docs_case("リンクを置く前の文書", 0, "OK")
+        (linked / "scripts" / "linked.sh").symlink_to(Path(outside) / "sample.sh")
+        text = (linked / detailed).read_text(encoding="utf-8")
+        (linked / detailed).write_text(text.replace("<!-- excerpt: scripts/sample.sh -->", "<!-- excerpt: scripts/linked.sh -->"),
+                                       encoding="utf-8")
+        expect("docs: シンボリックリンクで --root の外を指すコード片", [str(SCRIPTS / "verify-docs.py"), "--root", str(linked)],
+               1, "--root の外にある")
+    # --update-snippets は、字下げしたフェンスに同じ字下げを付けて書き直す
+    indented = docs_case("字下げしたフェンスの書き直し", 0, "コード片を書き直した", detailed,
+                         f"{FENCE}bash\necho one\necho two\necho three\n{FENCE}", f"  {FENCE}bash\n  echo old\n  {FENCE}",
+                         options=["--update-snippets"])
+    count += 1
+    if f"  {FENCE}bash\n  echo one\n  echo two\n  echo three\n  {FENCE}" not in (indented / detailed).read_text(encoding="utf-8"):
+        failures.append("docs: 字下げしたフェンスのコード片が同じ字下げで書き直されていない")
     # --update-snippets は、全文のコード片を実ファイルに合わせて書き直す
     fixed = docs_case("全文のコード片の書き直し", 0, "コード片を書き直した", detailed, "echo one\necho two\necho three", "echo old",
                       options=["--update-snippets"])
@@ -788,7 +1003,7 @@ def run_docs_cases() -> None:
 
 
 TESTS = {"settings": test_settings, "dependencies": test_dependencies, "versions": test_versions, "gitleaks": test_gitleaks,
-         "docs": test_docs}
+         "docs": test_docs, "coverage": test_coverage}
 
 
 def main() -> int:

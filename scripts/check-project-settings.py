@@ -178,6 +178,59 @@ def check_required(
                 errors.append(f"[{reason}] {target}: {key} = {value}（構成 {'・'.join(used)}。必要な値: {allowed[0]}）")
 
 
+# 変数の展開の深さの上限（循環する参照で止まらないように）
+MAX_EXPANSION_DEPTH = 8
+PORTRAIT_ONLY = ["UIInterfaceOrientationPortrait"]
+ORIENTATION_KEYS = ("UISupportedInterfaceOrientations~iphone", "UISupportedInterfaceOrientations")
+
+
+def expand_value(text: str, own: dict, shared: dict, configuration: str, sdk: str, depth: int = 0) -> Optional[str]:
+    """値の中の $(NAME)・${NAME} を、その構成・SDK のビルド設定で展開する。決められなければ None（未確定）。
+
+    設定がない変数（Xcode が組み込みで持つ変数を含む）、条件（arch など）なしに 1 つの値に決まらない変数、
+    修飾子つきの参照（$(NAME:lower) など）は展開できないものとして None を返す。展開できない値を空でない値と見なさない。
+    """
+    if depth > MAX_EXPANSION_DEPTH:
+        return None
+    unresolved = False
+
+    def substitute(found: "re.Match[str]") -> str:
+        nonlocal unresolved
+        name = found.group(1) or found.group(2)
+        if name == "inherited":
+            return ""
+        effective, undecided = resolve(own, shared, name, [configuration], sdk)
+        values = {value for (_, value) in effective}
+        if undecided or len(values) != 1:
+            unresolved = True
+            return ""
+        expanded = expand_value(values.pop(), own, shared, configuration, sdk, depth + 1)
+        if expanded is None:
+            unresolved = True
+            return ""
+        return expanded
+
+    result = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", substitute, text)
+    if unresolved or re.search(r"\$[({]", result):
+        return None
+    return result
+
+
+def infoplist_sources(
+    project_path: Path, target_name: str, own: dict, shared: dict, configuration: str, sdk: str
+) -> Tuple[set, List[Tuple[Path, dict]], bool]:
+    """その構成・SDK で、生成するか（GENERATE_INFOPLIST_FILE の取りうる値）と、INFOPLIST_FILE の参照先の内容と、
+    参照先が条件なしに決まらない（または明示的に空の書き方がある）かを返す。"""
+    generate, generate_undecided = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
+    modes = {enabled(value) for (_, value) in generate}
+    # 条件（arch など）なしに決まらない構成では、設定のない場合（生成しない）も起こりうる
+    if generate_undecided or not modes:
+        modes.add(False)
+    plists, plists_undecided = referenced_files(
+        project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)
+    return modes, [(path, load_plist(path)) for path in plists], plists_undecided
+
+
 def check_plist_values(
     project_path: Path, target: str, target_name: str, own: dict, shared: dict, configurations: List[str],
     root: Path, errors: List[str]
@@ -188,38 +241,48 @@ def check_plist_values(
     無効（設定がない場合も無効）な構成では、INFOPLIST_FILE の参照先だけが使われる。
     どちらが優先されるかに頼らないよう、効きうる値はすべて空でないことを求め、どこにもなければ欠落とする。
     ビルド設定の値が SDK の条件付きだけの場合、条件に合わない SDK では参照先の plist で補われていなければ欠落とする。
+    値は構成・SDK ごとに変数（$(NAME)）を展開してから判定する。展開後が空なら空、展開できなければ欠落（未確定）とする。
+    ビルド設定の値は文字列化する前の元の値で型を確かめ、文字列でない値（配列など）は認めない。
     """
     for name, reason in REQUIRED_PLIST_VALUES_APPLICATION.items():
+        # 文字列化（variants）の前に、元の値の型を確かめる（配列を空白で連結した文字列を利用目的と見なさない）
+        for label, level in (("ターゲット", own), ("プロジェクト", shared)):
+            for key, value in level.items():
+                if key.split("[", 1)[0] == f"INFOPLIST_KEY_{name}" and not isinstance(value, str):
+                    errors.append(f"[{reason}] {target}: {label}の {key} が文字列でない（{type(value).__name__}）")
         missing: List[str] = []
         empty: Dict[str, List[str]] = {}
         for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
             build = f"{configuration}（{sdk}）"
-            generate, generate_undecided = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
-            modes = {enabled(value) for (_, value) in generate}
-            # 条件（arch など）なしに決まらない構成では、設定のない場合（生成しない）も起こりうる
-            if generate_undecided or not modes:
-                modes.add(False)
+            modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, sdk)
             from_files: List[Tuple[str, str]] = []
-            plists, plists_undecided = referenced_files(
-                project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)
-            lacking = False  # 参照先の plist のうち、鍵を持たないものがある
-            for path in plists:
-                data = load_plist(path)
+            lacking = False  # 参照先の plist のうち、鍵を持たない・値を決められないものがある
+            for path, data in plists:
                 if name not in data:
                     lacking = True
                     continue
                 value = data[name]
                 source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
-                from_files.append((f"{source} の {name}", value.strip() if isinstance(value, str) else ""))
+                expanded = expand_value(value, own, shared, configuration, sdk) if isinstance(value, str) else ""
+                if expanded is None:
+                    lacking = True
+                    continue
+                from_files.append((f"{source} の {name}", expanded.strip()))
             from_settings: List[Tuple[str, str]] = []
             settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
             if True in modes:
                 effective, undecided = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration], sdk)
-                from_settings = [(key, value.replace("$(inherited)", "").strip()) for (key, value) in effective]
-                settings_cover = bool(from_settings) and not undecided
+                settings_unresolved = False
+                for key, value in effective:
+                    expanded = expand_value(value, own, shared, configuration, sdk)
+                    if expanded is None:
+                        settings_unresolved = True
+                        continue
+                    from_settings.append((key, expanded.strip()))
+                settings_cover = bool(from_settings) and not undecided and not settings_unresolved
             # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない。
             # 参照先が条件（arch など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ補えないとする。
-            # 参照先が条件なしに決まらない構成（arch の条件付きだけなど）は、別の条件の参照先で補わない
+            # 参照先が条件なしに決まらない構成（arch の条件付きだけ・明示的に空の書き方があるなど）は、別の参照先で補わない
             files_cover = bool(plists) and not lacking and not plists_undecided
             if (False in modes and not files_cover) or (True in modes and not (settings_cover or files_cover)):
                 missing.append(build)
@@ -229,10 +292,46 @@ def check_plist_values(
         if missing:
             errors.append(
                 f"[{reason}] {target}: 生成される Info.plist に {name} がない（構成 {'・'.join(missing)}。"
-                f"GENERATE_INFOPLIST_FILE = YES で INFOPLIST_KEY_{name} に置くか、INFOPLIST_FILE の参照先に置く）"
+                f"GENERATE_INFOPLIST_FILE = YES で INFOPLIST_KEY_{name} に置くか、INFOPLIST_FILE の参照先に置く。"
+                "変数を使う場合は、その構成で 1 つの値に展開できること）"
             )
         for label, used in empty.items():
             errors.append(f"[{reason}] {target}: {label} が空（構成 {'・'.join(used)}）")
+
+
+def check_plist_orientation(
+    project_path: Path, target: str, target_name: str, own: dict, shared: dict, configurations: List[str],
+    root: Path, errors: List[str]
+) -> None:
+    """画面の向きを縦だけにする（BD-UI-10）。生成しない構成では、使われる plist 自体に縦だけの指定を求める。
+
+    GENERATE_INFOPLIST_FILE = NO の構成では INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone は使われないので、
+    INFOPLIST_FILE の参照先に UISupportedInterfaceOrientations~iphone か UISupportedInterfaceOrientations が要る。
+    どの構成でも、参照先にある向きの指定は縦だけであること（ビルド設定の値と合わさっても横向きを足さない）。
+    """
+    missing: List[str] = []
+    wrong: Dict[str, List[str]] = {}
+    for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
+        build = f"{configuration}（{sdk}）"
+        modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, sdk)
+        covered = bool(plists) and not plists_undecided
+        for path, data in plists:
+            present = [key for key in ORIENTATION_KEYS if key in data]
+            if not present:
+                covered = False
+            source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+            for key in present:
+                if data[key] != PORTRAIT_ONLY:
+                    wrong.setdefault(f"{source} の {key}", []).append(build)
+        if False in modes and not covered:
+            missing.append(build)
+    if missing:
+        errors.append(
+            f"[BD-UI-10] {target}: Info.plist を生成しない構成で、使われる plist に縦だけの向きの指定がない"
+            f"（構成 {'・'.join(missing)}。UISupportedInterfaceOrientations~iphone を [UIInterfaceOrientationPortrait] にする）"
+        )
+    for label, used in wrong.items():
+        errors.append(f"[BD-UI-10] {target}: {label} が縦だけでない（構成 {'・'.join(used)}。必要な値: [UIInterfaceOrientationPortrait]）")
 
 
 def check_plist_entry(source: str, key: str, value: object, errors: List[str]) -> None:
@@ -306,7 +405,7 @@ def referenced_files(
     sdk: Optional[str] = None
 ) -> Tuple[List[Path], bool]:
     """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルと、
-    参照先が条件（arch など）なしには決まらないか（resolve の未確定）を返す。
+    参照先が条件（arch など）なしには決まらないか（resolve の未確定、または空の書き方が効きうる）を返す。
 
     ファイル名や拡張子にかかわらず検査するために使う。
     相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
@@ -316,9 +415,13 @@ def referenced_files(
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
     effective, undecided = resolve(own, shared, setting, [configuration], sdk)
     paths: List[Path] = []
+    explicit_empty = False  # 空の書き方（INFOPLIST_FILE[arch=arm64] = "" など）が効きうる
     for (key, value), _ in effective.items():
         text = value.strip()
         if not text:
+            # 空の書き方は、その条件のビルドでは参照先がないことを表す。読み飛ばして別の書き方の参照先で補わず、
+            # 参照先が条件なしに決まらないものとして呼び出し側に伝える
+            explicit_empty = True
             continue
 
         def expand(found: "re.Match[str]") -> str:
@@ -330,7 +433,7 @@ def referenced_files(
         expanded = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", expand, text)
         path = Path(expanded)
         paths.append((path if path.is_absolute() else source_root / path).resolve())
-    return paths, bool(undecided)
+    return paths, bool(undecided) or explicit_empty
 
 
 def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
@@ -361,6 +464,7 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         if target.get("product-type") == "application":
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
             check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
+            check_plist_orientation(project_path, name, target_name, own, shared, configurations, root, errors)
         check_build_settings(name, own, errors)
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:

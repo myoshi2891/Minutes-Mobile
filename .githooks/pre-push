@@ -4,13 +4,16 @@
 # 検査するのは HEAD のコミットだけなので、送信するコミットが HEAD と同じで、未コミットの変更がないことを求める
 # 照合した HEAD は --expect-head で渡し、check.sh の開始までに HEAD が変わっていれば失敗させる
 set -euo pipefail
-head=$(git rev-parse HEAD)
+# HEAD は削除以外の参照の行を受け取ってから解決する（削除だけの送信では解決しない。HEAD がまだない場合にも失敗させない）。
+# 最初に解決した値を、後続の照合と --expect-head に使う
+head=""
 updates=0  # 削除以外の参照の送信の数
 # 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
 while read -r local_ref local_sha remote_ref remote_sha; do
   # 削除の送信（ローカルの SHA がすべて 0）は検査するコミットがない
   if [ -z "${local_sha//0/}" ]; then continue; fi
   updates=$((updates + 1))
+  if [ -z "$head" ]; then head=$(git rev-parse --verify HEAD); fi
   # 注釈付きのタグはタグのオブジェクトを指すので、コミットまでたどってから比べる
   commit=$(git rev-parse --verify -q "${local_sha}^{commit}") || {
     echo "NG: 送信する ${local_ref} (${local_sha}) がコミットを指していない" >&2

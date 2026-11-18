@@ -61,10 +61,26 @@ check_field() {
   [[ $value =~ $pattern ]] || fail "tools/versions の${label}が不正: '$value'"
 }
 
+# シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
+link_directory() {
+  local link=$1 dest
+  dest=$(readlink "$link") || return 1
+  case "$dest" in /*) ;; *) dest="$(dirname "$link")/$dest" ;; esac
+  (cd -P "$(dirname "$dest")" 2>/dev/null && pwd)
+}
+
 verify_tool() {
   local name=$1 version=$2 binary=$3 sha=$4
   local link="$DEST/bin/$binary" stamp="$DEST/$name/$version/.archive-sha256" actual
   [ -x "$link" ] || fail "$name が導入されていない。scripts/setup-tools.sh を実行する"
+  # 実行するのは、導入記録のある版のディレクトリの中の実行ファイルに限る（リンクの先を別の導入に差し替えさせない）。
+  # bash 3.2 の macOS には readlink -f がないので、リンクの先のディレクトリを cd -P で実体に解決して比べる
+  local target_dir expected_dir
+  target_dir=$(link_directory "$link") || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
+  expected_dir=$(cd -P "$DEST/$name/$version" 2>/dev/null && pwd) \
+    || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
+  [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
+    || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
   [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] \
     || fail "$name $version の導入記録が tools/versions の SHA-256 と一致しない。scripts/setup-tools.sh を実行し直す"
   actual=$(runtime_version "$name" "$link") || fail "$name の版を表示できない（${link}）。scripts/setup-tools.sh を実行し直す"
@@ -85,6 +101,7 @@ install_tool() {
     echo "導入済み: $name $version"
   else
     echo "取得: $name ${version}（$repo $tag ${asset}）"
+    # 新しい導入は、置き換えを rename だけで済ませるため導入先と同じファイルシステムの $DEST の下で組み立てる
     mkdir -p "$work/download" "$work/extract" "$work/out"
     # 標準入力は版の写しを読んでいる途中なので、取得のコマンドに渡さない
     if [ "$name" = gh ]; then
@@ -121,16 +138,28 @@ install_tool() {
     actual=$(runtime_version "$name" "$work/out/$binary") || fail "取得した $name の版を表示できない。既存の導入は残す"
     [ "$actual" = "$version" ] \
       || fail "取得した $name の版が違う（tools/versions: $version / 取得したもの: ${actual}）。既存の導入は残す"
+    # 置き換えが終わるまで旧い導入を残す。旧い導入を退避 → 新しい導入を置く → 失敗したら退避したものを戻す → 退避を消す
     mkdir -p "$DEST/$name"
-    rm -rf -- "${target:?}"
-    mv "$work/out" "$target"
+    local backup=""
+    if [ -e "$target" ]; then
+      backup="$DEST/$name/.$version.old.$$"
+      rm -rf -- "${backup:?}"
+      mv "$target" "$backup" || fail "$name の既存の導入を退避できない"
+    fi
+    if ! mv "$work/out" "$target"; then
+      if [ -n "$backup" ]; then mv "$backup" "$target" || echo "NG: 退避した $name の導入を戻せない（${backup}）" >&2; fi
+      fail "$name の導入を置き換えられない。既存の導入は残す"
+    fi
+    if [ -n "$backup" ]; then rm -rf -- "${backup:?}"; fi
   fi
   mkdir -p "$DEST/bin"
   ln -sfn "../$name/$version/$binary" "$DEST/bin/$binary"
 }
 
 if [ "$MODE" = install ]; then
-  WORK=$(mktemp -d)
+  # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
+  mkdir -p "$DEST"
+  WORK=$(mktemp -d "$DEST/.work.XXXXXX")
   cleanup() {
     local status=$?
     rm -rf -- "${WORK:?}"
