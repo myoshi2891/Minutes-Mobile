@@ -283,6 +283,10 @@ def test_settings() -> None:
     settings_case("root 直下の除外するディレクトリは検査しない", 0, "OK", plists={"build/Info.plist": ats})
     settings_case("下位の階層の同じ名前のディレクトリは検査する", 1, "NSAppTransportSecurity",
                   plists={"Sources/build/Info.plist": ats})
+    # 成果物・個人の設定に固有の名前（DerivedData・.build・xcuserdata）は、どの階層でも除外する
+    for generated in ("Sources/DerivedData", "Packages/MinutesKit/.build", "MinutesMobile.xcodeproj/xcuserdata"):
+        settings_case(f"下位の階層の {generated.rsplit('/', 1)[1]} は検査しない", 0, "OK",
+                      plists={f"{generated}/Info.plist": ats})
 
 
 def dependencies_case(label: str, want_code: int, want_text: str, files: Dict[str, str], packages: Optional[List[dict]] = None,
@@ -600,6 +604,14 @@ def test_docs() -> None:
         docs_case("満たす要件の行が空", 1, "要件 ID も「—」の指定もない", basic, "満たす要件: TST-AAA-01\n", "満たす要件:\n"),
         docs_case("満たす要件が設計決定だけ", 1, "要件 ID も「—」の指定もない", basic, "満たす要件: TST-AAA-01\n", "満たす要件: BD-SMP-01\n"),
         docs_case("満たす要件に要件の群", 0, "OK", basic, "満たす要件: TST-AAA-01\n", "満たす要件: TST-AAA 群\n"),
+        # 「制約:」だけの行は「満たす要件:」の代わりにならない。制約は「／」の後に書く
+        docs_case("制約だけの行は認めない", 1, "冒頭に「満たす要件:」の行がない", basic, "満たす要件: TST-AAA-01\n", "制約: CON-01\n"),
+        docs_case("満たす要件の後の制約", 0, "OK", basic, "満たす要件: TST-AAA-01\n", "満たす要件: — ／ 制約: CON-01\n"),
+        # スラッシュ区切りの省略も個々の ID に展開する
+        docs_case("スラッシュ区切りの省略", 0, "OK", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-AAA-01 / 02、FR-AAA-01/03"),
+        docs_case("スラッシュ区切りの中に定義されていない ID", 1, "定義されていない ID: FR-AAA-04", detailed, "決定: BD-SMP-01",
+                  "決定: BD-SMP-01、FR-AAA-01 / 04"),
+        docs_case("スラッシュ区切りで網羅する", 0, "OK", basic, "FR-AAA-01・02、", "FR-AAA-01 / 02、"),
         docs_case("長いフェンスの中の短いフェンスで切り替わらない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
                   f"満たす要件: TST-AAA-01\n\n{FENCE}`markdown\n{FENCE}\n## 9. フェンスの中の見出し\n{FENCE}\n{FENCE}`\n\n"),
         docs_case("チルダのフェンス", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",

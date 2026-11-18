@@ -6,6 +6,8 @@
 #   scripts/check.sh --steps 0-8,10 指定した手順だけを実行する（プッシュ前のフックが使う）
 #   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
 #                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
+#   scripts/check.sh --require-clean 未コミットの変更（追跡していないファイルを含む）があれば、手順を始めずに失敗する。
+#                                   検査中に HEAD が変わった・変更が生じた場合も失敗する（プッシュ前のフックが使う）
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -25,13 +27,14 @@ MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
 LAST_STEP=10
 STAGED=0
+REQUIRE_CLEAN=0
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 
 usage() {
-  echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
+  echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean]" >&2
   exit 2
 }
 
@@ -63,11 +66,13 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --steps) [ $# -ge 2 ] || usage; STEPS=$(expand_steps "$2"); shift 2 ;;
     --staged) STAGED=1; shift ;;
+    --require-clean) REQUIRE_CLEAN=1; shift ;;
     *) usage ;;
   esac
 done
 if [ "$STAGED" = 1 ]; then
-  [ -z "$STEPS" ] || usage
+  # --staged はインデックスを検査する。作業ツリーの一致を求める --require-clean とは組み合わせない
+  [ -z "$STEPS" ] && [ "$REQUIRE_CLEAN" = 0 ] || usage
   STEPS="1 2 3 10"
 elif [ -z "$STEPS" ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
@@ -267,6 +272,10 @@ START_CHANGES=""
 if [ "$STAGED" = 0 ]; then
   START_HEAD=$(git rev-parse HEAD)
   START_CHANGES=$(git status --porcelain)
+  # 作業ツリーだけにある修正で合格させない。長い手順を回す前に止める
+  if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "$START_CHANGES" ]; then
+    fail "未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから再実行する（検査するのは HEAD のコミットだけ）"
+  fi
 fi
 
 for step in $STEPS; do
@@ -285,6 +294,9 @@ else
   end_changes=$(git status --porcelain)
   if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
     # 未コミットの変更を含む作業ツリーを検査した（または検査中にコミットが変わった）。コミットの合格にはしない
+    if [ "$REQUIRE_CLEAN" = 1 ]; then
+      fail "検査中に HEAD が変わった、または未コミットの変更が生じた。検査したツリーがコミットと一致しないので合格にしない"
+    fi
     echo "OK: 手順$STEPS を通過（未コミットの変更あり。コミットの合格としては記録しない）"
     echo "注意: PR の説明に貼る結果は、変更をすべてコミットした状態で再実行して得る" >&2
   else

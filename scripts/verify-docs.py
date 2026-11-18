@@ -26,7 +26,9 @@ STALE_DAYS = 92  # 確認日から 3 か月（docs/README.md §4）
 
 AREA_ID = r"(?:FR|NFR|SEC|TST|BD)-[A-Z]+-\d+"
 PLAIN_ID = r"(?:CON|INV|OQ|UD|COST)-\d+"
-ID_PATTERN = re.compile(rf"\b({AREA_ID}|{PLAIN_ID})((?:[・〜]\d+)*)")
+# 省略した書き方: 範囲（〜）・並び（・）・スラッシュ区切りの並び（「/」の前後に空白 1 つまで）
+SEPARATOR = r"(・|〜| ?/ ?)"
+ID_PATTERN = re.compile(rf"\b({AREA_ID}|{PLAIN_ID})((?:(?:[・〜]| ?/ ?)\d+)*)")
 GROUP_PATTERN = re.compile(r"\b(FR|NFR|SEC|TST)-([A-Z]+(?:・[A-Z]+)*) ?群")
 DEFINITION_ROW = re.compile(rf"^\| (?:\*\*)?({AREA_ID}|{PLAIN_ID})(?:\*\*)? \|")
 # 接頭辞ごとの定義文書（docs/README.md §3）
@@ -103,7 +105,7 @@ def prose_lines(text: str) -> Iterator[Tuple[int, str]]:
 def reversed_range(match: "re.Match[str]") -> bool:
     """「FR-AAA-03〜01」のように、範囲の終点が直前の番号より小さい書き方か。"""
     previous = int(match.group(1).rsplit("-", 1)[1])
-    for separator, digits in re.findall(r"([・〜])(\d+)", match.group(2)):
+    for separator, digits in re.findall(rf"{SEPARATOR}(\d+)", match.group(2)):
         if separator == "〜" and int(digits) < previous:
             return True
         previous = int(digits)
@@ -111,7 +113,7 @@ def reversed_range(match: "re.Match[str]") -> bool:
 
 
 def expand(match: "re.Match[str]") -> List[str]:
-    """「SEC-SUP-01〜05」「NFR-MNT-01・03」のような省略した書き方を、個々の ID に展開する。
+    """「SEC-SUP-01〜05」「NFR-MNT-01・03」「SEC-NET-03 / 04」のような省略した書き方を、個々の ID に展開する。
 
     範囲が逆順の書き方は、どの ID も参照したことにしない（空を返す。check_references が不正として報告する）。
     """
@@ -122,7 +124,7 @@ def expand(match: "re.Match[str]") -> List[str]:
     width = len(number)
     identifiers = [first]
     previous = int(number)
-    for separator, digits in re.findall(r"([・〜])(\d+)", match.group(2)):
+    for separator, digits in re.findall(rf"{SEPARATOR}(\d+)", match.group(2)):
         value = int(digits)
         if separator == "〜":
             identifiers.extend(f"{stem}-{n:0{width}d}" for n in range(previous + 1, value + 1))
@@ -267,9 +269,9 @@ class Checker:
             for number, heading, body in sections:
                 # 節が小節から始まる場合は、最初の小節の冒頭を見る
                 first = next((line for line in body if line.strip() and not line.startswith("### ")), "")
-                if not re.match(r"^(満たす要件|制約):", first):
-                    self.error(name, f"節「{heading}」の冒頭に「満たす要件:」（または「制約:」）の行がない", number)
-                elif first.startswith("満たす要件:") and not self.names_requirements(first):
+                if not first.startswith("満たす要件:"):
+                    self.error(name, f"節「{heading}」の冒頭に「満たす要件:」の行がない", number)
+                elif not self.names_requirements(first):
                     self.error(name, f"節「{heading}」の「満たす要件:」に要件 ID も「—」の指定もない", number)
             if name.endswith("/README.md"):
                 # 索引には必須の節と申し送りを求めないが、コード片は照合する

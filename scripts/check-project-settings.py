@@ -20,8 +20,11 @@ from xml.parsers.expat import ExpatError
 from xcproj import Unreadable, load_project
 
 ROOT = Path(__file__).resolve().parent.parent
-# 検査の対象にしないディレクトリ（成果物と導入したツール）
-SKIPPED_DIRECTORIES = {".git", ".tools", ".build", "build", "DerivedData", "xcuserdata"}
+# 検査の対象にしないディレクトリ（成果物と導入したツール）。
+# 名前がビルドの成果物・個人の設定に固有のものは、どの階層にあっても除外する
+SKIPPED_EVERYWHERE = {".build", "DerivedData", "xcuserdata"}
+# 一般的な名前（build など）は root 直下だけで除外し、下位の同じ名前のディレクトリ（Sources/build など）は検査する
+SKIPPED_AT_ROOT = {".git", ".tools", "build"}
 
 # すべてのターゲットで満たす値: 設定名 → (許す値, 根拠)
 REQUIRED_ALL_TARGETS: Dict[str, Tuple[Tuple[str, ...], str]] = {
@@ -235,9 +238,10 @@ def check_build_settings(target: str, settings: dict, errors: List[str]) -> None
 
 
 def find_files(root: Path, suffixes: Tuple[str, ...]) -> Iterator[Path]:
-    """root の下のファイルを列挙する。除外するディレクトリは root 直下のものだけで、降りる前に枝刈りする。
+    """root の下のファイルを列挙する。除外するディレクトリは降りる前に枝刈りする。
 
-    下位の階層にある同じ名前のディレクトリ（Sources/build など）は除外せず、検査の対象に残す。
+    SKIPPED_EVERYWHERE はどの階層でも、SKIPPED_AT_ROOT は root 直下だけで除外する。
+    下位の階層にある一般的な名前のディレクトリ（Sources/build など）は除外せず、検査の対象に残す。
     走査の失敗（読めないディレクトリ）は合格にせず、読めないものとして扱う。
     """
     def failed(error: OSError) -> None:
@@ -245,8 +249,8 @@ def find_files(root: Path, suffixes: Tuple[str, ...]) -> Iterator[Path]:
 
     found: List[Path] = []
     for directory, subdirectories, files in os.walk(root, onerror=failed):
-        if Path(directory) == root:
-            subdirectories[:] = [name for name in subdirectories if name not in SKIPPED_DIRECTORIES]
+        skipped = SKIPPED_EVERYWHERE | (SKIPPED_AT_ROOT if Path(directory) == root else set())
+        subdirectories[:] = [name for name in subdirectories if name not in skipped]
         found.extend(Path(directory) / name for name in files if name.endswith(suffixes))
     yield from sorted(found)
 

@@ -1,6 +1,21 @@
 #!/bin/bash
 # プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
 # 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+# 検査するのは HEAD のコミットだけなので、送信するコミットが HEAD と同じで、未コミットの変更がないことを求める
 set -euo pipefail
-# 標準入力（プッシュする参照の一覧）は使わない
-exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 </dev/null
+head=$(git rev-parse HEAD)
+# 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # 削除の送信（ローカルの SHA がすべて 0）は検査するコミットがない
+  if [ -z "${local_sha//0/}" ]; then continue; fi
+  # 注釈付きのタグはタグのオブジェクトを指すので、コミットまでたどってから比べる
+  commit=$(git rev-parse --verify -q "${local_sha}^{commit}") || {
+    echo "NG: 送信する ${local_ref} (${local_sha}) がコミットを指していない" >&2
+    exit 1
+  }
+  if [ "$commit" != "$head" ]; then
+    echo "NG: 送信する ${local_ref} (${commit}) が HEAD (${head}) と違う。そのコミットをチェックアウトしてから push する" >&2
+    exit 1
+  fi
+done
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 --require-clean </dev/null
