@@ -42,7 +42,8 @@ custom_rules:
 
   no_direct_logger:
     name: "Logger の直接の利用の禁止"
-    regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\('
+    # 型の注釈を付けた省略形（let logger: Logger = .init(subsystem:category:)）も生成として検出する
+    regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\(|:\s*(?:os\s*\.\s*)?Logger\s*[?!]?\s*=\s*\.\s*init\s*\('
     excluded:
       - '.*/Logging/AppLogger\.swift'
     match_kinds: *code
@@ -157,7 +158,8 @@ custom_rules:
 
   no_direct_clock:
     name: "時計の直接の利用の禁止"
-    regex: '\bDate\s*\(\s*\)|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\bsystemUptime\b'
+    # Date()・Date.init()・Date(timeIntervalSinceNow:) は現在時刻を読む。Date(timeIntervalSince1970:) などは認める
+    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\bsystemUptime\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
