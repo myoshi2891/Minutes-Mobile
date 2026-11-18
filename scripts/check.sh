@@ -27,6 +27,8 @@ PACKAGE="Packages/MinutesKit"
 UI_TESTS="MinutesMobileUITests"
 MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
+# 手順 7 がカバレッジを測ったコミットの記録（手順 8 が集計の前に現在の HEAD と照合する）
+COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
@@ -162,8 +164,10 @@ step_2() {
     else
       echo "ステージした Swift ファイルはない"
     fi
-    # 規則・試験用のファイル・入れ子の設定を変えたときだけ、規則の試験を回す
-    if git diff --cached --quiet -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py; then return 0; fi
+    # 規則・試験用のファイル・入れ子の設定・テストのディレクトリ（入れ子の設定の置き忘れを検査する）を変えたときだけ、
+    # 規則の試験を回す。テストのディレクトリの一覧は prepare_rules_tree と scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
+    if git diff --cached --quiet -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+      MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; then return 0; fi
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
     (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \
@@ -217,17 +221,24 @@ step_6() {
 step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
+  rm -f -- "$COVERAGE_HEAD"
   swift test --package-path "$PACKAGE" --enable-code-coverage
+  git rev-parse HEAD > "$COVERAGE_HEAD"
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
 }
 
 step_8() {
-  local report
+  local report measured
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
+  # 別のコミットで測った記録を集計しない
+  [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測ったコミットの記録がない。手順 7 を先に実行する"
+  measured=$(cat "$COVERAGE_HEAD")
+  [ "$measured" = "$(git rev-parse HEAD)" ] \
+    || fail "カバレッジは別のコミット（${measured}）で測ったもの。手順 7 を実行し直す"
   scripts/coverage-report.py "$report" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
@@ -270,6 +281,7 @@ trap on_exit EXIT
 trap 'exit 130' INT TERM
 if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
 # 通常の実行は作業ツリーを検査する。開始時と終了時の HEAD と未コミットの変更を控え、
+# （未追跡のファイルは status.showUntrackedFiles の設定によらず数える）
 # 検査したツリーがコミットと一致する場合だけ、そのコミットの合格として表示する
 START_HEAD=""
 START_CHANGES=""
@@ -282,7 +294,7 @@ if [ "$STAGED" = 0 ]; then
       fail "開始時の HEAD (${START_HEAD}) が期待したコミット (${expected}) と違う。送信するコミットをチェックアウトしてから push する"
     fi
   fi
-  START_CHANGES=$(git status --porcelain)
+  START_CHANGES=$(git status --porcelain --untracked-files=normal)
   # 作業ツリーだけにある修正で合格させない。長い手順を回す前に止める
   if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "$START_CHANGES" ]; then
     fail "未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから再実行する（検査するのは HEAD のコミットだけ）"
@@ -302,7 +314,7 @@ if [ "$STAGED" = 1 ]; then
   echo "OK: コミット前の検査を通過"
 else
   end_head=$(git rev-parse HEAD)
-  end_changes=$(git status --porcelain)
+  end_changes=$(git status --porcelain --untracked-files=normal)
   if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
     # 未コミットの変更を含む作業ツリーを検査した（または検査中にコミットが変わった）。コミットの合格にはしない
     if [ "$REQUIRE_CLEAN" = 1 ]; then

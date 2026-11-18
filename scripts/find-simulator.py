@@ -17,7 +17,11 @@ from typing import List, Tuple
 
 
 def version_key(text: str) -> Tuple[int, ...]:
-    return tuple(int(part) for part in text.split("."))
+    """版を比較用のタプルにする。末尾の 0 は除く（27.2 と 27.2.0 を同じ版として扱う）。"""
+    parts = [int(part) for part in text.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 def main() -> int:

@@ -5,6 +5,7 @@
 #   scripts/setup-tools.sh            導入する（導入済みで版と SHA-256 が一致するものは取得しない）
 #   scripts/setup-tools.sh --verify   取得せず、導入済みの版が tools/versions と一致するかだけ確かめる（check.sh の手順 0）
 # 試験用の指定（検査の自己試験が使う）: --versions <ファイル>  --dest <ディレクトリ>
+#   --require "<名前 …>"  台帳に行が要るツールの集合（既定は検査が使う 4 種。一部だけの台帳で試験するときに明示する）
 #
 # 終了コード: 0 = 一致 / 1 = 不一致・取得や照合の失敗 / 2 = 使い方の誤り
 # 前提: curl・shasum・unzip・tar（OS 同梱）。gh は記録した版を curl で取得して .tools/ に入れ、
@@ -15,6 +16,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSIONS="$ROOT/tools/versions"
 DEST="$ROOT/.tools"
 MODE=install
+# 検査（check.sh）が使うツール。台帳から行が消えても見落とさないよう、台帳の内容ではなくこの集合で必須を決める
+REQUIRED="gh swiftlint swiftformat gitleaks"
 
 usage() {
   echo "使い方: $0 [--verify] [--versions <ファイル>] [--dest <ディレクトリ>]" >&2
@@ -26,6 +29,7 @@ while [ $# -gt 0 ]; do
     --verify) MODE=verify; shift ;;
     --versions) [ $# -ge 2 ] || usage; VERSIONS=$2; shift 2 ;;
     --dest) [ $# -ge 2 ] || usage; DEST=$2; shift 2 ;;
+    --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; REQUIRED=$2; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -37,15 +41,16 @@ fail() {
 
 [ -f "$VERSIONS" ] || fail "版の写しがない: $VERSIONS"
 
-# 実行時の版を表示するコマンド。ツールを足すときはここにも足す（未定義のツールは失敗させる）
+# 実行時の版を表示するコマンド。ツールを足すときはここにも足す（未定義のツールは失敗させる）。
+# 呼び出し側は $(…) の中で実行するので set -e が効かない。表示のコマンドの失敗は非 0 で返し、版を出力しない
 runtime_version() {
   local name=$1 binary=$2 out
   case "$name" in
-    swiftlint) out=$("$binary" version) ;;
-    swiftformat) out=$("$binary" --version) ;;
-    gitleaks) out=$("$binary" version) ;;
-    gh) out=$("$binary" --version); out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
-    *) fail "版の確認方法が未定義のツール: $name" ;;
+    swiftlint) out=$("$binary" version) || return 1 ;;
+    swiftformat) out=$("$binary" --version) || return 1 ;;
+    gitleaks) out=$("$binary" version) || return 1 ;;
+    gh) out=$("$binary" --version) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
+    *) echo "NG: 版の確認方法が未定義のツール: $name" >&2; return 1 ;;
   esac
   printf '%s\n' "${out#v}"
 }
@@ -62,7 +67,7 @@ verify_tool() {
   [ -x "$link" ] || fail "$name が導入されていない。scripts/setup-tools.sh を実行する"
   [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] \
     || fail "$name $version の導入記録が tools/versions の SHA-256 と一致しない。scripts/setup-tools.sh を実行し直す"
-  actual=$(runtime_version "$name" "$link")
+  actual=$(runtime_version "$name" "$link") || fail "$name の版を表示できない（${link}）。scripts/setup-tools.sh を実行し直す"
   [ "$actual" = "$version" ] \
     || fail "$name の版が違う（tools/versions: $version / 実行時: ${actual}）。scripts/setup-tools.sh を実行し直す"
   echo "OK: $name $version"
@@ -70,10 +75,13 @@ verify_tool() {
 
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
-  local target="$DEST/$name/$version" work="$WORK/$name" actual found license
-  # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）
-  if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ] \
-    && [ "$(runtime_version "$name" "$target/$binary" 2>/dev/null)" = "$version" ]; then
+  local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
+  # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
+  # 版の表示に失敗した導入は、表示の内容によらず導入済みとして扱わない
+  if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
+    cached=$(runtime_version "$name" "$target/$binary" 2>/dev/null) || cached=""
+  fi
+  if [ -n "$cached" ] && [ "$cached" = "$version" ]; then
     echo "導入済み: $name $version"
   else
     echo "取得: $name ${version}（$repo $tag ${asset}）"
@@ -109,6 +117,10 @@ install_tool() {
     license=$(find "$work/extract" -maxdepth 2 -type f -name LICENSE)
     if [ -n "$license" ] && [ "$(printf '%s\n' "$license" | wc -l | tr -d ' ')" = 1 ]; then cp "$license" "$work/out/LICENSE"; fi
     printf '%s\n' "$sha" > "$work/out/.archive-sha256"
+    # 既存の導入を消す前に、取得したものが記録した版を名乗ることを確かめる（違えば既存の導入を残して失敗する）
+    actual=$(runtime_version "$name" "$work/out/$binary") || fail "取得した $name の版を表示できない。既存の導入は残す"
+    [ "$actual" = "$version" ] \
+      || fail "取得した $name の版が違う（tools/versions: $version / 取得したもの: ${actual}）。既存の導入は残す"
     mkdir -p "$DEST/$name"
     rm -rf -- "${target:?}"
     mv "$work/out" "$target"
@@ -160,7 +172,9 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
 done < "$VERSIONS"
 
 [ "$seen" != " " ] || fail "tools/versions にツールが 1 つもない"
-for name in $seen; do
+# 台帳に現れたツールと、検査が使う必須のツールの両方について、この Mac 向けの行が 1 つずつあること
+# （重複はループの中で失敗させている）
+for name in $seen $REQUIRED; do
   case "$matched" in *" $name "*) ;; *) fail "$name に $ARCH 向けの行がない" ;; esac
 done
 echo "OK: 開発ツールの版は tools/versions と一致"

@@ -11,7 +11,6 @@
 import json
 import platform
 import plistlib
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -112,6 +111,16 @@ def test_settings() -> None:
     sample = '{"a": ["x,]", "y",], "b": {"c": "d,}",},}'
     if json.loads(strip_trailing_commas(sample)) != {"a": ["x,]", "y"], "b": {"c": "d,}"}}:
         failures.append("settings: 末尾カンマの除去で、文字列の中のカンマが変わった")
+    # 開き括弧の直後のカンマは除かない（壊れた入力を空の辞書・配列として読まない）
+    for broken in ("{,}", "[,]", '{"a": [ , ]}'):
+        count += 1
+        try:
+            json.loads(strip_trailing_commas(broken))
+            failures.append(f"settings: 壊れた入力 {broken} を読めてしまった")
+        except json.JSONDecodeError:
+            pass
+    settings_case("開き括弧の直後のカンマは読めないものとして扱う", 2, "読めない",
+                  project=lambda t: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n  },', '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n  },\n  "extra": {,},'))
 
     settings_case("合格する設定", 0, "OK")
     settings_case("対象デバイスが iPhone 以外を含む", 1, "TARGETED_DEVICE_FAMILY",
@@ -262,6 +271,29 @@ def test_settings() -> None:
                   project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription":', '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]":'))
     settings_case("シミュレータの SDK だけの値を、参照先の Info.plist が実機用に補う", 0, "OK",
                   project=lambda t: info_plist_file("Config/App-Settings.plist")((lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription":', '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]":'))(t)),
+                  plists={"Config/App-Settings.plist": microphone})
+    # SDK の条件は版つきの SDK 名（iphoneos27.2 など）と照合する。空の条件はどの SDK にも当たらない
+    settings_case("版つきの SDK の条件も検査する", 1, "SWIFT_VERSION[sdk=iphoneos2*] = 5.0",
+                  project=lambda t: replaced(t, '"SWIFT_VERSION": "6.0",',
+                                             '"SWIFT_VERSION": "6.0",\n        "SWIFT_VERSION[sdk=iphoneos2*]": "5.0",'))
+    settings_case("版つきの SDK の条件で実機とシミュレータの両方を満たす", 0, "OK",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphoneos2*]": "会議を録音するためにマイクを使用します。",\n'
+                                             '        "INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]": "会議を録音するためにマイクを使用します。",'))
+    settings_case("空の SDK の条件の値は、条件のない値を上書きしない", 1, "Debug（iphoneos）",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription":',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=]":'))
+    # arch の条件付きの参照先は、別の arch の構成を補わない（条件なしに決まらない）
+    settings_case("arch の条件付きの参照先だけでは補えない", 1, "NSMicrophoneUsageDescription がない",
+                  project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t).replace(
+                      '"INFOPLIST_FILE":', '"INFOPLIST_FILE[arch=arm64]":')),
+                  plists={"Config/App-Settings.plist": microphone})
+    # 生成の指定が arch の条件付きだけの構成は、生成しない場合も起こりうるので参照先の plist も求める
+    settings_case("生成の指定が arch の条件付きだけ", 1, "NSMicrophoneUsageDescription がない",
+                  project=lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",', '"GENERATE_INFOPLIST_FILE[arch=arm64]": "YES",'))
+    settings_case("生成の指定が arch の条件付きだけでも、参照先の plist があれば合格", 0, "OK",
+                  project=lambda t: info_plist_file("Config/App-Settings.plist")(t).replace(
+                      '"GENERATE_INFOPLIST_FILE": "YES",', '"GENERATE_INFOPLIST_FILE[arch=arm64]": "YES",'),
                   plists={"Config/App-Settings.plist": microphone})
     # CODE_SIGN_ENTITLEMENTS が指すファイルは、拡張子にかかわらず検査する
     def entitlements_file(value: str) -> Callable[[str], str]:
@@ -466,6 +498,15 @@ def test_dependencies() -> None:
     dependencies_case("区間の上限は含まない", 1, "合わない",
                       {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", "1.0.0"..<"1.2.3")')},
                       [approved])
+    # 閉じていない文字列・補間は、後ろの宣言を本文として隠さないよう読めないものとして扱う
+    dependencies_case("閉じていない文字列", 2, "文字列リテラルが閉じていない",
+                      {"Package.swift": declare.format(unlisted) + 'let s = "abc\n'})
+    dependencies_case("閉じていない補間", 2, "補間が閉じていない", {"Package.swift": declare.format(unlisted) + 'let s = "\\(x\n'})
+    # 版別の manifest（Package@swift-<版>.swift）も同じ検査にかける
+    dependencies_case("版別の manifest の許可リスト外の依存", 1, "Package@swift-6.0.swift",
+                      {"Package@swift-6.0.swift": declare.format(unlisted)})
+    expect("dependencies: 存在しない起点", [str(SCRIPTS / "check-dependencies.py"), "--root", str(ROOT / "no-such-directory")],
+           2, "起点のディレクトリがない")
 
 
 def test_versions() -> None:
@@ -483,10 +524,9 @@ def test_versions() -> None:
 
     def changed_row(index: int, value: str) -> Callable[[str], str]:
         def change(text: str) -> str:
-            fields = row.split(" ")
-            # 空白の並びを保ったまま、index 番目の列だけを置き換える
-            positions = [i for i, field in enumerate(fields) if field]
-            fields[positions[index]] = value
+            # 空白文字（タブを含む）で列に分け、index 番目の列だけを置き換える（一時の台帳なので空白の並びは保たない）
+            fields = row.split()
+            fields[index] = value
             return replaced(text, row, " ".join(fields))
         return change
 
@@ -501,6 +541,10 @@ def test_versions() -> None:
         "この Mac 向けの行がない": (lambda t: "\n".join(
             line for line in t.splitlines() if not (line.startswith("gitleaks") and f" {platform.machine()} " in line)
         ) + "\n", "向けの行がない"),
+        # 台帳からツールの行がすべて消えても、検査が使う必須のツールとして欠落を検出する
+        "必須のツールの行がない": (lambda t: "\n".join(
+            line for line in t.splitlines() if not line.startswith("swiftformat")
+        ) + "\n", "swiftformat に"),
     }
     # 末尾に改行のない最終行も読む（最終行のツールを読み落とすと「行がない」で失敗する）
     with tempfile.TemporaryDirectory() as directory:
@@ -529,8 +573,13 @@ def test_versions() -> None:
         (dest / "bin" / "gh").symlink_to(f"../gh/{version}/gh")
         versions = Path(directory) / "versions"
         versions.write_text("\n".join(gh_rows) + "\n", encoding="utf-8")
-        expect("versions: 実行時の gh の版が違う", [setup, "--verify", "--versions", str(versions), "--dest", str(dest)], 1,
-               "実行時: 2.0.0")
+        # gh の行だけの台帳なので、期待するツールの集合を gh だけと明示する
+        expect("versions: 実行時の gh の版が違う",
+               [setup, "--verify", "--versions", str(versions), "--dest", str(dest), "--require", "gh"], 1, "実行時: 2.0.0")
+        # 版を表示するコマンドが失敗する導入は、出力によらず合格にしない
+        stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\nexit 3\n", encoding="utf-8")
+        expect("versions: 版の表示が失敗する", [setup, "--verify", "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
+               1, "版を表示できない")
 
 
 def test_gitleaks() -> None:
@@ -572,7 +621,7 @@ DOCS = {
         f"<!-- file: scripts/sample.sh -->\n\n{FENCE}bash\necho one\necho two\necho three\n{FENCE}\n\n"
         f"<!-- excerpt: scripts/sample.sh -->\n\n{FENCE}bash\necho two\necho three\n{FENCE}\n\n"
         "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n"
-        "## 4. 要件 ID ↔ テストの対応表\n\n満たす要件: TST-AAA-01\n\n"
+        "## 4. 要件 ID ↔ テストの対応表\n\n満たす要件: TST-AAA-01\n\n| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n\n"
         "## 5. 基本設計の申し送りの解決\n\n満たす要件: —\n\n| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n"
     ),
     "scripts/sample.sh": "echo one\necho two\necho three\n",
@@ -590,10 +639,15 @@ EXAMPLE_MARKERS = (
 )
 
 
+# test_docs が持つ一時ディレクトリ。各ケースのディレクトリはこの下に作り、例外が起きても丸ごと消えるようにする
+docs_parent: Optional[Path] = None
+
+
 def docs_case(label: str, want_code: int, want_text: str, name: str = "", old: str = "", new: str = "",
               options: Optional[List[str]] = None, extra: Optional[Dict[str, Optional[str]]] = None) -> Path:
     """extra の値が None のファイルは置かない（欠落の試験に使う）。"""
-    directory = Path(tempfile.mkdtemp())
+    assert docs_parent is not None, "docs_case は test_docs の一時ディレクトリの中で呼ぶ"
+    directory = Path(tempfile.mkdtemp(dir=docs_parent))
     files = dict(DOCS)
     files.update(extra or {})
     for path, content in files.items():
@@ -608,6 +662,16 @@ def docs_case(label: str, want_code: int, want_text: str, name: str = "", old: s
 
 
 def test_docs() -> None:
+    global docs_parent
+    with tempfile.TemporaryDirectory() as owner:
+        docs_parent = Path(owner)
+        try:
+            run_docs_cases()
+        finally:
+            docs_parent = None
+
+
+def run_docs_cases() -> None:
     global count
     basic, detailed = "docs/02-basic-design/sample.md", "docs/03-detailed-design/sample.md"
     requirements = "docs/01-requirements/requirements.md"
@@ -685,6 +749,26 @@ def test_docs() -> None:
         docs_case("コード片の元のファイルがない", 1, "元のファイルがない", detailed, "<!-- file: scripts/sample.sh -->", "<!-- file: scripts/missing.sh -->"),
         docs_case("詳細設計の索引のコード片も照合する", 1, "README.md:7: コード片が scripts/sample.sh と一致しない",
                   "docs/03-detailed-design/README.md", f"bash\necho one\n{FENCE}", f"bash\necho nine\n{FENCE}"),
+        # 「要件 ID ↔ テスト」の節には、要件 ID とテストの両方を持つ対応表の行が要る
+        docs_case("要件 ID ↔ テストの対応表がない", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", ""),
+        docs_case("対応表の行に要件 ID がない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| 未定 | 試験 |"),
+        docs_case("対応表の行にテストがない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| FR-AAA-01 |  |"),
+        # 範囲は、同じ接頭辞の定義済み ID の数を超えて展開しない
+        docs_case("広すぎる範囲", 1, "広すぎる範囲: FR-AAA-01〜99", detailed, "FR-AAA-01〜02", "FR-AAA-01〜99"),
+        # FR / NFR / SEC はフェーズ（MVP / P2 / P3）を持つ
+        docs_case("フェーズを読めない", 1, "FR-AAA-02 のフェーズ「未定」", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-02 | 二 | 未定 |"),
+        docs_case("フェーズの列がない", 1, "SEC-AAA-01 のフェーズの列がない", "docs/01-requirements/security-requirements.md",
+                  "| ID | 要件 | フェーズ |\n| --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP |", "| ID | 要件 |\n| --- | --- |\n| SEC-AAA-01 | 一 |"),
+        # 「満たす要件の例」などの説明文は、網羅に数えない
+        docs_case("説明文の要件は網羅に数えない", 1, "MVP の要件 FR-AAA-02", extra={basic: replaced(replaced(
+            DOCS[basic], "FR-AAA-01・02、", "FR-AAA-01、"),
+            "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n", "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n満たす要件の例: FR-AAA-02\n\n")}),
+        # 空白 4 個以上の字下げの行はフェンスを閉じない（コードの本文として扱う）
+        docs_case("字下げ 4 個のフェンス状の行は開かない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
+                  f"満たす要件: TST-AAA-01\n\n    {FENCE}\n    コードの本文\n\n"),
+        docs_case("字下げ 4 個のフェンス状の行は閉じない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
+                  f"満たす要件: TST-AAA-01\n\n{FENCE}text\n    {FENCE}\n## 9. フェンスの中の見出し\n{FENCE}\n\n"),
     ]
     # --update-snippets は、全文のコード片を実ファイルに合わせて書き直す
     fixed = docs_case("全文のコード片の書き直し", 0, "コード片を書き直した", detailed, "echo one\necho two\necho three", "echo old",
@@ -698,10 +782,9 @@ def test_docs() -> None:
     count += 1
     if EXAMPLE_MARKERS not in (example / detailed).read_text(encoding="utf-8"):
         failures.append("docs: フェンスの中の印のコード片が書き直された")
+    del created  # 一時ディレクトリは test_docs の TemporaryDirectory が消す
     with tempfile.TemporaryDirectory() as missing:
         expect("docs: 存在しない root", [str(SCRIPTS / "verify-docs.py"), "--root", str(Path(missing) / "none")], 2, "docs")
-    for directory in created + [fixed, example]:
-        shutil.rmtree(directory)
 
 
 TESTS = {"settings": test_settings, "dependencies": test_dependencies, "versions": test_versions, "gitleaks": test_gitleaks,

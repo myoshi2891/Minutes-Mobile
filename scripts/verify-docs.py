@@ -50,12 +50,15 @@ DETAILED = "docs/03-detailed-design"
 
 
 Fence = Tuple[str, int]  # フェンスの文字（` か ~）と長さ
-FENCE_OPEN = re.compile(r"^(`{3,}|~{3,})(.*)$")
+# フェンスの字下げは空白 0〜3 個まで（CommonMark）。4 個以上の字下げの行はコードの本文として扱う
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+PHASES = re.compile(r"^(MVP|P2|P3)\b")
+DETAILED_MAPPING = "要件 ID ↔ テスト"
 
 
 def fence_open(line: str) -> Optional[Tuple[Fence, str]]:
     """フェンスの開始行なら（フェンス, 情報文字列）を返す。バッククォートのフェンスの情報文字列にはバッククォートを含められない。"""
-    found = FENCE_OPEN.match(line.lstrip())
+    found = FENCE_OPEN.match(line)
     if not found:
         return None
     marker, info = found.group(1), found.group(2)
@@ -65,9 +68,9 @@ def fence_open(line: str) -> Optional[Tuple[Fence, str]]:
 
 
 def fence_closes(line: str, fence: Fence) -> bool:
-    """開始と同じ文字が開始以上の長さで並び、その後が空白だけの行だけが、フェンスを閉じる。"""
+    """字下げが空白 0〜3 個で、開始と同じ文字が開始以上の長さで並び、その後が空白だけの行だけが、フェンスを閉じる。"""
     char, length = fence
-    return re.fullmatch(rf"{re.escape(char)}{{{length},}}\s*", line.lstrip()) is not None
+    return re.fullmatch(rf" {{0,3}}{re.escape(char)}{{{length},}}\s*", line) is not None
 
 
 def fence_end(lines: List[str], start: int) -> int:
@@ -183,9 +186,29 @@ class Checker:
                     self.error(name, f"{identifier} の定義が重複している（{self.defined[identifier]}）", number)
                     continue
                 self.defined[identifier] = f"{name}:{number}"
-                if prefix in ("FR", "NFR", "SEC") and 0 <= phase_column < len(cells):
-                    if cells[phase_column].startswith("MVP"):
+                if prefix in ("FR", "NFR", "SEC"):
+                    # FR / NFR / SEC はフェーズ（MVP / P2 / P3）を必ず持つ（docs/README.md §3）
+                    phase = cells[phase_column] if 0 <= phase_column < len(cells) else ""
+                    if not PHASES.match(phase):
+                        what = "フェーズの列がない" if phase_column < 0 else f"フェーズ「{phase}」を MVP・P2・P3 として読めない"
+                        self.error(name, f"{identifier} の{what}", number)
+                    elif phase.startswith("MVP"):
                         self.mvp.add(identifier)
+
+    def oversized_range(self, match: "re.Match[str]") -> bool:
+        """範囲（〜）の要素数が、同じ接頭辞の定義済み ID の数を超えるか（巨大な範囲を展開しないため）。"""
+        stem, number = match.group(1).rsplit("-", 1)
+        limit = sum(1 for identifier in self.defined if identifier.rsplit("-", 1)[0] == stem)
+        previous = int(number)
+        for separator, digits in re.findall(rf"{SEPARATOR}(\d+)", match.group(2)):
+            if separator == "〜" and int(digits) - previous > limit:
+                return True
+            previous = int(digits)
+        return False
+
+    def expand_ids(self, match: "re.Match[str]") -> List[str]:
+        """expand と同じ。ただし広すぎる範囲は展開しない（check_references が不正として報告する）。"""
+        return [] if self.oversized_range(match) else expand(match)
 
     def check_references(self) -> None:
         prefixes = {identifier.rsplit("-", 1)[0] for identifier in self.defined}
@@ -194,6 +217,9 @@ class Checker:
                 for match in ID_PATTERN.finditer(line):
                     if reversed_range(match):
                         self.error(name, f"逆順の範囲: {match.group(0)}（終点が直前の番号より小さい）", number)
+                        continue
+                    if self.oversized_range(match):
+                        self.error(name, f"広すぎる範囲: {match.group(0)}（同じ接頭辞の定義済みの ID の数を超える）", number)
                         continue
                     for identifier in expand(match):
                         if identifier not in self.defined:
@@ -214,12 +240,14 @@ class Checker:
             if not name.startswith(BASIC + "/") or name.endswith("/README.md"):
                 continue
             for _, line in prose_lines(text):
-                if not re.match(r"^(\| )?満たす要件", line):
+                # 正式な欄だけを数える: 節の冒頭の「満たす要件:」と、文書の冒頭の表の「| 満たす要件 ID |」の行
+                # （「満たす要件の例」などの説明文は数えない）
+                if not re.match(r"^(?:満たす要件:|\| 満たす要件 ID \|)", line):
                     continue
                 # names_requirements と同じく「／」の前だけを見る（後ろの決定・関連の参照は網羅に数えない）
                 line = line.split("／", 1)[0]
                 for match in ID_PATTERN.finditer(line):
-                    covered.update(expand(match))
+                    covered.update(self.expand_ids(match))
                 for match in GROUP_PATTERN.finditer(line):
                     for area in match.group(2).split("・"):
                         stem = f"{match.group(1)}-{area}-"
@@ -287,7 +315,34 @@ class Checker:
                     self.error(name, f"「{word}」の節がない")
             if directory == DETAILED:
                 self.check_handover(name, sections)
+                self.check_mapping(name, sections)
                 self.check_snippets(name, text)
+
+    def check_mapping(self, name: str, sections: List[Tuple[int, str, List[str]]]) -> None:
+        """「要件 ID ↔ テスト」の節に対応表があり、要件 ID とテストの両方を持つ行が 1 行以上あること。
+
+        見出しだけがあって表のない節を合格にしない。行は、先頭の列に定義済みの要件 ID があり、
+        ほかの列（検査・試験）が空でないものを数える。各表の見出しの行と区切りの行は除く。
+        """
+        for number, heading, body in sections:
+            if DETAILED_MAPPING not in heading:
+                continue
+            rows: List[str] = []
+            table: List[str] = []
+            for line in body + [""]:
+                if line.startswith("|"):
+                    if not re.match(r"^\|[ :|-]+\|$", line):
+                        table.append(line)
+                    continue
+                rows.extend(table[1:])
+                table = []
+            for line in rows:
+                cells = table_cells(line)
+                if len(cells) < 2 or not any(cell.strip() for cell in cells[1:]):
+                    continue
+                if self.names_requirements("満たす要件: " + cells[0]) and not cells[0].startswith("—"):
+                    return
+            self.error(name, f"「{heading}」の節に、要件 ID とテストの両方を持つ対応表の行がない", number)
 
     def names_requirements(self, line: str) -> bool:
         """「満たす要件:」の後（「／」の前まで）に、定義済みの要件 ID・要件の群・「SEC 全般」・「—」（満たす要件なし）のどれかがあるか。"""
@@ -295,7 +350,8 @@ class Checker:
         if spec.startswith("—") or "SEC 全般" in spec:
             return True
         for match in ID_PATTERN.finditer(spec):
-            if any(identifier in self.defined and re.match(REQUIREMENT_PREFIX, identifier) for identifier in expand(match)):
+            if any(identifier in self.defined and re.match(REQUIREMENT_PREFIX, identifier)
+                   for identifier in self.expand_ids(match)):
                 return True
         prefixes = {identifier.rsplit("-", 1)[0] for identifier in self.defined}
         return any(

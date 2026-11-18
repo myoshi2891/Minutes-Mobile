@@ -5,10 +5,12 @@
 # 照合した HEAD は --expect-head で渡し、check.sh の開始までに HEAD が変わっていれば失敗させる
 set -euo pipefail
 head=$(git rev-parse HEAD)
+updates=0  # 削除以外の参照の送信の数
 # 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
 while read -r local_ref local_sha remote_ref remote_sha; do
   # 削除の送信（ローカルの SHA がすべて 0）は検査するコミットがない
   if [ -z "${local_sha//0/}" ]; then continue; fi
+  updates=$((updates + 1))
   # 注釈付きのタグはタグのオブジェクトを指すので、コミットまでたどってから比べる
   commit=$(git rev-parse --verify -q "${local_sha}^{commit}") || {
     echo "NG: 送信する ${local_ref} (${local_sha}) がコミットを指していない" >&2
@@ -19,4 +21,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     exit 1
   fi
 done
+# 削除だけの送信は、検査するコミットがないので検査を起動しない
+if [ "$updates" -eq 0 ]; then exit 0; fi
 exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

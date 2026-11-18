@@ -197,7 +197,8 @@ def starts_string(text: str, index: int) -> bool:
 
 
 def string_end(text: str, index: int) -> int:
-    """index で始まる文字列リテラルの終わりの次の位置を返す。閉じていなければ末尾。
+    """index で始まる文字列リテラルの終わりの次の位置を返す。閉じていなければ読めないものとして扱う
+    （末尾まで文字列と見なすと、後ろの宣言を本文として隠したまま検査を続けるため）。
 
     補間（\\(…)、生の文字列では \\#(…)）の中は括弧の対応で読み、中の文字列リテラルで外側が閉じたと見なさない
     （見なすと、補間の中の「/*」「//」をコメントの始まりと取り違え、後ろの宣言を隠すため）。
@@ -219,13 +220,13 @@ def string_end(text: str, index: int) -> int:
                 cursor += 1  # エスケープされた 1 文字
             continue
         cursor += 1
-    return len(text)
+    raise Unreadable("文字列リテラルが閉じていない")
 
 
 def interpolation_end(text: str, start: int) -> int:
     """start の位置の「(」に対応する「)」の次の位置を返す。中の文字列リテラルは string_end で、
     コメント（行コメントと入れ子のブロックコメント）は括弧や引用符を解釈する前に読み飛ばす
-    （コメントの中の「)」「"」を補間や外側の文字列の終わりと取り違えないため）。
+    （コメントの中の「)」「"」を補間や外側の文字列の終わりと取り違えないため）。閉じていなければ読めないものとして扱う。
     """
     depth = 0
     cursor = start
@@ -246,7 +247,7 @@ def interpolation_end(text: str, start: int) -> int:
             if depth == 0:
                 return cursor + 1
         cursor += 1
-    return len(text)
+    raise Unreadable("文字列の補間が閉じていない")
 
 
 def call_arguments(text: str, start: int) -> str:
@@ -399,7 +400,17 @@ def manifest_errors(
     return errors
 
 
+def manifests(root: Path) -> Iterator[Path]:
+    """Package.swift と、版別の manifest（Package@swift-<版>.swift）を返す。版別の manifest も同じ検査にかける
+    （SwiftPM はツールの版に合う版別の manifest を Package.swift より優先して読むため）。"""
+    found = set(find_files(root, "Package.swift")) | set(find_files(root, "Package@swift-*.swift"))
+    yield from sorted(found)
+
+
 def check(root: Path, allowlist: Path) -> List[str]:
+    # 存在しない起点を走査すると対象が 0 件になり合格してしまうので、読めないものとして扱う
+    if not root.is_dir():
+        raise Unreadable(f"{root}: 探す起点のディレクトリがない")
     by_pin, by_url, by_path = load_allowlist(allowlist)
     # by_url は URL ごとに 1 項目しか持たないので、版の照合には by_pin から作った URL → 承認した版を使う
     approved_versions: Dict[str, Set[str]] = {}
@@ -435,7 +446,7 @@ def check(root: Path, allowlist: Path) -> List[str]:
                 approved = by_pin[(identity, version)]["url"]
                 if not isinstance(location, str) or normalize(location) != normalize(approved):
                     errors.append(f"{source}: {identity} {version} の取得元 {location} が許可リスト（{approved}）と違う")
-    for path in find_files(root, "Package.swift"):
+    for path in manifests(root):
         try:
             manifest = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as error:

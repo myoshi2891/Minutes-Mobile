@@ -12,6 +12,7 @@ import fnmatch
 import os
 import plistlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -76,6 +77,35 @@ FORBIDDEN_ENTITLEMENT_PREFIXES = {
     "com.apple.developer.ubiquity": "SEC-NET-01（iCloud）",
 }
 
+# SDK の版つきの名前（iphoneos27.2 など）。条件 [sdk=…] はこの名前と照合する。取得できなければ None
+_SDK_NAMES: Dict[str, Optional[str]] = {}
+
+
+def sdk_name(sdk: str) -> Optional[str]:
+    """Xcode が SDK の条件を照合する、版つきの SDK 名を返す。取得できなければ None。"""
+    if sdk not in _SDK_NAMES:
+        env = dict(os.environ)
+        env.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
+        try:
+            result = subprocess.run(["xcrun", "--sdk", sdk, "--show-sdk-version"], env=env,
+                                    capture_output=True, text=True, check=True)
+            version = result.stdout.strip()
+            _SDK_NAMES[sdk] = f"{sdk}{version}" if re.fullmatch(r"\d+(\.\d+)*", version) else None
+        except (OSError, subprocess.CalledProcessError):
+            _SDK_NAMES[sdk] = None
+    return _SDK_NAMES[sdk]
+
+
+def sdk_matches(sdk: str, pattern: str, key: str) -> bool:
+    """条件 [sdk=pattern] が SDK に当たるか。空の条件はどの SDK にも当たらない。
+    版つきの SDK 名を取得できない場合は、条件を無視せず判定できないものとして扱う。"""
+    if not pattern:
+        return False
+    name = sdk_name(sdk)
+    if name is None:
+        raise Unreadable(f"{key}: SDK {sdk} の版を取得できず、条件 sdk={pattern} を判定できない")
+    return fnmatch.fnmatchcase(name, pattern)
+
 
 def as_text(value: object) -> str:
     if isinstance(value, list):
@@ -119,7 +149,7 @@ def resolve(
                 condition = conditions(key)
                 if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
                     continue
-                if sdk is not None and "sdk" in condition and not fnmatch.fnmatchcase(sdk, condition["sdk"]):
+                if sdk is not None and "sdk" in condition and not sdk_matches(sdk, condition["sdk"], key):
                     continue
                 applicable.append((key, value, condition))
             if any(condition and set(condition) <= decided for _, _, condition in applicable):
@@ -164,10 +194,14 @@ def check_plist_values(
         empty: Dict[str, List[str]] = {}
         for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
             build = f"{configuration}（{sdk}）"
-            generate, _ = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
-            modes = {enabled(value) for (_, value) in generate} or {False}
+            generate, generate_undecided = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
+            modes = {enabled(value) for (_, value) in generate}
+            # 条件（arch など）なしに決まらない構成では、設定のない場合（生成しない）も起こりうる
+            if generate_undecided or not modes:
+                modes.add(False)
             from_files: List[Tuple[str, str]] = []
-            plists = referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)
+            plists, plists_undecided = referenced_files(
+                project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)
             lacking = False  # 参照先の plist のうち、鍵を持たないものがある
             for path in plists:
                 data = load_plist(path)
@@ -184,8 +218,9 @@ def check_plist_values(
                 from_settings = [(key, value.replace("$(inherited)", "").strip()) for (key, value) in effective]
                 settings_cover = bool(from_settings) and not undecided
             # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない。
-            # 参照先が条件（arch など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ補えないとする
-            files_cover = bool(plists) and not lacking
+            # 参照先が条件（arch など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ補えないとする。
+            # 参照先が条件なしに決まらない構成（arch の条件付きだけなど）は、別の条件の参照先で補わない
+            files_cover = bool(plists) and not lacking and not plists_undecided
             if (False in modes and not files_cover) or (True in modes and not (settings_cover or files_cover)):
                 missing.append(build)
             for label, value in from_files + from_settings:
@@ -269,8 +304,9 @@ def load_plist(path: Path) -> dict:
 def referenced_files(
     project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str,
     sdk: Optional[str] = None
-) -> List[Path]:
-    """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルを返す。
+) -> Tuple[List[Path], bool]:
+    """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルと、
+    参照先が条件（arch など）なしには決まらないか（resolve の未確定）を返す。
 
     ファイル名や拡張子にかかわらず検査するために使う。
     相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
@@ -278,7 +314,7 @@ def referenced_files(
     parent = project_path.parent
     source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
-    effective, _ = resolve(own, shared, setting, [configuration], sdk)
+    effective, undecided = resolve(own, shared, setting, [configuration], sdk)
     paths: List[Path] = []
     for (key, value), _ in effective.items():
         text = value.strip()
@@ -294,7 +330,7 @@ def referenced_files(
         expanded = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", expand, text)
         path = Path(expanded)
         paths.append((path if path.is_absolute() else source_root / path).resolve())
-    return paths
+    return paths, bool(undecided)
 
 
 def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
@@ -318,9 +354,9 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
         for configuration in configurations:
-            referenced.extend(referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE"))
+            referenced.extend(referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE")[0])
             entitlements.extend(
-                referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS"))
+                referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS")[0])
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
         if target.get("product-type") == "application":
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
