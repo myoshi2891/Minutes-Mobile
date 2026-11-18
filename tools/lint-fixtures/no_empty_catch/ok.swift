@@ -29,4 +29,7 @@ func sample() throws {
     }
     // 入れ子のブロックコメントの後に処理がある本体は空ではない
     do { try work() } catch { /* 外 /* 内 */ 外 */ recorder.record(.failed) }
+    // 条件の括弧の中の空のクロージャーを空の本体と取り違えない
+    do { try work() } catch let error where handlers.allSatisfy(where: {}) { recorder.record(.failed) }
+    do { try work() } catch let error where check(error, label: "(", { _ in }) { recorder.record(.failed) }
 }

@@ -25,4 +25,7 @@ func sample() {
     }
     // 入れ子のブロックコメントだけの本体も空とみなす
     do { try work() } catch { /* 外 /* 内 */ 外 */ } // expect: no_empty_catch
+    // 条件の括弧の中のクロージャーの「{」を本体と取り違えない（処理のあるクロージャーの後の空の本体を検出する）
+    do { try work() } catch let error where codes.contains(where: { $0 == error.code }) {} // expect: no_empty_catch
+    do { try work() } catch let error where [{ (code: Int) in code == 5 }].contains(where: { $0(error.code) }) { } // expect: no_empty_catch
 }

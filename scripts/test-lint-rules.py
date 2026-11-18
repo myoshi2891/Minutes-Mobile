@@ -29,7 +29,8 @@ BUILTIN_RULES = ("force_try", "force_cast", "force_unwrapping")
 # テストコード用の入れ子の設定を試験するディレクトリと、同じ内容を置くテストのディレクトリ
 TEST_CODE_FIXTURE = "_test-code"
 TEST_CODE_DIRS = ("MinutesMobileTests", "MinutesMobileUITests", "Packages/MinutesKit/Tests")
-MARKER = re.compile(r"//\s*expect:\s*([a-z_]+)\s*$")
+# 規則名は custom_rules の規則名と同じ形（先頭は英小文字、以降は英小文字・数字・下線）
+MARKER = re.compile(r"//\s*expect:\s*([a-z][a-z0-9_]*)\s*$")
 
 
 def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
@@ -46,6 +47,8 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
             in_block = True
             continue
         if not in_block:
+            continue
+        if not line.strip() or re.match(r"^#", line):  # 空行と字下げのないコメントは読み飛ばす
             continue
         if re.match(r"^\S", line):  # 次の最上位の鍵で終わる
             break
