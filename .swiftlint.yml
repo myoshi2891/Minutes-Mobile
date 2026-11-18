@@ -18,7 +18,10 @@ opt_in_rules:
 # SEC-INP-03。テストコードでは入れ子の設定（tools/lint-fixtures/_test-code/.swiftlint.yml の写し）で外す
 force_try: error
 force_cast: error
-force_unwrapping: error
+# 既定では静的な文字列を渡した URL(string:)・UIImage(named:) などの強制アンラップを見逃すので、例外の一覧を空にする
+force_unwrapping:
+  severity: error
+  ignored_literal_argument_functions: []
 
 # match_kinds はコメントと文字列の中の一致を除くために指定する（コードとして現れた場合だけ検出する）
 custom_rules:
