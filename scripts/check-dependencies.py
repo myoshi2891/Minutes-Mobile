@@ -10,6 +10,7 @@ Package.swift の依存は、版の指定を同じディレクトリの Package.
 """
 import argparse
 import json
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -20,17 +21,35 @@ from xcproj import Unreadable, load_project
 ROOT = Path(__file__).resolve().parent.parent
 SKIPPED_DIRECTORIES = {".git", ".tools", ".build", "build", "DerivedData", "xcuserdata"}
 PACKAGE_FIELDS = ("identity", "url", "version", "license", "approvedOn", "ledger")
+# ローカルのバイナリ（.binaryTarget(path:)）の承認済みの項目は、url の代わりに path（リポジトリの起点からの相対パス）を持つ
+BINARY_FIELDS = ("identity", "path", "version", "license", "approvedOn", "ledger")
 REMOTE_URL = re.compile(r"^(https?|ssh|git)://|^git@")
 
 
 def normalize(url: str) -> str:
-    """同じリポジトリを指す書き方の違い（末尾の .git・スラッシュ・大文字小文字）をそろえる。"""
-    text = url.strip().lower().rstrip("/")
+    """同じリポジトリを指す書き方の違い（末尾の .git・スラッシュ、scheme とホストの大文字小文字）をそろえる。
+
+    パスの大文字小文字は区別する（パスだけが違う取得元を同じものと見なさない）。
+    """
+    text = url.strip().rstrip("/")
+    found = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/]*)(.*)$", text)
+    if found:
+        text = found.group(1).lower() + found.group(2).lower() + found.group(3)
+    else:
+        scp = re.match(r"^([^@/:]+@)([^:/]+)(:.*)$", text)  # git@host:owner/repo の形
+        if scp:
+            text = scp.group(1) + scp.group(2).lower() + scp.group(3)
     return text[:-4] if text.endswith(".git") else text
 
 
-def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, dict]]:
-    """許可リストを読み、(identity, 版) → 項目 と URL → 項目 を返す。形式が違えば読めないものとして扱う。"""
+def normalize_path(path: str) -> str:
+    """リポジトリの起点からの相対パスを、区切りと「.」「..」をそろえた形にする。"""
+    return posixpath.normpath(path.strip()).rstrip("/")
+
+
+def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, dict], Dict[str, dict]]:
+    """許可リストを読み、(identity, 版) → 項目、URL → 項目、ローカルのバイナリのパス → 項目 を返す。
+    形式が違えば読めないものとして扱う。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -45,10 +64,13 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
         raise Unreadable(f"{path}: approvedPackages の形式が違う")
     by_pin: Dict[Tuple[str, str], dict] = {}
     by_url: Dict[str, dict] = {}
+    by_path: Dict[str, dict] = {}
     for package in packages:
         if not isinstance(package, dict):
             raise Unreadable(f"{path}: approvedPackages の項目が辞書でない")
-        for field in PACKAGE_FIELDS:
+        if ("url" in package) == ("path" in package):
+            raise Unreadable(f"{path}: 承認済みの依存は url と path のどちらか一方だけを持つ")
+        for field in (PACKAGE_FIELDS if "url" in package else BINARY_FIELDS):
             if not isinstance(package.get(field), str) or not package[field].strip():
                 raise Unreadable(f"{path}: 承認済みの依存に {field} がない")
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", package["approvedOn"]):
@@ -60,9 +82,12 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
                 f"{path}: {package['identity']} のライセンス {package['license']} は許可の対象外。"
                 "ownerDecision にオーナーの決定（UD-nn）を記録する"
             )
+        if "path" in package:
+            by_path[normalize_path(package["path"])] = package
+            continue
         by_pin[(package["identity"].lower(), package["version"])] = package
         by_url[normalize(package["url"])] = package
-    return by_pin, by_url
+    return by_pin, by_url, by_path
 
 
 def find_files(root: Path, name: str) -> Iterator[Path]:
@@ -118,6 +143,25 @@ def strip_comments(text: str) -> str:
             # 文字列リテラル（"…"・"""…"""・#"…"#）は、閉じるまでそのまま写す
             end = string_end(text, index)
             out.append(text[index:end])
+            index = end
+        else:
+            out.append(text[index])
+            index += 1
+    return "".join(out)
+
+
+def mask_strings(text: str) -> str:
+    """strip_comments の後の内容の文字列リテラルを、両端の「"」を残して空白に置き換える（長さと改行の位置は変えない）。
+
+    宣言やキーワードの検索をこの内容に対して行い、文字列リテラルの本文に現れる「.package(」「url:」を宣言と見なさない。
+    """
+    out: List[str] = []
+    index = 0
+    while index < len(text):
+        if starts_string(text, index):
+            end = string_end(text, index)
+            body = "".join(char if char in "\r\n" else " " for char in text[index + 1:end - 1])
+            out.append('"' + body + '"' if end - index >= 2 else text[index:end])
             index = end
         else:
             out.append(text[index])
@@ -275,13 +319,25 @@ def satisfies(version: Version, rule: Tuple[Version, Version, bool]) -> bool:
 # 取得元を持つ宣言（Package の依存と、バイナリのターゲット）
 SOURCE_DECLARATION = re.compile(r"\.(package|binaryTarget)\s*\(")
 # 文字列リテラルだけの引数（連結・補間・変数を含まない）。引数の終わりは「,」か末尾
-LITERAL_URL = re.compile(r'\burl:\s*"[^"\\]*"\s*(?:,|$)')
-LITERAL_PATH = re.compile(r'\bpath:\s*"[^"\\]*"\s*(?:,|$)')
+LITERAL_URL = re.compile(r'url:\s*"([^"\\]*)"\s*(?:,|$)')
+LITERAL_PATH = re.compile(r'path:\s*"([^"\\]*)"\s*(?:,|$)')
 
 
-def version_errors(arguments: str, summary: str, approved: Set[str], pinned: Optional[List[object]]) -> List[str]:
+def literal_argument(arguments: str, masked: str, label: str, pattern: "re.Pattern[str]") -> Tuple[bool, Optional[str]]:
+    """引数のうちコードに現れる「label:」を探し、その値が文字列リテラルだけならその内容を返す。
+
+    戻り値は（キーワードがコードにあるか, 文字列リテラルの内容。リテラルでなければ None）。
+    """
+    found = re.search(rf"\b{label}:", masked)
+    if not found:
+        return False, None
+    literal = pattern.match(arguments, found.start())
+    return True, literal.group(1) if literal else None
+
+
+def version_errors(arguments: str, masked: str, summary: str, approved: Set[str], pinned: Optional[List[object]]) -> List[str]:
     """.package(url:) の版の指定を、承認した版と、同じディレクトリの Package.resolved の確定版で照合する。"""
-    if UNPINNED.search(arguments):
+    if UNPINNED.search(masked):
         return [f"版で固定されていない（ブランチやコミットの指定は認めない）: .package({summary})"]
     rule = requirement(arguments)
     if rule is None:
@@ -300,40 +356,51 @@ def version_errors(arguments: str, summary: str, approved: Set[str], pinned: Opt
 
 def manifest_errors(
     manifest: str, by_url: Dict[str, dict], approved: Optional[Dict[str, Set[str]]] = None,
-    pins: Optional[Dict[str, List[object]]] = None
+    pins: Optional[Dict[str, List[object]]] = None, by_path: Optional[Dict[str, dict]] = None, directory: str = ""
 ) -> List[str]:
     """Package.swift の取得元と版を調べる。取得元・版を文字列リテラルから判定できない宣言は合格にしない。
 
-    approved は URL → 承認した版、pins は URL → 同じディレクトリの Package.resolved の確定版。
-    コメントは先に除き、URL・宣言・版の検索はすべてコメントを除いた内容に対して行う。
+    approved は URL → 承認した版、pins は URL → 同じディレクトリの Package.resolved の確定版、
+    by_path はローカルのバイナリのパス → 承認済みの項目、directory は Package.swift のディレクトリ（起点からの相対）。
+    コメントは先に除く。宣言とキーワードは文字列リテラルの本文を除いた内容から探し、
+    取得元と版は、その宣言の引数の中だけで調べる。
     """
-    manifest = strip_comments(manifest)
+    code = strip_comments(manifest)
+    masked = mask_strings(code)
     approved = approved or {}
     pins = pins or {}
+    by_path = by_path or {}
     errors: List[str] = []
-    for url in re.findall(r'\burl:\s*"([^"]+)"', manifest):
-        if normalize(url) not in by_url:
-            errors.append(f"{url} は許可リストにない")
-    for match in SOURCE_DECLARATION.finditer(manifest):
+    for match in SOURCE_DECLARATION.finditer(masked):
         kind = match.group(1)
-        arguments = call_arguments(manifest, match.end() - 1)
+        start = match.end() - 1
+        masked_arguments = call_arguments(masked, start)
+        arguments = code[start + 1:start + 1 + len(masked_arguments)]  # 長さを変えずに置き換えたので位置は同じ
         summary = " ".join(arguments.split())[:80]
-        if kind == "package" and re.match(r"\s*id:", arguments):
+        has_url, url = literal_argument(arguments, masked_arguments, "url", LITERAL_URL)
+        has_path, path = literal_argument(arguments, masked_arguments, "path", LITERAL_PATH)
+        if kind == "package" and re.match(r"\s*id:", masked_arguments):
             errors.append(f"レジストリの依存は認めない: .package({summary})")
-        elif re.search(r"\burl:", arguments):
-            if not LITERAL_URL.search(arguments):
+        elif has_url:
+            if url is None:
                 errors.append(f"取得元の URL を判定できない（文字列リテラルで書く）: .{kind}({summary})")
+            elif normalize(url) not in by_url:
+                errors.append(f"{url} は許可リストにない")
             elif kind == "package":
-                url = normalize(re.findall(r'\burl:\s*"([^"\\]*)"', arguments)[0])
-                if url in by_url:  # 許可リストにない URL は上で報告済み
-                    errors.extend(version_errors(arguments, summary, approved.get(url, set()), pins.get(url)))
-        elif not LITERAL_PATH.search(arguments):
+                errors.extend(version_errors(arguments, masked_arguments, summary,
+                                             approved.get(normalize(url), set()), pins.get(normalize(url))))
+        elif not has_path or path is None:
             errors.append(f"取得元を判定できない（url: か path: を文字列リテラルで書く）: .{kind}({summary})")
+        elif kind == "binaryTarget":
+            # ローカルのバイナリは、承認済みの項目（版・ライセンス・承認日を持つ）がある場合だけ認める
+            location = normalize_path(posixpath.join(directory, path))
+            if location not in by_path:
+                errors.append(f"ローカルのバイナリ {location} は許可リストにない: .binaryTarget({summary})")
     return errors
 
 
 def check(root: Path, allowlist: Path) -> List[str]:
-    by_pin, by_url = load_allowlist(allowlist)
+    by_pin, by_url, by_path = load_allowlist(allowlist)
     # by_url は URL ごとに 1 項目しか持たないので、版の照合には by_pin から作った URL → 承認した版を使う
     approved_versions: Dict[str, Set[str]] = {}
     for package in by_pin.values():
@@ -375,7 +442,8 @@ def check(root: Path, allowlist: Path) -> List[str]:
             raise Unreadable(f"{path}: {error}") from error
         pins = pins_by_directory.get(path.parent, {})
         try:
-            found = manifest_errors(manifest, by_url, approved_versions, pins)
+            found = manifest_errors(manifest, by_url, approved_versions, pins, by_path,
+                                    path.parent.relative_to(root).as_posix())
         except Unreadable as error:
             raise Unreadable(f"{path}: {error}") from error
         errors.extend(f"{path.relative_to(root)}: {message}" for message in found)

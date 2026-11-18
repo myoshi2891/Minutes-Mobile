@@ -320,13 +320,22 @@ class Checker:
             item_name(line[2:]) for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
             for line in body if line.startswith("- ")
         ]
-        rows = [
-            line for _, heading, body in sections if "申し送り" in heading
-            for line in body if line.startswith("|") and not re.match(r"^\|[ :|-]+\|$", line)
-        ]
-        # 見出しの行を除く。解決の列（2 列目）が空・空白だけの行は、解決したことにしない
+        # 表ごとに（連続した「|」の行のまとまりごとに）区切り、各表の見出しの行を除く
+        rows: List[str] = []
+        for _, heading, body in sections:
+            if "申し送り" not in heading:
+                continue
+            table: List[str] = []
+            for line in body + [""]:
+                if line.startswith("|"):
+                    if not re.match(r"^\|[ :|-]+\|$", line):
+                        table.append(line)
+                    continue
+                rows.extend(table[1:])
+                table = []
+        # 解決の列（2 列目）が空・空白だけの行は、解決したことにしない
         resolved = []
-        for line in rows[1:]:
+        for line in rows:
             cells = table_cells(line)
             if len(cells) < 2 or not cells[1].strip():
                 self.error(name, f"申し送り「{item_name(cells[0])}」の解決の列が空")

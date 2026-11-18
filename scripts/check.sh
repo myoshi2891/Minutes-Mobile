@@ -8,6 +8,8 @@
 #                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
 #   scripts/check.sh --require-clean 未コミットの変更（追跡していないファイルを含む）があれば、手順を始めずに失敗する。
 #                                   検査中に HEAD が変わった・変更が生じた場合も失敗する（プッシュ前のフックが使う）
+#   scripts/check.sh --expect-head <SHA> 開始時の HEAD が指定したコミットでなければ、手順を始めずに失敗する
+#                                   （フックが送信する参照と照合した HEAD を、検査の開始までに差し替えられないようにする）
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -28,13 +30,14 @@ PACKAGE_COVERAGE_TARGET=90
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
+EXPECT_HEAD=""
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 
 usage() {
-  echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean]" >&2
+  echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean] [--expect-head <SHA>]" >&2
   exit 2
 }
 
@@ -67,12 +70,13 @@ while [ $# -gt 0 ]; do
     --steps) [ $# -ge 2 ] || usage; STEPS=$(expand_steps "$2"); shift 2 ;;
     --staged) STAGED=1; shift ;;
     --require-clean) REQUIRE_CLEAN=1; shift ;;
+    --expect-head) [ $# -ge 2 ] && [ -n "$2" ] || usage; EXPECT_HEAD=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 if [ "$STAGED" = 1 ]; then
   # --staged はインデックスを検査する。作業ツリーの一致を求める --require-clean とは組み合わせない
-  [ -z "$STEPS" ] && [ "$REQUIRE_CLEAN" = 0 ] || usage
+  [ -z "$STEPS" ] && [ "$REQUIRE_CLEAN" = 0 ] && [ -z "$EXPECT_HEAD" ] || usage
   STEPS="1 2 3 10"
 elif [ -z "$STEPS" ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
@@ -271,6 +275,13 @@ START_HEAD=""
 START_CHANGES=""
 if [ "$STAGED" = 0 ]; then
   START_HEAD=$(git rev-parse HEAD)
+  # 呼び出し元が照合した HEAD と、これから検査する HEAD が同じであること（A → A は通し、A → B は止める）
+  if [ -n "$EXPECT_HEAD" ]; then
+    expected=$(git rev-parse --verify -q "${EXPECT_HEAD}^{commit}") || fail "--expect-head の ${EXPECT_HEAD} がコミットを指していない"
+    if [ "$START_HEAD" != "$expected" ]; then
+      fail "開始時の HEAD (${START_HEAD}) が期待したコミット (${expected}) と違う。送信するコミットをチェックアウトしてから push する"
+    fi
+  fi
   START_CHANGES=$(git status --porcelain)
   # 作業ツリーだけにある修正で合格させない。長い手順を回す前に止める
   if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "$START_CHANGES" ]; then

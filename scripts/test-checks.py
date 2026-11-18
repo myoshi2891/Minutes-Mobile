@@ -428,6 +428,41 @@ def test_dependencies() -> None:
         dependencies_case(f"行コメントの後ろの宣言は検査する（{label}）", 1, "unlisted.git", {"Package.swift": text})
     dependencies_case("閉じていないブロックコメントは合格にしない", 2, "閉じていない",
                       {"Package.swift": declare.format(f"/* {unlisted}")})
+    # URL の正規化は scheme とホストだけ。パスの大文字小文字が違う取得元は別のものとして認めない
+    upper_path = json.dumps({"pins": [dict(pin, location="https://example.com/Owner/sample-lib.git")], "version": 3})
+    dependencies_case("パスの大文字小文字だけが違う取得元", 1, "取得元", {"Package.resolved": upper_path}, [approved])
+    upper_host = json.dumps({"pins": [dict(pin, location="HTTPS://EXAMPLE.COM/owner/sample-lib.git")], "version": 3})
+    dependencies_case("scheme とホストの大文字小文字は同一視する", 0, "OK", {"Package.resolved": upper_host}, [approved])
+    dependencies_case("Package.swift でパスの大文字小文字だけが違う URL", 1, "許可リストにない",
+                      {"Package.resolved": resolved,
+                       "Package.swift": declare.format('.package(url: "https://example.com/Owner/sample-lib.git", from: "1.2.3")')},
+                      [approved])
+    # 文字列リテラルの本文に現れる宣言は依存として数えない（文字列の外の宣言は検査する）
+    for label, declaration in {
+        "通常の文字列": f'let s = "{unlisted.replace(chr(34), chr(92) + chr(34))}"',
+        "生の文字列": f'let s = #"{unlisted}"#',
+        "複数行の文字列": f'let s = """\n{unlisted}\n"""',
+    }.items():
+        dependencies_case(f"文字列リテラルの中の宣言（{label}）", 0, "OK", {"Package.swift": declare.format(declaration)})
+    dependencies_case("文字列リテラルの後ろの宣言は検査する", 1, "unlisted.git",
+                      {"Package.swift": declare.format(f'let s = #"{unlisted}"#\n{unlisted}')})
+    dependencies_case("引数の中の文字列にある url: を取得元と見なさない", 1, "取得元を判定できない",
+                      {"Package.swift": declare.format('.package(name: "url: \\"https://example.com/owner/sample-lib\\",", path: local)')})
+    # ローカルのバイナリ（.binaryTarget(path:)）は、承認済みの項目がある場合だけ認める
+    binary = '.binaryTarget(name: "B", path: "Frameworks/B.xcframework")'
+    approved_binary = {"identity": "b", "path": "Sub/Frameworks/B.xcframework", "version": "1.0.0", "license": "MIT",
+                       "approvedOn": "2026-11-18", "ledger": "dependencies-and-costs.md §3"}
+    dependencies_case("記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
+                      {"Sub/Package.swift": declare.format(binary)})
+    dependencies_case("承認済みのローカルのバイナリ", 0, "OK", {"Sub/Package.swift": declare.format(binary)}, [approved_binary])
+    dependencies_case("別のディレクトリのローカルのバイナリは承認と一致しない", 1, "ローカルのバイナリ Frameworks/B.xcframework",
+                      {"Package.swift": declare.format(binary)}, [approved_binary])
+    dependencies_case("ローカルのバイナリの項目に版がない", 2, "version",
+                      {}, [{k: v for k, v in approved_binary.items() if k != "version"}])
+    dependencies_case("url と path の両方を持つ項目は読まない", 2, "どちらか一方",
+                      {}, [dict(approved_binary, url="https://example.com/owner/b")])
+    dependencies_case("ローカルの Package（.package(path:)）は従来どおり認める", 0, "OK",
+                      {"Package.swift": declare.format('.package(path: "../Local")')})
     dependencies_case("区間の上限は含まない", 1, "合わない",
                       {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", "1.0.0"..<"1.2.3")')},
                       [approved])
@@ -458,7 +493,7 @@ def test_versions() -> None:
     cases = {
         "版が違う": (changed_row(1, other_version), "swiftlint"),
         "SHA-256 が違う": (changed_row(len(columns) - 1, other_sha), "SHA-256"),
-        "形式が不正": (lambda t: replaced(t, "c1e429b0", "zzzzzzzz"), "不正"),
+        "形式が不正": (changed_row(len(columns) - 1, "z" * len(current_sha)), "不正"),
         "ツールの行がない": (lambda t: "\n".join(line for line in t.splitlines() if line.startswith("#")) + "\n", "1 つもない"),
         "gh の行がほかのツールより後": (lambda t: "\n".join(
             [line for line in t.splitlines() if not line.startswith("gh ")] + [line for line in t.splitlines() if line.startswith("gh ")]
@@ -628,6 +663,11 @@ def test_docs() -> None:
         docs_case("申し送りの解決の列が空", 1, "申し送り「二つ目」の解決の列が空", detailed, "| 二つ目 | 済 |", "| 二つ目 |   |"),
         docs_case("申し送りの解決の重複", 1, "申し送り「一つ目」の解決が表に 2 行ある",
                   detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 一つ目 | 再掲 |"),
+        # 申し送りの節に表が 2 つある場合も、各表の見出しの行を除く（2 つ目の見出しを項目と見なさない）
+        docs_case("申し送りの解決を 2 つの表に分ける", 0, "OK", detailed, "| 二つ目 | 済 |\n",
+                  "\n| 申し送り | 解決 |\n| --- | --- |\n| 二つ目 | 済 |\n"),
+        docs_case("2 つ目の表の項目も重複を検査する", 1, "申し送り「一つ目」の解決が表に 2 行ある", detailed, "| 二つ目 | 済 |\n",
+                  "| 二つ目 | 済 |\n\n| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 再掲 |\n"),
         docs_case("基本設計にない申し送りの行", 1, "基本設計にない申し送り「三つ目」", detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 三つ目 | 済 |"),
         # 設計書の配下のディレクトリの文書も検査する。対応する基本設計は詳細設計からの相対パスで決まる
         docs_case("入れ子の詳細設計に対応する基本設計がない", 1, "対応する基本設計 docs/02-basic-design/sub/nested.md がない",
