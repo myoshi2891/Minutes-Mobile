@@ -9,6 +9,7 @@
 """
 import argparse
 import fnmatch
+import os
 import plistlib
 import re
 import sys
@@ -234,12 +235,20 @@ def check_build_settings(target: str, settings: dict, errors: List[str]) -> None
 
 
 def find_files(root: Path, suffixes: Tuple[str, ...]) -> Iterator[Path]:
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or not path.name.endswith(suffixes):
-            continue
-        if SKIPPED_DIRECTORIES.intersection(path.relative_to(root).parts):
-            continue
-        yield path
+    """root の下のファイルを列挙する。除外するディレクトリは root 直下のものだけで、降りる前に枝刈りする。
+
+    下位の階層にある同じ名前のディレクトリ（Sources/build など）は除外せず、検査の対象に残す。
+    走査の失敗（読めないディレクトリ）は合格にせず、読めないものとして扱う。
+    """
+    def failed(error: OSError) -> None:
+        raise Unreadable(f"{error.filename}: {error}")
+
+    found: List[Path] = []
+    for directory, subdirectories, files in os.walk(root, onerror=failed):
+        if Path(directory) == root:
+            subdirectories[:] = [name for name in subdirectories if name not in SKIPPED_DIRECTORIES]
+        found.extend(Path(directory) / name for name in files if name.endswith(suffixes))
+    yield from sorted(found)
 
 
 def load_plist(path: Path) -> dict:

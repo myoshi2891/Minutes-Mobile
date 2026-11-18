@@ -5,7 +5,7 @@
 #   scripts/check.sh                手順 0〜10 を順に実行する（PR の作成前）
 #   scripts/check.sh --steps 0-8,10 指定した手順だけを実行する（プッシュ前のフックが使う）
 #   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
-#                                   手順 1・2 は作業ツリーではなくステージした内容（インデックス）を検査する
+#                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -28,6 +28,7 @@ STAGED=0
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
+STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
@@ -193,7 +194,9 @@ step_5() {
 test_destination() {
   local udid
   if [ -n "${MINUTES_SIMULATOR:-}" ]; then printf '%s\n' "$MINUTES_SIMULATOR"; return 0; fi
-  udid=$(scripts/find-simulator.py --minimum-os "$MINIMUM_OS")
+  # 呼び出し側は $(…) の中で実行するので set -e が効かない。取得の失敗は明示的に返し、空の id を出力しない
+  udid=$(scripts/find-simulator.py --minimum-os "$MINIMUM_OS") || return 1
+  [ -n "$udid" ] || return 1
   printf 'platform=iOS Simulator,id=%s\n' "$udid"
 }
 
@@ -228,8 +231,16 @@ step_9() {
 }
 
 step_10() {
-  if [ "$STAGED" = 0 ]; then scripts/test-checks.py docs; fi
-  scripts/verify-docs.py
+  if [ "$STAGED" = 1 ]; then
+    # 文書・コード片の元の実装・検査スクリプトのすべてを、作業ツリーではなくインデックスの内容で照合する。
+    # 文書と実装の両方をステージした一致する変更は通り、片方だけをステージした変更はコード片の不一致で止まる
+    STAGED_DOCS_TREE=$(mktemp -d)
+    git checkout-index -a --prefix="$STAGED_DOCS_TREE/"
+    "$STAGED_DOCS_TREE/scripts/verify-docs.py" --root "$STAGED_DOCS_TREE"
+  else
+    scripts/test-checks.py docs
+    scripts/verify-docs.py
+  fi
 }
 
 # 手順の関数は条件（if・&&・||）の中で呼ばない。条件の中では set -e が効かず、
@@ -239,6 +250,7 @@ on_exit() {
   local status=$?
   if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
   if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
+  if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）

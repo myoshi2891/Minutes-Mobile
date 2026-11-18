@@ -278,6 +278,11 @@ def test_settings() -> None:
                   project=entitlements_file("$(UNKNOWN)/App.entitlements"))
     settings_case("読めない設定は合格にしない", 2, "読めない", project=lambda t: t + "{")
     settings_case("ターゲットがない設定は合格にしない", 2, "読めない", project=lambda t: '{"build-settings": {}, "targets": []}')
+    # 除外するディレクトリ（build など）は root 直下だけ。下位の同じ名前のディレクトリは検査する
+    ats = {"NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True}}
+    settings_case("root 直下の除外するディレクトリは検査しない", 0, "OK", plists={"build/Info.plist": ats})
+    settings_case("下位の階層の同じ名前のディレクトリは検査する", 1, "NSAppTransportSecurity",
+                  plists={"Sources/build/Info.plist": ats})
 
 
 def dependencies_case(label: str, want_code: int, want_text: str, files: Dict[str, str], packages: Optional[List[dict]] = None,
@@ -402,6 +407,21 @@ def test_dependencies() -> None:
     }.items():
         dependencies_case(f"補間の中の文字列（{label}）で宣言を隠さない", 1, "unlisted.git",
                           {"Package.swift": declare.format(declaration)})
+    # 補間の中のコメントは、括弧や引用符を解釈する前に読み飛ばす。コメントの中の「)」で補間が早く閉じたと見なすと、
+    # 補間の中の文字列の引用符で外側の文字列が閉じ、その後ろの「/*」がコメントの始まりに見えて宣言を隠す
+    for label, declaration in {
+        "ブロックコメントの閉じ括弧": f'let s = "\\(f(x /* ) */) + "/*")"\n{unlisted}\n// */',
+        "入れ子のブロックコメント": f'let s = "\\(f(x /* /* ) */ ) */) + "/*")"\n{unlisted}\n// */',
+        "行コメント（複数行の文字列）": f'let s = """\n\\(f(x // )\n), g("""\n/*\n"""))\n"""\n{unlisted}\n// */',
+    }.items():
+        dependencies_case(f"補間の中のコメント（{label}）で宣言を隠さない", 1, "unlisted.git",
+                          {"Package.swift": declare.format(declaration)})
+    dependencies_case("通常の補間の後ろのコメントは除く", 0, "OK",
+                      {"Package.swift": declare.format(f'let s = "\\(f(x))"\n// {unlisted}')})
+    # 行コメントは CR・LF・CRLF のどれでも終わる（CR だけの改行で後ろの宣言をコメントに含めない）
+    for label, newline in {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}.items():
+        text = declare.format(f"// コメント\n{unlisted}\n").replace("\n", newline)
+        dependencies_case(f"行コメントの後ろの宣言は検査する（{label}）", 1, "unlisted.git", {"Package.swift": text})
     dependencies_case("閉じていないブロックコメントは合格にしない", 2, "閉じていない",
                       {"Package.swift": declare.format(f"/* {unlisted}")})
     dependencies_case("区間の上限は含まない", 1, "合わない",

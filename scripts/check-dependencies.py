@@ -107,27 +107,13 @@ def strip_comments(text: str) -> str:
     length = len(text)
     while index < length:
         if text.startswith("//", index):
-            end = text.find("\n", index)
-            end = length if end < 0 else end
+            end = line_comment_end(text, index)
             out.append(" " * (end - index))
             index = end
         elif text.startswith("/*", index):
-            depth = 0
             start = index
-            while index < length:
-                if text.startswith("/*", index):
-                    depth += 1
-                    index += 2
-                elif text.startswith("*/", index):
-                    depth -= 1
-                    index += 2
-                    if depth == 0:
-                        break
-                else:
-                    index += 1
-            if depth != 0:
-                raise Unreadable("ブロックコメントが閉じていない")
-            out.append("".join(char if char == "\n" else " " for char in text[start:index]))
+            index = block_comment_end(text, index)
+            out.append("".join(char if char in "\r\n" else " " for char in text[start:index]))
         elif starts_string(text, index):
             # 文字列リテラル（"…"・"""…"""・#"…"#）は、閉じるまでそのまま写す
             end = string_end(text, index)
@@ -137,6 +123,29 @@ def strip_comments(text: str) -> str:
             out.append(text[index])
             index += 1
     return "".join(out)
+
+
+def line_comment_end(text: str, index: int) -> int:
+    """index で始まる行コメントの終わり（改行の位置）を返す。Swift と同じく CR・LF・CRLF のどれでも終わる。"""
+    found = re.compile(r"[\r\n]").search(text, index)
+    return found.start() if found else len(text)
+
+
+def block_comment_end(text: str, index: int) -> int:
+    """index で始まるブロックコメント（入れ子にできる）の終わりの次の位置を返す。閉じていなければ読めないものとして扱う。"""
+    depth = 0
+    while index < len(text):
+        if text.startswith("/*", index):
+            depth += 1
+            index += 2
+        elif text.startswith("*/", index):
+            depth -= 1
+            index += 2
+            if depth == 0:
+                return index
+        else:
+            index += 1
+    raise Unreadable("ブロックコメントが閉じていない")
 
 
 def starts_string(text: str, index: int) -> bool:
@@ -170,10 +179,19 @@ def string_end(text: str, index: int) -> int:
 
 
 def interpolation_end(text: str, start: int) -> int:
-    """start の位置の「(」に対応する「)」の次の位置を返す。中の文字列リテラルは string_end で読み飛ばす。"""
+    """start の位置の「(」に対応する「)」の次の位置を返す。中の文字列リテラルは string_end で、
+    コメント（行コメントと入れ子のブロックコメント）は括弧や引用符を解釈する前に読み飛ばす
+    （コメントの中の「)」「"」を補間や外側の文字列の終わりと取り違えないため）。
+    """
     depth = 0
     cursor = start
     while cursor < len(text):
+        if text.startswith("//", cursor):
+            cursor = line_comment_end(text, cursor)
+            continue
+        if text.startswith("/*", cursor):
+            cursor = block_comment_end(text, cursor)
+            continue
         if starts_string(text, cursor):
             cursor = string_end(text, cursor)
             continue
