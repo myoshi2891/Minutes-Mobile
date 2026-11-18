@@ -36,7 +36,7 @@
 | AVFoundation（AVAudioEngine / AVAudioSession / AVAudioConverter / AVAudioFile） | 録音・変換・再生・WAV の読み書き | MVP | 割り込み・経路変更の通知に対応する（FR-INT 群） |
 | Speech（SpeechAnalyzer / SpeechTranscriber） | 端末内の文字起こし | MVP | 言語アセットは OS が取得する（SEC-NET-03） |
 | CryptoKit | SHA-256 | MVP | — |
-| SQLite（OS 同梱。iOS 27.2 SDK で 3.54.0） | メタデータ・ジョブ表 | MVP | UD-09 で決定。薄い自作ラッパー経由で直接使う。SwiftData は使わない（[storage.md](../02-basic-design/storage.md) BD-STO-01） |
+| SQLite（OS 同梱。iOS 27.2 SDK で 3.54.0） | メタデータ・ジョブ表 | MVP | UD-09 で決定。薄い自作ラッパー経由で直接使う。SwiftData は使わない（[storage.md](../02-basic-design/storage.md) BD-STO-01）。版は iOS 27.2 SDK の `usr/include/sqlite3.h` の `SQLITE_VERSION` で確認（確認日 2026-11-18。SDK の同梱物で公開の URL はない）。上流の 3.54.0 の公開記録: [SQLite Release 3.54.0](https://sqlite.org/releaselog/3_54_0.html)（確認日 2026-11-18） |
 | zlib（OS 同梱） | 書き出しの ZIP の CRC-32 | MVP | 無圧縮の ZIP を自作する（[export.md](../02-basic-design/export.md) BD-EXP-01） |
 | OSLog | ログ | MVP | privacy の指定（SEC-LOG 群） |
 | BackgroundTasks | 長時間の文字起こし（継続処理タスク） | MVP | GPU 資源は要求しない。Personal Team での動作は実機で確認する（TST-DEV-11） |
