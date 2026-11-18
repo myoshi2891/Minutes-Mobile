@@ -364,7 +364,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 | 呼び方 | 範囲 | 使う場面 |
 | --- | --- | --- |
 | `scripts/check.sh` | 0〜10 | PR の作成前と、PR の更新後 |
-| `scripts/check.sh --steps 0-8,10 --require-clean` | 指定した手順。未コミットの変更があれば手順を始めずに失敗する | プッシュ前のフック |
+| `scripts/check.sh --steps 0-8,10 --require-clean --expect-head <SHA>` | 指定した手順。未コミットの変更があるか、開始時の HEAD が指定したコミットでなければ、手順を始めずに失敗する | プッシュ前のフック |
 | `scripts/check.sh --staged` | ステージしたファイルに対する 1〜3 と 10 | コミット前のフック |
 
 `--staged` での違い:
@@ -381,6 +381,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 - 成功すると、検査したツリーが対象のコミットと一致する場合（開始時と終了時のどちらにも未コミットの変更がなく、検査中に HEAD が変わっていない場合）だけ、そのコミットのハッシュを付けて表示する。PR の説明にはこの行を貼る（基本設計 §6.2）。
 - 未コミットの変更（追跡していないファイルを含む）がある作業ツリーを検査した場合は、ハッシュを付けず「コミットの合格としては記録しない」と表示する。作業中の確認には使えるが、PR の説明に貼る結果は、変更をすべてコミットした状態で再実行して得る。
 - `--require-clean` を付けた場合は、未コミットの変更（追跡していないファイルを含む）があれば、手順を始める前に終了コード 1 で失敗する。検査中に HEAD が変わった、または変更が生じた場合も、手順の後で失敗する。作業ツリーだけにある修正で合格させないためで、プッシュ前のフックが使う（§5）。`--staged`（インデックスを検査する）とは組み合わせない。
+- `--expect-head <SHA>` を付けた場合は、開始時の HEAD（`START_HEAD`）を取得した直後に指定したコミットと照合し、違えば手順を始める前に終了コード 1 で失敗する。プッシュ前のフックは、送信する参照と照合した HEAD をこの引数で渡す（照合してから `check.sh` が始まるまでに HEAD が A から B に変わっても、B を A の合格として検査しない。A のままなら通る）。`--require-clean` の開始時・終了時の検査はそのまま行う。`--staged` とは組み合わせない。
 
 <!-- file: scripts/check.sh -->
 
@@ -395,6 +396,8 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 #                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
 #   scripts/check.sh --require-clean 未コミットの変更（追跡していないファイルを含む）があれば、手順を始めずに失敗する。
 #                                   検査中に HEAD が変わった・変更が生じた場合も失敗する（プッシュ前のフックが使う）
+#   scripts/check.sh --expect-head <SHA> 開始時の HEAD が指定したコミットでなければ、手順を始めずに失敗する
+#                                   （フックが送信する参照と照合した HEAD を、検査の開始までに差し替えられないようにする）
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -415,13 +418,14 @@ PACKAGE_COVERAGE_TARGET=90
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
+EXPECT_HEAD=""
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 
 usage() {
-  echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean]" >&2
+  echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean] [--expect-head <SHA>]" >&2
   exit 2
 }
 
@@ -454,12 +458,13 @@ while [ $# -gt 0 ]; do
     --steps) [ $# -ge 2 ] || usage; STEPS=$(expand_steps "$2"); shift 2 ;;
     --staged) STAGED=1; shift ;;
     --require-clean) REQUIRE_CLEAN=1; shift ;;
+    --expect-head) [ $# -ge 2 ] && [ -n "$2" ] || usage; EXPECT_HEAD=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 if [ "$STAGED" = 1 ]; then
   # --staged はインデックスを検査する。作業ツリーの一致を求める --require-clean とは組み合わせない
-  [ -z "$STEPS" ] && [ "$REQUIRE_CLEAN" = 0 ] || usage
+  [ -z "$STEPS" ] && [ "$REQUIRE_CLEAN" = 0 ] && [ -z "$EXPECT_HEAD" ] || usage
   STEPS="1 2 3 10"
 elif [ -z "$STEPS" ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
@@ -658,6 +663,13 @@ START_HEAD=""
 START_CHANGES=""
 if [ "$STAGED" = 0 ]; then
   START_HEAD=$(git rev-parse HEAD)
+  # 呼び出し元が照合した HEAD と、これから検査する HEAD が同じであること（A → A は通し、A → B は止める）
+  if [ -n "$EXPECT_HEAD" ]; then
+    expected=$(git rev-parse --verify -q "${EXPECT_HEAD}^{commit}") || fail "--expect-head の ${EXPECT_HEAD} がコミットを指していない"
+    if [ "$START_HEAD" != "$expected" ]; then
+      fail "開始時の HEAD (${START_HEAD}) が期待したコミット (${expected}) と違う。送信するコミットをチェックアウトしてから push する"
+    fi
+  fi
   START_CHANGES=$(git status --porcelain)
   # 作業ツリーだけにある修正で合格させない。長い手順を回す前に止める
   if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "$START_CHANGES" ]; then
@@ -729,6 +741,7 @@ exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --staged
 # プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
 # 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
 # 検査するのは HEAD のコミットだけなので、送信するコミットが HEAD と同じで、未コミットの変更がないことを求める
+# 照合した HEAD は --expect-head で渡し、check.sh の開始までに HEAD が変わっていれば失敗させる
 set -euo pipefail
 head=$(git rev-parse HEAD)
 # 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
@@ -745,7 +758,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     exit 1
   fi
 done
-exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 --require-clean </dev/null
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
 ```
 
 <!-- file: scripts/setup.sh -->
@@ -876,7 +889,8 @@ custom_rules:
 
   no_direct_logger:
     name: "Logger の直接の利用の禁止"
-    regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\('
+    # 型の注釈を付けた省略形（let logger: Logger = .init(subsystem:category:)）も生成として検出する
+    regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\(|:\s*(?:os\s*\.\s*)?Logger\s*[?!]?\s*=\s*\.\s*init\s*\('
     excluded:
       - '.*/Logging/AppLogger\.swift'
     match_kinds: *code
@@ -991,7 +1005,8 @@ custom_rules:
 
   no_direct_clock:
     name: "時計の直接の利用の禁止"
-    regex: '\bDate\s*\(\s*\)|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\bsystemUptime\b'
+    # Date()・Date.init()・Date(timeIntervalSinceNow:) は現在時刻を読む。Date(timeIntervalSince1970:) などは認める
+    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\bsystemUptime\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
@@ -1216,19 +1231,21 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | 項目 | 内容 |
 | --- | --- |
 | `identity` | パッケージの名前（`Package.resolved` の `identity`） |
-| `url` | リポジトリの URL |
+| `url` | リポジトリの URL。正規化では末尾の `.git`・スラッシュと、scheme とホストの大文字小文字だけをそろえ、パスの大文字小文字は区別する |
 | `version` | 承認した版（この版だけが通る） |
 | `license` | SPDX の識別子 |
 | `approvedOn` | 承認日（`YYYY-MM-DD`） |
 | `ledger` | 台帳の該当箇所 |
 | `ownerDecision` | `allowedLicenses` にないライセンスの場合に必須。オーナーの決定（`UD-nn`） |
 
+ローカルのバイナリ（`.binaryTarget(path:)`）を承認する要素は、`url` の代わりに `path`（リポジトリの起点からの相対パス。`Package.swift` のディレクトリと宣言の `path:` をつないで正規化したものと照合する）を持ち、ほかの項目（`identity`・`version`・`license`・`approvedOn`・`ledger`、必要なら `ownerDecision`）は同じく必須とする。`url` と `path` の両方を持つ・どちらも持たない要素は、読めないものとして終了コード 2 で失敗する。
+
 ### 9.2 検査（`scripts/check-dependencies.py`）
 
 | 対象 | 規則 |
 | --- | --- |
 | `Package.resolved`（すべて） | 各依存の名前と版が、承認済みの要素と一致する。名前と版が一致しても、取得元（`location`。古い形式は `repositoryURL`）を正規化して承認済みの URL と比べ、違う・ない場合は認めない。版で固定していない依存（ブランチ・コミットの指定）は認めない |
-| `Package.swift`（すべて） | 先にコメント（`//`・入れ子にできる `/* */`）を空白に置き換え、URL・宣言・版の検索はすべてその内容に対して行う（文字列リテラルの中の `//` は残す。閉じていないブロックコメントは読めないものとして失敗する）。`url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`path:`）は認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない**。`url:` の依存は、版の指定（`from:`・`exact:`・`.upToNextMajor`・`.upToNextMinor`・`..<`・`...`）を、**同じディレクトリの** `Package.resolved` の確定版と照合する。確定版がない、ブランチ・コミットの指定、版の指定を文字列リテラルから判定できない、確定版が宣言の版の指定を満たさない（古い承認済みの確定版が残った場合を含む）、確定版が承認した版でない、のいずれも認めない |
+| `Package.swift`（すべて） | 先にコメント（`//`・入れ子にできる `/* */`）を空白に置き換える（文字列リテラルの中の `//` は残す。閉じていないブロックコメントは読めないものとして失敗する）。宣言と `url:`・`path:`・`id:` などのキーワードは、さらに文字列リテラルの本文を空白に置き換えた内容から探し（文字列の中の `.package(` を宣言と見なさない）、取得元と版はその宣言の引数の中だけで調べる。`url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`.package(path:)`）は認める。ローカルのバイナリ（`.binaryTarget(path:)`）は、`path` の一致する承認済みの要素（§9.1）がある場合だけ認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない**。`url:` の依存は、版の指定（`from:`・`exact:`・`.upToNextMajor`・`.upToNextMinor`・`..<`・`...`）を、**同じディレクトリの** `Package.resolved` の確定版と照合する。確定版がない、ブランチ・コミットの指定、版の指定を文字列リテラルから判定できない、確定版が宣言の版の指定を満たさない（古い承認済みの確定版が残った場合を含む）、確定版が承認した版でない、のいずれも認めない |
 | `project.xcproj` | リモートの URL の形をした文字列が、承認済みの URL と一致する。承認済みの URL は、**同じ `.xcodeproj` の中の** `Package.resolved` に同じ取得元の確定版がある。要求条件（版の指定）は書き方が未確認（§20 の断定しない事項）なので、確認して検査を実装するまでは判定できないものとして認めない |
 
 - 許可リスト自体も検査する。`allowedLicenses` にないライセンスで `ownerDecision` がない要素、承認日のない要素があれば、終了コード 2 で失敗する。
