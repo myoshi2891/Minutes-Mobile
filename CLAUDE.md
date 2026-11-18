@@ -20,7 +20,7 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 
 ## ビルド・テスト
 
-Xcode プロジェクトは JSON 形式の `MinutesMobile.xcodeproj/project.xcproj` を使う（`project.pbxproj` は存在しない）。ビルド設定はこの JSON を直接読む。ただし末尾カンマを含むため、標準の JSON パーサー（`json.load`・`jq`・`JSONSerialization` など）では解析できない。スクリプトで読む場合は JSON5 対応のパーサーを使う。
+Xcode プロジェクトは JSON 形式の `MinutesMobile.xcodeproj/project.xcproj` を使う（`project.pbxproj` は存在しない）。ビルド設定はこの JSON を直接読む。ただし末尾カンマを含むため、標準の JSON パーサー（`json.load`・`jq`・`JSONSerialization` など）では直接解析できない。スクリプトで読む場合は、既存の `scripts/xcproj.py` の `load_project` を使う（Xcode 同梱の python3 の標準ライブラリだけで動く。末尾カンマを除いてから読み、読めない入力は `Unreadable` を送出するので、呼び出し側は読めないものを合格にせず失敗として扱う）。新しい依存（JSON5 のライブラリなど）は入れない。
 
 `xcode-select` が Command Line Tools を指しているため、`xcodebuild` には `DEVELOPER_DIR` を付ける（または `sudo xcode-select -s /Applications/Xcode.app` を一度実行する）。
 

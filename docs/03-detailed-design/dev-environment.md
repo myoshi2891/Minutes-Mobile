@@ -196,10 +196,26 @@ check_field() {
   [[ $value =~ $pattern ]] || fail "tools/versions の${label}が不正: '$value'"
 }
 
+# シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
+link_directory() {
+  local link=$1 dest
+  dest=$(readlink "$link") || return 1
+  case "$dest" in /*) ;; *) dest="$(dirname "$link")/$dest" ;; esac
+  (cd -P "$(dirname "$dest")" 2>/dev/null && pwd)
+}
+
 verify_tool() {
   local name=$1 version=$2 binary=$3 sha=$4
   local link="$DEST/bin/$binary" stamp="$DEST/$name/$version/.archive-sha256" actual
   [ -x "$link" ] || fail "$name が導入されていない。scripts/setup-tools.sh を実行する"
+  # 実行するのは、導入記録のある版のディレクトリの中の実行ファイルに限る（リンクの先を別の導入に差し替えさせない）。
+  # bash 3.2 の macOS には readlink -f がないので、リンクの先のディレクトリを cd -P で実体に解決して比べる
+  local target_dir expected_dir
+  target_dir=$(link_directory "$link") || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
+  expected_dir=$(cd -P "$DEST/$name/$version" 2>/dev/null && pwd) \
+    || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
+  [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
+    || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
   [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] \
     || fail "$name $version の導入記録が tools/versions の SHA-256 と一致しない。scripts/setup-tools.sh を実行し直す"
   actual=$(runtime_version "$name" "$link") || fail "$name の版を表示できない（${link}）。scripts/setup-tools.sh を実行し直す"
@@ -220,6 +236,7 @@ install_tool() {
     echo "導入済み: $name $version"
   else
     echo "取得: $name ${version}（$repo $tag ${asset}）"
+    # 新しい導入は、置き換えを rename だけで済ませるため導入先と同じファイルシステムの $DEST の下で組み立てる
     mkdir -p "$work/download" "$work/extract" "$work/out"
     # 標準入力は版の写しを読んでいる途中なので、取得のコマンドに渡さない
     if [ "$name" = gh ]; then
@@ -256,16 +273,28 @@ install_tool() {
     actual=$(runtime_version "$name" "$work/out/$binary") || fail "取得した $name の版を表示できない。既存の導入は残す"
     [ "$actual" = "$version" ] \
       || fail "取得した $name の版が違う（tools/versions: $version / 取得したもの: ${actual}）。既存の導入は残す"
+    # 置き換えが終わるまで旧い導入を残す。旧い導入を退避 → 新しい導入を置く → 失敗したら退避したものを戻す → 退避を消す
     mkdir -p "$DEST/$name"
-    rm -rf -- "${target:?}"
-    mv "$work/out" "$target"
+    local backup=""
+    if [ -e "$target" ]; then
+      backup="$DEST/$name/.$version.old.$$"
+      rm -rf -- "${backup:?}"
+      mv "$target" "$backup" || fail "$name の既存の導入を退避できない"
+    fi
+    if ! mv "$work/out" "$target"; then
+      if [ -n "$backup" ]; then mv "$backup" "$target" || echo "NG: 退避した $name の導入を戻せない（${backup}）" >&2; fi
+      fail "$name の導入を置き換えられない。既存の導入は残す"
+    fi
+    if [ -n "$backup" ]; then rm -rf -- "${backup:?}"; fi
   fi
   mkdir -p "$DEST/bin"
   ln -sfn "../$name/$version/$binary" "$DEST/bin/$binary"
 }
 
 if [ "$MODE" = install ]; then
-  WORK=$(mktemp -d)
+  # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
+  mkdir -p "$DEST"
+  WORK=$(mktemp -d "$DEST/.work.XXXXXX")
   cleanup() {
     local status=$?
     rm -rf -- "${WORK:?}"
@@ -365,7 +394,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 | 5 | 依存 | `check-dependencies.py` | `test-checks.py dependencies` | 通過（1 秒） |
 | 6 | ビルド | `xcodebuild build`（機種を特定しないシミュレータ向け） | — | 通過（15 秒） |
 | 7 | 単体・結合テスト | `swift test`（Package）と `xcodebuild test`（UI テストを除く） | — | **失敗**: Package とテストターゲットがない |
-| 8 | カバレッジ | `coverage-report.py`（初期は警告だけ） | — | **失敗**: Package がない（一時的に置いた Package では通過した。§17.3） |
+| 8 | カバレッジ | `coverage-report.py`（初期は警告だけ） | `test-checks.py coverage` | **失敗**: Package がない（一時的に置いた Package では通過した。§17.3） |
 | 9 | UI テスト | `xcodebuild test`（UI テストだけ） | — | **失敗**: テストターゲットがない |
 | 10 | 文書の整合 | `verify-docs.py` | `test-checks.py docs` | 通過（1 秒） |
 
@@ -429,8 +458,12 @@ PACKAGE="Packages/MinutesKit"
 UI_TESTS="MinutesMobileUITests"
 MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
-# 手順 7 がカバレッジを測ったコミットの記録（手順 8 が集計の前に現在の HEAD と照合する）
+# 手順 7 がカバレッジを測った入力の記録（手順 8 が集計の前に現在の入力と照合する）。
+# 未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」を書く
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
+# gitleaks の履歴の検査で git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、
+# 既定の 2 つも書く。-m でマージのコミットの差分も検査する（マージの解決で足した行を見落とさない）
+GITLEAKS_LOG_OPTS="--all --full-history -m"
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
@@ -458,7 +491,8 @@ expand_steps() {
       *-*) first=${part%-*}; last=${part#*-} ;;
       *) first=$part; last=$part ;;
     esac
-    [[ $first =~ ^[0-9]+$ && $last =~ ^[0-9]+$ ]] || usage
+    # 番号は先頭に 0 のない正規の形だけを認める（08 などは bash の算術で 8 進数として読まれ、範囲の判定を誤るため）
+    [[ $first =~ ^(0|[1-9][0-9]*)$ && $last =~ ^(0|[1-9][0-9]*)$ ]] || usage
     if [ "$first" -gt "$last" ] || [ "$last" -gt "$LAST_STEP" ]; then usage; fi
     number=$first
     while [ "$number" -le "$last" ]; do
@@ -590,7 +624,7 @@ step_3() {
     git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
   else
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml .
+    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --log-opts="$GITLEAKS_LOG_OPTS" .
     scripts/test-checks.py gitleaks
   fi
 }
@@ -603,6 +637,26 @@ step_4() {
 step_5() {
   scripts/test-checks.py dependencies
   scripts/check-dependencies.py
+}
+
+# カバレッジを測った入力の識別子。未コミットの変更がなければ HEAD のコミット、あれば作業ツリー全体（追跡していない
+# ファイルを含む。無視するファイルは除く）のツリーのハッシュ。作業ツリーの記録はコミットの合格の記録と区別する
+coverage_input() {
+  local index tree
+  if [ -z "$(git status --porcelain --untracked-files=normal)" ]; then
+    printf 'commit %s\n' "$(git rev-parse HEAD)"
+    return 0
+  fi
+  # 一時のインデックスに作業ツリーを写してツリーを作る（本来のインデックスとステージの内容は変えない）
+  index=$(mktemp)
+  rm -f -- "$index"
+  if ! GIT_INDEX_FILE="$index" git read-tree HEAD || ! GIT_INDEX_FILE="$index" git add -A \
+    || ! tree=$(GIT_INDEX_FILE="$index" git write-tree); then
+    rm -f -- "$index"
+    return 1
+  fi
+  rm -f -- "$index"
+  printf 'worktree %s\n' "$tree"
 }
 
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
@@ -623,24 +677,32 @@ step_6() {
 step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
+  local measured
   rm -f -- "$COVERAGE_HEAD"
+  # 測る前の入力を控え、測った後も同じ場合だけ記録する（測定中に変わった入力の結果をどちらにも帰属させない）
+  measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
   swift test --package-path "$PACKAGE" --enable-code-coverage
-  git rev-parse HEAD > "$COVERAGE_HEAD"
+  [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
+  printf '%s\n' "$measured" > "$COVERAGE_HEAD"
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
 }
 
 step_8() {
-  local report measured
+  local report measured current
+  scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
-  # 別のコミットで測った記録を集計しない
-  [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測ったコミットの記録がない。手順 7 を先に実行する"
+  # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
+  [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
   measured=$(cat "$COVERAGE_HEAD")
-  [ "$measured" = "$(git rev-parse HEAD)" ] \
-    || fail "カバレッジは別のコミット（${measured}）で測ったもの。手順 7 を実行し直す"
+  current=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
+  [ "$measured" = "$current" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  case "$measured" in
+    worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
+  esac
   scripts/coverage-report.py "$report" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
@@ -743,7 +805,8 @@ fi
 
 - Package: `swift test --enable-code-coverage` が出す JSON のうち、`Packages/MinutesKit/Sources/` 配下のファイルだけを数える。合計にはテストコードと自動生成のファイルが混ざるためである（実測で、合計 59%・本体 50% と食い違った）。目標は 90%（TST-CI-07）で、初期は警告だけを出す。
 - アプリ側（全体 70%）の集計は、アプリのテストターゲットを足す作業で実装する。それまで手順 8 は「未実装」の警告を出す。
-- 手順 7 は、カバレッジを測ったコミット（`git rev-parse HEAD`）を `Packages/MinutesKit/.build/minutes-coverage-head` に記録する。手順 8 は集計の前にこれを現在の HEAD と照合し、記録がない・違うコミットで測った場合は失敗する（古い記録を集計して合格にしない）。
+- 手順 7 は、カバレッジを測った入力を `Packages/MinutesKit/.build/minutes-coverage-head` に記録する。未コミットの変更がなければ `commit <HEAD>`、あれば `worktree <ツリーのハッシュ>`（一時のインデックスに作業ツリーを写して `git write-tree` で作る。本来のインデックスは変えない）とし、未コミットの測定にコミットの SHA を付けない。測定の前後で入力が変わった場合は記録しない。手順 8 は集計の前に現在の入力と照合し、記録がない・違う入力で測った場合は失敗する（古い記録を集計して合格にしない）。`worktree` の記録はコミットの記録として扱わない旨を表示する。
+- `coverage-report.py` は、各ファイルの行数（`count`・`covered`）が整数（真偽値を除く）で `0 <= covered <= count` であることを確かめ、不正な記録は終了コード 2 で失敗する（手順 8 は `test-checks.py coverage` で自己試験してから集計する）。
 - 未コミットの変更の判定（`git status --porcelain`）には `--untracked-files=normal` を付け、`status.showUntrackedFiles` の設定によらず追跡していないファイルを数える。
 
 ---
@@ -771,13 +834,16 @@ exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --staged
 # 検査するのは HEAD のコミットだけなので、送信するコミットが HEAD と同じで、未コミットの変更がないことを求める
 # 照合した HEAD は --expect-head で渡し、check.sh の開始までに HEAD が変わっていれば失敗させる
 set -euo pipefail
-head=$(git rev-parse HEAD)
+# HEAD は削除以外の参照の行を受け取ってから解決する（削除だけの送信では解決しない。HEAD がまだない場合にも失敗させない）。
+# 最初に解決した値を、後続の照合と --expect-head に使う
+head=""
 updates=0  # 削除以外の参照の送信の数
 # 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
 while read -r local_ref local_sha remote_ref remote_sha; do
   # 削除の送信（ローカルの SHA がすべて 0）は検査するコミットがない
   if [ -z "${local_sha//0/}" ]; then continue; fi
   updates=$((updates + 1))
+  if [ -z "$head" ]; then head=$(git rev-parse --verify HEAD); fi
   # 注釈付きのタグはタグのオブジェクトを指すので、コミットまでたどってから比べる
   commit=$(git rev-parse --verify -q "${local_sha}^{commit}") || {
     echo "NG: 送信する ${local_ref} (${local_sha}) がコミットを指していない" >&2
@@ -974,9 +1040,11 @@ custom_rules:
   # ブロックコメントは 1 段の入れ子まで読む（/* 外 /* 内 */ 外 */ を 1 つのコメントとして扱う）。外側を閉じる「*/」の後に
   # 実行文がある catch を空と見なさない。正規表現では任意の深さの入れ子を数えられないので、2 段以上の入れ子は読み違えうる
   # 行コメントは条件側・本体側とも行末まで後戻りせずに読み飛ばす（*+）。コメント内の「{」「}」を本体の始まりや終わりと取り違えない
+  # 条件の中の丸括弧・角括弧の組は 2 段の入れ子まで、中の文字列ごと読み飛ばす（引数のクロージャー「f(where: { … })」の
+  # 「{」「}」を本体と取り違えない。括弧なしの後置クロージャーは Swift が条件の中で認めない）。3 段以上の入れ子は検出しない
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*+|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*+\s*|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/\s*)*\})'
+    regex: '\bcatch\b(?=(?:[^{"/(\[]|[(\[](?:[^()\[\]"]|"(?:[^"\\\n]|\\.)*"|[(\[](?:[^()\[\]"]|"(?:[^"\\\n]|\\.)*")*[)\]])*[)\]]|/(?![/*])|//[^\n]*+|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*+\s*|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/\s*)*\})'
     match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
@@ -1060,7 +1128,7 @@ custom_rules:
 
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])(?<!\.\s{1,16})u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\s*\.\s*sleep\b|\bThread\.sleep\b|(?<![.\w])(?<!\.\s{1,16})u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
@@ -1135,6 +1203,7 @@ disabled_rules:
 | 文字列から組み立てた呼び出し（`NSClassFromString("URLSession")`） | 通信ゼロの自動テスト（TST-SEC-01）、実機の確認（TST-SEC-02） |
 | ログに D1〜D3 を入れていないか | 型付きのログ（BD-ARC-06）、TST-SEC-07 |
 | 例外の場所の中での誤用 | レビュー（例外の場所を変える PR は、規則の変更として扱う） |
+| `no_empty_catch` の条件で 3 段以上に入れ子にした括弧（`where f(g(h({ … })))` など）。条件の丸括弧・角括弧は 2 段の入れ子まで読み飛ばし、それより深い入れ子のある `catch` は検出しない | レビュー。PR のチェックリストの「エラーを握りつぶしていないか」 |
 
 ---
 
@@ -1163,6 +1232,7 @@ useDefault = true
 - SwiftFormat は `--lint` で確認だけを行い、検査の中でファイルを書き換えない。直すときは開発者が `.tools/bin/swiftformat .` を実行する。
 - gitleaks は既定の規則をそのまま使い、除外の指定を置かない。`--redact` を付け、検出した値そのものを出力に残さない（出力を PR に貼っても漏れない）。
 - gitleaks の全体の検査はコミット済みの履歴を対象にする。未コミットの変更は、コミット前のフック（ステージした差分）が受け持つ。
+- 履歴の検査には `--log-opts="--all --full-history -m"` を渡す（`check.sh` の `GITLEAKS_LOG_OPTS`）。既定の `git log` はマージのコミットの差分を出さず、マージの解決で足した行を見落とす。`--log-opts` は既定の指定を置き換えるので、既定の `--all --full-history` も書く。自己試験は、通常のコミットとマージのコミットだけで足した行の両方が検出され、指定がなければマージの行を見落とすことを確かめる。
 
 ---
 
@@ -1240,6 +1310,9 @@ FORBIDDEN_ENTITLEMENT_PREFIXES = {
 ```
 
 - 利用目的の文言は `NSMicrophoneUsageDescription` だけを認める。音声認識の利用目的は置かない（§14.2）。
+- マイクの利用目的は、ビルド設定の元の値（文字列化の前）が文字列であることを確かめる。plist とビルド設定の値の変数（`$(NAME)`）は構成・SDK ごとに展開してから空かを判定し、展開できない値（設定のない変数・1 つの値に決まらない変数・修飾子つきの参照）は欠落として扱う。
+- 空の条件付きの `INFOPLIST_FILE`（`INFOPLIST_FILE[arch=arm64] = ""` など）は、その条件のビルドに参照先がないことを表すので、条件のない参照先で補わない。
+- 画面の向き（BD-UI-10）は、`GENERATE_INFOPLIST_FILE` が `NO` になりうる構成では、使われる plist に `UISupportedInterfaceOrientations~iphone`（または `UISupportedInterfaceOrientations`）が `[UIInterfaceOrientationPortrait]` であることを求める。どの構成でも、参照先の plist にある向きの指定は縦だけであること。
 - Bundle Identifier が仮の値（`devplaceholder`）のままの場合は、失敗ではなく警告にする。確定はオーナーの判断で、最初の実録音の前に行う（CON-09、BD-DEV-06）。
 - 共有拡張かどうかは、Info.plist の拡張の種類で判定する。ウィジェット（Live Activity）だけを認める。
 
@@ -1273,14 +1346,14 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | `ledger` | 台帳の該当箇所 |
 | `ownerDecision` | `allowedLicenses` にないライセンスの場合に必須。オーナーの決定（`UD-nn`） |
 
-ローカルのバイナリ（`.binaryTarget(path:)`）を承認する要素は、`url` の代わりに `path`（リポジトリの起点からの相対パス。`Package.swift` のディレクトリと宣言の `path:` をつないで正規化したものと照合する）を持ち、ほかの項目（`identity`・`version`・`license`・`approvedOn`・`ledger`、必要なら `ownerDecision`）は同じく必須とする。`url` と `path` の両方を持つ・どちらも持たない要素は、読めないものとして終了コード 2 で失敗する。
+ローカルのバイナリ（`.binaryTarget(path:)`）を承認する要素は、`url` の代わりに `path`（リポジトリの起点からの相対パス。`Package.swift` のディレクトリと宣言の `path:` をつないで正規化したものと照合する）と `sha256`（承認したときの内容のハッシュ。ファイルはその内容の SHA-256、ディレクトリは配下の項目を相対パスの順に「種別・相対パス・内容の SHA-256（シンボリックリンクはたどらずにリンクの先の文字列）」として連ねた SHA-256。`check-dependencies.py` の `content_digest`）を持ち、ほかの項目（`identity`・`version`・`license`・`approvedOn`・`ledger`、必要なら `ownerDecision`）は同じく必須とする。リモートのバイナリ（`.binaryTarget(url:checksum:)`）を承認する要素は、`url` に加えて `checksum`（承認した配布物の SHA-256）を持つ。`sha256`・`checksum` は 64 桁の小文字の 16 進数とし、形式が違えば終了コード 2。`url` と `path` の両方を持つ・どちらも持たない要素は、読めないものとして終了コード 2 で失敗する。
 
 ### 9.2 検査（`scripts/check-dependencies.py`）
 
 | 対象 | 規則 |
 | --- | --- |
 | `Package.resolved`（すべて） | 各依存の名前と版が、承認済みの要素と一致する。名前と版が一致しても、取得元（`location`。古い形式は `repositoryURL`）を正規化して承認済みの URL と比べ、違う・ない場合は認めない。版で固定していない依存（ブランチ・コミットの指定）は認めない |
-| `Package.swift`（すべて。版別の manifest `Package@swift-<版>.swift` も同じ検査にかける） | 先にコメント（`//`・入れ子にできる `/* */`）を空白に置き換える（文字列リテラルの中の `//` は残す。閉じていないブロックコメント・文字列リテラル・補間は読めないものとして失敗する。末尾まで文字列と見なすと後ろの宣言を隠すため）。宣言と `url:`・`path:`・`id:` などのキーワードは、さらに文字列リテラルの本文を空白に置き換えた内容から探し（文字列の中の `.package(` を宣言と見なさない）、取得元と版はその宣言の引数の中だけで調べる。`url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`.package(path:)`）は認める。ローカルのバイナリ（`.binaryTarget(path:)`）は、`path` の一致する承認済みの要素（§9.1）がある場合だけ認める。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない**。`url:` の依存は、版の指定（`from:`・`exact:`・`.upToNextMajor`・`.upToNextMinor`・`..<`・`...`）を、**同じディレクトリの** `Package.resolved` の確定版と照合する。確定版がない、ブランチ・コミットの指定、版の指定を文字列リテラルから判定できない、確定版が宣言の版の指定を満たさない（古い承認済みの確定版が残った場合を含む）、確定版が承認した版でない、のいずれも認めない |
+| `Package.swift`（すべて。版別の manifest `Package@swift-<版>.swift` も同じ検査にかける） | 先にコメント（`//`・入れ子にできる `/* */`）を空白に置き換える（文字列リテラルの中の `//` は残す。閉じていないブロックコメント・文字列リテラル・補間は読めないものとして失敗する。末尾まで文字列と見なすと後ろの宣言を隠すため）。宣言と `url:`・`path:`・`id:` などのキーワードは、さらに文字列リテラルの本文を空白に置き換えた内容から探し（文字列の中の `.package(` を宣言と見なさない）、取得元と版はその宣言の引数の中だけで調べる。`url:` で指す依存が、承認済みの URL と一致する。ローカルの Package（`.package(path:)`）は認める。ローカルのバイナリ（`.binaryTarget(path:)`）は、`path` の一致する承認済みの要素（§9.1）があり、現在の内容のハッシュがその `sha256` と一致する場合だけ認める（内容が変われば再承認を求める。成果物がなければ終了コード 2）。リモートのバイナリ（`.binaryTarget(url:)`）は、URL の一致に加えて、宣言の `checksum:`（文字列リテラル）が承認した `checksum` と一致する場合だけ認める（同じ URL の配布物の差し替えを通さない）。レジストリの依存（`id:`）は認めない。**`.package(…)`・`.binaryTarget(…)` の宣言をすべて列挙し、取得元が文字列リテラルだけの `url:` か `path:` でないもの（変数・連結・補間・その他の式）は、取得元を判定できないものとして認めない**。`url:` の依存は、版の指定（`from:`・`exact:`・`.upToNextMajor`・`.upToNextMinor`・`..<`・`...`）を、**同じディレクトリの** `Package.resolved` の確定版と照合する。確定版がない、ブランチ・コミットの指定、版の指定を文字列リテラルから判定できない、確定版が宣言の版の指定を満たさない（古い承認済みの確定版が残った場合を含む）、確定版が承認した版でない、のいずれも認めない |
 | `project.xcproj` | リモートの URL の形をした文字列が、承認済みの URL と一致する。承認済みの URL は、**同じ `.xcodeproj` の中の** `Package.resolved` に同じ取得元の確定版がある。要求条件（版の指定）は書き方が未確認（§20 の断定しない事項）なので、確認して検査を実装するまでは判定できないものとして認めない |
 
 - 許可リスト自体も検査する。`allowedLicenses` にないライセンスで `ownerDecision` がない要素、承認日のない要素があれば、終了コード 2 で失敗する。
@@ -1298,10 +1371,10 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | ID の参照 | すべての文書（`docs/`・`README.md`・`CLAUDE.md`）が参照する ID が定義されている。`SEC-SUP-01〜05`・`NFR-MNT-01・03`・`SEC-NET-03 / 04`（スラッシュ区切り。「/」の前後の空白は 1 つまで）・`FR-REC 群` のような省略した書き方も展開して調べる。範囲（〜）の要素数が同じ接頭辞の定義済みの ID の数を超える書き方は展開せず、不正として報告する（巨大な範囲の展開を防ぐ） |
 | フェーズ | 定義文書の FR / NFR / SEC の行は、フェーズの列を持ち、値が MVP・P2・P3 のいずれかで始まる。列がない・読めない行は行番号つきで失敗する |
 | MVP の網羅 | フェーズが MVP の FR / NFR / SEC が、基本設計の各文書（索引の README.md を除く）の「満たす要件」（節の冒頭の「満たす要件:」と文書の冒頭の表の「\| 満たす要件 ID \|」の行だけ。「満たす要件の例」などの説明文は数えない）の、「／」より前（決定・関連などの参照を除く）のどこかに現れる。索引は「SEC 全般」や群の表記でまとめて挙げるため、判定に含めると欠落を隠す |
-| 書式 | 相対リンクの先がある。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である。フェンスは開始行の文字（バッククォートかチルダ）と長さを覚え、同じ文字が開始以上の長さで並び、その後が空白だけの行でだけ閉じる（長いフェンスの中の短いフェンスで切り替わらない）。開始・終了とも字下げは空白 0〜3 個に限り、4 個以上の字下げの行はコードの本文として扱う（CommonMark）。この判定は ID の走査・節の区切り・コード片の照合と書き直しで共通に使う |
-| 節の構成 | 基本設計・詳細設計（配下のディレクトリの文書を含む）の各節の冒頭に「満たす要件:」がある（「制約:」だけの行は認めない。制約は「／」の後に書く）。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もあり、後者には先頭の列に定義済みの要件 ID を持ち、ほかの列（検査・試験）が空でない対応表の行が 1 行以上ある |
+| 書式 | 相対リンクの先がある（リンク先を山括弧で囲んだ書き方は、山括弧を除いて解決する）。表は、見出しの行の直後に区切りの行（`| --- |`）があるものだけを表として数える（申し送りの解決と要件 ID ↔ テストの対応表に適用する）。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である。フェンスは開始行の文字（バッククォートかチルダ）と長さを覚え、同じ文字が開始以上の長さで並び、その後が空白だけの行でだけ閉じる（長いフェンスの中の短いフェンスで切り替わらない）。開始・終了とも字下げは空白 0〜3 個に限り、4 個以上の字下げの行はコードの本文として扱う（CommonMark）。この判定は ID の走査・節の区切り・コード片の照合と書き直しで共通に使う |
+| 節の構成 | 基本設計・詳細設計（配下のディレクトリの文書を含む）の各節の冒頭に「満たす要件:」がある（「制約:」だけの行は認めない。制約は「／」の後に書く）。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もあり、後者には先頭の列に定義済みの要件 ID を個別に持ち（群の表記・「SEC 全般」だけの行は数えない）、ほかの列（検査・試験）が空でない対応表の行が 1 行以上ある |
 | 申し送りの解決 | 対応する基本設計（詳細設計からの相対パスが同じ文書）の「詳細設計への申し送り」の各項目が、詳細設計の「申し送り」の節の表の先頭の列に、項目名（前後の空白と末尾の「。」を除く）で一度ずつ現れる。欠落・重複・基本設計にない行を失敗にする（行数だけを比べると、重複した行が欠落を埋めて合格になるため） |
-| コード片 | フェンスの外にある印の直後のコード片が実ファイルと一致する（下）。フェンスの中の印は説明用の例として、照合にも書き直しにも使わない |
+| コード片 | フェンスの外にある印の直後のコード片が実ファイルと一致する（下）。フェンスの中の印は説明用の例として、照合にも書き直しにも使わない。字下げしたフェンスは、本文の行から開始行の字下げの分を除いて照合し、書き直しでは同じ字下げを付ける。元のファイルは、シンボリックリンクを解決した後も `--root` の中にあるものに限る（外を指す印は不整合として報告し、書き直さない） |
 | 確認日 | 確認日から 3 か月を過ぎた記述のある文書を警告する（失敗にはしない） |
 | 読むもの | `--root` の下に `docs/` と定義文書（要件・SEC・TST・COST・`docs/README.md`）がなければ、何も調べずに通らないよう終了コード 2 で失敗する |
 
@@ -1411,7 +1484,7 @@ let package = Package(
 
 | 手順 | 条件 |
 | --- | --- |
-| 1 | `ContentView.swift` の import を並べ替える（テンプレートのコードを置き換える時点で解消する） |
+| 1 | `ContentView.swift` の import を並べ替える（作業単位 2 の最初に `.tools/bin/swiftformat .` で整形して解消する。§7） |
 | 4 | §12.1 の変更（Bundle Identifier を除く） |
 | 7・9 | §11 の Package とテストターゲット |
 
@@ -1569,11 +1642,12 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
 | 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 22 規則・58 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする |
-| 設定の検査 | `scripts/test-checks.py settings` | 81 件 | 合格する設定で通り、項目ごとの違反で失敗する。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
-| 依存の検査 | `scripts/test-checks.py dependencies` | 73 件 | 許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
-| 版の照合 | `scripts/test-checks.py versions` | 11 件 | 版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序・版の表示の失敗で失敗する |
-| 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 2 件 | 実行時に組み立てた偽の鍵を検出する |
-| 文書の検査 | `scripts/test-checks.py docs` | 59 件 | 未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
+| 設定の検査 | `scripts/test-checks.py settings` | 92 件 | 合格する設定で通り、項目ごとの違反で失敗する。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
+| 依存の検査 | `scripts/test-checks.py dependencies` | 83 件 | ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
+| 版の照合 | `scripts/test-checks.py versions` | 15 件 | 版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンクで失敗する |
+| 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 5 件 | 実行時に組み立てた偽の鍵を検出する。履歴の検査の指定で、通常のコミットとマージのコミットだけで足した行の両方を検出する |
+| カバレッジの集計 | `scripts/test-checks.py coverage` | 7 件 | 目標以上・未満（警告）の集計と、不正な行数の記録（整数でない・真偽値・範囲外）で終了コード 2 |
+| 文書の検査 | `scripts/test-checks.py docs` | 71 件 | 山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
@@ -1590,6 +1664,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 2026-11-16 の追加分（`check-dependencies.py`・`check-project-settings.py`・`verify-docs.py`・`setup-tools.sh` を変更前の版に戻す。`setup-tools.sh` の `gh` の行の順序の照合だけを外す、実行時の版の比較だけを外す） | 6 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
 | 2026-11-18 の追加分（`no_documents_directory` に保存ルートの型の除外を戻す） | 1 | 失敗した（例外の場所がないのに `allowed/` がない、`violation/Storage/StorageRoot.swift` の検出行が不一致） |
 | 2026-11-18 のレビュー対応の追加分（`no_empty_catch` の入れ子のコメントの読み取り・`no_bsd_socket` と `no_direct_sleep_timer` の空白を挟むメンバーの除外・組み込み規則の Sample の違反の確認・規則名の行の読み取り。設定の検査の arch の条件付きの参照先と生成の指定・版つきの SDK 名・開き括弧の直後のカンマ。依存の検査の閉じていない文字列と補間・版別の manifest・起点の確認。版の照合の必須のツール・版の表示の失敗。文書の検査のフェンスの字下げ（開始・終了）・対応表の行・広すぎる範囲・フェーズ・網羅の欄） | 23 | 試験を足した後は 22 件が失敗した。版つきの SDK 名を照合しない変更（既存の試験は SDK を指定しない経路を通っていた）と開始のフェンスの字下げを外す変更は、試験を足すまで生き残った。空の SDK の条件を除く分岐を外す変更は、`fnmatch` が空の条件に当たらず結果が同じ（等価な変更）なので生き残った |
+| 2026-11-19 のレビュー対応の追加分（`no_empty_catch`・`no_direct_sleep_timer` の正規表現、`setup-tools.sh` のリンクの先の照合、`check-dependencies.py` の内容のハッシュと checksum の照合・CR の行コメント、`check-project-settings.py`・`xcproj.py`・`coverage-report.py`・`verify-docs.py` を変更前の版に戻す） | 8 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
 | `check.sh` を変更前の版に戻し、`print` を含む内容をステージして作業ツリーだけを直す | 1 | 変更前は手順 2 が通過し、変更後は失敗した（作業ツリーではなくインデックスを検査している） |
 | 文書の検査（未定義の ID を報告しない、範囲の省略を展開しない、MVP の網羅を調べない、コード片の不一致を報告しない など） | 15 | すべて失敗した |
 | 2026-11-17 の追加分（`no_empty_catch` の条件の文字列の読み飛ばしを外す。依存のコメントの除去を呼ばない・文字列を扱わない・入れ子を数えない・補間を追わない・補間の中の文字列を読み飛ばさない。設定の未設定の生成を有効と見なす・生成しない構成でビルド設定を数える・ビルド設定や参照先の Info.plist を見ない・`CODE_SIGN_ENTITLEMENTS` を見ない。文書の申し送りの重複や余分な行を見ない・照合や書き直しでフェンスを無視する・入れ子の文書を見ない） | 16 | すべて失敗した |
@@ -1649,7 +1724,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | TST-CI-04 | `check.sh` 手順 3、`test-checks.py gitleaks` | コミット前・プッシュ前 | 通過 |
 | TST-CI-05 | `check.sh` 手順 5、`test-checks.py dependencies` | プッシュ前 | 通過 |
 | TST-CI-06、TST-SEC-03 | `check.sh` 手順 4、`test-checks.py settings` | プッシュ前 | 作業単位 2 の後（自己試験は通過） |
-| TST-CI-07 | `check.sh` 手順 8、`coverage-report.py` | プッシュ前 | Package の集計は確認済み。アプリ側は未実装 |
+| TST-CI-07 | `check.sh` 手順 8、`coverage-report.py`、`test-checks.py coverage` | プッシュ前 | Package の集計は確認済み。アプリ側は未実装 |
 | TST-CI-08 | `check.sh` 手順 9 | PR の作成前 | 作業単位 2 の後 |
 | SEC-SUP-01 | `check.sh` 手順 0、`test-checks.py versions` | プッシュ前 | 通過 |
 | SEC-SUP-02 | `check.sh` 手順 5 | プッシュ前 | 通過 |
@@ -1708,6 +1783,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 
 - [GitHub: realm/SwiftLint releases](https://github.com/realm/SwiftLint/releases)（0.65.1。配布ファイルの `digest`、タグ 0.65.1 の `LICENSE` と `README.md`〈独自ルール・入れ子の設定〉）
 - [GitHub: nicklockwood/SwiftFormat releases](https://github.com/nicklockwood/SwiftFormat/releases)（0.64.7。配布ファイルの `digest`、タグ 0.64.7 の `LICENSE.md`）
+- [GitHub: cli/cli v2.104.0](https://github.com/cli/cli/releases/tag/v2.104.0)（公開 2026-11-12。GitHub の API（`https://api.github.com/repos/cli/cli/releases/tags/v2.104.0`）の配布ファイルの `digest` で、`gh_2.104.0_macOS_arm64.zip` と `gh_2.104.0_macOS_amd64.zip` の SHA-256 が `tools/versions` の値と一致することを確認した。確認日 2026-11-19）
 - [GitHub: gitleaks/gitleaks releases](https://github.com/gitleaks/gitleaks/releases)（v8.30.1。`gitleaks_8.30.1_checksums.txt`、タグ v8.30.1 の `LICENSE`）
 - 各ツールのヘルプ（`swiftlint lint --help`・`swiftformat --help`・`gitleaks git --help`。導入した版で確認）
 - Xcode 27.2 の定義ファイル（`Swift.xcspec`: `SWIFT_VERSION`・`SWIFT_TREAT_WARNINGS_AS_ERRORS` ほか。`INFOPLIST_KEY_…` の一覧）、`xcrun simctl list`
