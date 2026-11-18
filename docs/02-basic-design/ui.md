@@ -4,7 +4,7 @@
 | --- | --- |
 | 版 | 1.0（初版） |
 | 作成日 | 2026-11-15（技術情報の確認日 2026-11-14） |
-| 満たす要件 ID | FR-CNS-01・03、FR-REC-06、FR-INT-06、FR-SAV-05、FR-FIN-02、FR-STT-07、FR-TRV-01〜03、FR-MTG-01〜03、FR-SET-01〜03、NFR-PRF-04、NFR-CAP-02、NFR-UX-01〜04、NFR-L10N-01、SEC-APP-01、SEC-PLT-01・02・06・07、SEC-PRV-02・04 |
+| 満たす要件 ID | FR-CNS-01・03、FR-REC-06、FR-INT-06、FR-SAV-05、FR-FIN-01・02、FR-STT-07、FR-TRV-01〜03、FR-MTG-01〜03、FR-SET-01〜03、NFR-PRF-04、NFR-CAP-02、NFR-UX-01〜04、NFR-L10N-01、SEC-APP-01、SEC-PLT-01・02・06・07、SEC-PRV-02・04 |
 | 解決する未解決事項 | OQ-04 |
 | 参照元 | Minutes P1 §3.6・§3.9・§20、Minutes P2 §18 |
 | 関連文書 | [architecture.md](architecture.md)・[recording.md](recording.md)・[storage.md](storage.md)・[transcription.md](transcription.md)・[export.md](export.md) |
@@ -110,7 +110,7 @@ flowchart TB
 
 ### 4.3 録音中（SC-04）
 
-満たす要件: FR-REC-06、FR-SAV-05、NFR-UX-02
+満たす要件: FR-REC-06、FR-SAV-05、FR-FIN-01、NFR-UX-02
 
 | 表示 | もとになる値 |
 | --- | --- |
@@ -119,7 +119,7 @@ flowchart TB
 | 入力レベル | 録音パイプライン |
 | 保存済みの Chunk 数 | 保存の actor |
 | 録音できる残り時間の目安 | 空き容量（[storage.md](storage.md) §6） |
-| メモリ上の未保存 Chunk の件数と「アプリが終了すると失われる」こと | 段階 3 のときだけ |
+| メモリ上の未保存 Chunk の件数と「アプリが終了すると失われる」こと。未保存の記録を永続化できていない間は「失われたことも後から分からない」ことを加える（FR-FIN-01 ⑤、[storage.md](storage.md) §5.1） | 段階 3 のときだけ |
 | 入力の種別（内蔵マイク / Bluetooth など） | 経路の履歴 |
 
 操作は「停止」と、中断中の「再開」。停止は誤操作を防ぐため確認を挟むか、長押しにする（詳細設計で決める）。中断中は「録音が止まっています」を最上位に表示する（FR-INT-02）。
