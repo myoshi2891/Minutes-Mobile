@@ -89,10 +89,13 @@ grep -rnE "FR-REC-[0-9]+ ?/ ?[0-9]+" docs/ CLAUDE.md README.md          # スラ
 ### 6. 検査する
 
 ```bash
-scripts/verify-docs.py                    # 文書の整合（ID・リンク・節の構成・申し送り・コード片）
+scripts/verify-docs.py                    # 文書の整合（ID・リンク・節の構成・申し送り・コード片）。作業ツリーを検査する
 scripts/verify-docs.py --update-snippets  # 実ファイルを変えた後に、全文のコード片を書き直すとき
-scripts/check.sh --staged                 # コミット前の範囲
+git add <変えた文書と実ファイル> && scripts/check.sh --staged   # コミット前の範囲。ステージした内容（インデックス）だけを検査する
 ```
+
+- `scripts/check.sh --staged` は作業ツリーではなくインデックスを検査する。文書（とコード片の元の実ファイル）を**ステージしてから**実行する。ステージしていない変更は検査されず、ステージした文書だけが古いまま照合される。
+- コミットしない（利用者に頼まれていない）場合は `--staged` を実行しない。その場合は作業ツリーを対象とする `scripts/verify-docs.py` の結果で検査とする（上の 1 行目は必ず実行する）。
 
 失敗したら文書の側を直す。検査を弱めない。
 
