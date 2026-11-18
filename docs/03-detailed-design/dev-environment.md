@@ -374,6 +374,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 | 1・2 | ステージした Swift ファイルだけを見る（規則の試験用のファイルは除く）。**作業ツリーではなく、ステージした内容（インデックス）を検査する。** `git checkout-index --prefix` で、ステージした Swift ファイルと、インデックスにある設定（`.swiftformat`・各階層の `.swiftlint.yml`）を、元の相対位置のまま一時ディレクトリへ書き出し、そこを起点に実行する（入れ子の設定と、パスで指定した除外が作業ツリーと同じに解決される）。SwiftLint には `--force-exclude` を付け、明示したファイルにも除外の指定を効かせる。一時ディレクトリは終了時に消す |
 | 2 | 規則・試験用のファイル・入れ子の設定をステージしたときだけ、規則の試験を回す。**規則の試験もステージした内容で行う。** 規則（各階層の `.swiftlint.yml`）・試験用のファイル（`tools/lint-fixtures/`）・試験のスクリプトをインデックスから同じ一時ディレクトリへ書き出し、その中のスクリプトを実行する（スクリプトは自身の位置をリポジトリ直下とみなす）。開発ツールは作業ツリーの `.tools` へのリンクで使い、入れ子の設定の列挙（`git ls-files`）は `GIT_DIR` と `GIT_WORK_TREE` でインデックスに対して行う |
 | 3 | `gitleaks git --pre-commit --staged`（ステージした差分だけ） |
+| 10 | **文書の整合もステージした内容で検査する。** `git checkout-index -a --prefix` でインデックス全体を一時ディレクトリへ書き出し、その中の `scripts/verify-docs.py` を `--root` にその一時ディレクトリを指定して実行する。文書・コード片の元の実装・検査スクリプトがすべてインデックスの内容になるので、文書と実装の両方をステージした一致する変更は通り、片方だけをステージした変更はコード片の不一致で止まる。検査スクリプトの自己試験（`test-checks.py docs`）は通常の実行だけで回す |
 
 - ファイルの一部だけをステージした場合も、コミットされる内容（インデックス）だけを検査する。作業ツリーで直しただけでステージしていない違反は、コミットを止める。
 - 違反の表示は一時ディレクトリのパスになる（末尾の相対パスは元の位置と同じ）。
@@ -390,7 +391,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 #   scripts/check.sh                手順 0〜10 を順に実行する（PR の作成前）
 #   scripts/check.sh --steps 0-8,10 指定した手順だけを実行する（プッシュ前のフックが使う）
 #   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
-#                                   手順 1・2 は作業ツリーではなくステージした内容（インデックス）を検査する
+#                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
 #
 # 1 つでも失敗したら、そこで止まる。終了コード: 0 = 全て通過 / 1 = 失敗 / 2 = 使い方の誤り
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
@@ -413,6 +414,7 @@ STAGED=0
 STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
+STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged]" >&2
@@ -578,7 +580,9 @@ step_5() {
 test_destination() {
   local udid
   if [ -n "${MINUTES_SIMULATOR:-}" ]; then printf '%s\n' "$MINUTES_SIMULATOR"; return 0; fi
-  udid=$(scripts/find-simulator.py --minimum-os "$MINIMUM_OS")
+  # 呼び出し側は $(…) の中で実行するので set -e が効かない。取得の失敗は明示的に返し、空の id を出力しない
+  udid=$(scripts/find-simulator.py --minimum-os "$MINIMUM_OS") || return 1
+  [ -n "$udid" ] || return 1
   printf 'platform=iOS Simulator,id=%s\n' "$udid"
 }
 
@@ -613,8 +617,16 @@ step_9() {
 }
 
 step_10() {
-  if [ "$STAGED" = 0 ]; then scripts/test-checks.py docs; fi
-  scripts/verify-docs.py
+  if [ "$STAGED" = 1 ]; then
+    # 文書・コード片の元の実装・検査スクリプトのすべてを、作業ツリーではなくインデックスの内容で照合する。
+    # 文書と実装の両方をステージした一致する変更は通り、片方だけをステージした変更はコード片の不一致で止まる
+    STAGED_DOCS_TREE=$(mktemp -d)
+    git checkout-index -a --prefix="$STAGED_DOCS_TREE/"
+    "$STAGED_DOCS_TREE/scripts/verify-docs.py" --root "$STAGED_DOCS_TREE"
+  else
+    scripts/test-checks.py docs
+    scripts/verify-docs.py
+  fi
 }
 
 # 手順の関数は条件（if・&&・||）の中で呼ばない。条件の中では set -e が効かず、
@@ -624,6 +636,7 @@ on_exit() {
   local status=$?
   if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
   if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
+  if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
@@ -811,7 +824,10 @@ opt_in_rules:
 # SEC-INP-03。テストコードでは入れ子の設定（tools/lint-fixtures/_test-code/.swiftlint.yml の写し）で外す
 force_try: error
 force_cast: error
-force_unwrapping: error
+# 既定では静的な文字列を渡した URL(string:)・UIImage(named:) などの強制アンラップを見逃すので、例外の一覧を空にする
+force_unwrapping:
+  severity: error
+  ignored_literal_argument_functions: []
 
 # match_kinds はコメントと文字列の中の一致を除くために指定する（コードとして現れた場合だけ検出する）
 custom_rules:
@@ -1510,6 +1526,11 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | マイクの利用目的が `sdk=iphonesimulator*` の条件付きだけでも合格した（実機用の欠落を見落とした。2026-11-18） | 構成と SDK の組ごとに判定する試験を足した |
 | `check.sh --staged` の規則の試験が作業ツリーの規則を読み、ステージした内容を試験していなかった（2026-11-18） | 古い規則をステージし、作業ツリーだけを直して手順 2 が失敗することを確かめた |
 | 依存の検査のコメントの除去で、補間の中の文字列で外側の文字列が閉じたと見なし、偽のコメントで後ろの宣言を隠せた（2026-11-17） | 補間の中に `"/*"` を置く試験を足した。補間の中の文字列を読み飛ばさない突然変異が、括弧を含む文字列の試験を足すまで生き残った |
+| `force_unwrapping` の既定の例外（`URL(string:)`・`UIImage(named:)` などに静的な文字列を渡した場合）で、テストコード以外の強制アンラップを見逃していた（2026-11-18） | 例外の一覧を空にし、違反例に `UIImage(named:)`・`URL(string:)` を足した |
+| 依存の検査で、補間の中のコメントの `)`・`"` を補間や文字列の終わりと取り違えうる。行コメントの終わりを LF だけで判定していた（2026-11-18） | 補間の中のコメントを先に読み飛ばし、行コメントは CR・LF・CRLF で終わるようにした。補間の中のコメントと改行の 3 種の試験を足した（ファイルの読み込みは改行を LF にそろえるので、CR の不具合は単体の関数でだけ起きていた） |
+| 設定の検査が除外するディレクトリの名前を全階層で照合し、下位の `build` などにある Info.plist を見落としうる。除外の配下も列挙していた（2026-11-18） | 除外を root 直下に限り、走査の前に枝刈りするようにした。下位の `Sources/build/Info.plist` を検出する試験を足した |
+| `check.sh` の `test_destination` が、シミュレータの選択に失敗しても空の id で destination を出力していた（`$(…)` の中では `set -e` が効かない。2026-11-18） | 失敗を `return 1` で返すようにした |
+| `check.sh --staged` の文書の整合が作業ツリーを読み、片方だけをステージした文書・実装の変更を通しえた（2026-11-18） | インデックス全体を書き出して照合するようにした |
 
 ### 17.3 実行して確かめたこと（2026-11-16）
 
