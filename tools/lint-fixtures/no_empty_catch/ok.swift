@@ -27,4 +27,6 @@ func sample() throws {
     } catch { // }
         recorder.record(.failed)
     }
+    // 入れ子のブロックコメントの後に処理がある本体は空ではない
+    do { try work() } catch { /* 外 /* 内 */ 外 */ recorder.record(.failed) }
 }

@@ -4,6 +4,7 @@ func sample() async throws {
     sleep(1) // expect: no_direct_sleep_timer
     Darwin.sleep(1) // expect: no_direct_sleep_timer
     Darwin.usleep(1000) // expect: no_direct_sleep_timer
+    Darwin . sleep(1) // expect: no_direct_sleep_timer
     Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in } // expect: no_direct_sleep_timer
     queue.asyncAfter(deadline: deadline) {} // expect: no_direct_sleep_timer
 }

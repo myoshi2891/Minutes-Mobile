@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / ".swiftlint.yml"
@@ -32,8 +32,12 @@ TEST_CODE_DIRS = ("MinutesMobileTests", "MinutesMobileUITests", "Packages/Minute
 MARKER = re.compile(r"//\s*expect:\s*([a-z_]+)\s*$")
 
 
-def custom_rules(config_text: str) -> Dict[str, bool]:
-    """.swiftlint.yml の custom_rules から、規則名 → 例外（excluded）の有無 を取り出す。"""
+def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
+    """.swiftlint.yml の custom_rules から、規則名 → 例外（excluded）の有無 を取り出す。
+
+    規則名の行は末尾のコメント（「# …」）を許す。字下げ 2 の行で規則名として読めないものは、
+    規則を黙って読み飛ばさないよう errors に入れる。
+    """
     rules: Dict[str, bool] = {}
     in_block = False
     current = ""
@@ -45,10 +49,12 @@ def custom_rules(config_text: str) -> Dict[str, bool]:
             continue
         if re.match(r"^\S", line):  # 次の最上位の鍵で終わる
             break
-        name = re.match(r"^  ([a-z][a-z0-9_]*):\s*$", line)
+        name = re.match(r"^  ([a-z][a-z0-9_]*):\s*(?:#.*)?$", line)
         if name:
             current = name.group(1)
             rules[current] = False
+        elif re.match(r"^  [^\s#]", line):
+            errors.append(f".swiftlint.yml の custom_rules の行を規則名として読めない: {line.strip()}")
         elif current and re.match(r"^    excluded:", line):
             rules[current] = True
     return rules
@@ -135,12 +141,34 @@ def check_test_code(errors: List[str]) -> List[Tuple[Path, str, Set[int]]]:
     return [(sample, rule, set()) for rule in BUILTIN_RULES]
 
 
-def run_swiftlint(paths: List[Path]) -> List[dict]:
+def check_sample_violates(errors: List[str]) -> None:
+    """入れ子の設定の試験用のファイルが、通常の設定では組み込みの 3 規則すべてに違反すること。
+
+    違反のないファイルで「入れ子の設定では検出されない」を確かめても、規則を外したことの証拠にならないため。
+    --config を付けると入れ子の設定が無効になるので、通常の設定だけで検査できる。
+    """
+    sample = FIXTURES / TEST_CODE_FIXTURE / "Sample.swift"
+    if not sample.is_file():
+        return  # 欠落は check_test_code が報告する
+    found = {str(item.get("rule_id", "")) for item in run_swiftlint([sample], CONFIG)}
+    for rule in BUILTIN_RULES:
+        if rule not in found:
+            errors.append(f"{sample.relative_to(ROOT)}: 通常の設定で規則 {rule} の違反が検出されない（入れ子の設定の試験にならない）")
+
+
+def run_swiftlint(paths: List[Path], config: Optional[Path] = None) -> List[dict]:
     env = dict(os.environ)
     env.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
-    # --config を付けると入れ子の設定が無効になるので付けない。リポジトリ直下で実行する
+    # --config を付けると入れ子の設定が無効になるので、通常は付けない（入れ子の設定を無効にして調べるときだけ渡す）。
+    # リポジトリ直下で実行する
     command = [str(SWIFTLINT), "lint", "--quiet", "--no-cache", "--reporter", "json"]
-    result = subprocess.run(command + [str(p) for p in paths], cwd=ROOT, env=env, capture_output=True, text=True)
+    if config is not None:
+        command += ["--config", str(config)]
+    try:
+        result = subprocess.run(command + [str(p) for p in paths], cwd=ROOT, env=env, capture_output=True, text=True)
+    except OSError as error:
+        print(f"NG: SwiftLint（{SWIFTLINT}）を起動できない: {error}", file=sys.stderr)
+        sys.exit(2)
     try:
         report = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -161,7 +189,7 @@ def main() -> int:
         print("NG: .swiftlint.yml がない", file=sys.stderr)
         return 1
     errors: List[str] = []
-    rules = custom_rules(CONFIG.read_text(encoding="utf-8"))
+    rules = custom_rules(CONFIG.read_text(encoding="utf-8"), errors)
     if not rules:
         errors.append(".swiftlint.yml に custom_rules が 1 つもない")
     for rule in BUILTIN_RULES:
@@ -171,6 +199,7 @@ def main() -> int:
         if directory.name not in known:
             errors.append(f"tools/lint-fixtures/{directory.name}/ に対応する規則がない")
     cases = collect(rules, errors) + check_test_code(errors)
+    check_sample_violates(errors)
     if not cases:
         for message in errors:
             print(f"NG: {message}")

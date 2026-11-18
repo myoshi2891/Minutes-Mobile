@@ -64,9 +64,10 @@ custom_rules:
     message: "Network / CFNetwork を import しない（SEC-NET-01）"
     severity: error
 
+  # 「.」の後に空白を挟むメンバーの呼び出し（store . connect()）は、有界の後読みで除く（ICU は可変長の後読みを持たない）
   no_bsd_socket:
     name: "BSD ソケットの禁止"
-    regex: '(?:\bDarwin\s*\.\s*|(?<![.\w])(?<!func\s))(socket|connect)\s*\('
+    regex: '(?:\bDarwin\s*\.\s*|(?<![.\w])(?<!\.\s{1,16})(?<!func\s))(socket|connect)\s*\('
     match_kinds: *code
     message: "ソケットを直接使わない（SEC-NET-01）"
     severity: error
@@ -90,11 +91,12 @@ custom_rules:
   # 条件に文字列を含む空の catch も見逃さない（一致範囲に文字列の種別が入ると match_kinds で外れるため）。
   # 条件は複数行にわたってよい。条件の中の文字列リテラル・行コメント・ブロックコメントは読み飛ばす
   # （中の「{」「{}」を本体の始まりや空の本体と取り違えない）。
-  # 本体のブロックコメントは最初の「*/」で閉じる（間に実行文がある catch を空と見なさない）
+  # ブロックコメントは 1 段の入れ子まで読む（/* 外 /* 内 */ 外 */ を 1 つのコメントとして扱う）。外側を閉じる「*/」の後に
+  # 実行文がある catch を空と見なさない。正規表現では任意の深さの入れ子を数えられないので、2 段以上の入れ子は読み違えうる
   # 行コメントは条件側・本体側とも行末まで後戻りせずに読み飛ばす（*+）。コメント内の「{」「}」を本体の始まりや終わりと取り違えない
   no_empty_catch:
     name: "空の catch の禁止"
-    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*+|/\*(?:[^*]|\*(?!/))*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*+\s*|/\*(?:[^*]|\*(?!/))*\*/\s*)*\})'
+    regex: '\bcatch\b(?=(?:[^{"/]|/(?![/*])|//[^\n]*+|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\n]*+\s*|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/\s*)*\})'
     match_kinds: *code
     message: "エラーを握りつぶさない（SEC-LOG-04）"
     severity: error
@@ -178,7 +180,7 @@ custom_rules:
 
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\.sleep\b|\bThread\.sleep\b|(?<![.\w])(?<!\.\s{1,16})u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code

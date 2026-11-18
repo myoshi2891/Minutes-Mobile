@@ -23,4 +23,6 @@ func sample() {
     } catch { // expect: no_empty_catch
         // 何もしない }
     }
+    // 入れ子のブロックコメントだけの本体も空とみなす
+    do { try work() } catch { /* 外 /* 内 */ 外 */ } // expect: no_empty_catch
 }
