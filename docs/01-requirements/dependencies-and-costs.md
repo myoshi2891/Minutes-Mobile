@@ -102,7 +102,7 @@
    - **SPM 以外の開発ツール**（gitleaks CLI・SwiftLint・SwiftFormat、およびそれらの取得に使う `gh` など）: 公式のリリースページの配布ファイルを使い、版・取得元（リリースページの URL と配布ファイルの名前）・配布ファイルの SHA-256 を §3 と機械可読の写し（`tools/versions`）に記録する。導入スクリプトは記録した版を取得し、SHA-256 が一致した場合だけ展開する（どの環境でも同じ版を再現する）。検査スクリプトは実行時の版（`gitleaks version` など）を確かめ、記録と一致しなければ失敗する。Homebrew は過去の版に固定できないため使わない。版を変えるときは、§3 と `tools/versions` を同じ PR で直す（[dev-environment.md](../02-basic-design/dev-environment.md) §5.2）。
    - **モデル**（代替 STT のモデル重みなど。P2）: 版・取得元の URL・SHA-256 を記録し、ハッシュを検証してから使う（SEC-NET-04）。
 6. **保守状況**: 直近の更新・未対応の脆弱性・iOS と Swift の最新版への対応。
-7. **記録**: この台帳の §3 に 1 行追加し、PR の説明にも書く。**同じ PR で** 許可リスト（`tools/dependency-allowlist.json`）に項目（identity・取得元・版・ライセンス・承認日・台帳の行）を追加する（TST-CI-05）。台帳と許可リストのどちらかだけを直した PR は統合しない。
+7. **記録**: この台帳の §3 に 1 行追加し、PR の説明にも書く。**同じ PR で** 許可リスト（`tools/dependency-allowlist.json`）に項目（identity・取得元・版・ライセンス・承認日・台帳の行）を追加する（TST-CI-05）。バイナリの依存は、承認した内容も記録する（リモートの `.binaryTarget(url:)` は配布物の `checksum`、ローカルの `.binaryTarget(path:)` は内容のハッシュ `sha256`。形式は [dev-environment.md](../03-detailed-design/dev-environment.md) §9.1）。内容を更新したら値を直し、同じく再承認を得る。台帳と許可リストのどちらかだけを直した PR は統合しない。
    - **Xcode プロジェクト（`project.xcproj`）に初めて依存を足す場合**は、`scripts/check-dependencies.py` が `project.xcproj` の版の要求条件の書き方を判定できない（判定できないものは合格にしない）。そのため、書き方を実物で確かめ、確定版の指定であることを判定する検査と、その自己試験（`scripts/test-checks.py dependencies`）を**同じ PR に含める**ことを前提とする。検査を外して通すことはしない。
 
 更新時も同じ手順をとる。特に、**無償だったものが有償・独自ライセンスに変わっていないか**を確認する（例: gitleaks の GitHub Action）。

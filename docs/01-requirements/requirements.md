@@ -116,18 +116,18 @@ AI 議事録（版管理。上書きしない）
 | FR-REC-05 | 録音中は画面ロック中・他アプリ使用中（バックグラウンド）でも録音を継続する | MVP | P1 Invariant 8 の読み替え |
 | FR-REC-06 | 録音中は経過時間・入力レベル・保存済み Chunk 数・空き容量の目安を表示する | MVP | P1 §3.6、P2 §18 |
 | FR-REC-07 | 録音中の会議は同時に 1 件だけとする。録音中に別の録音を開始する操作は受け付けない | MVP | P1 meeting-lock の読み替え |
-| FR-REC-08 | 録音に使った入力経路（内蔵マイク / 有線 / Bluetooth など）と、その変更履歴を会議メタデータに記録する | MVP | 新規（iOS 固有。経路変更の通知 `AVAudioSessionRouteChangeNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18） |
+| FR-REC-08 | 録音に使った入力経路（内蔵マイク / 有線 / Bluetooth など）と、その変更履歴を会議メタデータに記録する | MVP | 新規（iOS 固有。経路変更の通知 `AVAudioSessionRouteChangeNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18。Apple の文書: [routeChangeNotification](https://developer.apple.com/documentation/avfaudio/avaudiosession/routechangenotification)。確認日 2026-11-19） |
 
 ### 5.3 割り込み・中断への対応（INT）
 
 | ID | 要件 | フェーズ | 出典 |
 | --- | --- | --- | --- |
 | FR-INT-01 | 着信・Siri・アラームなどのオーディオ割り込みで入力が止まったら、それまでの音声を Chunk として保存し、割り込みの開始・終了時刻を「録音の空白区間」として記録する | MVP | P1 §19 の読み替え |
-| FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する。**例外:** 利用者が通知を許可していない場合は通知で知らせられない。この場合は、①録音の開始時に、通知が許可されていないため背面で録音が止まっても知らせられないことを表示し（録音の開始は妨げない）、②前面に戻ったときに画面で明示する。アプリが背面にある間に即時に知らせられないことは残る危険とする | MVP | 新規（iOS 固有。割り込みの後に OS が再開を勧める通知 `AVAudioSessionResumptionRecommendationNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18）、UD-08（OQ-01 を解決） |
+| FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する。**例外:** 利用者が通知を許可していない場合は通知で知らせられない。この場合は、①録音の開始時に、通知が許可されていないため背面で録音が止まっても知らせられないことを表示し（録音の開始は妨げない）、②前面に戻ったときに画面で明示する。アプリが背面にある間に即時に知らせられないことは残る危険とする | MVP | 新規（iOS 固有。割り込みの後に OS が再開を勧める通知 `AVAudioSessionResumptionRecommendationNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18。Apple の文書: [resumptionRecommendationNotification](https://developer.apple.com/documentation/avfaudio/avaudiosession/resumptionrecommendationnotification)（iOS 27.0 以降。同じ SDK で従来の `AVAudioSessionInterruptionNotification` は iOS 27.0 で非推奨）。確認日 2026-11-19）、UD-08（OQ-01 を解決） |
 | FR-INT-03 | 入力経路が変わったとき（AirPods の切断など）は、OS が選んだ次の入力で録音を継続し、経路変更を記録する。どの入力も使えなくなったときは保存済みの音声を確定可能な状態にして録音を停止し、停止理由を記録する | MVP | P1 `mic_ended` の読み替え |
-| FR-INT-04 | オーディオのメディアサービスがリセットされたら、録音パイプラインを再構築して再開を試みる。失敗したら FR-INT-02 と同じく停止を明示する | MVP | 新規（iOS 固有。`AVAudioSessionMediaServicesWereResetNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18） |
+| FR-INT-04 | オーディオのメディアサービスがリセットされたら、録音パイプラインを再構築して再開を試みる。失敗したら FR-INT-02 と同じく停止を明示する | MVP | 新規（iOS 固有。`AVAudioSessionMediaServicesWereResetNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18。Apple の文書: [mediaServicesWereResetNotification](https://developer.apple.com/documentation/avfaudio/avaudiosession/mediaserviceswereresetnotification)。確認日 2026-11-19） |
 | FR-INT-05 | 停止理由（`manual` / `interruption_unresumed` / `no_input` / `disk_full` / `terminated` など）と検出時刻を会議メタデータに記録する | MVP | Minutes README の停止理由確認（`stopReason`）の読み替え |
-| FR-INT-06 | マイク権限が未許可・拒否のときは録音を開始せず、設定アプリへの導線を表示する | MVP | P1 Browser DoD の読み替え |
+| FR-INT-06 | マイク権限は録音の開始の操作で確認する。①未決定のときは、同意確認（FR-CNS-01）の後に OS の許可を求め、許可されたときだけ録音を開始する。②拒否（または ①で許可されなかった）のときは録音を開始せず、設定アプリへの導線を表示する | MVP | P1 Browser DoD の読み替え |
 
 ### 5.4 Chunk 保存（SAV）
 
@@ -191,7 +191,7 @@ stateDiagram-v2
 | FR-STT-06 | 音声認識が使えない状態（言語アセット未取得・非対応端末・OS 側の一時的な失敗）では、会議を `finalized` のまま待たせ、理由を表示する。録音と確定には影響させない | MVP | P2 §5.3、Invariant 3 |
 | FR-STT-07 | 日本語の言語アセットが端末にない場合、OS 標準の取得手順を利用者の明示操作で開始する。開始前に「OS が音声認識モデルをダウンロードします。会議データは送信されません」と説明する（SEC-NET-03） | MVP | P2 §7.4 の読み替え |
 | FR-STT-08 | セグメントごとに信頼度（取得できる場合）を保存し、低信頼度のセグメントを UI で区別して表示する | MVP | P1 §3.8、P2 §18 |
-| FR-STT-09 | 文字起こしに使ったエンジン名・モデルや言語アセットの識別子・OS バージョンを会議ごとに記録し、画面に常時表示する | MVP | P1 §3.8、P2 §18 |
+| FR-STT-09 | 文字起こしに使ったエンジン名・モデルや言語アセットの識別子・OS バージョンを、文字起こしの版ごとに記録する（再文字起こしで版ごとに変わりうるため。FR-STT-05）。画面には、表示中の版に対応する情報を常時表示する | MVP | P1 §3.8、P2 §18 |
 | FR-STT-10 | VAD スコアが低い Chunk は文字起こしのスキップ候補にできる。ただしスキップは `skipped` として記録し、原音は消さない。利用者は手動で文字起こしできる | P2 | P1 §3.2、P2 §13、Invariant 7 |
 | FR-STT-11 | OS 標準の音声認識が使えない端末向けの代替エンジン（候補: WhisperKit、MIT ライセンス）を提供する。採否は基本設計で決める | P2 | P2 §7.2、dependencies-and-costs.md |
 | FR-STT-12 | 文字起こしは利用者が開始を指示する。既定では確定直後に自動開始する設定とし、オフにもできる | MVP | 新規 |
