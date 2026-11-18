@@ -116,16 +116,16 @@ AI 議事録（版管理。上書きしない）
 | FR-REC-05 | 録音中は画面ロック中・他アプリ使用中（バックグラウンド）でも録音を継続する | MVP | P1 Invariant 8 の読み替え |
 | FR-REC-06 | 録音中は経過時間・入力レベル・保存済み Chunk 数・空き容量の目安を表示する | MVP | P1 §3.6、P2 §18 |
 | FR-REC-07 | 録音中の会議は同時に 1 件だけとする。録音中に別の録音を開始する操作は受け付けない | MVP | P1 meeting-lock の読み替え |
-| FR-REC-08 | 録音に使った入力経路（内蔵マイク / 有線 / Bluetooth など）と、その変更履歴を会議メタデータに記録する | MVP | 新規（iOS 固有） |
+| FR-REC-08 | 録音に使った入力経路（内蔵マイク / 有線 / Bluetooth など）と、その変更履歴を会議メタデータに記録する | MVP | 新規（iOS 固有。経路変更の通知 `AVAudioSessionRouteChangeNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18） |
 
 ### 5.3 割り込み・中断への対応（INT）
 
 | ID | 要件 | フェーズ | 出典 |
 | --- | --- | --- | --- |
 | FR-INT-01 | 着信・Siri・アラームなどのオーディオ割り込みで入力が止まったら、それまでの音声を Chunk として保存し、割り込みの開始・終了時刻を「録音の空白区間」として記録する | MVP | P1 §19 の読み替え |
-| FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する。**例外:** 利用者が通知を許可していない場合は通知で知らせられない。この場合は、①録音の開始時に、通知が許可されていないため背面で録音が止まっても知らせられないことを表示し（録音の開始は妨げない）、②前面に戻ったときに画面で明示する。アプリが背面にある間に即時に知らせられないことは残る危険とする | MVP | 新規（iOS 固有）、UD-08（OQ-01 を解決） |
+| FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する。**例外:** 利用者が通知を許可していない場合は通知で知らせられない。この場合は、①録音の開始時に、通知が許可されていないため背面で録音が止まっても知らせられないことを表示し（録音の開始は妨げない）、②前面に戻ったときに画面で明示する。アプリが背面にある間に即時に知らせられないことは残る危険とする | MVP | 新規（iOS 固有。割り込みの後に OS が再開を勧める通知 `AVAudioSessionResumptionRecommendationNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18）、UD-08（OQ-01 を解決） |
 | FR-INT-03 | 入力経路が変わったとき（AirPods の切断など）は、OS が選んだ次の入力で録音を継続し、経路変更を記録する。どの入力も使えなくなったときは保存済みの音声を確定可能な状態にして録音を停止し、停止理由を記録する | MVP | P1 `mic_ended` の読み替え |
-| FR-INT-04 | オーディオのメディアサービスがリセットされたら、録音パイプラインを再構築して再開を試みる。失敗したら FR-INT-02 と同じく停止を明示する | MVP | 新規（iOS 固有） |
+| FR-INT-04 | オーディオのメディアサービスがリセットされたら、録音パイプラインを再構築して再開を試みる。失敗したら FR-INT-02 と同じく停止を明示する | MVP | 新規（iOS 固有。`AVAudioSessionMediaServicesWereResetNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18） |
 | FR-INT-05 | 停止理由（`manual` / `interruption_unresumed` / `no_input` / `disk_full` / `terminated` など）と検出時刻を会議メタデータに記録する | MVP | Minutes README の停止理由確認（`stopReason`）の読み替え |
 | FR-INT-06 | マイク権限が未許可・拒否のときは録音を開始せず、設定アプリへの導線を表示する | MVP | P1 Browser DoD の読み替え |
 
@@ -152,7 +152,7 @@ stateDiagram-v2
     [*] --> recording: 同意確認 → 録音開始
     recording --> stop_requested: 停止操作 / 入力喪失 / 容量枯渇
     recording --> stop_requested: 強制終了後の起動時復旧
-    stop_requested --> finalizing: 末尾 Chunk 保存完了
+    stop_requested --> finalizing: 末尾 Chunk の保存の試行が終了（成功・失敗とも。保存できなければ Barrier で止まる）
     finalizing --> finalized: Finalization Barrier 通過
     finalizing --> stop_requested: Barrier 不成立（確定待ち）
     stop_requested --> finalized: 欠落を承知した例外確定（FR-FIN-02。lossRecord を記録）
@@ -162,8 +162,10 @@ stateDiagram-v2
     transcribed --> transcribing: 再文字起こし（新しい版を作る。以前の版は保持。FR-STT-05）
     completed --> transcribing: 再文字起こし（P2。AI 議事録は保持。FR-STT-05）
     transcribed --> summarizing: AI 要約（P2）
-    summarizing --> completed: 要約保存（P2）
-    summarizing --> transcribed: 要約失敗（文字起こしは保持）
+    completed --> summarizing: AI 議事録の再生成（P2。既存の文字起こしを使う。FR-SUM-05）
+    summarizing --> completed: 要約保存（P2。再生成では新しい版を追加）
+    summarizing --> transcribed: 初回の要約の失敗（文字起こしは保持）
+    summarizing --> completed: 再生成の失敗（既存の AI 議事録を保持。再試行できる）
     transcribed --> [*]
     completed --> [*]
 ```
@@ -211,7 +213,7 @@ stateDiagram-v2
 | FR-SUM-02 | LLM が一度に扱える長さ（コンテキスト長）を実行時に取得し、超える場合は分割して要約し、その結果を統合する（Map-Reduce） | P2 | P2 §12.3 |
 | FR-SUM-03 | 出力は構造化スキーマで受け取り、検証する。各項目は根拠となるセグメント ID（`sourceSegmentIds`）を持ち、実在しない ID を含む項目は除外して `rejected` に保持し、件数を警告表示する。除外項目は利用者が確認して手動で採用できる | P2 | P1 §3.8、P2 §12.5 |
 | FR-SUM-04 | 担当者・期限は文字起こしに出現する表現だけから採る。AI に人名を推定させない | P2 | P2 §12.5、Invariant 9 |
-| FR-SUM-05 | AI 議事録は版管理し、再生成は新しい版の追加とする。以前の版と差分を表示できる | P2 | P2 §12.7 |
+| FR-SUM-05 | AI 議事録は版管理し、再生成は新しい版の追加とする。以前の版と差分を表示できる。再生成は既存の確定文字起こしを使い、`completed` から `summarizing` へ遷移して行う（FR-FIN-03）。再生成に失敗した場合は既存の AI 議事録を保持して `completed` に戻り、利用者は再試行できる | P2 | P2 §12.7 |
 | FR-SUM-06 | 使用したモデルと既知の弱点の注記を常時表示する | P2 | P1 §3.8、P2 §12.6 |
 | FR-SUM-07 | Apple Intelligence が非対応・無効の端末では要約機能を無効にし、理由を表示する。文字起こしまでの機能は影響を受けない | P2 | Invariant 2 |
 
@@ -297,7 +299,7 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | NFR-UX-01 | Dynamic Type・VoiceOver・ダークモードに対応し、録音開始と停止のボタンは VoiceOver で一意に読み上げられる | MVP | 新規 |
 | NFR-UX-02 | 録音状態（録音中 / 一時停止 / 停止）は色だけに頼らず、文字とアイコンでも示す | MVP | 新規 |
-| NFR-UX-03 | 録音中であることを、アプリの外でも確認できるようにする。①Live Activity が使える場合: ロック画面とダイナミックアイランドに録音の状態（録音中 / 中断中）と経過時間を表示する。②Live Activity が使えない場合（Personal Team で動かないなど。OQ-04）: アプリ内の表示と、OS が表示する録音インジケータで確認できることを条件とし、ロック画面とダイナミックアイランドに状態と経過時間を出すことは求めない。中断は予約したローカル通知（FR-INT-02）で知らせる（通知の権限がない場合は FR-INT-02 の例外に従う）。②の場合は、ロック画面では OS のインジケータしか見えないことを設定画面に明記する。どちらの場合も D1〜D3 を表示しない（SEC-PLT-07） | MVP | 新規 |
+| NFR-UX-03 | 録音中であることを、アプリの外でも確認できるようにする。①Live Activity が使える場合: ロック画面に録音の状態（録音中 / 中断中）と経過時間を表示する（ダイナミックアイランドのない機種でも必須）。ダイナミックアイランドのある機種では、ダイナミックアイランドにも同じ内容を表示する。②Live Activity が使えない場合（Personal Team で動かないなど。OQ-04）: アプリ内の表示と、OS が表示する録音インジケータで確認できることを条件とし、ロック画面とダイナミックアイランドに状態と経過時間を出すことは求めない。中断は予約したローカル通知（FR-INT-02）で知らせる（通知の権限がない場合は FR-INT-02 の例外に従う）。②の場合は、ロック画面では OS のインジケータしか見えないことを設定画面に明記する。どちらの場合も D1〜D3 を表示しない（SEC-PLT-07） | MVP | 新規 |
 | NFR-UX-04 | エラー表示は「何が起きたか・録音は無事か・利用者がすべきこと」を含める | MVP | P1 §3.6 |
 
 ### 6.6 ローカライズ（L10N）
@@ -323,18 +325,18 @@ stateDiagram-v2
 
 Minutes P2 §25 の Invariant 1〜10 を変更せずに継承し、iOS での読み替えを示す。設計とテストはこれを破らない。
 
-| ID | Minutes の Invariant | MinutesMobile での意味 | 主な担保要件 |
-| --- | --- | --- | --- |
-| INV-01 | Live STT failure ≠ Recording failure | 録音中の文字起こし（P3）が失敗しても録音は止まらない。録音経路は文字起こしの状態を参照しない | FR-REC-05、NFR-PWR-02 |
-| INV-02 | AI failure ≠ Transcript loss | 要約の失敗・検証エラーは文字起こしに触れない | FR-SUM-03、FR-SUM-07 |
-| INV-03 | STT failure ≠ Recording loss | 文字起こしは録音ファイルを読むだけで、失敗しても録音を変更・削除しない | FR-STT-01、FR-STT-06 |
-| INV-04 | Queue failure ≠ Job metadata loss | ジョブの状態は永続化した表が唯一の記録で、アプリの終了で失われない | FR-STT-02、FR-RCV-04 |
-| INV-05 | Duplicate delivery ≠ Duplicate transcript | 同じジョブを二重に実行しても、セグメントは重複しない | FR-STT-04、FR-SAV-03 |
-| INV-06 | AI regeneration ≠ Manual note overwrite | AI 議事録を再生成しても手動ノートは変わらない | FR-NOT-01、FR-NOT-02 |
-| INV-07 | VAD false negative ≠ Original audio loss | VAD の判定でスキップしても原音は削除しない | FR-STT-10 |
-| INV-08 | Browser tab hidden ≠ timer-based recording failure | **画面ロック・バックグラウンド遷移で録音が壊れない**。時刻はサンプル数で数え、タイマーに依存しない | FR-REC-04、FR-REC-05 |
-| INV-09 | Speaker source ≠ Speaker identity | 入力経路（内蔵マイク / Bluetooth）は話者ではない。話者分離（P3）の ID はラベルで、名前は利用者が付ける | FR-SUM-04、FR-REC-08 |
-| INV-10 | Queue ≠ Source of Truth | ジョブ表が消えても録音から再生成できる | FR-RCV-03 |
+| ID | Minutes の Invariant | MinutesMobile での意味 | 主な担保要件 | 出典 |
+| --- | --- | --- | --- | --- |
+| INV-01 | Live STT failure ≠ Recording failure | 録音中の文字起こし（P3）が失敗しても録音は止まらない。録音経路は文字起こしの状態を参照しない | FR-REC-05、NFR-PWR-02 | P2 §25 Invariant 1 |
+| INV-02 | AI failure ≠ Transcript loss | 要約の失敗・検証エラーは文字起こしに触れない | FR-SUM-03、FR-SUM-07 | P2 §25 Invariant 2 |
+| INV-03 | STT failure ≠ Recording loss | 文字起こしは録音ファイルを読むだけで、失敗しても録音を変更・削除しない | FR-STT-01、FR-STT-06 | P2 §25 Invariant 3 |
+| INV-04 | Queue failure ≠ Job metadata loss | ジョブの状態は永続化した表が唯一の記録で、アプリの終了で失われない | FR-STT-02、FR-RCV-04 | P2 §25 Invariant 4 |
+| INV-05 | Duplicate delivery ≠ Duplicate transcript | 同じジョブを二重に実行しても、セグメントは重複しない | FR-STT-04、FR-SAV-03 | P2 §25 Invariant 5 |
+| INV-06 | AI regeneration ≠ Manual note overwrite | AI 議事録を再生成しても手動ノートは変わらない | FR-NOT-01、FR-NOT-02 | P2 §25 Invariant 6 |
+| INV-07 | VAD false negative ≠ Original audio loss | VAD の判定でスキップしても原音は削除しない | FR-STT-10 | P2 §25 Invariant 7 |
+| INV-08 | Browser tab hidden ≠ timer-based recording failure | **画面ロック・バックグラウンド遷移で録音が壊れない**。時刻はサンプル数で数え、タイマーに依存しない | FR-REC-04、FR-REC-05 | P2 §25 Invariant 8 |
+| INV-09 | Speaker source ≠ Speaker identity | 入力経路（内蔵マイク / Bluetooth）は話者ではない。話者分離（P3）の ID はラベルで、名前は利用者が付ける | FR-SUM-04、FR-REC-08 | P2 §25 Invariant 9 |
+| INV-10 | Queue ≠ Source of Truth | ジョブ表が消えても録音から再生成できる | FR-RCV-03 | P2 §25 Invariant 10 |
 
 ---
 
@@ -368,7 +370,7 @@ Minutes P2 §25 の Invariant 1〜10 を変更せずに継承し、iOS での読
 
 | ID | 内容 | 出典 |
 | --- | --- | --- |
-| CON-01 | 最低 OS は iOS 27.2（現在の Xcode プロジェクトの設定値）。下げる場合は、OS 標準の音声認識と LLM の提供条件を再確認する | プロジェクト設定 |
+| CON-01 | 最低 OS は iOS 27.2（現在の Xcode プロジェクトの設定値）。下げる場合は、OS 標準の音声認識と LLM の提供条件を再確認する | プロジェクト設定（`IPHONEOS_DEPLOYMENT_TARGET`。`MinutesMobile.xcodeproj/project.xcproj`） |
 | CON-02 | 配布は無料の Personal Team による個人実機への導入のみ。署名は約 7 日で失効するため、再インストールが必要。Personal Team で使えない capability に依存しない | UD-02 |
 | CON-03 | 対象デバイスは iPhone のみ。現在のプロジェクト設定（対象デバイス `1,2,7` = iPhone / iPad / visionOS）を iPhone のみに変更する（実装着手時に実施） | UD-03 |
 | CON-04 | Swift のバージョン設定を 5.0 から Swift 6 言語モードに変更する（実装着手時に実施） | NFR-MNT-01 |
