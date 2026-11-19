@@ -1,11 +1,14 @@
 #!/bin/bash
 # プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
 # 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
-# 検査するのは HEAD のコミットだけなので、送信するコミットが HEAD と同じで、未コミットの変更がないことを求める
-# 照合した HEAD は --expect-head で渡し、check.sh の開始までに HEAD が変わっていれば失敗させる
+# 送信するコミットが HEAD と同じで、未コミットの変更がないことを求める。
+# 検査は、送信するコミットだけをチェックアウトした専用の作業ツリーで行う。元の作業ツリーで検査中にブランチを
+# 切り替えても（切り替えて戻しても）、すべての手順が同じスナップショットを読む。専用の作業ツリーはリポジトリの外
+# （<ホーム>/Library/Caches/MinutesMobile/pre-push/<リポジトリごとの値>。MINUTES_PRE_PUSH_DIR で変えられる）に置く
+# （リポジトリの中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読み、元の作業ツリーの設定が混ざる）
 set -euo pipefail
 # HEAD は削除以外の参照の行を受け取ってから解決する（削除だけの送信では解決しない。HEAD がまだない場合にも失敗させない）。
-# 最初に解決した値を、後続の照合と --expect-head に使う
+# 最初に解決した値を、後続の照合・専用の作業ツリーのチェックアウト・--expect-head に使う
 head=""
 updates=0  # 削除以外の参照の送信の数
 # 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
@@ -26,4 +29,41 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 done
 # 削除だけの送信は、検査するコミットがないので検査を起動しない
 if [ "$updates" -eq 0 ]; then exit 0; fi
-exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
+# 元の作業ツリーに未コミットの変更（追跡していないファイルを含む）があれば、送信するコミットと手元が食い違うので止める
+if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+  echo "NG: 未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから push する" >&2
+  exit 1
+fi
+
+source_root=$(git rev-parse --show-toplevel)
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
+mkdir -p "$base"
+base=$(cd -P "$base" && pwd)  # git worktree list が示す実体のパスと比べる
+key=$(printf '%s' "$common_dir" | shasum -a 256)
+snapshot="$base/${key%% *}"
+lock="$snapshot.lock"
+# フックの実行中に Git が設定する変数を外す（残すと、専用の作業ツリーでの git が元のリポジトリの作業ツリーを操作する）
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+
+# 同時に 2 つの push が同じ作業ツリーを使わないようにする
+if ! mkdir "$lock" 2>/dev/null; then
+  echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
+  exit 1
+fi
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+trap 'exit 130' INT TERM
+
+# 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
+if git -C "$source_root" worktree list --porcelain | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
+  git -C "$snapshot" checkout -q --detach --force "$head"
+  git -C "$snapshot" clean -q -f -d  # 追跡していないファイル（無視するものは除く）を消し、送信するコミットと一致させる
+else
+  rm -rf -- "$snapshot"  # 登録のない残骸（前回の作成の途中で止まったものなど）
+  # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
+  git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
+fi
+# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）
+[ -e "$snapshot/.tools" ] || ln -s "$source_root/.tools" "$snapshot/.tools"
+
+"$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

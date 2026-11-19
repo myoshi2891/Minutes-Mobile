@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
 from xcproj import Unreadable, load_project
@@ -252,6 +252,8 @@ def check_plist_values(
                     errors.append(f"[{reason}] {target}: {label}の {key} が文字列でない（{type(value).__name__}）")
         missing: List[str] = []
         empty: Dict[str, List[str]] = {}
+        # 効きうる候補のうち展開できないもの。ほかの候補で補えるかによらず違反とする（展開できない値を見逃さない）
+        unresolved: Dict[str, List[str]] = {}
         for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
             build = f"{configuration}（{sdk}）"
             modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, sdk)
@@ -266,6 +268,7 @@ def check_plist_values(
                 expanded = expand_value(value, own, shared, configuration, sdk) if isinstance(value, str) else ""
                 if expanded is None:
                     lacking = True
+                    unresolved.setdefault(f"{source} の {name}", []).append(build)
                     continue
                 from_files.append((f"{source} の {name}", expanded.strip()))
             from_settings: List[Tuple[str, str]] = []
@@ -277,6 +280,7 @@ def check_plist_values(
                     expanded = expand_value(value, own, shared, configuration, sdk)
                     if expanded is None:
                         settings_unresolved = True
+                        unresolved.setdefault(key, []).append(build)
                         continue
                     from_settings.append((key, expanded.strip()))
                 settings_cover = bool(from_settings) and not undecided and not settings_unresolved
@@ -297,6 +301,9 @@ def check_plist_values(
             )
         for label, used in empty.items():
             errors.append(f"[{reason}] {target}: {label} が空（構成 {'・'.join(used)}）")
+        for label, used in unresolved.items():
+            errors.append(f"[{reason}] {target}: {label} の値を展開できない（構成 {'・'.join(used)}。"
+                          "その構成で 1 つの値に展開できる変数だけを使う）")
 
 
 def check_plist_orientation(
@@ -334,15 +341,50 @@ def check_plist_orientation(
         errors.append(f"[BD-UI-10] {target}: {label} が縦だけでない（構成 {'・'.join(used)}。必要な値: [UIInterfaceOrientationPortrait]）")
 
 
-def check_plist_entry(source: str, key: str, value: object, errors: List[str]) -> None:
-    """Info.plist の 1 項目を調べる。入れ子の辞書と配列もたどる。"""
+# 値の中の変数を、検査する構成・SDK のすべてについて展開した結果を返す関数。展開できない組の値は None
+Expander = Callable[[str], List[Optional[str]]]
+VARIABLE = re.compile(r"\$[({]")
+
+
+def target_expander(own: dict, shared: dict, configurations: List[str]) -> Expander:
+    """そのターゲットの各構成・各 SDK（SDKS）のビルド設定で値を展開する関数を返す。"""
+    return lambda text: [expand_value(text, own, shared, c, s) for c in configurations for s in SDKS]
+
+
+def combined_expander(expanders: List[Expander]) -> Expander:
+    """複数のターゲットの展開の結果をすべて合わせる（どのターゲットのビルドでも違反しないことを求める）。"""
+    return lambda text: [value for expand in expanders for value in expand(text)]
+
+
+def check_enabled(source: str, key: str, value: object, errors: List[str], expand: Optional[Expander]) -> None:
+    """有効にすると違反になる鍵の値を判定する。変数を含む値は、構成・SDK ごとに展開してから判定する。
+
+    展開できない値（どのターゲットのビルド設定で展開するか決まらない plist の値を含む）は、無効とみなさず違反として報告する。
+    """
+    reason = FORBIDDEN_WHEN_ENABLED[key]
+    if not (isinstance(value, str) and VARIABLE.search(value)):
+        if enabled(value):
+            errors.append(f"[{reason}] {source}: {key} を有効にしない")
+        return
+    values = expand(value) if expand is not None else [None]
+    if any(item is None for item in values):
+        errors.append(f"[{reason}] {source}: {key} の値を展開できない（{value}。リテラルの NO にするか、鍵を置かない）")
+    if any(item is not None and enabled(item) for item in values):
+        errors.append(f"[{reason}] {source}: {key} を有効にしない（{value} が有効な値に展開される）")
+
+
+def check_plist_entry(source: str, key: str, value: object, errors: List[str], expand: Optional[Expander] = None) -> None:
+    """Info.plist の 1 項目を調べる。入れ子の辞書と配列もたどる。
+
+    expand は値の変数を展開する関数（その plist・ビルド設定を使うターゲットのもの）。None なら変数は判定できないものとする。
+    """
     if key in FORBIDDEN_PLIST_KEYS:
         errors.append(f"[{FORBIDDEN_PLIST_KEYS[key]}] {source}: {key} を設定しない")
     for prefix, reason in FORBIDDEN_PLIST_KEY_PREFIXES.items():
         if key.startswith(prefix):
             errors.append(f"[{reason}] {source}: {key} を設定しない")
-    if key in FORBIDDEN_WHEN_ENABLED and enabled(value):
-        errors.append(f"[{FORBIDDEN_WHEN_ENABLED[key]}] {source}: {key} を有効にしない")
+    if key in FORBIDDEN_WHEN_ENABLED:
+        check_enabled(source, key, value, errors, expand)
     if re.fullmatch(r"NS\w*UsageDescription", key) and key not in ALLOWED_USAGE_DESCRIPTIONS:
         errors.append(f"[TST-SEC-03] {source}: 使わない権限の文言 {key} を置かない")
     if key == "UIBackgroundModes":
@@ -354,21 +396,21 @@ def check_plist_entry(source: str, key: str, value: object, errors: List[str]) -
         errors.append(f"[SEC-PLT-04] {source}: 拡張 {value} を置かない")
     if isinstance(value, dict):
         for child_key, child_value in value.items():
-            check_plist_entry(source, str(child_key), child_value, errors)
+            check_plist_entry(source, str(child_key), child_value, errors, expand)
     elif isinstance(value, list):
         for item in value:
             if isinstance(item, dict):
                 for child_key, child_value in item.items():
-                    check_plist_entry(source, str(child_key), child_value, errors)
+                    check_plist_entry(source, str(child_key), child_value, errors, expand)
 
 
-def check_build_settings(target: str, settings: dict, errors: List[str]) -> None:
+def check_build_settings(target: str, settings: dict, errors: List[str], expand: Optional[Expander] = None) -> None:
     for key, value in settings.items():
         name = key.split("[", 1)[0]
         if name in FORBIDDEN_BUILD_SETTINGS:
             errors.append(f"[{FORBIDDEN_BUILD_SETTINGS[name]}] {target}: {key} を削除する")
         if name.startswith("INFOPLIST_KEY_"):
-            check_plist_entry(f"{target} の {key}", name[len("INFOPLIST_KEY_"):], value, errors)
+            check_plist_entry(f"{target} の {key}", name[len("INFOPLIST_KEY_"):], value, errors, expand)
 
 
 def find_files(root: Path, suffixes: Tuple[str, ...]) -> Iterator[Path]:
@@ -447,17 +489,22 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
     configurations = project.get("configurations")
     if not isinstance(configurations, list) or not configurations or not all(isinstance(c, str) for c in configurations):
         raise Unreadable(f"{project_path}: configurations の形式が違う")
-    check_build_settings("プロジェクト", shared, errors)
-    referenced: List[Path] = []
-    entitlements: List[Path] = []
     for target in targets:
         if not isinstance(target, dict) or not isinstance(target.get("build-settings"), dict):
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
+    # プロジェクトの設定はすべてのターゲットのビルドに効くので、すべてのターゲットの構成・SDK で展開する
+    expanders = [target_expander(target["build-settings"], shared, configurations) for target in targets]
+    check_build_settings("プロジェクト", shared, errors, combined_expander(expanders))
+    # INFOPLIST_FILE の参照先 → それを使うターゲットの展開（参照するターゲットのビルド設定で値の変数を展開する）
+    referenced: Dict[Path, List[Expander]] = {}
+    entitlements: List[Path] = []
+    for target, expander in zip(targets, expanders):
         name = f"ターゲット {target.get('name', '?')}"
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
         for configuration in configurations:
-            referenced.extend(referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE")[0])
+            for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE")[0]:
+                referenced.setdefault(path, []).append(expander)
             entitlements.extend(
                 referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS")[0])
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
@@ -465,16 +512,18 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
             check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
             check_plist_orientation(project_path, name, target_name, own, shared, configurations, root, errors)
-        check_build_settings(name, own, errors)
+        check_build_settings(name, own, errors, expander)
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")
     found = [path.resolve() for path in find_files(root, ("Info.plist",))]
     # INFOPLIST_FILE が指すファイルも読む。ないファイル・読めないファイルは load_plist が Unreadable にする
-    for path in found + [path for path in dict.fromkeys(referenced) if path not in found]:
+    for path in found + [path for path in referenced if path not in found]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+        # どのターゲットも参照しない plist の値の変数は、展開するビルド設定が決まらないので判定できないものとする
+        expand = combined_expander(referenced[path]) if path in referenced else None
         for key, value in load_plist(path).items():
-            check_plist_entry(source, str(key), value, errors)
+            check_plist_entry(source, str(key), value, errors, expand)
     # CODE_SIGN_ENTITLEMENTS が指すファイルも、拡張子にかかわらず読む。ないファイル・読めないファイルは Unreadable
     scanned = [path.resolve() for path in find_files(root, (".entitlements",))]
     for path in scanned + [path for path in dict.fromkeys(entitlements) if path not in scanned]:

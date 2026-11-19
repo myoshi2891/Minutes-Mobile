@@ -53,6 +53,11 @@ Fence = Tuple[str, int]  # フェンスの文字（` か ~）と長さ
 # フェンスの字下げは空白 0〜3 個まで（CommonMark）。4 個以上の字下げの行はコードの本文として扱う
 FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 PHASES = re.compile(r"^(MVP|P2|P3)\b")
+# sections() が節の本文でコードフェンスの行の代わりに置く行。空行と違って節の冒頭を終わらせ、
+# 「|」で始まらないので表のまとまりも区切る（「- 」「### 」「満たす要件:」とも一致しない）
+FENCE_LINE = "\0fence"
+# リンク先（山括弧で囲んだもの、または空白と「)」を含まないもの）と、続けて書けるタイトル（"…"・'…'・(…)）
+LINK = re.compile(r"""\]\((<[^<>\n]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)""")
 DETAILED_MAPPING = "要件 ID ↔ テスト"
 
 
@@ -138,7 +143,13 @@ def expand(match: "re.Match[str]") -> List[str]:
 
 
 def table_cells(line: str) -> List[str]:
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    """表の行を列に分ける。エスケープした「\\|」は列の区切りにしない（GFM と同じ）。"""
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", text)]
 
 
 TABLE_SEPARATOR = re.compile(r"^\|[ :|-]+\|$")
@@ -146,14 +157,16 @@ TABLE_SEPARATOR = re.compile(r"^\|[ :|-]+\|$")
 
 def table_rows(body: List[str]) -> List[str]:
     """本文の中の表のデータ行を返す。連続した「|」の行のまとまりごとに区切り、見出しの行の直後が区切りの行
-    （| --- |）である表だけを表として扱い、見出しと区切りの行を除いた行を返す。区切りの行のないまとまりは表として数えない。"""
+    （| --- |）で、見出しと区切りの行の列の数が同じものだけを表として扱い、見出しと区切りの行を除いた行を返す。
+    区切りの行のないまとまり・列の数が合わないまとまりは表として数えない（GFM でも表にならない）。"""
     rows: List[str] = []
     block: List[str] = []
     for line in body + [""]:
         if line.startswith("|"):
             block.append(line)
             continue
-        if len(block) >= 2 and TABLE_SEPARATOR.match(block[1]) and not TABLE_SEPARATOR.match(block[0]):
+        if (len(block) >= 2 and TABLE_SEPARATOR.match(block[1]) and not TABLE_SEPARATOR.match(block[0])
+                and len(table_cells(block[0])) == len(table_cells(block[1]))):
             rows.extend(row for row in block[2:] if not TABLE_SEPARATOR.match(row))
         block = []
     return rows
@@ -293,7 +306,10 @@ class Checker:
         fields: List[str] = []
         in_head = True
         after_heading = False
-        for _, line in prose_lines(text):
+        for _, line, inside, _ in fenced_lines(text):
+            if inside:
+                after_heading = False  # コードブロックは節の冒頭を終わらせる（sections() と同じ境界）
+                continue
             if line.startswith("## ") or line.startswith("### "):
                 in_head = False
                 after_heading = True
@@ -320,7 +336,7 @@ class Checker:
                 if fence_end(lines, number - 1) >= len(lines):
                     self.error(name, "コードフェンスが閉じていない", number)
             for number, line in prose_lines(text):
-                for target in re.findall(r"\]\((<[^<>\n]+>|[^)\s]+)\)", line):
+                for target in LINK.findall(line):
                     # 山括弧で囲んだリンク先（空白を含められる）は、山括弧を除いてから解決する
                     if target.startswith("<") and target.endswith(">"):
                         target = target[1:-1]
@@ -335,9 +351,10 @@ class Checker:
         result: List[Tuple[int, str, List[str]]] = []
         for number, line, inside, _ in fenced_lines(text):
             if inside:
-                # フェンスの中は検査の対象外。位置は空行として残し、フェンスをまたいだ行を 1 つの表として扱わない
+                # フェンスの中は検査の対象外。位置は FENCE_LINE として残し、フェンスをまたいだ行を 1 つの表として扱わず、
+                # 節の冒頭のコードブロックの後ろの行を節の冒頭として扱わない
                 if result:
-                    result[-1][2].append("")
+                    result[-1][2].append(FENCE_LINE)
                 continue
             if line.startswith("## "):
                 result.append((number, line[3:].strip(), []))
@@ -501,12 +518,20 @@ class Checker:
             if not name.startswith(DETAILED + "/"):
                 continue
             lines = text.splitlines()
+            # 読み込み（load）は改行を LF にそろえるので、元の改行を行ごとに読み直して書き直しに使う（CRLF の行を変えない）
+            with (self.root / name).open(encoding="utf-8", newline="") as handle:
+                raw = handle.read().splitlines(keepends=True)
+            endings = [line[len(line.rstrip("\r\n")):] for line in raw]
+            if len(endings) != len(lines):
+                endings = ["\n"] * len(lines)  # 行の数え方が合わない場合は LF とみなす（通常は起きない）
             # フェンスの外の行の位置（フェンスの中の印は説明用の例であり、書き直さない）
             outside = {number - 1 for number, _, inside, _ in fenced_lines(text) if not inside}
             out: List[str] = []
+            out_endings: List[str] = []  # out の各行の改行
             index = 0
             while index < len(lines):
                 out.append(lines[index])
+                out_endings.append(endings[index])
                 marker = re.match(r"^<!-- file: (\S+) -->$", lines[index].strip()) if index in outside else None
                 index += 1
                 if not marker:
@@ -526,6 +551,8 @@ class Checker:
                 if end >= len(lines) or any(fence_closes(line, opened[0]) for line in content):
                     continue
                 out.extend(lines[index:start + 1] + content + [lines[end]])
+                # 書き直した本文の行は、フェンスの開始行と同じ改行にする
+                out_endings.extend(endings[index:start + 1] + [endings[start] or "\n"] * len(content) + [endings[end]])
                 index = end + 1
             # 末尾の改行の有無などコード片以外の違いでは書き直さない（本文の行が変わったときだけ）
             if out == lines:
@@ -534,8 +561,9 @@ class Checker:
             if target is None:
                 self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
                 continue
+            with target.open("w", encoding="utf-8", newline="") as handle:
+                handle.write("".join(line + ending for line, ending in zip(out, out_endings)))
             updated = "\n".join(out) + ("\n" if text.endswith("\n") else "")
-            target.write_text(updated, encoding="utf-8")
             self.texts[name] = updated
             print(f"コード片を書き直した: {name}")
 

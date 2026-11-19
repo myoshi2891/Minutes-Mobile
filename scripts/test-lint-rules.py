@@ -7,7 +7,8 @@ tools/lint-fixtures/<規則名>/ の各ファイルを SwiftLint にかけ、
   violation.swift  検出される例（印が 1 行以上）
   violation/**     ほかの規則の例外の場所などのパスに置いた違反（印が 1 行以上。検出されること）
   ok.swift         検出されない例（印なし）
-  allowed/**       例外を認める場所のパスに置いた違反（印なし。検出されないこと）
+  allowed/**       例外を認める場所のパスに置いた違反（印なし。検出されないこと）。対照として、同じ内容を
+                   例外の場所でないパス（リポジトリの外の一時ディレクトリ）に写すと検出されることも確かめる
 
 規則に試験用のファイルがない場合も失敗する（試験のない規則を作らせない）。
 使い方: scripts/test-lint-rules.py [--staged]
@@ -18,8 +19,10 @@ tools/lint-fixtures/<規則名>/ の各ファイルを SwiftLint にかけ、
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -211,6 +214,32 @@ def run_swiftlint(paths: List[Path], config: Optional[Path] = None) -> List[dict
     return report
 
 
+def check_allowed_controls(cases: List[Tuple[Path, str, Set[int]]], rules: Dict[str, bool], errors: List[str]) -> None:
+    """allowed/ の各ファイルを、例外の場所でないパスに写すと規則が検出すること（例外が検出を止めていることの対照）。
+
+    allowed/ の中で検出されないことだけでは、そもそも違反を含まない内容でも通ってしまう。
+    写す先はリポジトリの外の一時ディレクトリ（作業ツリーを変えない）で、例外のパターンに当たる階層の名前を含まない。
+    入れ子の設定が効かない場所なので、通常の設定を --config で渡す。
+    """
+    allowed = [(path, rule) for path, rule, _ in cases if rules.get(rule) and "allowed" in path.relative_to(FIXTURES).parts]
+    if not allowed:
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        copies: Dict[Path, Tuple[Path, str]] = {}
+        for index, (path, rule) in enumerate(allowed):
+            copy = Path(directory) / "Control" / f"Control{index}.swift"
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, copy)
+            copies[copy] = (path, rule)
+        found: Set[Tuple[str, str]] = set()
+        for item in run_swiftlint(sorted(copies), CONFIG):
+            found.add((os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", ""))))
+        for copy, (path, rule) in copies.items():
+            if (os.path.realpath(str(copy)), rule) not in found:
+                errors.append(f"{path.relative_to(ROOT)}: 例外の場所でないパスに写しても規則 {rule} が検出されない"
+                              "（例外の場所の試験にならない。違反する式を含める）")
+
+
 def main() -> int:
     arguments = sys.argv[1:]
     if arguments not in ([], ["--staged"]):
@@ -243,6 +272,7 @@ def main() -> int:
     for item in run_swiftlint(sorted({path for path, _, _ in cases})):
         key = (os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", "")))
         reported.setdefault(key, set()).add(int(item.get("line", 0)))
+    check_allowed_controls(cases, rules, errors)
     for path, rule, expected in cases:
         actual = reported.get((os.path.realpath(str(path)), rule), set())
         if actual != expected:

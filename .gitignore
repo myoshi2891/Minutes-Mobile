@@ -5,8 +5,9 @@ DerivedData/
 build/
 *.xcresult
 
-# 導入スクリプトが展開した開発ツール（版は tools/versions で管理する）
-.tools/
+# 導入スクリプトが展開した開発ツール（版は tools/versions で管理する）。
+# 末尾の「/」を付けない（プッシュ前のフックが専用の作業ツリーに置く .tools のシンボリックリンクも無視する）
+/.tools
 
 # 録音データを誤って入れない（SEC-SUP-04・05）
 *.wav

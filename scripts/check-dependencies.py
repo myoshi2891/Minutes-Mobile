@@ -330,8 +330,11 @@ def satisfies(version: Version, rule: Tuple[Version, Version, bool]) -> bool:
     return low <= version and (version <= high if inclusive else version < high)
 
 
-# 取得元を持つ宣言（Package の依存と、バイナリのターゲット）
-SOURCE_DECLARATION = re.compile(r"\.(package|binaryTarget)\s*\(")
+# 取得元を持つ宣言（Package の依存と、バイナリのターゲット）。識別子はバッククォートで囲んでも同じ（.`package`(…)）
+SOURCE_DECLARATION = re.compile(r"\.(`?)(package|binaryTarget)\1\s*\(")
+# 同じ識別子のメンバーの参照。呼び出しの形（SOURCE_DECLARATION）でないもの（関数の値として渡すなど）は、
+# 取得元を判定できないので合格にしない。変数名の package（let package = Package(…)）は「.」がないので当たらない
+MEMBER_REFERENCE = re.compile(r"\.(`?)(package|binaryTarget)\1(?![\w`])")
 # 文字列リテラルだけの引数（連結・補間・変数を含まない）。引数の終わりは「,」か末尾
 LITERAL_URL = re.compile(r'url:\s*"([^"\\]*)"\s*(?:,|$)')
 LITERAL_PATH = re.compile(r'path:\s*"([^"\\]*)"\s*(?:,|$)')
@@ -364,7 +367,12 @@ def content_digest(path: Path) -> str:
         for item in sorted(path.rglob("*"), key=lambda found: found.relative_to(path).as_posix()):
             relative = item.relative_to(path).as_posix()
             if item.is_symlink():
-                entry = f"L\0{relative}\0{item.readlink()}"
+                # リンクは成果物の中を指すものだけを認める（ビルドはリンクをたどるので、外を指すリンクは
+                # 内容のハッシュに入らない外のファイルを成果物に取り込む）。連鎖したリンクもたどった先で判定する
+                link = item.readlink()
+                if link.is_absolute() or not item.resolve().is_relative_to(path.resolve()):
+                    raise Unreadable(f"{item}: ローカルのバイナリの中のリンクが成果物の外を指す（{link}）")
+                entry = f"L\0{relative}\0{link}"
             elif item.is_file():
                 entry = f"F\0{relative}\0{file_hash(item)}"
             elif item.is_dir():
@@ -408,6 +416,27 @@ def version_errors(arguments: str, masked: str, summary: str, approved: Set[str]
     return errors
 
 
+def local_package_errors(directory: str, path: str, summary: str, root: Optional[Path]) -> List[str]:
+    """.package(path:) の参照先を、参照元の Package.swift のディレクトリから解決して確かめる。
+
+    起点の外・検査で除外するディレクトリの中・manifest のない参照先は、中の依存を検査できないので認めない。
+    """
+    location = posixpath.normpath(posixpath.join(directory, path))
+    if posixpath.isabs(location) or location == ".." or location.startswith("../"):
+        return [f"ローカルの Package {path} は起点の外にあり、中の依存を検査できない: .package({summary})"]
+    parts = location.split("/")
+    if parts[0] in SKIPPED_AT_ROOT or SKIPPED_ANYWHERE.intersection(parts):
+        return [f"ローカルの Package {location} は検査の対象外のディレクトリにある: .package({summary})"]
+    if root is None:
+        return []
+    target = (root / location).resolve()
+    if not target.is_relative_to(root.resolve()):
+        return [f"ローカルの Package {path} は起点の外にあり、中の依存を検査できない: .package({summary})"]
+    if not (target / "Package.swift").is_file():
+        return [f"ローカルの Package {location} に manifest がない（Package.swift）: .package({summary})"]
+    return []
+
+
 def manifest_errors(
     manifest: str, by_url: Dict[str, dict], approved: Optional[Dict[str, Set[str]]] = None,
     pins: Optional[Dict[str, List[object]]] = None, by_path: Optional[Dict[str, dict]] = None, directory: str = "",
@@ -427,8 +456,12 @@ def manifest_errors(
     pins = pins or {}
     by_path = by_path or {}
     errors: List[str] = []
+    for match in MEMBER_REFERENCE.finditer(masked):
+        if not SOURCE_DECLARATION.match(masked, match.start()):
+            errors.append(f"宣言を判定できない（.{match.group(2)}(…) の呼び出しの形で書く）: "
+                          f"{' '.join(masked[match.start():match.start() + 60].split())}")
     for match in SOURCE_DECLARATION.finditer(masked):
-        kind = match.group(1)
+        kind = match.group(2)
         start = match.end() - 1
         masked_arguments = call_arguments(masked, start)
         arguments = code[start + 1:start + 1 + len(masked_arguments)]  # 長さを変えずに置き換えたので位置は同じ
@@ -470,6 +503,10 @@ def manifest_errors(
                 if actual != by_path[location]["sha256"]:
                     errors.append(f"ローカルのバイナリ {location} の内容が承認したものと違う（現在 {actual}）。"
                                   "確かめてから許可リストの sha256 を更新し、再承認を得る")
+        else:
+            # ローカルの Package（.package(path:)）は、起点の中で検査の対象になる manifest を指す場合だけ認める
+            # （起点の中の manifest はすべて manifests() で検査するので、参照先の未承認の依存・バイナリも検出される）
+            errors.extend(local_package_errors(directory, path, summary, root))
     return errors
 
 

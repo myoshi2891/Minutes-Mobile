@@ -11,13 +11,14 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 HOOKS=0
-# 引数は 0 個か、--hooks の 1 個だけ（ツールの導入とフックの変更より前に確かめる）
-[ $# -le 1 ] || { echo "使い方: $0 [--hooks]" >&2; exit 2; }
-case "${1:-}" in
-  "") ;;
-  --hooks) HOOKS=1 ;;
-  *) echo "使い方: $0 [--hooks]" >&2; exit 2 ;;
-esac
+# 引数は 0 個か、--hooks の 1 個だけ（ツールの導入とフックの変更より前に確かめる）。
+# 引数が 1 個あれば空文字列でも引数として扱い、--hooks との完全一致を求める
+usage() { echo "使い方: $0 [--hooks]" >&2; exit 2; }
+[ $# -le 1 ] || usage
+if [ $# -eq 1 ]; then
+  [ "$1" = --hooks ] || usage
+  HOOKS=1
+fi
 
 scripts/setup-tools.sh
 if [ "$HOOKS" = 1 ]; then

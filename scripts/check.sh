@@ -28,7 +28,8 @@ UI_TESTS="MinutesMobileUITests"
 MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
 # 手順 7 がカバレッジを測った入力の記録（手順 8 が集計の前に現在の入力と照合する）。
-# 未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」を書く
+# 1 行目は入力（未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」）、
+# 2 行目は測った結果のカバレッジの JSON の SHA-256（手順 7 と 8 の間に別の測定で JSON が書き換えられていないこと）
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
 # gitleaks の履歴の検査で git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、
 # 既定の 2 つも書く。-m でマージのコミットの差分も検査する（マージの解決で足した行を見落とさない）
@@ -243,32 +244,46 @@ step_6() {
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator' build
 }
 
+# カバレッジの JSON の SHA-256。読めなければ失敗を返す
+coverage_digest() {
+  local digest
+  digest=$(shasum -a 256 "$1") || return 1
+  printf '%s\n' "${digest%% *}"
+}
+
 step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
-  local measured
+  local measured report digest
   rm -f -- "$COVERAGE_HEAD"
   # 測る前の入力を控え、測った後も同じ場合だけ記録する（測定中に変わった入力の結果をどちらにも帰属させない）
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
   swift test --package-path "$PACKAGE" --enable-code-coverage
   [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
-  printf '%s\n' "$measured" > "$COVERAGE_HEAD"
+  report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
+  [ -f "$report" ] || fail "カバレッジの記録がない（swift test の結果を確かめる）"
+  digest=$(coverage_digest "$report") || fail "カバレッジの記録のハッシュを計算できない"
+  printf '%s\n%s\n' "$measured" "$digest" > "$COVERAGE_HEAD"
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
 }
 
 step_8() {
-  local report measured current
+  local report measured current recorded_digest
   scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
   [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
-  measured=$(cat "$COVERAGE_HEAD")
+  measured=$(sed -n 1p "$COVERAGE_HEAD")
+  recorded_digest=$(sed -n 2p "$COVERAGE_HEAD")
   current=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
   [ "$measured" = "$current" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  # 手順 7 の後に別の測定で記録が書き換えられていれば、入力が同じでも集計しない
+  [ -n "$recorded_digest" ] && [ "$(coverage_digest "$report")" = "$recorded_digest" ] \
+    || fail "カバレッジの記録が手順 7 で測ったものと違う。手順 7 を実行し直す"
   case "$measured" in
     worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
   esac

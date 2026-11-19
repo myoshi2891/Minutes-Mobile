@@ -56,7 +56,8 @@ def reject_constant(name: str) -> None:
 def load_project(path: Path) -> dict:
     try:
         data = json.loads(strip_trailing_commas(path.read_text(encoding="utf-8")), parse_constant=reject_constant)
-    except (OSError, UnicodeDecodeError, ValueError) as error:  # json.JSONDecodeError は ValueError の派生
+    # json.JSONDecodeError は ValueError の派生。入れ子が深すぎる入力は RecursionError（ValueError の派生ではない）になる
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:
         raise Unreadable(f"{path}: {error}") from error
     if not isinstance(data, dict):
         raise Unreadable(f"{path}: 最上位がオブジェクトでない")
