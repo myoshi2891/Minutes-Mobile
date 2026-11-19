@@ -231,7 +231,7 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 | `.env`・`.env.*` | 秘密情報 |
 | `.DS_Store` | — |
 
-試験用の音声は合成するので、音声ファイルをリポジトリに置く必要はない（TST-GEN-08）。実機試験の記録には、件数・結果・ハッシュだけを残す。
+試験用の音声は合成するので、音声ファイルをリポジトリに置く必要はない（TST-GEN-08）。実機試験の記録には、試験の様式（[test-requirements.md](../01-requirements/test-requirements.md) §3.7）の項目（日付・ビルドのコミット・端末機種・OS 版・試験 ID・結果・観測値（件数・ハッシュを含む）・不合格の理由）だけを残す（SEC-SUP-05）。
 
 ---
 
@@ -349,5 +349,6 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 - [GitHub: nicklockwood/SwiftFormat releases](https://github.com/nicklockwood/SwiftFormat/releases)（0.64.7、MIT）
 - [GitHub: gitleaks/gitleaks releases](https://github.com/gitleaks/gitleaks/releases)（v8.30.1、MIT）
 - Homebrew の formula 情報（`brew info`。swiftlint 0.65.1・swiftformat 0.64.6・gitleaks 8.30.1）
-- 各版の配布ファイルの一覧（`gh release view`。gitleaks v8.30.1・SwiftLint 0.65.1・SwiftFormat 0.64.7。確認日 2026-11-16）
+- 各版の配布ファイルの一覧（`gh release view`。gh v2.104.0・gitleaks v8.30.1・SwiftLint 0.65.1・SwiftFormat 0.64.7。確認日 2026-11-16）
+- [GitHub: cli/cli releases](https://github.com/cli/cli/releases)（gh 2.104.0、MIT。配布ファイルと `gh_2.104.0_checksums.txt` の SHA-256 の根拠。確認日 2026-11-16）
 - [Apple: Supported capabilities (iOS)](https://developer.apple.com/help/account/reference/supported-capabilities-ios/)
