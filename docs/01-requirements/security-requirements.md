@@ -150,7 +150,7 @@
 | SEC-SUP-02 | 依存を追加する前に、ライセンス（許可: MIT / Apache-2.0 / BSD 系。その他はオーナーに確認）、有償要素、通信の有無、保守状況を確認し、[dependencies-and-costs.md](dependencies-and-costs.md) に記録する | MVP | 設計 / レビュー・CI（ライセンス確認） | CODE |
 | SEC-SUP-03 | 秘密情報の検出（gitleaks）をコミット前（pre-commit）と CI で実行する | MVP | CI | CODE |
 | SEC-SUP-04 | `.gitignore` で、録音データ（`*.wav` など）・個人の Xcode 設定（`xcuserdata`）・ビルド成果物・`.env` を管理対象から外す | MVP | 実装 / レビュー | CODE |
-| SEC-SUP-05 | 実機で録音した試験データは、リポジトリに入れない。試験記録には件数・結果・ハッシュだけを残す | MVP | 運用 | PRIVACY |
+| SEC-SUP-05 | 実機で録音した試験データは、リポジトリに入れない。試験記録には、試験の様式（test-requirements.md §3.7）の項目（日付・ビルドのコミット・端末機種・OS 版・試験 ID・結果・観測値（件数・ハッシュを含む）・不合格の理由）だけを残し、音声とその書き起こしの本文は残さない | MVP | 運用 | PRIVACY |
 | SEC-SUP-06 | 改ざん検知・脱獄検知（MASVS-RESILIENCE）は、個人利用（UD-02）の段階では対象外とする。配布範囲を広げるときに再評価する | P3 | — | RESILIENCE |
 
 ---
