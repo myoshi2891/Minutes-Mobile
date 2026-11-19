@@ -10,6 +10,9 @@ tools/lint-fixtures/<規則名>/ の各ファイルを SwiftLint にかけ、
   allowed/**       例外を認める場所のパスに置いた違反（印なし。検出されないこと）
 
 規則に試験用のファイルがない場合も失敗する（試験のない規則を作らせない）。
+使い方: scripts/test-lint-rules.py [--staged]
+  --staged  入れ子の設定の列挙をインデックス（git ls-files）に対して行う（check.sh --staged がステージした内容で試験するとき）。
+            指定しなければ作業ツリーを走査し、Git が無視するファイルも含めて列挙する
 終了コード: 0 = 全件一致 / 1 = 不一致あり / 2 = 実行できない
 """
 import json
@@ -29,6 +32,10 @@ BUILTIN_RULES = ("force_try", "force_cast", "force_unwrapping")
 # テストコード用の入れ子の設定を試験するディレクトリと、同じ内容を置くテストのディレクトリ
 TEST_CODE_FIXTURE = "_test-code"
 TEST_CODE_DIRS = ("MinutesMobileTests", "MinutesMobileUITests", "Packages/MinutesKit/Tests")
+# 作業ツリーを走査するときに飛ばすディレクトリ（リポジトリ直下からの相対パス）。.swiftlint.yml の excluded のうち、
+# SwiftLint が解析しない場所（設定が対象のソースに適用されない）と、Git の管理領域の .git。
+# tools/lint-fixtures は excluded にあるが、この試験が明示したパスで解析し入れ子の設定も効くので、走査の対象にする
+WALK_SKIPPED = {".git", ".tools", ".build", "build", "DerivedData"}
 # 規則名は custom_rules の規則名と同じ形（先頭は英小文字、以降は英小文字・数字・下線）
 MARKER = re.compile(r"//\s*expect:\s*([a-z][a-z0-9_]*)\s*$")
 
@@ -110,7 +117,36 @@ def collect(rules: Dict[str, bool], errors: List[str]) -> List[Tuple[Path, str, 
     return cases
 
 
-def check_test_code(errors: List[str]) -> List[Tuple[Path, str, Set[int]]]:
+def nested_configs_in_worktree() -> List[str]:
+    """作業ツリーの .swiftlint.yml を、Git が無視するものも含めて列挙する（リポジトリ直下からの相対パス）。"""
+    found: List[str] = []
+    for current, directories, files in os.walk(ROOT):
+        relative = Path(current).relative_to(ROOT).as_posix()
+        directories[:] = sorted(
+            name for name in directories
+            if (name if relative == "." else f"{relative}/{name}") not in WALK_SKIPPED
+        )
+        if ".swiftlint.yml" in files:
+            found.append(".swiftlint.yml" if relative == "." else f"{relative}/.swiftlint.yml")
+    return found
+
+
+def nested_configs_in_index() -> List[str]:
+    """インデックスにある .swiftlint.yml を列挙する。列挙できなければ実行できないとして止める。"""
+    try:
+        return subprocess.run(
+            ["git", "ls-files", "--cached", "--", ":(glob)**/.swiftlint.yml"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError) as error:
+        # 入れ子の設定を列挙できなければ抜け道を検査できないので、実行できないとして止める
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        print(detail, file=sys.stderr)
+        print("NG: git ls-files を実行できない（入れ子の設定を列挙できない）", file=sys.stderr)
+        sys.exit(2)
+
+
+def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Set[int]]]:
     """テストコード用の入れ子の設定で、組み込みの 3 規則が外れることを試験する。"""
     directory = FIXTURES / TEST_CODE_FIXTURE
     nested, sample = directory / ".swiftlint.yml", directory / "Sample.swift"
@@ -127,17 +163,8 @@ def check_test_code(errors: List[str]) -> List[Tuple[Path, str, Set[int]]]:
             errors.append(f"{name}/.swiftlint.yml が {TEST_CODE_FIXTURE}/.swiftlint.yml と一致しない")
     # それ以外の場所に入れ子の設定を置かせない（規則を外す抜け道になる）
     allowed = {ROOT / name / ".swiftlint.yml" for name in TEST_CODE_DIRS} | {CONFIG, nested}
-    try:
-        listed = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/.swiftlint.yml"],
-            cwd=ROOT, capture_output=True, text=True, check=True,
-        ).stdout.splitlines()
-    except (OSError, subprocess.CalledProcessError) as error:
-        # 入れ子の設定を列挙できなければ抜け道を検査できないので、実行できないとして止める
-        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
-        print(detail, file=sys.stderr)
-        print("NG: git ls-files を実行できない（入れ子の設定を列挙できない）", file=sys.stderr)
-        sys.exit(2)
+    # 通常は作業ツリー（Git が無視するファイルも含む）、--staged ではインデックスにある設定だけを調べる
+    listed = nested_configs_in_index() if staged else nested_configs_in_worktree()
     for relative in listed:
         if ROOT / relative not in allowed:
             errors.append(f"許可していない場所に入れ子の設定がある: {relative}")
@@ -185,6 +212,11 @@ def run_swiftlint(paths: List[Path], config: Optional[Path] = None) -> List[dict
 
 
 def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments not in ([], ["--staged"]):
+        print(f"使い方: {sys.argv[0]} [--staged]", file=sys.stderr)
+        return 2
+    staged = arguments == ["--staged"]
     if not SWIFTLINT.exists():
         print("NG: .tools/bin/swiftlint がない。scripts/setup-tools.sh を実行する", file=sys.stderr)
         return 2
@@ -201,7 +233,7 @@ def main() -> int:
     for directory in sorted(p for p in FIXTURES.iterdir() if p.is_dir()):
         if directory.name not in known:
             errors.append(f"tools/lint-fixtures/{directory.name}/ に対応する規則がない")
-    cases = collect(rules, errors) + check_test_code(errors)
+    cases = collect(rules, errors) + check_test_code(errors, staged)
     check_sample_violates(errors)
     if not cases:
         for message in errors:

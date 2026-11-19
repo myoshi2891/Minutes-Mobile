@@ -180,9 +180,10 @@ custom_rules:
     message: "UUID は注入した生成器から得る（TST-GEN-04・07）"
     severity: error
 
+  # 裸の sleep( はメソッドの宣言（func sleep(）を除く（no_bsd_socket と同じ後読み）
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\s*\.\s*sleep\b|\bThread\.sleep\b|(?<![.\w])(?<!\.\s{1,16})u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\s*\.\s*sleep\b|\bThread\.sleep\b|(?<![.\w])(?<!\.\s{1,16})(?<!func\s)u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
