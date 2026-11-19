@@ -268,11 +268,7 @@ class Checker:
         for name, text in self.texts.items():
             if not name.startswith(BASIC + "/") or name.endswith("/README.md"):
                 continue
-            for _, line in prose_lines(text):
-                # 正式な欄だけを数える: 節の冒頭の「満たす要件:」と、文書の冒頭の表の「| 満たす要件 ID |」の行
-                # （「満たす要件の例」などの説明文は数えない）
-                if not re.match(r"^(?:満たす要件:|\| 満たす要件 ID \|)", line):
-                    continue
+            for line in self.requirement_fields(text):
                 # names_requirements と同じく「／」の前だけを見る（後ろの決定・関連の参照は網羅に数えない）
                 line = line.split("／", 1)[0]
                 for match in ID_PATTERN.finditer(line):
@@ -285,6 +281,31 @@ class Checker:
                     covered.update(identifier for identifier in self.defined if identifier.startswith("SEC-"))
         for identifier in sorted(self.mvp - covered):
             self.error(BASIC, f"MVP の要件 {identifier} が、どの文書の「満たす要件」にも現れない")
+
+    @staticmethod
+    def requirement_fields(text: str) -> List[str]:
+        """正式な「満たす要件」の欄の行を返す。
+
+        数えるのは、文書の冒頭（最初の「## 」より前）の表の「| 満たす要件 ID |」の行と、見出し（「## 」「### 」）の
+        直後の最初の本文行にある「満たす要件:」の行だけ（節の冒頭の検査と同じ位置。節の後半にある同名の行や
+        「満たす要件の例」などの説明文は数えない）。「## 」の直後が「### 」なら、その小節の冒頭を見る。
+        """
+        fields: List[str] = []
+        in_head = True
+        after_heading = False
+        for _, line in prose_lines(text):
+            if line.startswith("## ") or line.startswith("### "):
+                in_head = False
+                after_heading = True
+                continue
+            if not line.strip():
+                continue
+            if in_head and line.startswith("| 満たす要件 ID |"):
+                fields.append(line)
+            if after_heading and line.startswith("満たす要件:"):
+                fields.append(line)
+            after_heading = False
+        return fields
 
     def check_format(self) -> None:
         for name, text in self.texts.items():
@@ -312,7 +333,12 @@ class Checker:
     def sections(self, text: str) -> List[Tuple[int, str, List[str]]]:
         """「## 」の節ごとに、行番号・見出し・本文の行を返す。"""
         result: List[Tuple[int, str, List[str]]] = []
-        for number, line in prose_lines(text):
+        for number, line, inside, _ in fenced_lines(text):
+            if inside:
+                # フェンスの中は検査の対象外。位置は空行として残し、フェンスをまたいだ行を 1 つの表として扱わない
+                if result:
+                    result[-1][2].append("")
+                continue
             if line.startswith("## "):
                 result.append((number, line[3:].strip(), []))
             elif result:
@@ -501,11 +527,17 @@ class Checker:
                     continue
                 out.extend(lines[index:start + 1] + content + [lines[end]])
                 index = end + 1
-            updated = "\n".join(out) + "\n"
-            if updated != text:
-                (self.root / name).write_text(updated, encoding="utf-8")
-                self.texts[name] = updated
-                print(f"コード片を書き直した: {name}")
+            # 末尾の改行の有無などコード片以外の違いでは書き直さない（本文の行が変わったときだけ）
+            if out == lines:
+                continue
+            target = self.snippet_source(name)
+            if target is None:
+                self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
+                continue
+            updated = "\n".join(out) + ("\n" if text.endswith("\n") else "")
+            target.write_text(updated, encoding="utf-8")
+            self.texts[name] = updated
+            print(f"コード片を書き直した: {name}")
 
     def check_freshness(self) -> None:
         """技術情報の確認日が 3 か月を過ぎた文書を警告する（失敗にはしない）。"""

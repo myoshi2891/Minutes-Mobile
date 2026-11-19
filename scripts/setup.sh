@@ -11,6 +11,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
 HOOKS=0
+# 引数は 0 個か、--hooks の 1 個だけ（ツールの導入とフックの変更より前に確かめる）
+[ $# -le 1 ] || { echo "使い方: $0 [--hooks]" >&2; exit 2; }
 case "${1:-}" in
   "") ;;
   --hooks) HOOKS=1 ;;

@@ -71,7 +71,8 @@ link_directory() {
 
 verify_tool() {
   local name=$1 version=$2 binary=$3 sha=$4
-  local link="$DEST/bin/$binary" stamp="$DEST/$name/$version/.archive-sha256" actual
+  # 公開するリンクの名前はツールの名前（検査が呼ぶ名前）。リンク先は配布ファイルの中の実行ファイル（$binary）
+  local link="$DEST/bin/$name" stamp="$DEST/$name/$version/.archive-sha256" actual
   [ -x "$link" ] || fail "$name が導入されていない。scripts/setup-tools.sh を実行する"
   # 実行するのは、導入記録のある版のディレクトリの中の実行ファイルに限る（リンクの先を別の導入に差し替えさせない）。
   # bash 3.2 の macOS には readlink -f がないので、リンクの先のディレクトリを cd -P で実体に解決して比べる
@@ -144,6 +145,9 @@ install_tool() {
     if [ -e "$target" ]; then
       backup="$DEST/$name/.$version.old.$$"
       rm -rf -- "${backup:?}"
+      # 中断（INT・TERM）されても終了処理が旧い導入を戻せるよう、退避の前に場所を記録する
+      PENDING_TARGET=$target
+      PENDING_BACKUP=$backup
       mv "$target" "$backup" || fail "$name の既存の導入を退避できない"
     fi
     if ! mv "$work/out" "$target"; then
@@ -151,10 +155,16 @@ install_tool() {
       fail "$name の導入を置き換えられない。既存の導入は残す"
     fi
     if [ -n "$backup" ]; then rm -rf -- "${backup:?}"; fi
+    PENDING_TARGET=""
+    PENDING_BACKUP=""
   fi
   mkdir -p "$DEST/bin"
-  ln -sfn "../$name/$version/$binary" "$DEST/bin/$binary"
+  ln -sfn "../$name/$version/$binary" "$DEST/bin/$name"
 }
+
+# 置き換えの途中の導入先と退避先（install_tool が設定し、置き換えが終わったら空に戻す）
+PENDING_TARGET=""
+PENDING_BACKUP=""
 
 if [ "$MODE" = install ]; then
   # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
@@ -162,6 +172,15 @@ if [ "$MODE" = install ]; then
   WORK=$(mktemp -d "$DEST/.work.XXXXXX")
   cleanup() {
     local status=$?
+    # 置き換えの途中で終わった場合: 新しい導入がまだ置かれていなければ退避した旧い導入を戻し、
+    # 置かれていれば新しい導入を残して退避を消す
+    if [ -n "$PENDING_BACKUP" ] && [ -e "$PENDING_BACKUP" ]; then
+      if [ ! -e "$PENDING_TARGET" ]; then
+        mv "$PENDING_BACKUP" "$PENDING_TARGET" || echo "NG: 退避した導入を戻せない（${PENDING_BACKUP}）" >&2
+      else
+        rm -rf -- "${PENDING_BACKUP:?}"
+      fi
+    fi
     rm -rf -- "${WORK:?}"
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
     exit "$status"

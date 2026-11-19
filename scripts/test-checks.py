@@ -582,6 +582,11 @@ def test_dependencies() -> None:
                       {"Package.swift": declare.format(unlisted) + 'let s = "abc\n'})
     dependencies_case("閉じていない補間", 2, "補間が閉じていない", {"Package.swift": declare.format(unlisted) + 'let s = "\\(x\n'})
     # 版別の manifest（Package@swift-<版>.swift）も同じ検査にかける
+    # 除外の階層: 下位の build は検査し、直下の build と全階層の .build は除外する
+    dependencies_case("下位の build の中の許可リスト外の依存", 1, "Sub/build/Package.swift",
+                      {"Sub/build/Package.swift": declare.format(unlisted)})
+    dependencies_case("直下の build は除外", 0, "OK", {"build/Package.swift": declare.format(unlisted)})
+    dependencies_case("下位の .build は除外", 0, "OK", {"Sub/.build/Package.swift": declare.format(unlisted)})
     dependencies_case("版別の manifest の許可リスト外の依存", 1, "Package@swift-6.0.swift",
                       {"Package@swift-6.0.swift": declare.format(unlisted)})
     expect("dependencies: 存在しない起点", [str(SCRIPTS / "check-dependencies.py"), "--root", str(ROOT / "no-such-directory")],
@@ -594,7 +599,10 @@ def test_versions() -> None:
     original = (ROOT / "tools" / "versions").read_text(encoding="utf-8")
     expect("versions: 導入済みの版が一致する", [setup, "--verify"], 0, "OK")
     # 版と SHA-256 の負例は、現在の swiftlint の行から値を取り出して変える（ツールを更新しても負例を作れるように）
-    row = next(line for line in original.splitlines() if line.split()[:1] == ["swiftlint"])
+    # この Mac に適用される行（setup-tools.sh と同じく、アーキテクチャが一致する行、なければ any の行）を変える
+    swiftlint_rows = [line for line in original.splitlines() if line.split()[:1] == ["swiftlint"]]
+    row = (next((line for line in swiftlint_rows if line.split()[2:3] == [platform.machine()]), None)
+           or next(line for line in swiftlint_rows if line.split()[2:3] == ["any"]))
     columns = row.split()
     current_version, current_sha = columns[1], columns[-1]
     parts = current_version.split(".")
@@ -651,7 +659,9 @@ def test_versions() -> None:
             expect(f"versions: {label}", [setup, "--verify", "--versions", str(versions), "--dest", tools], want_code, want_text)
     # 導入記録は一致するが、実行時の gh が別の版を名乗る（取得に使う gh の版を実行して確かめていること）
     # 列は空白文字（タブを含む）で分けて比べる（名前とアーキテクチャの列）
-    gh_rows = [line for line in original.splitlines() if line.split()[:1] == ["gh"] and line.split()[2:3] == [platform.machine()]]
+    gh_rows = [line for line in original.splitlines()
+               if line.split()[:1] == ["gh"] and line.split()[2:3] in ([platform.machine()], ["any"])]
+    gh_rows.sort(key=lambda line: line.split()[2] == "any")  # アーキテクチャが一致する行を any の行より先にする
     with tempfile.TemporaryDirectory() as directory:
         dest = Path(directory) / "tools"
         version, sha = gh_rows[0].split()[1], gh_rows[0].split()[-1]
@@ -683,6 +693,23 @@ def test_versions() -> None:
         (dest / "bin" / "gh").symlink_to("../gh/other/gh")
         expect("versions: リンクが導入記録のない場所を指す", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                   "--require", "gh"], 1, "導入先を指していない")
+    # 配布ファイルの中の実行ファイル名が名前と違っても、検査が呼ぶリンクは名前（bin/<名前>）で照合する
+    with tempfile.TemporaryDirectory() as directory:
+        dest = Path(directory) / "tools"
+        fields = gh_rows[0].split()
+        version, sha = fields[1], fields[-1]
+        stub = dest / "gh" / version / "gh-cli"
+        stub.parent.mkdir(parents=True)
+        stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        stub.chmod(0o755)
+        (stub.parent / ".archive-sha256").write_text(sha + "\n", encoding="utf-8")
+        (dest / "bin").mkdir()
+        (dest / "bin" / "gh").symlink_to(f"../gh/{version}/gh-cli")
+        fields[6] = "gh-cli"
+        versions = Path(directory) / "versions"
+        versions.write_text(" ".join(fields) + "\n", encoding="utf-8")
+        expect("versions: 実行ファイル名が名前と違う", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
+                                               "--require", "gh"], 0, "OK: gh")
 
 
 def test_gitleaks() -> None:
@@ -733,7 +760,8 @@ def gitleaks_merge_case() -> None:
         commit("normal.txt", f'token = "{normal_key}"\n', "side")
         git("checkout", "-q", "main")
         commit("main.txt", "main\n", "main")
-        git("merge", "-q", "--no-commit", "side")
+        # 開発者の設定（merge.ff=only など）によらず二親のマージを作る
+        git("merge", "-q", "--no-ff", "--no-commit", "side")
         commit("merge.txt", f'token = "{merge_key}"\n', "merge")  # マージのコミットだけで足した行
         for label, extra, want in (("指定あり", [f"--log-opts={options}"], {"normal.txt", "merge.txt"}),
                                    ("指定なし（既定の git log）", [], {"normal.txt"})):
@@ -942,6 +970,18 @@ def run_docs_cases() -> None:
         docs_case("説明文の要件は網羅に数えない", 1, "MVP の要件 FR-AAA-02", extra={basic: replaced(replaced(
             DOCS[basic], "FR-AAA-01・02、", "FR-AAA-01、"),
             "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n", "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n満たす要件の例: FR-AAA-02\n\n")}),
+        # 節の後半にある「満たす要件:」の行は、網羅に数えない（節・小節の見出しの直後の行だけが正式な欄）
+        docs_case("節の後半の満たす要件は網羅に数えない", 1, "MVP の要件 FR-AAA-02", extra={basic: replaced(replaced(
+            DOCS[basic], "FR-AAA-01・02、", "FR-AAA-01、"),
+            "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n", "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n本文\n\n満たす要件: FR-AAA-02\n\n")}),
+        docs_case("小節の冒頭の満たす要件は網羅に数える", 0, "OK", extra={basic: replaced(replaced(
+            DOCS[basic], "FR-AAA-01・02、", "FR-AAA-01、"),
+            "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n",
+            "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n### 2.1 小節\n\n満たす要件: FR-AAA-02\n\n")}),
+        # フェンスをまたいだ行は 1 つの表にならない（フェンスの後の行だけでは、見出しと区切りのない表なので数えない）
+        docs_case("フェンスをまたいだ対応表は数えない", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |",
+                  f"| 要件 | 試験 |\n| --- | --- |\n{FENCE}text\n例\n{FENCE}\n| FR-AAA-01 | 試験 |"),
         # 空白 4 個以上の字下げの行はフェンスを閉じない（コードの本文として扱う）
         docs_case("字下げ 4 個のフェンス状の行は開かない", 0, "OK", basic, "満たす要件: TST-AAA-01\n\n",
                   f"満たす要件: TST-AAA-01\n\n    {FENCE}\n    コードの本文\n\n"),
@@ -997,6 +1037,29 @@ def run_docs_cases() -> None:
     count += 1
     if EXAMPLE_MARKERS not in (example / detailed).read_text(encoding="utf-8"):
         failures.append("docs: フェンスの中の印のコード片が書き直された")
+    # --update-snippets は、コード片が一致していれば末尾の改行の有無だけで書き直さない
+    no_newline = DOCS[detailed].rstrip("\n")
+    kept = docs_case("末尾の改行だけでは書き直さない", 0, "OK", options=["--update-snippets"], extra={detailed: no_newline})
+    count += 1
+    if (kept / detailed).read_text(encoding="utf-8") != no_newline:
+        failures.append("docs: コード片が一致しているのに、末尾の改行だけで文書が書き直された")
+    # --update-snippets は、実パスが --root の外にある文書に書き込まない
+    assert docs_parent is not None
+    outside = Path(tempfile.mkdtemp(dir=docs_parent)) / "outside.md"
+    stale = replaced(DOCS[detailed], "echo one\necho two\necho three", "echo old")
+    outside.write_text(stale, encoding="utf-8")
+    linked = Path(tempfile.mkdtemp(dir=docs_parent))
+    for path, content in DOCS.items():
+        (linked / path).parent.mkdir(parents=True, exist_ok=True)
+        if path == detailed:
+            (linked / path).symlink_to(outside)
+        else:
+            (linked / path).write_text(content, encoding="utf-8")
+    expect("docs: root の外の文書は書き直さない", [str(SCRIPTS / "verify-docs.py"), "--root", str(linked), "--update-snippets"],
+           1, "--root の外にあるため")
+    count += 1
+    if outside.read_text(encoding="utf-8") != stale:
+        failures.append("docs: --root の外にある文書が書き直された")
     del created  # 一時ディレクトリは test_docs の TemporaryDirectory が消す
     with tempfile.TemporaryDirectory() as missing:
         expect("docs: 存在しない root", [str(SCRIPTS / "verify-docs.py"), "--root", str(Path(missing) / "none")], 2, "docs")

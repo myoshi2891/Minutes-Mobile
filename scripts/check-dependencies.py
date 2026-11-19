@@ -20,7 +20,10 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 from xcproj import Unreadable, load_project
 
 ROOT = Path(__file__).resolve().parent.parent
-SKIPPED_DIRECTORIES = {".git", ".tools", ".build", "build", "DerivedData", "xcuserdata"}
+# ビルドの成果物と個人の設定は全階層で除外する。.git・.tools・build はリポジトリ直下だけを除外する
+# （下位の build という名前のディレクトリにある manifest・設定も検査する）
+SKIPPED_ANYWHERE = {".build", "DerivedData", "xcuserdata"}
+SKIPPED_AT_ROOT = {".git", ".tools", "build"}
 PACKAGE_FIELDS = ("identity", "url", "version", "license", "approvedOn", "ledger")
 # ローカルのバイナリ（.binaryTarget(path:)）の承認済みの項目は、url の代わりに path（リポジトリの起点からの相対パス）と、
 # 承認したときの内容のハッシュ sha256（content_digest の値）を持つ
@@ -100,8 +103,10 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
 
 def find_files(root: Path, name: str) -> Iterator[Path]:
     for path in sorted(root.rglob(name)):
-        if path.is_file() and not SKIPPED_DIRECTORIES.intersection(path.relative_to(root).parts):
-            yield path
+        parts = path.relative_to(root).parts
+        if not path.is_file() or SKIPPED_ANYWHERE.intersection(parts[:-1]) or parts[0] in SKIPPED_AT_ROOT:
+            continue
+        yield path
 
 
 def resolved_pins(path: Path) -> List[dict]:

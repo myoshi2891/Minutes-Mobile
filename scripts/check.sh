@@ -176,7 +176,7 @@ step_2() {
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
     (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \
-      "$STAGED_TREE/scripts/test-lint-rules.py")
+      "$STAGED_TREE/scripts/test-lint-rules.py" --staged)
     return 0
   else
     "$TOOLS/swiftlint" lint --quiet --no-cache
