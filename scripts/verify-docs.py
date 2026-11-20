@@ -34,7 +34,10 @@ PLAIN_ID = r"(?:CON|INV|OQ|UD|COST)-\d+"
 SEPARATOR = r"(・|〜| ?/ ?)"
 ID_PATTERN = re.compile(rf"\b({AREA_ID}|{PLAIN_ID})((?:(?:[・〜]| ?/ ?)\d+)*)")
 GROUP_PATTERN = re.compile(r"\b(FR|NFR|SEC|TST)-([A-Z]+(?:・[A-Z]+)*) ?群")
-DEFINITION_ROW = re.compile(rf"^\| (?:\*\*)?({AREA_ID}|{PLAIN_ID})(?:\*\*)? \|")
+# 定義の行の先頭の列（table_cells で前後の空白を除いた値）。太字（**…**）の ID も定義とする
+DEFINITION_CELL = re.compile(rf"(?:\*\*)?({AREA_ID}|{PLAIN_ID})(?:\*\*)?")
+# 申し送りの項目の行（「- 」の箇条書きと「1. 」の番号付き）。印の後ろを項目名とする
+HANDOVER_ITEM = re.compile(r"^(?:- |\d+\. )(.*)$")
 # 接頭辞ごとの定義文書（docs/README.md §3）
 DEFINED_IN = {
     "FR": "docs/01-requirements/requirements.md",
@@ -251,7 +254,8 @@ class Checker:
     def collect_definition(self, name: str, number: int, line: str, phase_column: int) -> None:
         """表のデータ行 1 行から ID の定義を集める（collect_definitions から呼ぶ）。"""
         cells = table_cells(line)
-        found = DEFINITION_ROW.match(line)
+        # 先頭の列の空白の有無（|FR-AAA-01| と | FR-AAA-01 |）によらず、正規化した値で判定する
+        found = DEFINITION_CELL.fullmatch(cells[0]) if cells else None
         if not found:
             return
         identifier = found.group(1)
@@ -260,7 +264,7 @@ class Checker:
         if not (name == home or (prefix == "BD" and name.startswith(BASIC + "/"))):
             return
         # 基本設計では、設計決定の表（先頭の列が ID）の行だけを定義として扱う
-        if prefix == "BD" and not re.match(r"^\| BD-[A-Z]+-\d+ \| ", line):
+        if prefix == "BD" and cells[0] != identifier:
             return
         if identifier in self.defined:
             self.error(name, f"{identifier} の定義が重複している（{self.defined[identifier]}）", number)
@@ -489,8 +493,8 @@ class Checker:
             return text.strip().rstrip("。").strip()
 
         items = [
-            item_name(line[2:]) for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
-            for line in body if line.startswith("- ")
+            item_name(found.group(1)) for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
+            for found in (HANDOVER_ITEM.match(line) for line in body) if found
         ]
         # 表ごとに（連続した「|」の行のまとまりごとに）区切り、見出しと区切りの行を持つ表のデータ行だけを数える
         rows: List[str] = []

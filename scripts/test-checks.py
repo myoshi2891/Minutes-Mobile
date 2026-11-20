@@ -321,6 +321,26 @@ def test_settings() -> None:
                   plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, UIFileSharingEnabled="$(SHARING)")})
     settings_case("どのターゲットも参照しない plist の変数は判定できない", 1, "UIFileSharingEnabled の値を展開できない",
                   plists={"Other/Info.plist": {"UIFileSharingEnabled": "$(SHARING)"}})
+
+    # plist の変数は、その plist を参照する構成・SDK のビルド設定だけで展開する
+    def debug_plist(debug: str, release: str) -> Callable[[str], str]:
+        return lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",',
+                                  '"GENERATE_INFOPLIST_FILE": "YES",\n        "INFOPLIST_FILE[config=Debug]": "Config/Debug.plist",'
+                                  f'\n        "SHARING[config=Debug]": "{debug}",\n        "SHARING[config=Release]": "{release}",')
+    debug_only = {"Config/Debug.plist": dict(OK_INFO_PLIST, UIFileSharingEnabled="$(SHARING)")}
+    settings_case("Debug だけが参照する plist の変数が Debug で YES に展開される", 1, "UIFileSharingEnabled を有効にしない",
+                  project=debug_plist("YES", "NO"), plists=debug_only)
+    settings_case("参照しない Release の値は plist の判定に含めない", 0, project=debug_plist("NO", "YES"), plists=debug_only)
+
+    # GENERATE_INFOPLIST_FILE の変数は展開してから判定する。展開できなければ、生成しない経路も検査する
+    def generate(value: str, define: str = "") -> Callable[[str], str]:
+        return lambda t: replaced(t, '"GENERATE_INFOPLIST_FILE": "YES",', f'"GENERATE_INFOPLIST_FILE": "{value}",{define}')
+    settings_case("GENERATE_INFOPLIST_FILE の変数が YES に展開される", 0,
+                  project=generate("$(GENERATE)", '\n        "GENERATE": "YES",'))
+    settings_case("GENERATE_INFOPLIST_FILE の変数が NO に展開される", 1, "NSMicrophoneUsageDescription がない",
+                  project=generate("$(GENERATE)", '\n        "GENERATE": "NO",'))
+    settings_case("GENERATE_INFOPLIST_FILE の変数を展開できない", 1, "NSMicrophoneUsageDescription がない",
+                  project=generate("$(GENERATE)"))
     settings_case("Info.plist を生成しないとビルド設定のマイクの利用目的は使われない", 1, "NSMicrophoneUsageDescription がない",
                   project=generate_no)
     settings_case("GENERATE_INFOPLIST_FILE がない（既定は生成しない）", 1, "NSMicrophoneUsageDescription がない",
@@ -603,6 +623,22 @@ def test_dependencies() -> None:
     dependencies_case("承認の後に内容が変わったローカルのバイナリ", 1, "内容が承認したものと違う", changed, [approved_binary])
     added = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/extra": "x", "Sub/Package.swift": declare.format(binary)})
     dependencies_case("承認の後にファイルが増えたローカルのバイナリ", 1, "内容が承認したものと違う", added, [approved_binary])
+    # 前後に空白のあるパスは、空白を除いた承認済みのバイナリと取り違えずに拒否する
+    spaced = dict(binary_files, **{"Sub/Package.swift": declare.format(binary.replace('.xcframework"', '.xcframework "'))})
+    dependencies_case("前後に空白のあるローカルのバイナリのパス", 1, "前後に空白のあるパス", spaced, [approved_binary])
+    # 走査の失敗（読めないディレクトリ）は合格にしない。走査に失敗がなく依存のファイルもなければ通る
+    with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "Sub" / "Locked").mkdir(parents=True)
+        allowlist = Path(directory) / "allowlist.json"
+        allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}),
+                             encoding="utf-8")
+        command = [str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)]
+        expect("dependencies: 依存のファイルがない", command, 0, "OK")
+        (Path(directory) / "Sub" / "Locked").chmod(0)
+        try:
+            expect("dependencies: 読めないディレクトリ", command, 2, "読めない")
+        finally:
+            (Path(directory) / "Sub" / "Locked").chmod(0o755)
     dependencies_case("承認済みのローカルのバイナリがない", 2, "ローカルのバイナリがない",
                       {"Sub/Package.swift": declare.format(binary)}, [approved_binary])
     dependencies_case("ローカルのバイナリの項目に sha256 がない", 2, "sha256",
@@ -841,6 +877,19 @@ def test_versions() -> None:
         versions.write_text(" ".join(fields) + "\n", encoding="utf-8")
         expect("versions: 実行ファイル名が名前と違う", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                "--require", "gh"], 0, "OK: gh")
+    # ロックを作れない理由が競合でなければ、待たずに理由を示して止める（取得の前に止まるので通信しない）
+    with tempfile.TemporaryDirectory() as directory:
+        dest = Path(directory) / "readonly"
+        dest.mkdir()
+        dest.chmod(0o555)
+        try:
+            expect("versions: 書き込めない導入先ではロックを待たない", [setup, "--dest", str(dest)], 1, "ロック")
+        finally:
+            dest.chmod(0o755)
+        dest = Path(directory) / "file-lock"
+        dest.mkdir()
+        (dest / ".install.lock").write_text("", encoding="utf-8")
+        expect("versions: ロックの位置にファイルがある", [setup, "--dest", str(dest)], 1, "ロック")
 
 
 def test_gitleaks() -> None:
@@ -861,14 +910,16 @@ def gitleaks_merge_case() -> None:
     """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
 
     マージの解決で足した行（どちらの親にもない行）は、git log の既定ではマージの差分を出さないため見落とされる。
-    check.sh の GITLEAKS_LOG_OPTS と同じ指定で実行し、指定がない場合は見落とすことも確かめる（試験が効いていることの確認）。
+    陽性の試験は手順 3 と同じコマンド（scripts/gitleaks-history.sh）を実行する。指定（--log-opts）がない gitleaks の
+    既定の動作では見落とすことも対照として確かめる（試験が効いていることの確認）。
     """
     global count
     gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
-    options = "--all --full-history -m"
+    history = str(SCRIPTS / "gitleaks-history.sh")
     count += 1
-    if f'GITLEAKS_LOG_OPTS="{options}"' not in (SCRIPTS / "check.sh").read_text(encoding="utf-8"):
-        failures.append(f"gitleaks: check.sh の GITLEAKS_LOG_OPTS が試験の指定（{options}）と違う")
+    # 手順 3 が同じコマンドで全履歴を検査していること（手順 3 が別のコマンドに変わると、陽性の試験が手順 3 を試験しなくなる）
+    if 'scripts/gitleaks-history.sh .\n' not in (SCRIPTS / "check.sh").read_text(encoding="utf-8"):
+        failures.append("gitleaks: check.sh の手順 3 が scripts/gitleaks-history.sh で全履歴を検査していない")
     # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
     normal_key = "ghp_" + "a8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
     merge_key = "ghp_" + "b9Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
@@ -902,13 +953,15 @@ def gitleaks_merge_case() -> None:
         # 開発者の設定（merge.ff=only など）によらず二親のマージを作る
         git("merge", "-q", "--no-ff", "--no-commit", "side")
         commit("merge.txt", f'token = "{merge_key}"\n', "merge")  # マージのコミットだけで足した行
-        for label, extra, want in (("指定あり", [f"--log-opts={options}"], {"normal.txt", "merge.txt"}),
-                                   ("指定なし（既定の git log）", [], {"normal.txt"})):
+        direct = [gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config", str(ROOT / ".gitleaks.toml")]
+        # （名前, 報告の指定の前の引数, 後の引数, 期待）。gitleaks-history.sh はリポジトリの後ろに追加の引数を取る
+        cases = (("手順 3 のコマンド", [history, str(repository)], [], {"normal.txt", "merge.txt"}),
+                 ("指定なし（既定の git log）", direct, [str(repository)], {"normal.txt"}))
+        for index, (label, before, after, want) in enumerate(cases):
             count += 1
-            report = Path(directory) / f"report-{len(extra)}.json"
-            result = subprocess.run([gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config",
-                                     str(ROOT / ".gitleaks.toml"), "--report-format", "json", "--report-path", str(report),
-                                     *extra, str(repository)], capture_output=True, text=True, env=isolated)
+            report = Path(directory) / f"report-{index}.json"
+            result = subprocess.run(before + ["--report-format", "json", "--report-path", str(report)] + after,
+                                    capture_output=True, text=True, env=isolated)
             # どちらの場合も鍵を検出するので、終了コードは 1（検出あり）であること
             if result.returncode != 1:
                 failures.append(f"gitleaks: マージの差分（{label}）の終了コードが {result.returncode}（期待 1）\n{result.stderr.strip()}")
@@ -1034,6 +1087,17 @@ def run_docs_cases() -> None:
         docs_case("定義されていない ID の群", 1, "定義されていない ID の群: FR-ZZZ", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-ZZZ 群"),
         docs_case("定義されていない設計決定", 1, "定義されていない ID: BD-SMP-02", detailed, "BD-SMP-01", "BD-SMP-02"),
         docs_case("ID の定義の重複", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-01 | 二 | MVP |"),
+        # 定義の行は、列の区切りの前後の空白の有無によらず読む
+        docs_case("空白のない表の要件の定義", 0, "MVP の要件 3 件", requirements, "| FR-AAA-02 | 二 | MVP |", "|FR-AAA-02|二|MVP|"),
+        docs_case("空白のない表の設計決定の定義", 0, "OK", basic, "| BD-SMP-01 | 決定 |", "|BD-SMP-01|決定|"),
+        docs_case("空白のない表の重複した定義", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "|FR-AAA-01|二|MVP|"),
+        # 申し送りは番号付きの項目も照合する（解決の表から行が欠けた・表がない場合も欠落として報告する）
+        docs_case("番号付きの申し送り", 0, "OK", basic, "- 一つ目\n- 二つ目\n", "1. 一つ目\n2. 二つ目\n"),
+        docs_case("番号付きの申し送りの解決が足りない", 1, "申し送り「二つ目」の解決が表にない", detailed, "| 二つ目 | 済 |\n", "",
+                  extra={basic: replaced(DOCS[basic], "- 一つ目\n- 二つ目\n", "1. 一つ目\n2. 二つ目\n")}),
+        docs_case("番号付きの申し送りの解決の表がない", 1, "申し送り「一つ目」の解決が表にない", detailed,
+                  "| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n", "",
+                  extra={basic: replaced(DOCS[basic], "- 一つ目\n- 二つ目\n", "1. 一つ目\n2. 二つ目\n")}),
         docs_case("MVP の要件が基本設計に現れない", 1, "MVP の要件 FR-AAA-02", basic, "FR-AAA-01・02、", "FR-AAA-01、"),
         docs_case("P2 の要件は網羅の対象にしない", 0, "OK", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-02 | 二 | P2 |"),
         # 「／」の後（決定・関連などの参照）にだけある要件は、網羅したことにしない

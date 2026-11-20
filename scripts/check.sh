@@ -29,11 +29,10 @@ MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
 # 手順 7 がカバレッジを測った入力の記録（手順 8 が集計の前に現在の入力と照合する）。
 # 1 行目は入力（未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」）、
-# 2 行目は測った結果のカバレッジの JSON の SHA-256（手順 7 と 8 の間に別の測定で JSON が書き換えられていないこと）
+# 2 行目は測った結果のカバレッジの JSON（COVERAGE_JSON）の SHA-256（手順 7 と 8 の間に JSON が書き換えられていないこと）
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
-# gitleaks の履歴の検査で git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、
-# 既定の 2 つも書く。-m でマージのコミットの差分も検査する（マージの解決で足した行を見落とさない）
-GITLEAKS_LOG_OPTS="--all --full-history -m"
+# 手順 7 がその測定の JSON を写して置く場所（手順 8 はこれだけを集計する。swift test の共有の出力先は読まない）
+COVERAGE_JSON="$PACKAGE/.build/minutes-coverage.json"
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
@@ -42,6 +41,8 @@ STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
+COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
+COVERAGE_COPY=""  # 手順 8 が照合と集計に使う、カバレッジの記録の写し（一時ファイル）
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean] [--expect-head <SHA>]" >&2
@@ -194,7 +195,8 @@ step_3() {
     git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
   else
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --log-opts="$GITLEAKS_LOG_OPTS" .
+    # 全履歴の検査は、自己試験（test-checks.py gitleaks）と同じコマンドで行う
+    scripts/gitleaks-history.sh .
     scripts/test-checks.py gitleaks
   fi
 }
@@ -212,8 +214,10 @@ step_5() {
 # カバレッジを測った入力の識別子。未コミットの変更がなければ HEAD のコミット、あれば作業ツリー全体（追跡していない
 # ファイルを含む。無視するファイルは除く）のツリーのハッシュ。作業ツリーの記録はコミットの合格の記録と区別する
 coverage_input() {
-  local index tree
-  if [ -z "$(git status --porcelain --untracked-files=normal)" ]; then
+  local changes index tree
+  # git status の失敗を「変更なし」と取り違えない（$(…) を条件の中に書くと失敗が見えないので、先に取得して確かめる）
+  changes=$(git status --porcelain --untracked-files=normal) || return 1
+  if [ -z "$changes" ]; then
     printf 'commit %s\n' "$(git rev-parse HEAD)"
     return 0
   fi
@@ -255,39 +259,54 @@ step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest
-  rm -f -- "$COVERAGE_HEAD"
+  mkdir -p "$PACKAGE/.build"
+  rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
   # 測る前の入力を控え、測った後も同じ場合だけ記録する（測定中に変わった入力の結果をどちらにも帰属させない）
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
-  swift test --package-path "$PACKAGE" --enable-code-coverage
+  # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
+  # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
+  COVERAGE_SCRATCH=$(mktemp -d)
+  swift test --package-path "$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --enable-code-coverage
   [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
-  report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
+  report=$(swift test --package-path "$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない（swift test の結果を確かめる）"
-  digest=$(coverage_digest "$report") || fail "カバレッジの記録のハッシュを計算できない"
-  printf '%s\n%s\n' "$measured" "$digest" > "$COVERAGE_HEAD"
+  # この測定の JSON を記録の場所へ写す。同じディレクトリの一時ファイルに写してから rename で置き換え、
+  # 写したものからハッシュを計算する。JSON を置いてから入力とハッシュの記録を置く（記録があれば JSON もある）
+  cp -- "$report" "$COVERAGE_JSON.$$"
+  digest=$(coverage_digest "$COVERAGE_JSON.$$") || fail "カバレッジの記録のハッシュを計算できない"
+  mv -f -- "$COVERAGE_JSON.$$" "$COVERAGE_JSON"
+  printf '%s\n%s\n' "$measured" "$digest" > "$COVERAGE_HEAD.$$"
+  mv -f -- "$COVERAGE_HEAD.$$" "$COVERAGE_HEAD"
+  rm -rf -- "$COVERAGE_SCRATCH"
+  COVERAGE_SCRATCH=""
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
 }
 
 step_8() {
-  local report measured current recorded_digest
+  # current は EXIT の trap が使う手順の番号なので、局所変数の名前に使わない（隠すと失敗した手順の表示が壊れる）
+  local measured present recorded_digest
   scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
-  report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
-  [ -f "$report" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
   [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
   measured=$(sed -n 1p "$COVERAGE_HEAD")
   recorded_digest=$(sed -n 2p "$COVERAGE_HEAD")
-  current=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
-  [ "$measured" = "$current" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  present=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
+  [ "$measured" = "$present" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  # 照合と集計で同じバイト列を使う。記録を一時ファイルへ写し、写しのハッシュを照合してから同じ写しを集計する
+  # （照合の後に記録が書き換えられても、照合していない内容を集計しない）
+  [ -f "$COVERAGE_JSON" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
+  COVERAGE_COPY=$(mktemp)
+  cp -- "$COVERAGE_JSON" "$COVERAGE_COPY"
   # 手順 7 の後に別の測定で記録が書き換えられていれば、入力が同じでも集計しない
-  [ -n "$recorded_digest" ] && [ "$(coverage_digest "$report")" = "$recorded_digest" ] \
+  [ -n "$recorded_digest" ] && [ "$(coverage_digest "$COVERAGE_COPY")" = "$recorded_digest" ] \
     || fail "カバレッジの記録が手順 7 で測ったものと違う。手順 7 を実行し直す"
   case "$measured" in
     worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
   esac
-  scripts/coverage-report.py "$report" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
+  scripts/coverage-report.py "$COVERAGE_COPY" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
 
@@ -319,6 +338,8 @@ on_exit() {
   if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
   if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
   if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
+  if [ -n "$COVERAGE_SCRATCH" ]; then rm -rf -- "$COVERAGE_SCRATCH"; fi
+  if [ -n "$COVERAGE_COPY" ]; then rm -f -- "$COVERAGE_COPY"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）

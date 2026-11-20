@@ -9,8 +9,10 @@ Package.swift の依存は、版の指定を同じディレクトリの Package.
 終了コード: 0 = 問題なし / 1 = 許可リスト外の依存あり / 2 = 読めない（読めないものを合格にしない）
 """
 import argparse
+import fnmatch
 import hashlib
 import json
+import os
 import posixpath
 import re
 import sys
@@ -49,8 +51,11 @@ def normalize(url: str) -> str:
 
 
 def normalize_path(path: str) -> str:
-    """リポジトリの起点からの相対パスを、区切りと「.」「..」をそろえた形にする。"""
-    return posixpath.normpath(path.strip()).rstrip("/")
+    """リポジトリの起点からの相対パスを、区切りと「.」「..」をそろえた形にする。
+
+    前後の空白は除かない（除くと、宣言が指すものと別のファイルを照合しうる）。空白を含むパスは manifest_errors が拒否する。
+    """
+    return posixpath.normpath(path).rstrip("/")
 
 
 def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, dict], Dict[str, dict]]:
@@ -102,11 +107,19 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
 
 
 def find_files(root: Path, name: str) -> Iterator[Path]:
-    for path in sorted(root.rglob(name)):
-        parts = path.relative_to(root).parts
-        if not path.is_file() or SKIPPED_ANYWHERE.intersection(parts[:-1]) or parts[0] in SKIPPED_AT_ROOT:
-            continue
-        yield path
+    """root の下で名前（glob の形）に合うファイルを列挙する。除外するディレクトリは降りる前に枝刈りする。
+
+    走査の失敗（読めないディレクトリ）は合格にせず、読めないものとして扱う（rglob は権限の失敗を黙って読み飛ばすため使わない）。
+    """
+    def failed(error: OSError) -> None:
+        raise Unreadable(f"{error.filename}: {error}")
+
+    found: List[Path] = []
+    for directory, subdirectories, files in os.walk(root, onerror=failed):
+        skipped = SKIPPED_ANYWHERE | (SKIPPED_AT_ROOT if Path(directory) == root else set())
+        subdirectories[:] = [entry for entry in subdirectories if entry not in skipped]
+        found.extend(Path(directory) / entry for entry in files if fnmatch.fnmatchcase(entry, name))
+    yield from sorted(path for path in found if path.is_file())
 
 
 def resolved_pins(path: Path) -> List[dict]:
@@ -537,6 +550,9 @@ def manifest_errors(
                     errors.append(f"リモートのバイナリ {url} の checksum {checksum} が承認したもの（{approved_checksum}）と違う")
         elif not has_path or path is None:
             errors.append(f"取得元を判定できない（url: か path: を文字列リテラルで書く）: .{kind}({summary})")
+        elif path != path.strip():
+            # 前後に空白のあるパスは、空白を除いた別のファイルと取り違えないよう、照合せずに認めない
+            errors.append(f"前後に空白のあるパスは認めない: .{kind}({summary})")
         elif kind == "binaryTarget":
             # ローカルのバイナリは、承認済みの項目（版・ライセンス・承認日を持つ）がある場合だけ認める
             location = normalize_path(posixpath.join(directory, path))

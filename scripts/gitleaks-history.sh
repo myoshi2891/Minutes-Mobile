@@ -1,0 +1,19 @@
+#!/bin/bash
+# Git の全履歴の秘密情報の検査（TST-CI-04、SEC-SUP-03）。check.sh の手順 3 と、その自己試験（test-checks.py gitleaks）が
+# 同じこのコマンドを実行する（試験した指定と手順 3 の指定が食い違わないようにする）。
+#
+# 使い方: scripts/gitleaks-history.sh <リポジトリ> [gitleaks に渡す追加の引数…]
+# 終了コード: gitleaks のもの（0 = 検出なし / 1 = 検出あり・失敗）。2 = 使い方の誤り
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、既定の 2 つも書く。
+# -m でマージのコミットの差分も検査する（マージの解決で足した行を見落とさない）
+GITLEAKS_LOG_OPTS="--all --full-history -m"
+
+[ $# -ge 1 ] && [ -n "$1" ] || { echo "使い方: $0 <リポジトリ> [gitleaks の追加の引数…]" >&2; exit 2; }
+repository=$1
+shift
+# --redact: 検出した値そのものを出力に残さない
+exec "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
+  --log-opts="$GITLEAKS_LOG_OPTS" "$@" "$repository"

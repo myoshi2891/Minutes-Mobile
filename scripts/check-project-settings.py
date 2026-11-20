@@ -256,7 +256,12 @@ def infoplist_sources(
     """その構成・SDK で、生成するか（GENERATE_INFOPLIST_FILE の取りうる値）と、INFOPLIST_FILE の参照先の内容と、
     参照先が条件なしに決まらない（または明示的に空の書き方がある）かを返す。"""
     generate, generate_undecided = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
-    modes = {enabled(value) for (_, value) in generate}
+    modes = set()
+    for key, value in generate:
+        # 変数（$(NAME)）はその構成・SDK で展開してから判定する。展開できなければ、生成する・しないの両方の経路を検査する
+        expanded = expand_value(value, own, shared, configuration, sdk, setting="GENERATE_INFOPLIST_FILE",
+                                from_target=key in own and as_text(own[key]) == value)
+        modes.update({True, False} if expanded is None else {enabled(expanded)})
     # 条件（arch など）なしに決まらない構成では、設定のない場合（生成しない）も起こりうる
     if generate_undecided or not modes:
         modes.add(False)
@@ -548,19 +553,21 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         if not isinstance(target, dict) or not isinstance(target.get("build-settings"), dict):
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
     # プロジェクトの設定はすべてのターゲットのビルドに効くので、すべてのターゲットの構成・SDK で展開する
-    expanders = [target_expander(target["build-settings"], shared, configurations) for target in targets]
     check_build_settings("プロジェクト", shared, errors, lambda key: combined_expander([
         target_expander(target["build-settings"], shared, configurations, key, False) for target in targets]))
-    # INFOPLIST_FILE の参照先 → それを使うターゲットの展開（参照するターゲットのビルド設定で値の変数を展開する）
+    # INFOPLIST_FILE の参照先 → それを参照する構成・SDK の展開（参照するターゲットの、その構成・SDK のビルド設定だけで
+    # 値の変数を展開する。参照しない構成の値で判定しない）
     referenced: Dict[Path, List[Expander]] = {}
     entitlements: List[Path] = []
-    for target, expander in zip(targets, expanders):
+    for target in targets:
         name = f"ターゲット {target.get('name', '?')}"
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
         for configuration in configurations:
-            for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE")[0]:
-                referenced.setdefault(path, []).append(expander)
+            for sdk in SDKS:
+                for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)[0]:
+                    referenced.setdefault(path, []).append(
+                        lambda text, own=own, c=configuration, s=sdk: [expand_value(text, own, shared, c, s)])
             entitlements.extend(
                 referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS")[0])
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)

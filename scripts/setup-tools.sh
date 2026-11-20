@@ -205,14 +205,25 @@ if [ "$MODE" = install ]; then
   }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  # 作れない理由を区別する。ロックのディレクトリがあるときだけ別の導入の実行中として待ち、
+  # ないのに作れない場合（書き込めない導入先など）や、ディレクトリ以外のものがある場合は待たずに止める
   waited=0
-  until mkdir "$LOCK" 2>/dev/null && LOCK_HELD=1; do
-    if [ "$waited" -ge 600 ]; then
-      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+  retried=""
+  until lock_error=$(mkdir "$LOCK" 2>&1); do
+    if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then
+      if [ "$waited" -ge 600 ]; then
+        fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      retried=""
+    elif [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ] && [ -z "$retried" ]; then
+      retried=1  # 失敗の直後に先の実行がロックを解放した場合に備え、待たずに 1 回だけ作り直す
+    else
+      fail "ロック（${LOCK}）を作れない: ${lock_error}"
     fi
-    sleep 1
-    waited=$((waited + 1))
   done
+  LOCK_HELD=1
   WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
 fi
 
