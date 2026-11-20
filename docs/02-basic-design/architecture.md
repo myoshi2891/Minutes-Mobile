@@ -24,10 +24,10 @@
 | 事項 | 確認結果 | 出典 |
 | --- | --- | --- |
 | 開発環境 | Xcode 27.2（27B52）、iOS 27.2 SDK、Swift 6.4.2、最低 OS は iOS 27.2（CON-01） | 手元の `xcodebuild -version`・`swift --version`・プロジェクト設定 |
-| 音声認識 | `SpeechAnalyzer`・`SpeechTranscriber`・`AssetInventory`・`SpeechDetector` は iOS 26 以降。`AnalyzerInputConverter`・`AssetInputSequenceProvider`・`CaptureInputSequenceProvider` は iOS 27 以降。`SpeechTranscriber` は `isAvailable`・`supportedLocales`・`installedLocales` と、結果の属性 `audioTimeRange`・`transcriptionConfidence` を持つ | iOS 27.2 SDK の `Speech.swiftinterface` |
-| バックグラウンド処理 | `BGContinuedProcessingTaskRequest` は iOS 26 以降。前面のアプリから投入し、実行中はシステムが進行状況の UI を出す。タスクは進捗を報告し続ける必要があり、止まって見えると打ち切られうる。GPU 資源の要求には専用の entitlement が要る | SDK の `BGTaskRequest.h`・`BGTask.h` |
-| 端末内 LLM | `SystemLanguageModel`（iOS 26 以降・オンデバイス）と `PrivateCloudComputeLanguageModel`（iOS 27 以降・端末外）が同じフレームワークにある | SDK の `FoundationModels.swiftinterface` |
-| SQLite | OS 同梱は 3.54.0。オープン時に保護クラスを指定するフラグ（`SQLITE_OPEN_FILEPROTECTION_*`）がある | SDK の `sqlite3.h` |
+| 音声認識 | `SpeechAnalyzer`・`SpeechTranscriber`・`AssetInventory`・`SpeechDetector` は iOS 26 以降。`AnalyzerInputConverter`・`AssetInputSequenceProvider`・`CaptureInputSequenceProvider` は iOS 27 以降。`SpeechTranscriber` は `isAvailable`・`supportedLocales`・`installedLocales` と、結果の属性 `audioTimeRange`・`transcriptionConfidence` を持つ | iOS 27.2 SDK の `Speech.swiftinterface`（版は SDK の宣言で確認。SDK の版は `xcodebuild -showsdks` で確認。[dev-environment.md](dev-environment.md) §2）。シンボルの文書: [SpeechAnalyzer](https://developer.apple.com/documentation/speech/speechanalyzer)・[SpeechTranscriber](https://developer.apple.com/documentation/speech/speechtranscriber)・[AssetInventory](https://developer.apple.com/documentation/speech/assetinventory)・[SpeechDetector](https://developer.apple.com/documentation/speech/speechdetector)（ページの存在を確認。対応 OS の記述はページから取得できず、版の根拠は SDK の宣言） |
+| バックグラウンド処理 | `BGContinuedProcessingTaskRequest` は iOS 26 以降。前面のアプリから投入し、実行中はシステムが進行状況の UI を出す。タスクは進捗を報告し続ける必要があり、止まって見えると打ち切られうる。GPU 資源の要求には専用の entitlement が要る | SDK の `BGTaskRequest.h`・`BGTask.h`（SDK はローカルのファイルで公開の URL はない）。シンボルの文書: [BGContinuedProcessingTaskRequest](https://developer.apple.com/documentation/backgroundtasks/bgcontinuedprocessingtaskrequest)（ページの存在を確認。版の根拠は SDK の宣言） |
+| 端末内 LLM | `SystemLanguageModel`（iOS 26 以降・オンデバイス）と `PrivateCloudComputeLanguageModel`（iOS 27 以降・端末外）が同じフレームワークにある | SDK の `FoundationModels.swiftinterface`（SDK はローカルのファイルで公開の URL はない）。シンボルの文書: [SystemLanguageModel](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel)（ページの存在を確認。版の根拠は SDK の宣言） |
+| SQLite | OS 同梱は 3.54.0。オープン時に保護クラスを指定するフラグ（`SQLITE_OPEN_FILEPROTECTION_*`）がある | SDK の `sqlite3.h`（`SQLITE_VERSION`。SDK の同梱物で公開の URL はない）。上流の記録: [SQLite Release 3.54.0](https://sqlite.org/releaselog/3_54_0.html)。保護クラスのフラグは Apple の拡張で、上流の [Flags For File Open Operations](https://sqlite.org/c3ref/c_open_autoproxy.html) には載っていない（確認日 2026-11-20） |
 | Personal Team で使える capability | 無償アカウントの列に印があるのは App groups・**Background modes**・**Data protection**・HealthKit・HomeKit・Inter-App Audio・Keychain sharing・Maps・Wireless Accessory Configuration の 9 項目。**Push notifications・Time Sensitive Notifications・Siri は使えない**。Live Activity と継続処理タスクは表に行がない（capability としては管理されていない） | [Apple: Supported capabilities (iOS)](https://developer.apple.com/help/account/reference/supported-capabilities-ios/) |
 | 開発ツール | SwiftLint 0.65.1、SwiftFormat 0.64.7、gitleaks 8.30.1。いずれも MIT | [dev-environment.md](dev-environment.md) §5 |
 
@@ -176,7 +176,7 @@ scripts/  .githooks/           # ローカル検査（dev-environment.md）
 | 状態 | 値 | 永続化 | 定義する文書 |
 | --- | --- | --- | --- |
 | 会議の状態 | `recording` / `stop_requested` / `finalizing` / `finalized` / `transcribing` / `transcribed`（P2: `summarizing` / `completed`） | する（SQLite と `meeting.json`） | [../01-requirements/requirements.md](../01-requirements/requirements.md) §5.5 の図をそのまま採用 |
-| 録音セッションの状態 | `idle` / `preparing` / `capturing` / `interrupted` / `rebuilding` / `stopping` | しない（プロセス内だけ。割り込みの開始だけは空白区間として永続化する） | [recording.md](recording.md) §5 |
+| 録音セッションの状態 | `idle` / `preparing` / `capturing` / `interrupted` / `rebuilding` / `stopping` | しない（プロセス内だけ。割り込みの開始だけは、排出の前に割り込みの記録として、開始位置が決まったら空白区間として永続化する。[recording.md](recording.md) §5.1） | [recording.md](recording.md) §5 |
 | ジョブの状態 | `pending` / `processing` / `succeeded` / `failed` / `skipped` | する（SQLite） | [transcription.md](transcription.md) §4 |
 
 - 割り込み中も会議の状態は `recording` のままで、録音セッションの状態だけが `interrupted` になる（UD-08）。
@@ -279,7 +279,7 @@ func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> (next: MeetingStat
 | 機能 | 接続点 |
 | --- | --- |
 | AI 議事録（P2） | 会議ディレクトリに版ごとのファイルを置く。ジョブの種別を追加する。セグメント ID は決定的（連番と Chunk 内番号）なので根拠 ID に使える。モデルの指定は 1 か所に集約し、`PrivateCloudComputeLanguageModel` の使用を静的解析で禁止する（SEC-NET-02） |
-| 手動ノート（P2） | 会議ディレクトリにノート単独のファイルを置く（FR-NOT-05）。文字起こし・要約の処理はこのファイルに触れない |
+| 手動ノート（P2） | 会議ディレクトリにノート単独のファイルを置く（FR-NOT-05）。文字起こし・要約の処理はこのファイルに触れない。保管（`complete`）への切り替えの対象外とし、ロック中の flush（FR-NOT-03）を書けるようにする（[storage.md](storage.md) §7.1。最終の決定は P2 の基本設計） |
 | 全件の再構築（P2） | 起動時の照合と同じ関数を全会議に適用する（[storage.md](storage.md) §8） |
 | 会議検索（P2） | 本文の索引をどの保護クラスに置くかを P2 で決める（BD-ARC-03 と衝突しうる） |
 | VAD によるスキップ・代替 STT（P2） | エンジンは protocol の背後にある。`SpeechDetector` を高精度 VAD の候補とする |

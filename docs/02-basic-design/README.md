@@ -25,7 +25,7 @@
 
 | 要点 | 内容 | 文書 |
 | --- | --- | --- |
-| 原本はファイル、SQLite は索引 | 音声・文字起こし本文（D1・D2）は会議ディレクトリのファイルにだけ置く。SQLite には D3（会議タイトルなど）と処理状態だけを置く。処理が終わった会議は、会議ディレクトリの中のファイルを丸ごと最も強い保護クラス（`complete`）へ上げられる。全会議で共有する SQLite は録音中・文字起こし中にも書くため、既存の保護クラス（`completeUntilFirstUserAuthentication`）のままとし、`complete` へは移さない（storage.md §7.1） | architecture.md BD-ARC-03、storage.md |
+| 原本はファイル、SQLite は索引 | 音声・文字起こし本文（D1・D2）は会議ディレクトリのファイルにだけ置く。SQLite には D3（会議タイトルなど）と処理状態だけを置く。処理が終わった会議は、会議ディレクトリの中のファイルのうち `notes/` を除くすべて（SEC-DAT-02 の録音・文字起こしを含む）を最も強い保護クラス（`complete`）へ上げられる。P2 の手動ノート（`notes/`）はこの切り替えの対象外とし、`completeUntilFirstUserAuthentication` のままにする（ロック中の flush を FR-NOT-03 の上限内で書けるようにするため。最終の決定は P2 の基本設計。storage.md §7.1）。全会議で共有する SQLite は録音中・文字起こし中にも書くため、既存の保護クラス（`completeUntilFirstUserAuthentication`）のままとし、`complete` へは移さない（storage.md §7.1） | architecture.md BD-ARC-03、storage.md |
 | 時間軸は 2 本 | 音声の正は累積サンプル数。画面の時刻はそこに空白区間を足して導く | architecture.md §6 |
 | 判断は純粋関数 | 状態遷移・Barrier・Chunk 分割・統合・再試行・縮退の判定を、I/O を持たない関数にして表形式のテストで網羅する | architecture.md BD-ARC-01 |
 | 通信コードを持たない | MVP には通信を集約する型も置かない。静的解析と自動テストで確かめる | architecture.md BD-ARC-05 |

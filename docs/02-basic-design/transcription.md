@@ -420,7 +420,8 @@ SQLite の `transcript_versions` には、版・実行番号・件数・ファ�
 
 満たす要件: —（出典の一覧。満たす要件はない）
 
-- iOS 27.2 SDK の `Speech.swiftinterface`（`SpeechAnalyzer`・`SpeechTranscriber`・`AssetInventory`・`AssetInstallationRequest`・エラーコード）、`BGTaskRequest.h`・`BGTask.h`（確認日 2026-11-14）
+- iOS 27.2 SDK の `Speech.swiftinterface`（`SpeechAnalyzer`・`SpeechTranscriber`・`AssetInventory`・`AssetInstallationRequest`・エラーコード）、`BGTaskRequest.h`・`BGTask.h`（確認日 2026-11-14）。SDK はローカルのファイルで公開の URL はない。SDK の版（27.2）は `xcodebuild -showsdks` で、各 API の対応 OS は SDK の宣言（`@available`・`API_AVAILABLE`）で確かめた（[dev-environment.md](dev-environment.md) §2）
+- Apple のシンボルの文書: [SpeechTranscriber](https://developer.apple.com/documentation/speech/speechtranscriber)・[AssetInventory](https://developer.apple.com/documentation/speech/assetinventory)・[BGContinuedProcessingTaskRequest](https://developer.apple.com/documentation/backgroundtasks/bgcontinuedprocessingtaskrequest)（ページの存在を確認。対応 OS の記述はページから取得できなかったので、版の根拠は上の SDK の宣言とする。確認日 2026-11-20）
 - [Apple Developer Forums: 継続処理タスクの識別子のワイルドカードに関する報告](https://developer.apple.com/forums/thread/799126)（確認日 2026-11-14）
 - [Apple Developer: SpeechAnalyzer](https://developer.apple.com/documentation/speech/speechanalyzer)
 - Minutes `docs/design-local-phase2.md` §9〜§11
