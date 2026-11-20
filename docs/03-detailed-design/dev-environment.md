@@ -197,6 +197,13 @@ check_field() {
 }
 
 # シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
+# 版ディレクトリの中の実行ファイルが、シンボリックリンクではない通常のファイルで、実行できること
+# （導入先の中のリンクで別の場所の実行ファイルを指させない）
+regular_binary() {
+  local file=$1
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -x "$file" ]
+}
+
 link_directory() {
   local link=$1 dest
   dest=$(readlink "$link") || return 1
@@ -217,6 +224,8 @@ verify_tool() {
     || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
   [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
     || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
+  regular_binary "$DEST/$name/$version/$binary" \
+    || fail "$name $version の実行ファイル（$DEST/$name/$version/${binary}）が通常のファイルでない。scripts/setup-tools.sh を実行し直す"
   [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] \
     || fail "$name $version の導入記録が tools/versions の SHA-256 と一致しない。scripts/setup-tools.sh を実行し直す"
   actual=$(runtime_version "$name" "$link") || fail "$name の版を表示できない（${link}）。scripts/setup-tools.sh を実行し直す"
@@ -230,7 +239,7 @@ install_tool() {
   local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
   # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
   # 版の表示に失敗した導入は、表示の内容によらず導入済みとして扱わない
-  if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
+  if regular_binary "$target/$binary" && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
     cached=$(runtime_version "$name" "$target/$binary" 2>/dev/null) || cached=""
   fi
   if [ -n "$cached" ] && [ "$cached" = "$version" ]; then
@@ -241,12 +250,13 @@ install_tool() {
     mkdir -p "$work/download" "$work/extract" "$work/out"
     # 標準入力は版の写しを読んでいる途中なので、取得のコマンドに渡さない
     if [ "$name" = gh ]; then
-      # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）
+      # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）。
+      # ほかのツールは、GH_HOST の設定に取得先が左右されないよう、--repo にホスト（github.com）を明示する
       curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
         -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     else
-      "$DEST/bin/gh" release download "$tag" --repo "$repo" --pattern "$asset" --dir "$work/download" </dev/null \
+      "$DEST/bin/gh" release download "$tag" --repo "github.com/$repo" --pattern "$asset" --dir "$work/download" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     fi
     actual=$(shasum -a 256 "$work/download/$asset" | awk '{print $1}')
@@ -307,15 +317,10 @@ if [ "$MODE" = install ]; then
   # 同じ導入先への並行の導入を防ぐ。キャッシュの判定から退避・公開・リンクの更新までをロックの中で行う。
   # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）
   LOCK="$DEST/.install.lock"
-  waited=0
-  until mkdir "$LOCK" 2>/dev/null; do
-    if [ "$waited" -ge 600 ]; then
-      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || { rmdir "$LOCK"; fail "作業場所を作れない（${DEST}）"; }
+  LOCK_HELD=""
+  WORK=""
+  # ロックを待つ前に終了処理を登録する（取得の直後や作業場所の作成の途中で中断されても、ロックを残さない）。
+  # 解放するのは LOCK_HELD が立った後、つまり自分が取得したロックだけ
   cleanup() {
     local status=$?
     # 置き換えの途中で終わった場合: 新しい導入がまだ置かれていなければ退避した旧い導入を戻し、
@@ -327,13 +332,23 @@ if [ "$MODE" = install ]; then
         rm -rf -- "${PENDING_BACKUP:?}"
       fi
     fi
-    rm -rf -- "${WORK:?}"
-    rmdir "$LOCK" 2>/dev/null || true
+    if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}"; fi
+    # 自分が取得したロックだけを解放する（ロックを待っている間に終わった場合は、他の実行のロックを消さない）
+    if [ -n "$LOCK_HELD" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
     exit "$status"
   }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  waited=0
+  until mkdir "$LOCK" 2>/dev/null && LOCK_HELD=1; do
+    if [ "$waited" -ge 600 ]; then
+      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
 fi
 
 ARCH=$(uname -m)
@@ -379,7 +394,11 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 
 ```text
 .tools/
-  bin/swiftlint -> ../swiftlint/0.65.1/swiftlint      検査スクリプトが呼ぶのはここだけ
+  bin/gh -> ../gh/2.104.0/gh                          ほかのツールの取得に使う
+  bin/swiftlint -> ../swiftlint/0.65.1/swiftlint      検査スクリプトが呼ぶのは bin/ のリンクだけ
+  bin/swiftformat -> ../swiftformat/0.64.7/swiftformat
+  bin/gitleaks -> ../gitleaks/8.30.1/gitleaks
+  gh/2.104.0/{gh, LICENSE, .archive-sha256}
   swiftlint/0.65.1/{swiftlint, LICENSE, .archive-sha256}
   swiftformat/0.64.7/{swiftformat, .archive-sha256}
   gitleaks/8.30.1/{gitleaks, LICENSE, .archive-sha256}
@@ -845,6 +864,7 @@ fi
 - 実例（2026-11-16、この Mac）: 「iPhone 17」は iOS 27.0 のランタイムにしかなく、`name=iPhone 17` の指定は「destination が見つからない」で失敗した。iOS 27.2 のシミュレータは「iPhone Duo」1 台だけだった。
 - 規則: `xcrun simctl list -j` の結果から、最低 OS 以上のランタイムにある iPhone のうち、ランタイムの版が最も低いもの、同じ版の中では名前の順で最初のものを選ぶ（同じ環境では毎回同じ結果になる）。条件を満たすものがなければ失敗する。
 - ビルド（手順 6）は `generic/platform=iOS Simulator` を使い、特定の機種に依存しない。
+- 一覧の形が違う場合（`devices` が辞書でないなど）は、取得の失敗として終了コード 2 で止める。`devices` が空の辞書なら、候補なしとして終了コード 1 にする。
 - 環境変数 `MINUTES_SIMULATOR` に `xcodebuild` の destination を入れると、選択を上書きできる。
 
 ### 4.4 カバレッジ（`scripts/coverage-report.py`）
@@ -1010,7 +1030,7 @@ fi
 
 ### 6.1 基本設計の表との対応
 
-基本設計 §7 の 14 行を、SwiftLint の組み込みの規則 3 つと独自ルール 19 個で実現する。基本設計の表にない規則として、`no_url_content_loading` を足す（下の「基本設計の文言より広げた点」）。
+基本設計 §7 の 14 行を、SwiftLint の組み込みの規則 3 つと独自ルール 20 個（`.swiftlint.yml` の `custom_rules`。`no_url_content_loading` を含む）で実現する。基本設計の表にない規則として、`no_url_content_loading` を足す（下の「基本設計の文言より広げた点」）。
 
 | 基本設計 §7 の行 | 規則 | 例外を認める場所 |
 | --- | --- | --- |
@@ -1123,7 +1143,7 @@ custom_rules:
   # append(contentsOf:) などコレクションの操作は対象外にするため、型の名前を付けた呼び出しと、型の注釈つきの .init だけを検出する
   no_url_content_loading:
     name: "URL を受け取る読み込みの禁止"
-    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS)?(?:Data|String|XMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:'
+    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:'
     match_kinds: *code
     message: "URL を受け取る読み込みはリモートの URL も読める。ローカルのファイルはパスを受け取る API で読む（SEC-NET-01）"
     severity: error
@@ -1493,7 +1513,7 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | フェーズ | 定義文書の FR / NFR / SEC の行は、フェーズの列を持ち、値が MVP・P2・P3 のいずれかで始まる。列がない・読めない行は行番号つきで失敗する |
 | MVP の網羅 | フェーズが MVP の FR / NFR / SEC が、基本設計の各文書（索引の README.md を除く）の「満たす要件」（節・小節の見出し（`##`・`###`）の直後の最初の本文行にある「満たす要件:」と、文書の冒頭（最初の `##` より前）の表の「\| 満たす要件 ID \|」の行だけ。節の後半にある同名の行や「満たす要件の例」などの説明文は数えない）の、「／」より前（決定・関連などの参照を除く）のどこかに現れる。索引は「SEC 全般」や群の表記でまとめて挙げるため、判定に含めると欠落を隠す |
 | 書式 | 相対リンクの先がある（リンク先を山括弧で囲んだ書き方は、山括弧を除いて解決する。リンク先の後ろのタイトル（`"…"`・`'…'`・`(…)`）は除いてリンク先だけを解決する）。表は、見出しの行の直後に区切りの行（`\| --- \|`）があり、見出しと区切りの行の列の数が同じものだけを表として数える（列はエスケープした `\|` で区切らない）（申し送りの解決と要件 ID ↔ テストの対応表に適用する）。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である。フェンスは開始行の文字（バッククォートかチルダ）と長さを覚え、同じ文字が開始以上の長さで並び、その後が空白だけの行でだけ閉じる（長いフェンスの中の短いフェンスで切り替わらない）。開始・終了とも字下げは空白 0〜3 個に限り、4 個以上の字下げの行はコードの本文として扱う（CommonMark）。この判定は ID の走査・節の区切り・コード片の照合と書き直しで共通に使う |
-| 節の構成 | 基本設計・詳細設計（配下のディレクトリの文書を含む）の各節の冒頭に「満たす要件:」がある（コードブロックは節の冒頭を終わらせるので、コードブロックの後ろの「満たす要件:」は冒頭の行として数えず、MVP の網羅にも数えない）（「制約:」だけの行は認めない。制約は「／」の後に書く）。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もあり、後者には先頭の列に定義済みの要件 ID を個別に持ち（群の表記・「SEC 全般」だけの行は数えない）、ほかの列（検査・試験）が空でない対応表の行が 1 行以上ある |
+| 節の構成 | 基本設計・詳細設計（配下のディレクトリの文書を含む）の各節の冒頭に「満たす要件:」がある（コードブロックは節の冒頭を終わらせるので、コードブロックの後ろの「満たす要件:」は冒頭の行として数えず、MVP の網羅にも数えない）（「制約:」だけの行は認めない。制約は「／」の後に書く）。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もあり、後者には先頭の列に定義済みの要件 ID を個別に持ち（群の表記・「SEC 全般」だけの行は数えない）、検査・試験の列（先頭以外で、見出しに「試験」「検査」「テスト」を含む列）が空でない対応表の行が 1 行以上ある（「実行する場所」「状態」などほかの列の値だけでは数えない） |
 | 申し送りの解決 | 対応する基本設計（詳細設計からの相対パスが同じ文書）の「詳細設計への申し送り」の各項目が、詳細設計の「申し送り」の節の表の先頭の列に、項目名（前後の空白と末尾の「。」を除く）で一度ずつ現れる。欠落・重複・基本設計にない行を失敗にする（行数だけを比べると、重複した行が欠落を埋めて合格になるため） |
 | コード片 | フェンスの外にある印の直後のコード片が実ファイルと一致する（下）。フェンスの中の印は説明用の例として、照合にも書き直しにも使わない。字下げしたフェンスは、本文の行から開始行の字下げの分を除いて照合し、書き直しでは同じ字下げを付ける。書き直しはコード片の本文だけを置き換え、ほかの行の改行（CRLF など）を変えない。元のファイルは、シンボリックリンクを解決した後も `--root` の中にあるものに限る（外を指す印は不整合として報告し、書き直さない） |
 | 確認日 | 確認日から 3 か月を過ぎた記述のある文書を警告する（失敗にはしない） |
@@ -1506,7 +1526,7 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | `<!-- file: パス -->` | 直後のコード片が、そのファイルの全文と一致する |
 | `<!-- excerpt: パス -->` | 直後のコード片が、そのファイルの連続した一部と一致する |
 
-- 実ファイルを変えたら、`scripts/verify-docs.py --update-snippets` で全文のコード片を書き直す。一部のコード片は手で直す。どちらも、食い違いが残れば手順 10 が失敗する。
+- 実ファイルを変えたら、`scripts/verify-docs.py --update-snippets` で全文のコード片を書き直す（同じディレクトリの一時ファイルに書いて閉じてから置き換える。保存に失敗したら元の文書を残す）。一部のコード片は手で直す。どちらも、食い違いが残れば手順 10 が失敗する。
 - 印のないコード片（`Package.swift`・`PrivacyInfo.xcprivacy` など、まだ作っていないファイル）は照合しない。ファイルを作る作業で印を付ける。
 
 ---
@@ -1762,13 +1782,13 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
-| 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 23 規則・60 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定は、通常は作業ツリーを走査して Git が無視するものも含めて列挙し（`.git` と、SwiftLint が解析しない excluded の場所は飛ばす。`tools/lint-fixtures` は試験で明示して解析するので走査する）、`--staged`（`check.sh --staged` が渡す）ではインデックスにあるものだけを列挙する。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする |
-| 設定の検査 | `scripts/test-checks.py settings` | 92 件 | 合格する設定で通り、項目ごとの違反で失敗する。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
-| 依存の検査 | `scripts/test-checks.py dependencies` | 86 件 | 除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
-| 版の照合 | `scripts/test-checks.py versions` | 16 件 | 実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンクで失敗する |
+| 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 23 規則・60 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定は、通常は作業ツリーを走査して Git が無視するものも含めて列挙し（`.git` と、SwiftLint が解析しない excluded の場所は飛ばす。`tools/lint-fixtures` は試験で明示して解析するので走査する）、`--staged`（`check.sh --staged` が渡す）ではインデックスにあるものだけを列挙する。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。`custom_rules:` の行と規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする |
+| 設定の検査 | `scripts/test-checks.py settings` | 106 件 | 合格する設定で通り、項目ごとの違反で失敗する。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
+| 依存の検査 | `scripts/test-checks.py dependencies` | 102 件 | 除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
+| 版の照合 | `scripts/test-checks.py versions` | 19 件 | 実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンク・版のディレクトリの中の実行ファイルがシンボリックリンク（通常のファイルでない）で失敗する |
 | 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 5 件 | 実行時に組み立てた偽の鍵を検出する。履歴の検査の指定で、通常のコミットとマージのコミットだけで足した行の両方を検出する |
 | カバレッジの集計 | `scripts/test-checks.py coverage` | 7 件 | 目標以上・未満（警告）の集計と、不正な行数の記録（整数でない・真偽値・範囲外）で終了コード 2 |
-| 文書の検査 | `scripts/test-checks.py docs` | 78 件 | 節の後半の「満たす要件:」を網羅に数えないこと（小節の冒頭は数える）・フェンスをまたいだ行を 1 つの表にしないこと・`--update-snippets` が末尾の改行だけでは書き直さず、`--root` の外の文書に書き込まないことも確かめる。山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
+| 文書の検査 | `scripts/test-checks.py docs` | 95 件 | 節の後半の「満たす要件:」を網羅に数えないこと（小節の冒頭は数える）・フェンスをまたいだ行を 1 つの表にしないこと・`--update-snippets` が末尾の改行だけでは書き直さず、`--root` の外の文書に書き込まず、書き直しを保存できない（一時ファイルを作れない）ときに元の文書を残すことも確かめる。対応表の行は、検査・試験の列が空なら「状態」などほかの列に値があっても数えないことも確かめる。山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
@@ -1787,6 +1807,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 2026-11-18 のレビュー対応の追加分（`no_empty_catch` の入れ子のコメントの読み取り・`no_bsd_socket` と `no_direct_sleep_timer` の空白を挟むメンバーの除外・組み込み規則の Sample の違反の確認・規則名の行の読み取り。設定の検査の arch の条件付きの参照先と生成の指定・版つきの SDK 名・開き括弧の直後のカンマ。依存の検査の閉じていない文字列と補間・版別の manifest・起点の確認。版の照合の必須のツール・版の表示の失敗。文書の検査のフェンスの字下げ（開始・終了）・対応表の行・広すぎる範囲・フェーズ・網羅の欄） | 23 | 試験を足した後は 22 件が失敗した。版つきの SDK 名を照合しない変更（既存の試験は SDK を指定しない経路を通っていた）と開始のフェンスの字下げを外す変更は、試験を足すまで生き残った。空の SDK の条件を除く分岐を外す変更は、`fnmatch` が空の条件に当たらず結果が同じ（等価な変更）なので生き残った |
 | 2026-11-19 のレビュー対応の追加分（`no_empty_catch`・`no_direct_sleep_timer` の正規表現、`setup-tools.sh` のリンクの先の照合、`check-dependencies.py` の内容のハッシュと checksum の照合・CR の行コメント、`check-project-settings.py`・`xcproj.py`・`coverage-report.py`・`verify-docs.py` を変更前の版に戻す） | 8 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
 | 2026-11-19 のレビュー対応の追加分（2 回目。`xcproj.py` の入れ子の深さ、`setup.sh` の空文字列の引数、`check-dependencies.py` のバッククォートの宣言・`.package(path:)` の参照先・成果物の外を指すリンク、`check-project-settings.py` の候補の展開の失敗・有効にすると違反になる鍵の変数の展開、`test-lint-rules.py` の `allowed/` の対照、`verify-docs.py` の表の列の数・節の冒頭のコードブロック・タイトル付きのリンク・CRLF の書き直し） | 13 | 追加した試験は、変更前の版ではそれぞれ失敗した（`xcproj.py` は Xcode 同梱の python3（3.9）でだけ再現する。3.14 の `json` は深い入れ子でも RecursionError にならない）。`allowed/` の対照は、例外の場所のファイルを違反のない内容に置き換えると失敗することを確かめた。エスケープした `\|` を含む見出しの表の試験は、列の数の照合で誤って表から外さないことの回帰の確認で、変更前から通る。プッシュ前のフックの専用の作業ツリーは、複製したリポジトリで作成・再利用（追跡していないファイルの除去）・未コミットの変更での停止を確かめた。`check.sh` のカバレッジの記録のハッシュは未試験（手順 7・8 は Package の作成後） |
+| 2026-11-20 のレビュー対応の追加分（`no_url_content_loading` の型の注釈の `NS(Mutable)…` を外す、`verify-docs.py` を変更前の版に戻す〈対応表の列・書き直しの保存〉、`setup-tools.sh` の実行ファイルが通常のファイルであることの照合を外す） | 3 | 追加した試験は、それぞれ失敗した（違反例の 9・10 行目が検出されない、対応表と書けないディレクトリの 4 件、版のディレクトリの実行ファイルのリンク）。`setup-tools.sh` のロックは、他の実行のロックを置いた状態でロック待ちの間に TERM を送り、そのロックが残ることを手で確かめた |
 | `check.sh` を変更前の版に戻し、`print` を含む内容をステージして作業ツリーだけを直す | 1 | 変更前は手順 2 が通過し、変更後は失敗した（作業ツリーではなくインデックスを検査している） |
 | 文書の検査（未定義の ID を報告しない、範囲の省略を展開しない、MVP の網羅を調べない、コード片の不一致を報告しない など） | 15 | すべて失敗した |
 | 2026-11-17 の追加分（`no_empty_catch` の条件の文字列の読み飛ばしを外す。依存のコメントの除去を呼ばない・文字列を扱わない・入れ子を数えない・補間を追わない・補間の中の文字列を読み飛ばさない。設定の未設定の生成を有効と見なす・生成しない構成でビルド設定を数える・ビルド設定や参照先の Info.plist を見ない・`CODE_SIGN_ENTITLEMENTS` を見ない。文書の申し送りの重複や余分な行を見ない・照合や書き直しでフェンスを無視する・入れ子の文書を見ない） | 16 | すべて失敗した |
