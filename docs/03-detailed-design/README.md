@@ -10,7 +10,7 @@
 
 | 順 | 文書 | 対応する基本設計 | 状態 |
 | --- | --- | --- | --- |
-| 1 | [dev-environment.md](dev-environment.md) | [dev-environment.md](../02-basic-design/dev-environment.md) | 初版（2026-11-16）。検査基盤は実装し、動かして確かめた。プロジェクト設定の変更は次の作業単位 |
+| 1 | [dev-environment.md](dev-environment.md) | [dev-environment.md](../02-basic-design/dev-environment.md) | 初版（2026-11-16）。検査基盤は実装し、動かして確かめた。プロジェクト設定の変更は次の作業単位。長いスクリプトの全文のコード片は分冊 [dev-environment-scripts.md](dev-environment-scripts.md)（2026-11-21） |
 | 2 | `architecture.md` | [architecture.md](../02-basic-design/architecture.md) | 未着手 |
 | 3 | `recording.md` | [recording.md](../02-basic-design/recording.md) | 未着手 |
 | 4 | `storage.md` | [storage.md](../02-basic-design/storage.md) | 未着手 |

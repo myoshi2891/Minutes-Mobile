@@ -31,7 +31,7 @@ docs/
 ```
 
 - ファイル名は英小文字のケバブケース、本文は日本語。
-- 1 文書が 2,000 行を超えそうなら、機能単位（例: `recording.md` / `transcription.md`）に分割する。
+- 1 文書が 2,000 行を超えそうなら、機能単位（例: `recording.md` / `transcription.md`）に分割する。詳細設計で長いコード片が原因の場合は、本冊（基本設計と同じ名前）に説明を残し、コード片を分冊（`<基本設計の名前>-<名前>.md`。例: `dev-environment-scripts.md`）へ移す。分冊には各節の冒頭の「満たす要件:」とコード片の照合だけを求める（`scripts/verify-docs.py`）。
 - 図は Mermaid、コードフェンスには必ず言語を指定する（`text` / `swift` / `mermaid`）。
 
 ## 3. 要件 ID 体系
