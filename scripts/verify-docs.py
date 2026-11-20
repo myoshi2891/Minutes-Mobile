@@ -6,6 +6,7 @@
   3. 相対リンクの先がある。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である
   4. 基本設計・詳細設計の各文書に「セキュリティ」節と「テスト観点」節があり、各節の冒頭に要件 ID がある
   5. 詳細設計が、対応する基本設計の「詳細設計への申し送り」の項目をすべて表で解決している
+     （対応する基本設計の名前に「-<名前>」を付けた詳細設計は本冊の分冊とし、節の冒頭とコード片の照合だけを求める）
   6. 詳細設計のコード片が実ファイルと一致する（<!-- file: パス --> は全文、<!-- excerpt: パス --> は連続した一部）
 
 使い方: scripts/verify-docs.py [--root <リポジトリの起点>] [--update-snippets]
@@ -171,6 +172,8 @@ SEPARATOR_CELL = re.compile(r":?-+:?")
 
 
 UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+# 字下げしたコードブロックの行（空白 4 個以上かタブで始まる。CommonMark）。表の行として数えない
+INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
 
 
 def is_row(line: str) -> bool:
@@ -195,7 +198,8 @@ def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tupl
     found: List[Tuple[List[str], List[Tuple[int, str]]]] = []
     block: List[Tuple[int, str]] = []
     for item in lines + [(0, "")]:
-        if is_row(item[1]):
+        # 字下げしたコードブロックの行は表の行にしない（コードの中の対応表の例を、表として数えない）
+        if is_row(item[1]) and not INDENTED_CODE.match(item[1]):
             block.append(item)
             continue
         start = next((at for at in range(1, len(block)) if is_separator(block[at][1]) and not is_separator(block[at - 1][1])), None)
@@ -225,12 +229,9 @@ def reference_label(label: str) -> str:
 
 
 def section_lead(body: List[str]) -> str:
-    """節の冒頭の行（空行を除く最初の行）を返す。節が小節（「### 」）から始まる場合は、最初の小節の冒頭の行を返し、
-    次の小節の見出しより後は見ない（最初の小節に本文がなければ空文字列。後ろの小節の行で節を合格にしない）。"""
-    lines = [line for line in body if line.strip()]
-    if not lines or not lines[0].startswith("### "):
-        return lines[0] if lines else ""
-    return lines[1] if len(lines) > 1 and not lines[1].startswith("### ") else ""
+    """節（「## 」）の冒頭の行（空行を除く最初の行）を返す。節が小節（「### 」）から始まる場合も小節の行で代えず、
+    小節の見出しの行を返す（親の節は自身の「満たす要件:」を持つ。小節の「満たす要件:」は網羅の集計にだけ数える）。"""
+    return next((line for line in body if line.strip()), "")
 
 
 def fence_indent(line: str) -> int:
@@ -242,6 +243,10 @@ def dedent(line: str, indent: int) -> str:
     """CommonMark と同じく、フェンスの本文の行から開始行の字下げの分だけ（あるだけ）先頭の空白を除く。"""
     spaces = len(line) - len(line.lstrip(" "))
     return line[min(spaces, indent):]
+
+
+class Unresolvable(Exception):
+    """パスを解決できない（循環するリンクなど）。"""
 
 
 class Checker:
@@ -459,8 +464,8 @@ class Checker:
                     self.error(name, f"節「{heading}」の冒頭に「満たす要件:」の行がない", number)
                 elif not self.names_requirements(first):
                     self.error(name, f"節「{heading}」の「満たす要件:」に要件 ID も「—」の指定もない", number)
-            if name.endswith("/README.md"):
-                # 索引には必須の節と申し送りを求めないが、コード片は照合する
+            # 索引と分冊（長いコード片を置く本冊の付録）には必須の節と申し送りを求めないが、コード片は照合する
+            if name.endswith("/README.md") or (directory == DETAILED and self.part_of(name)):
                 if directory == DETAILED:
                     self.check_snippets(name, text)
                 continue
@@ -475,6 +480,22 @@ class Checker:
                 self.check_handover(name, sections)
                 self.check_mapping(name, sections)
                 self.check_snippets(name, text)
+
+    def part_of(self, name: str) -> Optional[str]:
+        """詳細設計 name が分冊なら、本冊（同じ名前の基本設計に対応する詳細設計）の名前を返す。分冊でなければ None。
+
+        分冊は、対応する基本設計がなく、基本設計の名前（拡張子を除く）に「-<名前>」を付けた名前の文書で、
+        本冊の詳細設計があるものに限る（本冊のない分冊は、対応する基本設計がない文書として check_handover が報告する）。
+        """
+        relative = name[len(DETAILED) + 1:]
+        if f"{BASIC}/{relative}" in self.texts or not relative.endswith(".md"):
+            return None
+        stems = [basic[len(BASIC) + 1:-len(".md")] for basic in self.texts
+                 if basic.startswith(BASIC + "/") and basic.endswith(".md") and "/" not in basic[len(BASIC) + 1:]]
+        for stem in sorted(stems, key=len, reverse=True):
+            if relative.startswith(stem + "-") and f"{DETAILED}/{stem}.md" in self.texts:
+                return f"{DETAILED}/{stem}.md"
+        return None
 
     def check_mapping(self, name: str, sections: List[Tuple[int, str, List[str]]]) -> None:
         """「要件 ID ↔ テスト」の節に対応表があり、要件 ID とテストの両方を持つ行が 1 行以上あること。
@@ -579,7 +600,11 @@ class Checker:
             # 字下げしたフェンスの本文は、開始行の字下げの分を除いてから照合する
             indent = fence_indent(lines[start])
             snippet = [dedent(line, indent) for line in lines[start + 1:end]]
-            path = self.snippet_source(marker.group(2))
+            try:
+                path = self.snippet_source(marker.group(2))
+            except Unresolvable as error:
+                self.error(name, f"コード片の元のファイルのパスを解決できない: {error}", index + 1)
+                continue
             if path is None:
                 self.error(name, f"コード片の元のファイルが --root の外にある: {marker.group(2)}", index + 1)
                 continue
@@ -598,7 +623,10 @@ class Checker:
     def snippet_source(self, relative: str) -> Optional[Path]:
         """コード片の元のファイルのパス。シンボリックリンクを解決した後も --root の中にある場合だけ返す。"""
         root = self.root.resolve()
-        path = (root / relative).resolve()
+        try:
+            path = (root / relative).resolve()
+        except (OSError, RuntimeError) as error:  # Python 3.9〜3.12 は循環するリンクで RuntimeError を送出する
+            raise Unresolvable(f"{relative}: {error}") from error
         return path if path.is_relative_to(root) else None
 
     def update_snippets(self) -> None:
@@ -631,7 +659,10 @@ class Checker:
                 start = index
                 while start < len(lines) and not lines[start].strip():
                     start += 1
-                path = self.snippet_source(marker.group(1))
+                try:
+                    path = self.snippet_source(marker.group(1))
+                except Unresolvable:
+                    continue  # 検査の側（check_snippets）が印の行とともに報告する
                 opened = fence_open(lines[start]) if start < len(lines) else None
                 if not opened or path is None or not path.is_file():
                     continue  # 不備（root の外の参照先を含む）は検査の側で報告する
@@ -649,7 +680,11 @@ class Checker:
             # 末尾の改行の有無などコード片以外の違いでは書き直さない（本文の行が変わったときだけ）
             if out == lines:
                 continue
-            target = self.snippet_source(name)
+            try:
+                target = self.snippet_source(name)
+            except Unresolvable as error:
+                self.error(name, f"文書の実パスを解決できないため、コード片を書き直さない: {error}")
+                continue
             if target is None:
                 self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
                 continue

@@ -65,8 +65,8 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
     形式が違えば読めないものとして扱う。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise Unreadable(f"{path}: {error}") from error
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:  # 深い入れ子は RecursionError
+        raise Unreadable(f"{path}: {error!r}") from error
     if not isinstance(data, dict) or data.get("formatVersion") != 1:
         raise Unreadable(f"{path}: formatVersion が 1 でない")
     licenses = data.get("allowedLicenses")
@@ -127,8 +127,8 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
 def resolved_pins(path: Path) -> List[dict]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise Unreadable(f"{path}: {error}") from error
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:  # 深い入れ子は RecursionError
+        raise Unreadable(f"{path}: {error!r}") from error
     pins = data.get("pins") if isinstance(data, dict) else None
     if pins is None and isinstance(data, dict) and isinstance(data.get("object"), dict):
         pins = data["object"].get("pins")  # 古い形式（version 1）
@@ -167,11 +167,21 @@ def strip_comments(text: str) -> str:
             start = index
             index = block_comment_end(text, index)
             out.append("".join(char if char in "\r\n" else " " for char in text[start:index]))
+        elif starts_regex(text, index):
+            # 拡張の区切りの正規表現のリテラル（#/…/#）は、閉じるまでそのまま写す（中の「"」「//」を文字列・コメントと
+            # 取り違えない）
+            end = regex_end(text, index)
+            out.append(text[index:end])
+            index = end
         elif starts_string(text, index):
             # 文字列リテラル（"…"・"""…"""・#"…"#）は、閉じるまでそのまま写す
             end = string_end(text, index)
             out.append(text[index:end])
             index = end
+        elif text[index] == "/":
+            # 区切りのない正規表現のリテラル（/…/）と除算は字句だけでは区別できない。取り違えると中の「"」で後ろの宣言を
+            # 文字列として隠しうるので、判定できないものとして扱う（manifest では #/…/# の形で書く）
+            raise Unreadable("「/」を判定できない（区切りのない正規表現のリテラルか除算。正規表現は #/…/# の形で書く）")
         else:
             out.append(text[index])
             index += 1
@@ -192,7 +202,11 @@ def mask_strings(text: str) -> str:
     out: List[str] = []
     index = 0
     while index < len(text):
-        if starts_string(text, index):
+        if starts_regex(text, index):
+            end = regex_end(text, index)
+            out.append(blank(text[index:end]))  # 正規表現のリテラルの中は宣言として数えない
+            index = end
+        elif starts_string(text, index):
             masked, index = mask_literal(text, index)
             out.append(masked)
         else:
@@ -259,6 +273,21 @@ def block_comment_end(text: str, index: int) -> int:
         else:
             index += 1
     raise Unreadable("ブロックコメントが閉じていない")
+
+
+def starts_regex(text: str, index: int) -> bool:
+    """拡張の区切りの正規表現のリテラル（#/…/#・##/…/##）の始まりか。"""
+    return text[index] == "#" and re.match(r"#+/", text[index:]) is not None
+
+
+def regex_end(text: str, index: int) -> int:
+    """index で始まる拡張の区切りの正規表現のリテラルの終わりの次の位置を返す。閉じていなければ読めないものとして扱う。"""
+    hashes = len(text[index:]) - len(text[index:].lstrip("#"))
+    closing = "/" + "#" * hashes
+    end = text.find(closing, index + hashes + 1)
+    if end < 0:
+        raise Unreadable("正規表現のリテラルが閉じていない")
+    return end + len(closing)
 
 
 def starts_string(text: str, index: int) -> bool:

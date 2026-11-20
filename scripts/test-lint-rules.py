@@ -78,7 +78,13 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
 
 def expected_lines(path: Path, rule: str, errors: List[str]) -> Set[int]:
     lines: Set[int] = set()
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        # 読めない試験用のファイルは、検出行の不一致（終了コード 1）と区別して、実行できないとして止める
+        print(f"NG: 試験用のファイル {path} を読めない: {error}", file=sys.stderr)
+        sys.exit(2)
+    for number, line in enumerate(text.splitlines(), start=1):
         found = MARKER.search(line)
         if not found:
             continue

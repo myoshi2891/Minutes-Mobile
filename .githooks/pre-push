@@ -72,12 +72,18 @@ trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 trap 'exit 130' INT TERM
 
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
-if git -C "$source_root" worktree list --porcelain | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
+# 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）
+worktrees=$(git -C "$source_root" worktree list --porcelain) || {
+  echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
+  exit 1
+}
+if printf '%s\n' "$worktrees" | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
   git -C "$snapshot" checkout -q --detach --force "$head"
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
-  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールへのリンク（/.tools）と
-  # ビルドの成果物（.build）だけ
-  git -C "$snapshot" clean -q -f -d -x -e /.tools -e .build
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールへのリンク（/.tools）と、
+  # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
+  # ほかの階層の .build（docs/.build など）は消す
+  git -C "$snapshot" clean -q -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
 else
   rm -rf -- "$snapshot"  # 登録のない残骸（前回の作成の途中で止まったものなど）
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）

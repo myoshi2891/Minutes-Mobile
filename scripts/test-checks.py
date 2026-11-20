@@ -263,6 +263,22 @@ def test_settings() -> None:
             if result.returncode != 1 or "UIFileSharingEnabled" not in result.stdout:
                 failures.append(f"settings: {label}の --project で $(SRCROOT) の参照先を解決できない（終了コード {result.returncode}）\n"
                                 f"{(result.stdout + result.stderr).strip()}")
+    # 参照先のパスを解決できない（循環するリンク）場合は、例外で落ちずに終了コード 2
+    with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "Config").mkdir()
+        (Path(directory) / "Config" / "Loop.plist").symlink_to("Loop.plist")
+        (Path(directory) / "project.xcproj").write_text(info_plist_file("Config/Loop.plist")(OK_PROJECT), encoding="utf-8")
+        expect("settings: 参照先が循環するリンク", [str(SCRIPTS / "check-project-settings.py"), "--project",
+                                          str(Path(directory) / "project.xcproj"), "--root", directory], 2, "読めない")
+    # 機種・OS の修飾子つきの向きの鍵（-iphoneos~iphone）に横向きがあれば違反
+    settings_case("修飾子つきの向きの鍵に横向き", 1, "UISupportedInterfaceOrientations-iphoneos~iphone",
+                  project=info_plist_file("Config/App-Settings.plist"),
+                  plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, **{
+                      "UISupportedInterfaceOrientations-iphoneos~iphone": ["UIInterfaceOrientationLandscapeLeft"]})})
+    settings_case("修飾子つきの向きの鍵が縦だけ", 0, "OK",
+                  project=info_plist_file("Config/App-Settings.plist"),
+                  plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, **{
+                      "UISupportedInterfaceOrientations-iphoneos~iphone": ["UIInterfaceOrientationPortrait"]})})
     settings_case("INFOPLIST_FILE が指す合格のファイル", 0, "OK",
                   project=info_plist_file("Config/App-Settings.plist"), plists={"Config/App-Settings.plist": OK_INFO_PLIST})
     settings_case("INFOPLIST_FILE が指すファイルがない", 2, "読めない", project=info_plist_file("Config/Missing.plist"))
@@ -808,6 +824,16 @@ def test_dependencies() -> None:
     dependencies_case("閉じていない文字列", 2, "文字列リテラルが閉じていない",
                       {"Package.swift": declare.format(unlisted) + 'let s = "abc\n'})
     dependencies_case("閉じていない補間", 2, "補間が閉じていない", {"Package.swift": declare.format(unlisted) + 'let s = "\\(x\n'})
+    # 正規表現のリテラルの中の「"」「//」を文字列・コメントと取り違えず、後ろの宣言を検査する
+    dependencies_case("正規表現のリテラルの後ろの宣言", 1, "unlisted.git",
+                      {"Package.swift": declare.format(f'let r = #/"//#\n{unlisted}\nlet s = "x"')})
+    dependencies_case("正規表現のリテラルの中の宣言は数えない", 0, "OK",
+                      {"Package.swift": declare.format(f'let r = #/{unlisted}/#')})
+    dependencies_case("閉じていない正規表現のリテラル", 2, "正規表現のリテラルが閉じていない",
+                      {"Package.swift": declare.format("let r = #/abc\n")})
+    dependencies_case("区切りのない「/」", 2, "「/」を判定できない", {"Package.swift": declare.format("let x = 4 / 2")})
+    # JSON の深い入れ子（Python 3.9 の json は RecursionError）は読めないものとして終了コード 2
+    dependencies_case("深い入れ子の Package.resolved", 2, "読めない", {"Package.resolved": "[" * 100000 + "]" * 100000})
     # 版別の manifest（Package@swift-<版>.swift）も同じ検査にかける
     # 除外の階層: 下位の build は検査し、直下の build と全階層の .build は除外する
     dependencies_case("下位の build の中の許可リスト外の依存", 1, "Sub/build/Package.swift",
@@ -869,12 +895,19 @@ def simulator_cases() -> None:
         ("devices の項目が辞書でない", {"runtimes": [runtime], "devices": {"r": ["x"]}}, 2),
         ("devices の値が配列でない", {"runtimes": [runtime], "devices": {"r": "x"}}, 2),
         ("空の一覧は候補なし", {"runtimes": [], "devices": {}}, 1),
+        ("udid が文字列でない", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": 1, "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
+            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+        ("name が文字列でない", {"runtimes": [runtime], "devices": {"r": [
+            {"name": None, "udid": "y", "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
+            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
     ):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "listing.json").write_text(json.dumps(listing), encoding="utf-8")
             stub = Path(directory) / "xcrun"
-            stub.write_text(f"#!/bin/sh\ncat '{Path(directory) / 'listing.json'}'\n", encoding="utf-8")
+            # 一覧は実行時に自身の位置から読む（一時ディレクトリのパスをシェルの本文に埋め込まない）
+            stub.write_text('#!/bin/sh\ncat "$(dirname "$0")/listing.json"\n', encoding="utf-8")
             stub.chmod(0o755)
             result = subprocess.run([str(SCRIPTS / "find-simulator.py")], capture_output=True, text=True,
                                     env=dict(os.environ, PATH=f"{directory}:{os.environ.get('PATH', '')}"))
@@ -1053,6 +1086,7 @@ def test_versions() -> None:
 
 
 def test_gitleaks() -> None:
+    global count
     gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
     base = [gitleaks, "dir", "--no-banner", "--no-color", "--redact", "--config", str(ROOT / ".gitleaks.toml")]
     # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
@@ -1082,6 +1116,24 @@ def test_gitleaks() -> None:
         git("clone", "-q", "--depth", "1", f"file://{source}", str(clone))
         expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン")
         expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found")
+    # 最初のコミットで足した行も、設定 log.showRoot=false によらず検査する
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        repository = Path(directory) / "repository"
+        root_key = "ghp_" + "c8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"  # 実行時に組み立てる
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        for name, content in (("root.txt", f'token = "{root_key}"\n'), ("next.txt", "next\n")):
+            (repository / name).write_text(content, encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), *identity, "add", name], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), *identity, "commit", "-q", "-m", name], env=env, check=True,
+                           capture_output=True)
+        result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository)], capture_output=True, text=True,
+                                env=dict(env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="log.showRoot", GIT_CONFIG_VALUE_0="false"))
+        if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
+            failures.append(f"gitleaks: log.showRoot=false で最初のコミットの鍵を検出しない（終了コード {result.returncode}）")
 
 
 def gitleaks_merge_case() -> None:
@@ -1240,6 +1292,21 @@ def docs_case(label: str, want_code: int, want_text: str, name: str = "", old: s
     return directory
 
 
+def cyclic_snippet_case() -> Path:
+    """コード片の元のファイルが循環するリンクでも、例外で止まらずに印の行を報告し、ほかの文書の検査を続けること
+    （通常と --update-snippets の両方）。"""
+    global count
+    directory = docs_case("循環するリンクの準備（整合した文書）", 0, "OK")
+    (directory / "scripts" / "loop.sh").symlink_to("loop.sh")
+    path = directory / "docs/03-detailed-design/sample.md"
+    path.write_text(path.read_text(encoding="utf-8") + f"\n<!-- file: scripts/loop.sh -->\n\n{FENCE}bash\necho loop\n{FENCE}\n",
+                    encoding="utf-8")
+    for options in ([], ["--update-snippets"]):
+        expect(f"docs: 循環するリンクのコード片{' '.join(options)}", [str(SCRIPTS / "verify-docs.py"), "--root", str(directory)]
+               + options, 1, "パスを解決できない")
+    return directory
+
+
 def test_docs() -> None:
     global docs_parent
     with tempfile.TemporaryDirectory() as owner:
@@ -1279,10 +1346,31 @@ def run_docs_cases() -> None:
         docs_case("インラインのコードの外のリンク", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
                   "`コード` [例](missing.md)"),
         # 節が小節から始まる場合は、最初の小節の冒頭だけを見る（後ろの小節の「満たす要件:」で節を合格にしない）
+        cyclic_snippet_case(),
+        # 分冊（本冊の基本設計の名前に「-<名前>」を付けた詳細設計）は、必須の節と申し送りを求めず、節の冒頭とコード片を照合する
+        docs_case("分冊は必須の節を求めない", 0, "OK", extra={"docs/03-detailed-design/sample-scripts.md": (
+            f"# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n\n<!-- file: scripts/sample.sh -->\n\n"
+            f"{FENCE}bash\necho one\necho two\necho three\n{FENCE}\n")}),
+        docs_case("分冊のコード片の不一致", 1, "コード片が scripts/sample.sh と一致しない", extra={
+            "docs/03-detailed-design/sample-scripts.md": (
+                f"# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n\n<!-- file: scripts/sample.sh -->\n\n{FENCE}bash\necho one\n{FENCE}\n")}),
+        docs_case("分冊の節の冒頭に満たす要件がない", 1, "節「1. 全文」の冒頭", extra={
+            "docs/03-detailed-design/sample-scripts.md": "# 分冊\n\n## 1. 全文\n\n本文\n"}),
+        # 本冊（同じ名前の詳細設計）のない分冊は、対応する基本設計がない文書として扱う
+        docs_case("本冊のない分冊", 1, "対応する基本設計", extra={
+            "docs/03-detailed-design/sample.md": None,
+            "docs/03-detailed-design/sample-scripts.md": "# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n"}),
         docs_case("最初の小節に本文がない節", 1, "節「2. セキュリティ」の冒頭", basic, "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01",
                   "## 2. セキュリティ\n\n### 2.1 前\n\n### 2.2 後\n\n満たす要件: SEC-AAA-01"),
-        docs_case("最初の小節の冒頭の満たす要件", 0, "OK", basic, "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01",
+        # 親の節は自身の「満たす要件:」を持つ（最初の小節の「満たす要件:」で代えない）
+        docs_case("小節だけが満たす要件を持つ節", 1, "節「2. セキュリティ」の冒頭", basic, "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01",
                   "## 2. セキュリティ\n\n### 2.1 前\n\n満たす要件: SEC-AAA-01\n\n### 2.2 後\n\n本文"),
+        docs_case("親の節と小節の両方の満たす要件", 0, "OK", basic, "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01",
+                  "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n### 2.1 前\n\n満たす要件: SEC-AAA-01\n\n本文"),
+        # 字下げしたコードブロックの中の表の形の行は、対応表として数えない
+        docs_case("字下げしたコードブロックの対応表", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |",
+                  "    | 要件 | 試験 |\n    | --- | --- |\n    | FR-AAA-01 | 試験 |"),
         # 申し送りは番号付きの項目も照合する（解決の表から行が欠けた・表がない場合も欠落として報告する）
         docs_case("番号付きの申し送り", 0, "OK", basic, "- 一つ目\n- 二つ目\n", "1. 一つ目\n2. 二つ目\n"),
         docs_case("番号付きの申し送りの解決が足りない", 1, "申し送り「二つ目」の解決が表にない", detailed, "| 二つ目 | 済 |\n", "",

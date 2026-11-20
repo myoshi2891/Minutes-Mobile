@@ -181,7 +181,9 @@ def check_required(
 # 変数の展開の深さの上限（循環する参照で止まらないように）
 MAX_EXPANSION_DEPTH = 8
 PORTRAIT_ONLY = ["UIInterfaceOrientationPortrait"]
-ORIENTATION_KEYS = ("UISupportedInterfaceOrientations~iphone", "UISupportedInterfaceOrientations")
+# 機種・OS の修飾子つきの鍵（<鍵>-<OS>~<機種>）も、iPhone で使われうるものは同じく縦だけを求める
+ORIENTATION_KEYS = ("UISupportedInterfaceOrientations~iphone", "UISupportedInterfaceOrientations",
+                    "UISupportedInterfaceOrientations-iphoneos~iphone")
 
 
 def setting_value(own: dict, shared: dict, name: str, configuration: str, sdk: str) -> Optional[Tuple[str, bool]]:
@@ -491,6 +493,14 @@ def find_files(root: Path, suffixes: Tuple[str, ...]) -> Iterator[Path]:
     yield from sorted(found)
 
 
+def resolved(path: Path) -> Path:
+    """リンクを解決した絶対パス。解決できない（循環するリンクなど）場合は、読めないものとして扱う。"""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError) as error:  # Python 3.9〜3.12 は循環するリンクで RuntimeError を送出する
+        raise Unreadable(f"{path}: パスを解決できない: {error!r}") from error
+
+
 def load_plist(path: Path) -> dict:
     try:
         with path.open("rb") as handle:
@@ -514,7 +524,7 @@ def referenced_files(
     """
     # 絶対パスにしてから SRCROOT を決める（相対の --project では、展開した $(SRCROOT)/… が相対パスのまま残り、
     # さらに source_root から解決されて二重になる）
-    parent = project_path.resolve().parent
+    parent = resolved(project_path).parent
     source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
     effective, undecided = resolve(own, shared, setting, [configuration], sdk)
@@ -536,7 +546,7 @@ def referenced_files(
 
         expanded = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", expand, text)
         path = Path(expanded)
-        paths.append((path if path.is_absolute() else source_root / path).resolve())
+        paths.append(resolved(path if path.is_absolute() else source_root / path))
     return paths, bool(undecided) or explicit_empty
 
 
@@ -582,7 +592,7 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")
-    found = [path.resolve() for path in find_files(root, ("Info.plist",))]
+    found = [resolved(path) for path in find_files(root, ("Info.plist",))]
     # INFOPLIST_FILE が指すファイルも読む。ないファイル・読めないファイルは load_plist が Unreadable にする
     for path in found + [path for path in referenced if path not in found]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
@@ -591,7 +601,7 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
         for key, value in load_plist(path).items():
             check_plist_entry(source, str(key), value, errors, expand)
     # CODE_SIGN_ENTITLEMENTS が指すファイルも、拡張子にかかわらず読む。ないファイル・読めないファイルは Unreadable
-    scanned = [path.resolve() for path in find_files(root, (".entitlements",))]
+    scanned = [resolved(path) for path in find_files(root, (".entitlements",))]
     for path in scanned + [path for path in dict.fromkeys(entitlements) if path not in scanned]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         for key in load_plist(path):

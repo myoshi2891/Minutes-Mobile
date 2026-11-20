@@ -16,6 +16,13 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# 部分的なコミット（git commit <パス>）のフックでは、Git が一時のインデックスを GIT_INDEX_FILE で渡す。相対パスは
+# 実行時の作業ディレクトリから解決されるので、ディレクトリを移る前に絶対パスにする（--staged の規則の試験は別の
+# ディレクトリで git を実行するので、相対パスのままでは別のインデックスを読む）
+if [ -n "${GIT_INDEX_FILE:-}" ]; then
+  case "$GIT_INDEX_FILE" in /*) ;; *) GIT_INDEX_FILE="$PWD/$GIT_INDEX_FILE" ;; esac
+  export GIT_INDEX_FILE
+fi
 cd "$ROOT"
 # xcode-select が Command Line Tools を指していても Xcode を使う
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
@@ -38,6 +45,10 @@ COVERAGE_JSON="$PACKAGE/.build/minutes-coverage.json"
 # 置き場所はリポジトリ直下の .build（整形・静的解析・入れ子の設定の列挙・Git がすべて除外する。Package の下の .build は
 # 静的解析などの除外が直下だけなので、写しの Swift ファイルと入れ子の設定が検査の対象になってしまう）
 COVERAGE_INPUT=".build/minutes-coverage-input"
+# 手順 7・8 の排他（同じ作業ツリーで並行に走る測定が、互いの写し・記録を置き換えて別の入力の結果を帰属させない）。
+# 手順 7 は写しの削除から記録の公開まで、手順 8 は記録の読み取りから集計までを、このロックを持って行う
+COVERAGE_LOCK=".build/minutes-coverage.lock"
+COVERAGE_LOCK_HELD=""
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
@@ -240,6 +251,35 @@ coverage_input() {
   printf 'worktree %s\n' "$tree"
 }
 
+# カバレッジのロックを取る。待たずに失敗する（別の測定が実行中。残骸なら削除して実行し直す）
+take_coverage_lock() {
+  mkdir -p .build
+  mkdir "$COVERAGE_LOCK" 2>/dev/null \
+    || fail "別のカバレッジの測定・集計が実行中（${COVERAGE_LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+  COVERAGE_LOCK_HELD=1
+}
+
+release_coverage_lock() {
+  if [ -n "$COVERAGE_LOCK_HELD" ]; then rmdir "$COVERAGE_LOCK" 2>/dev/null || true; fi
+  COVERAGE_LOCK_HELD=""
+}
+
+# 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
+# 試験用のファイルなどを省きうるので使わず、一時のインデックスに読み込んで checkout-index で書き出す（追跡している
+# ファイルをすべて書き出す）。失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
+materialize_coverage_input() {
+  local index status=0
+  index=$(mktemp)
+  rm -f -- "$index"
+  GIT_INDEX_FILE="$index" git read-tree "$1" || status=1
+  if [ "$status" = 0 ]; then
+    GIT_INDEX_FILE="$index" git ls-files -z -- Packages \
+      | GIT_INDEX_FILE="$index" git checkout-index -z --stdin --prefix="$COVERAGE_INPUT/" || status=1
+  fi
+  rm -f -- "$index"
+  return "$status"
+}
+
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
 test_destination() {
   local udid
@@ -267,14 +307,14 @@ step_7() {
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest
   mkdir -p "$PACKAGE/.build"
+  take_coverage_lock
   rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
   rm -rf -- "$COVERAGE_INPUT"
   # 測る入力を固定する。入力の識別子（コミット、または作業ツリーを写したツリー）が指すツリーから Packages/ を展開し、
   # その写しを測る。展開できなければ測らない（識別子と違う内容を測った結果をコミットに帰属させない）
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
   mkdir -p "$COVERAGE_INPUT"
-  git archive --format=tar "${measured#* }" -- Packages | tar -x -f - -C "$COVERAGE_INPUT" \
-    || fail "カバレッジを測る入力（${measured}）を展開できない"
+  materialize_coverage_input "${measured#* }" || fail "カバレッジを測る入力（${measured}）を展開できない"
   # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
   # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
   COVERAGE_SCRATCH=$(mktemp -d)
@@ -293,6 +333,7 @@ step_7() {
   mv -f -- "$COVERAGE_HEAD.$$" "$COVERAGE_HEAD"
   rm -rf -- "$COVERAGE_SCRATCH"
   COVERAGE_SCRATCH=""
+  release_coverage_lock
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
@@ -304,6 +345,7 @@ step_8() {
   scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
+  take_coverage_lock
   [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
   # 2 行を同じ開いたファイルから読む（2 回開くと、その間に記録が置き換えられたとき別の記録の行を組み合わせうる）。
   # 行がなければ空のまま続け、下の照合で失敗させる（set -e で黙って止めない）
@@ -325,6 +367,7 @@ step_8() {
   esac
   # 手順 7 が測ったのは固定した入力の写しなので、写しの Sources の行を数える
   scripts/coverage-report.py "$COVERAGE_COPY" --sources "$COVERAGE_INPUT/$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
+  release_coverage_lock
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
 
@@ -358,6 +401,7 @@ on_exit() {
   if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then rm -rf -- "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then rm -f -- "$COVERAGE_COPY"; fi
+  release_coverage_lock
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）

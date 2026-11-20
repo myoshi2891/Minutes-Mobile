@@ -54,6 +54,10 @@ def main() -> int:
             for device in devices
             if device.get("isAvailable") and "iPhone" in device.get("deviceTypeIdentifier", "")
         ]
+        # 候補の名前と UDID は文字列で、UDID は空でないこと（並べ替えや出力の前に確かめ、形の違う一覧を取得の失敗にする）
+        for _, name, udid in candidates:
+            if not isinstance(name, str) or not isinstance(udid, str) or not udid:
+                raise TypeError(f"シミュレータの name・udid の形が違う: {name!r}, {udid!r}")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         print(f"NG: シミュレータの一覧を取得できない: {error!r}", file=sys.stderr)
         return 2
