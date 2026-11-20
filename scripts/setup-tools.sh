@@ -62,6 +62,13 @@ check_field() {
 }
 
 # シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
+# 版ディレクトリの中の実行ファイルが、シンボリックリンクではない通常のファイルで、実行できること
+# （導入先の中のリンクで別の場所の実行ファイルを指させない）
+regular_binary() {
+  local file=$1
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -x "$file" ]
+}
+
 link_directory() {
   local link=$1 dest
   dest=$(readlink "$link") || return 1
@@ -82,6 +89,8 @@ verify_tool() {
     || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
   [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
     || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
+  regular_binary "$DEST/$name/$version/$binary" \
+    || fail "$name $version の実行ファイル（$DEST/$name/$version/${binary}）が通常のファイルでない。scripts/setup-tools.sh を実行し直す"
   [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] \
     || fail "$name $version の導入記録が tools/versions の SHA-256 と一致しない。scripts/setup-tools.sh を実行し直す"
   actual=$(runtime_version "$name" "$link") || fail "$name の版を表示できない（${link}）。scripts/setup-tools.sh を実行し直す"
@@ -95,7 +104,7 @@ install_tool() {
   local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
   # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
   # 版の表示に失敗した導入は、表示の内容によらず導入済みとして扱わない
-  if [ -x "$target/$binary" ] && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
+  if regular_binary "$target/$binary" && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
     cached=$(runtime_version "$name" "$target/$binary" 2>/dev/null) || cached=""
   fi
   if [ -n "$cached" ] && [ "$cached" = "$version" ]; then
@@ -106,12 +115,13 @@ install_tool() {
     mkdir -p "$work/download" "$work/extract" "$work/out"
     # 標準入力は版の写しを読んでいる途中なので、取得のコマンドに渡さない
     if [ "$name" = gh ]; then
-      # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）
+      # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）。
+      # ほかのツールは、GH_HOST の設定に取得先が左右されないよう、--repo にホスト（github.com）を明示する
       curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
         -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     else
-      "$DEST/bin/gh" release download "$tag" --repo "$repo" --pattern "$asset" --dir "$work/download" </dev/null \
+      "$DEST/bin/gh" release download "$tag" --repo "github.com/$repo" --pattern "$asset" --dir "$work/download" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     fi
     actual=$(shasum -a 256 "$work/download/$asset" | awk '{print $1}')
@@ -172,15 +182,10 @@ if [ "$MODE" = install ]; then
   # 同じ導入先への並行の導入を防ぐ。キャッシュの判定から退避・公開・リンクの更新までをロックの中で行う。
   # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）
   LOCK="$DEST/.install.lock"
-  waited=0
-  until mkdir "$LOCK" 2>/dev/null; do
-    if [ "$waited" -ge 600 ]; then
-      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || { rmdir "$LOCK"; fail "作業場所を作れない（${DEST}）"; }
+  LOCK_HELD=""
+  WORK=""
+  # ロックを待つ前に終了処理を登録する（取得の直後や作業場所の作成の途中で中断されても、ロックを残さない）。
+  # 解放するのは LOCK_HELD が立った後、つまり自分が取得したロックだけ
   cleanup() {
     local status=$?
     # 置き換えの途中で終わった場合: 新しい導入がまだ置かれていなければ退避した旧い導入を戻し、
@@ -192,13 +197,23 @@ if [ "$MODE" = install ]; then
         rm -rf -- "${PENDING_BACKUP:?}"
       fi
     fi
-    rm -rf -- "${WORK:?}"
-    rmdir "$LOCK" 2>/dev/null || true
+    if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}"; fi
+    # 自分が取得したロックだけを解放する（ロックを待っている間に終わった場合は、他の実行のロックを消さない）
+    if [ -n "$LOCK_HELD" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
     exit "$status"
   }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  waited=0
+  until mkdir "$LOCK" 2>/dev/null && LOCK_HELD=1; do
+    if [ "$waited" -ge 600 ]; then
+      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
 fi
 
 ARCH=$(uname -m)

@@ -32,6 +32,10 @@ def main() -> int:
         minimum = version_key(arguments.minimum_os)
         listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True, check=True)
         data = json.loads(listing.stdout)
+        devices_by_runtime = data["devices"]
+        # 形が違う一覧は取得の失敗として扱う（空の辞書は候補なしとして下で扱う）
+        if not isinstance(devices_by_runtime, dict):
+            raise TypeError(f"devices が辞書でない: {type(devices_by_runtime).__name__}")
         runtimes = {
             item["identifier"]: version_key(item["version"])
             for item in data["runtimes"]
@@ -39,7 +43,7 @@ def main() -> int:
         }
         candidates: List[Tuple[Tuple[int, ...], str, str]] = [
             (runtimes[runtime], device["name"], device["udid"])
-            for runtime, devices in data["devices"].items()
+            for runtime, devices in devices_by_runtime.items()
             if runtime in runtimes and runtimes[runtime] >= minimum
             for device in devices
             if device.get("isAvailable") and "iPhone" in device.get("deviceTypeIdentifier", "")

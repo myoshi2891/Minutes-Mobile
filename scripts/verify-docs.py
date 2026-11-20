@@ -14,9 +14,13 @@
 終了コード: 0 = 問題なし / 1 = 不整合あり / 2 = 読むもの（docs/・定義文書）がない
 """
 import argparse
+import contextlib
 import datetime
+import os
 import re
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -59,6 +63,8 @@ FENCE_LINE = "\0fence"
 # リンク先（山括弧で囲んだもの、または空白と「)」を含まないもの）と、続けて書けるタイトル（"…"・'…'・(…)）
 LINK = re.compile(r"""\]\((<[^<>\n]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)""")
 DETAILED_MAPPING = "要件 ID ↔ テスト"
+# 対応表で検査・試験を書く列の見出しに含まれる語
+TEST_COLUMN_WORDS = ("試験", "検査", "テスト")
 
 
 def fence_open(line: str) -> Optional[Tuple[Fence, str]]:
@@ -160,20 +166,25 @@ def is_separator(line: str) -> bool:
     return line.startswith("|") and all(SEPARATOR_CELL.fullmatch(cell) for cell in table_cells(line))
 
 
-def table_rows(body: List[str]) -> List[str]:
-    """本文の中の表のデータ行を返す。連続した「|」の行のまとまりごとに区切り、見出しの行の直後が区切りの行
-    （| --- |）で、見出しと区切りの行の列の数が同じものだけを表として扱い、見出しと区切りの行を除いた行を返す。
+def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
+    """本文の中の表ごとに、見出しの列とデータ行を返す。連続した「|」の行のまとまりごとに区切り、見出しの行の直後が
+    区切りの行（| --- |）で、見出しと区切りの行の列の数が同じものだけを表として扱い、見出しと区切りの行を除いた行を返す。
     区切りの行のないまとまり・列の数が合わないまとまりは表として数えない（GFM でも表にならない）。"""
-    rows: List[str] = []
+    found: List[Tuple[List[str], List[str]]] = []
     block: List[str] = []
     for line in body + [""]:
         if line.startswith("|"):
             block.append(line)
             continue
         if is_table(block):
-            rows.extend(row for row in block[2:] if not is_separator(row))
+            found.append((table_cells(block[0]), [row for row in block[2:] if not is_separator(row)]))
         block = []
-    return rows
+    return found
+
+
+def table_rows(body: List[str]) -> List[str]:
+    """本文の中の表のデータ行を返す（table_blocks の行をつないだもの）。"""
+    return [row for _, rows in table_blocks(body) for row in rows]
 
 
 def is_table(block: List[str]) -> bool:
@@ -425,18 +436,23 @@ class Checker:
         """「要件 ID ↔ テスト」の節に対応表があり、要件 ID とテストの両方を持つ行が 1 行以上あること。
 
         見出しだけがあって表のない節を合格にしない。行は、先頭の列に定義済みの要件 ID があり、
-        ほかの列（検査・試験）が空でないものを数える。各表の見出しの行と区切りの行は除く。
+        検査・試験の列（先頭以外で、見出しに「試験」「検査」「テスト」を含む列）が空でないものを数える。
+        「実行する場所」「状態」などほかの列の値だけでは数えない。検査・試験の列のない表の行は数えない。
+        各表の見出しの行と区切りの行は除く。
         """
         for number, heading, body in sections:
             if DETAILED_MAPPING not in heading:
                 continue
-            for line in table_rows(body):
-                cells = table_cells(line)
-                if len(cells) < 2 or not any(cell.strip() for cell in cells[1:]):
-                    continue
-                # 先頭の列は個々の要件 ID を持つこと（群の表記・「SEC 全般」は対応の行として数えない）
-                if self.names_individual_requirement(cells[0]):
-                    return
+            for header, rows in table_blocks(body):
+                columns = [at for at, cell in enumerate(header)
+                           if at > 0 and any(word in cell for word in TEST_COLUMN_WORDS)]
+                for line in rows:
+                    cells = table_cells(line)
+                    if not any(at < len(cells) and cells[at].strip() for at in columns):
+                        continue
+                    # 先頭の列は個々の要件 ID を持つこと（群の表記・「SEC 全般」は対応の行として数えない）
+                    if self.names_individual_requirement(cells[0]):
+                        return
             self.error(name, f"「{heading}」の節に、要件 ID とテストの両方を持つ対応表の行がない", number)
 
     def names_individual_requirement(self, text: str) -> bool:
@@ -596,8 +612,23 @@ class Checker:
             if self.read_raw(name) != raw_text:
                 self.error(name, "書き直しの途中で変更された。上書きしないので、--update-snippets を実行し直す")
                 continue
-            with target.open("w", encoding="utf-8", newline="") as handle:
-                handle.write("".join(line + ending for line, ending in zip(out, out_endings)))
+            # 元の文書を切り詰めないよう、同じディレクトリの一時ファイルに書いて閉じてから置き換える。
+            # 書き込み・閉じるのに失敗したら置き換えず、一時ファイルを消して元の文書を残す
+            try:
+                handle, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+            except OSError as error:
+                self.error(name, f"一時ファイルを作れないので、コード片を書き直さない: {error}")
+                continue
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
+                    stream.write("".join(line + ending for line, ending in zip(out, out_endings)))
+                os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+                os.replace(temporary, target)
+            except OSError as error:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+                self.error(name, f"書き直した内容を保存できないので、元の文書を残す: {error}")
+                continue
             updated = "\n".join(out) + ("\n" if text.endswith("\n") else "")
             self.texts[name] = updated
             print(f"コード片を書き直した: {name}")

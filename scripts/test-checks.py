@@ -365,6 +365,10 @@ def test_settings() -> None:
     settings_case("空の SDK の条件の値は、条件のない値を上書きしない", 1, "Debug（iphoneos）",
                   project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription":',
                                              '"INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=]":'))
+    settings_case("空の SDK の条件の空の値は、条件のない有効な値を上書きしない", 0, "OK",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n'
+                                             '        "INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=]": "",'))
     # arch の条件付きの参照先は、別の arch の構成を補わない（条件なしに決まらない）
     settings_case("arch の条件付きの参照先だけでは補えない", 1, "NSMicrophoneUsageDescription がない",
                   project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t).replace(
@@ -813,6 +817,13 @@ def test_versions() -> None:
         (dest / "bin" / "gh").symlink_to(f"../gh/other/{executable}")
         expect("versions: リンクが導入記録のない場所を指す", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                   "--require", "gh"], 1, "導入先を指していない")
+        # 版のディレクトリの中の実行ファイルがシンボリックリンクなら、版の表示が合っていても合格にしない
+        (dest / "bin" / "gh").unlink()
+        (dest / "bin" / "gh").symlink_to(f"../gh/{version}/{executable}")
+        stub.unlink()
+        stub.symlink_to(other)
+        expect("versions: 版のディレクトリの実行ファイルがリンク", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
+                                                     "--require", "gh"], 1, "通常のファイルでない")
     # 配布ファイルの中の実行ファイル名が名前と違っても、検査が呼ぶリンクは名前（bin/<名前>）で照合する
     with tempfile.TemporaryDirectory() as directory:
         dest = Path(directory) / "tools"
@@ -1091,6 +1102,13 @@ def run_docs_cases() -> None:
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", ""),
         docs_case("対応表の行に要件 ID がない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| 未定 | 試験 |"),
         docs_case("対応表の行にテストがない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| FR-AAA-01 |  |"),
+        # 検査・試験の列が空なら、「状態」などほかの列に値があっても数えない
+        docs_case("対応表の行の検査・試験が空で状態だけがある", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 検査・試験 | 状態 |\n| --- | --- | --- |\n| FR-AAA-01 |  | 通過 |"),
+        docs_case("対応表に検査・試験の列がない", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 状態 |\n| --- | --- |\n| FR-AAA-01 | 通過 |"),
+        docs_case("対応表の検査・試験の列に値があれば数える", 0, "OK", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 検査・試験 | 状態 |\n| --- | --- | --- |\n| FR-AAA-01 | 試験 |  |"),
         # 範囲は、同じ接頭辞の定義済み ID の数を超えて展開しない
         docs_case("広すぎる範囲", 1, "広すぎる範囲: FR-AAA-01〜99", detailed, "FR-AAA-01〜02", "FR-AAA-01〜99"),
         # FR / NFR / SEC はフェーズ（MVP / P2 / P3）を持つ
@@ -1208,6 +1226,22 @@ def run_docs_cases() -> None:
     data = (crlf / detailed).read_bytes()
     if data.count(b"\n") != data.count(b"\r\n") or b"echo one\r\necho two\r\necho three" not in data:
         failures.append("docs: CRLF の文書の書き直しで改行が変わった、またはコード片が書き直されていない")
+    # --update-snippets は、一時ファイルを作れない（ディレクトリに書けない）ときに元の文書を切り詰めず、そのまま残す
+    assert docs_parent is not None
+    readonly = Path(tempfile.mkdtemp(dir=docs_parent))
+    stale_text = replaced(DOCS[detailed], "echo one\necho two\necho three", "echo old")
+    for path, content in {**DOCS, detailed: stale_text}.items():
+        (readonly / path).parent.mkdir(parents=True, exist_ok=True)
+        (readonly / path).write_text(content, encoding="utf-8")
+    (readonly / detailed).parent.chmod(0o555)
+    try:
+        expect("docs: 書けないディレクトリでは元の文書を残す", [str(SCRIPTS / "verify-docs.py"), "--root", str(readonly), "--update-snippets"],
+               1, "コード片を書き直さない")
+    finally:
+        (readonly / detailed).parent.chmod(0o755)
+    count += 1
+    if (readonly / detailed).read_text(encoding="utf-8") != stale_text:
+        failures.append("docs: 書き直しに失敗したのに、元の文書が変わった")
     # --update-snippets は、実パスが --root の外にある文書に書き込まない
     assert docs_parent is not None
     outside = Path(tempfile.mkdtemp(dir=docs_parent)) / "outside.md"

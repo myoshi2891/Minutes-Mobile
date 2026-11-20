@@ -53,7 +53,7 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
     in_block = False
     current = ""
     for line in config_text.splitlines():
-        if re.match(r"^custom_rules:\s*$", line):
+        if re.match(r"^custom_rules:\s*(?:#.*)?$", line):
             in_block = True
             continue
         if not in_block:
