@@ -64,6 +64,16 @@ custom_rules:
     message: "Network / CFNetwork を import しない（SEC-NET-01）"
     severity: error
 
+  # URL を受け取る読み込みの初期化子は、https:// などのリモートの URL も読めるので使わない（通信の経路になる）。
+  # ローカルのファイルは、パスを受け取る API（contentsOfFile:・FileManager.contents(atPath:)・FileHandle）で読む。
+  # append(contentsOf:) などコレクションの操作は対象外にするため、型の名前を付けた呼び出しと、型の注釈つきの .init だけを検出する
+  no_url_content_loading:
+    name: "URL を受け取る読み込みの禁止"
+    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS)?(?:Data|String|XMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:'
+    match_kinds: *code
+    message: "URL を受け取る読み込みはリモートの URL も読める。ローカルのファイルはパスを受け取る API で読む（SEC-NET-01）"
+    severity: error
+
   # 「.」の後に空白を挟むメンバーの呼び出し（store . connect()）は、有界の後読みで除く（ICU は可変長の後読みを持たない）
   no_bsd_socket:
     name: "BSD ソケットの禁止"
