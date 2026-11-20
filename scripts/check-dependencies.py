@@ -163,23 +163,64 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
+def blank(text: str) -> str:
+    """改行を残して空白に置き換える（長さと改行の位置は変えない）。"""
+    return "".join(char if char in "\r\n" else " " for char in text)
+
+
 def mask_strings(text: str) -> str:
-    """strip_comments の後の内容の文字列リテラルを、両端の「"」を残して空白に置き換える（長さと改行の位置は変えない）。
+    """strip_comments の後の内容の文字列リテラルの本文を空白に置き換える（長さと改行の位置は変えない）。
 
     宣言やキーワードの検索をこの内容に対して行い、文字列リテラルの本文に現れる「.package(」「url:」を宣言と見なさない。
+    補間（\\(…)、生の文字列では \\#(…)）の中の式は実行されるコードなので空白にせず、検査の対象に残す（mask_literal）。
     """
     out: List[str] = []
     index = 0
     while index < len(text):
         if starts_string(text, index):
-            end = string_end(text, index)
-            body = "".join(char if char in "\r\n" else " " for char in text[index + 1:end - 1])
-            out.append('"' + body + '"' if end - index >= 2 else text[index:end])
-            index = end
+            masked, index = mask_literal(text, index)
+            out.append(masked)
         else:
             out.append(text[index])
             index += 1
     return "".join(out)
+
+
+def mask_literal(text: str, index: int) -> Tuple[str, int]:
+    """index で始まる文字列リテラルを置き換えた内容と、リテラルの終わりの次の位置を返す。
+
+    リテラルは「"…"」の形にし（開始と終了の区切りの最後の 1 文字を「"」、ほかを空白）、本文は空白にする。
+    補間は「"」で文字列を閉じてから式を置き、「"」で開き直す形にする（\\(式) → "␣式"。引用符の対が崩れず、
+    式の中の宣言は呼び出しの形のまま見つかる）。式の中のコメントは strip_comments で、文字列は再帰的に置き換える。
+    """
+    end = string_end(text, index)  # 閉じていない文字列・補間はここで読めないものとして扱う
+    hashes = len(text[index:]) - len(text[index:].lstrip("#"))
+    quote_at = index + hashes
+    quotes = '"""' if text.startswith('"""', quote_at) else '"'
+    closing = quotes + "#" * hashes
+    escape = "\\" + "#" * hashes
+    content_end = end - len(closing)
+    out = ['"' + " " * (quote_at + len(quotes) - index - 1)]
+    cursor = quote_at + len(quotes)
+    while cursor < content_end:
+        if text.startswith(escape, cursor):
+            after = cursor + len(escape)
+            if after < content_end and text[after] == "(":
+                close = interpolation_end(text, after)
+                expression = text[after + 1:close - 1]
+                out.append('"' + " " * len(escape) + mask_strings(strip_comments(expression)) + '"')
+                cursor = close
+            else:
+                out.append(blank(text[cursor:after + 1]))  # エスケープされた 1 文字
+                cursor = after + 1
+            continue
+        out.append(blank(text[cursor]))
+        cursor += 1
+    out.append(" " * (len(closing) - 1) + '"')
+    masked = "".join(out)
+    if len(masked) != end - index:
+        raise Unreadable("文字列リテラルの補間を判定できない")  # 長さが変わると宣言の位置がずれるので合格にしない
+    return masked, end
 
 
 def line_comment_end(text: str, index: int) -> int:
@@ -432,6 +473,10 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
     target = (root / location).resolve()
     if not target.is_relative_to(root.resolve()):
         return [f"ローカルの Package {path} は起点の外にあり、中の依存を検査できない: .package({summary})"]
+    # シンボリックリンクを解決した先にも同じ除外の規則を当てる（リンクで検査の対象外のディレクトリを指させない）
+    resolved = target.relative_to(root.resolve()).parts
+    if resolved and (resolved[0] in SKIPPED_AT_ROOT or SKIPPED_ANYWHERE.intersection(resolved)):
+        return [f"ローカルの Package {location} の実体（{'/'.join(resolved)}）は検査の対象外のディレクトリにある: .package({summary})"]
     if not (target / "Package.swift").is_file():
         return [f"ローカルの Package {location} に manifest がない（Package.swift）: .package({summary})"]
     return []

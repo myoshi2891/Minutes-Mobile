@@ -169,7 +169,18 @@ PENDING_BACKUP=""
 if [ "$MODE" = install ]; then
   # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
   mkdir -p "$DEST"
-  WORK=$(mktemp -d "$DEST/.work.XXXXXX")
+  # 同じ導入先への並行の導入を防ぐ。キャッシュの判定から退避・公開・リンクの更新までをロックの中で行う。
+  # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）
+  LOCK="$DEST/.install.lock"
+  waited=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    if [ "$waited" -ge 600 ]; then
+      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || { rmdir "$LOCK"; fail "作業場所を作れない（${DEST}）"; }
   cleanup() {
     local status=$?
     # 置き換えの途中で終わった場合: 新しい導入がまだ置かれていなければ退避した旧い導入を戻し、
@@ -182,6 +193,7 @@ if [ "$MODE" = install ]; then
       fi
     fi
     rm -rf -- "${WORK:?}"
+    rmdir "$LOCK" 2>/dev/null || true
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
     exit "$status"
   }

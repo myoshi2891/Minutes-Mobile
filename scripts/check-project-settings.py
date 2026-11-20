@@ -184,11 +184,34 @@ PORTRAIT_ONLY = ["UIInterfaceOrientationPortrait"]
 ORIENTATION_KEYS = ("UISupportedInterfaceOrientations~iphone", "UISupportedInterfaceOrientations")
 
 
-def expand_value(text: str, own: dict, shared: dict, configuration: str, sdk: str, depth: int = 0) -> Optional[str]:
+def setting_value(own: dict, shared: dict, name: str, configuration: str, sdk: str) -> Optional[Tuple[str, bool]]:
+    """その構成・SDK で効く設定の値と、値がターゲットの段のものかを返す。1 つの値に決まらなければ None。
+
+    resolve と同じく、ターゲットの段で決まればプロジェクトの段は効かない。ターゲットの段に条件（arch など）付きの
+    書き方だけがある場合は、どちらの段の値が効くか決まらないので None とする。
+    """
+    effective, undecided = resolve(own, {}, name, [configuration], sdk)
+    from_target = not undecided
+    if not from_target:
+        if effective:
+            return None
+        effective, undecided = resolve({}, shared, name, [configuration], sdk)
+        if undecided:
+            return None
+    values = {value for (_, value) in effective}
+    return (values.pop(), from_target) if len(values) == 1 else None
+
+
+def expand_value(
+    text: str, own: dict, shared: dict, configuration: str, sdk: str, depth: int = 0,
+    setting: Optional[str] = None, from_target: bool = False
+) -> Optional[str]:
     """値の中の $(NAME)・${NAME} を、その構成・SDK のビルド設定で展開する。決められなければ None（未確定）。
 
     設定がない変数（Xcode が組み込みで持つ変数を含む）、条件（arch など）なしに 1 つの値に決まらない変数、
     修飾子つきの参照（$(NAME:lower) など）は展開できないものとして None を返す。展開できない値を空でない値と見なさない。
+    $(inherited) は、値がターゲットの段の設定 setting のものなら、プロジェクトの段の同じ設定の値で展開する。
+    プロジェクトの段の値・plist の値・設定の名前が分からない値では継承元（SDK の既定値など）を決められないので None とする。
     """
     if depth > MAX_EXPANSION_DEPTH:
         return None
@@ -198,13 +221,24 @@ def expand_value(text: str, own: dict, shared: dict, configuration: str, sdk: st
         nonlocal unresolved
         name = found.group(1) or found.group(2)
         if name == "inherited":
-            return ""
-        effective, undecided = resolve(own, shared, name, [configuration], sdk)
-        values = {value for (_, value) in effective}
-        if undecided or len(values) != 1:
+            if setting is None or not from_target:
+                unresolved = True
+                return ""
+            effective, undecided = resolve({}, shared, setting, [configuration], sdk)
+            values = {value for (_, value) in effective}
+            if undecided or len(values) != 1:
+                unresolved = True
+                return ""
+            inherited = expand_value(values.pop(), own, shared, configuration, sdk, depth + 1, setting, False)
+            if inherited is None:
+                unresolved = True
+                return ""
+            return inherited
+        found_value = setting_value(own, shared, name, configuration, sdk)
+        if found_value is None:
             unresolved = True
             return ""
-        expanded = expand_value(values.pop(), own, shared, configuration, sdk, depth + 1)
+        expanded = expand_value(found_value[0], own, shared, configuration, sdk, depth + 1, name, found_value[1])
         if expanded is None:
             unresolved = True
             return ""
@@ -277,7 +311,8 @@ def check_plist_values(
                 effective, undecided = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration], sdk)
                 settings_unresolved = False
                 for key, value in effective:
-                    expanded = expand_value(value, own, shared, configuration, sdk)
+                    expanded = expand_value(value, own, shared, configuration, sdk, setting=f"INFOPLIST_KEY_{name}",
+                                            from_target=key in own and as_text(own[key]) == value)
                     if expanded is None:
                         settings_unresolved = True
                         unresolved.setdefault(key, []).append(build)
@@ -346,9 +381,25 @@ Expander = Callable[[str], List[Optional[str]]]
 VARIABLE = re.compile(r"\$[({]")
 
 
-def target_expander(own: dict, shared: dict, configurations: List[str]) -> Expander:
-    """そのターゲットの各構成・各 SDK（SDKS）のビルド設定で値を展開する関数を返す。"""
-    return lambda text: [expand_value(text, own, shared, c, s) for c in configurations for s in SDKS]
+def target_expander(
+    own: dict, shared: dict, configurations: List[str], key: Optional[str] = None, from_target: bool = False
+) -> Expander:
+    """そのターゲットの各構成・各 SDK（SDKS）のビルド設定で値を展開する関数を返す。
+
+    key を指定した場合（ビルド設定の値を展開する場合）は、その書き方の条件（config・sdk）に合う構成・SDK だけで展開し
+    （Debug だけの書き方を Release の値で判定しない）、$(inherited) をその設定の継承元で展開する。
+    arch の条件は構成・SDK では決まらないので、どの構成・SDK でも効きうるものとして展開する。
+    """
+    condition = conditions(key) if key is not None else {}
+    setting = key.split("[", 1)[0] if key is not None else None
+
+    def applies(configuration: str, sdk: str) -> bool:
+        if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
+            return False
+        return "sdk" not in condition or sdk_matches(sdk, condition["sdk"], str(key))
+
+    return lambda text: [expand_value(text, own, shared, c, s, setting=setting, from_target=from_target)
+                         for c in configurations for s in SDKS if applies(c, s)]
 
 
 def combined_expander(expanders: List[Expander]) -> Expander:
@@ -404,12 +455,16 @@ def check_plist_entry(source: str, key: str, value: object, errors: List[str], e
                     check_plist_entry(source, str(child_key), child_value, errors, expand)
 
 
-def check_build_settings(target: str, settings: dict, errors: List[str], expand: Optional[Expander] = None) -> None:
+def check_build_settings(
+    target: str, settings: dict, errors: List[str], expanders: Optional[Callable[[str], Expander]] = None
+) -> None:
+    """ビルド設定を調べる。expanders は書き方（条件つきの鍵）ごとに、その条件に合う構成・SDK で値を展開する関数を返す。"""
     for key, value in settings.items():
         name = key.split("[", 1)[0]
         if name in FORBIDDEN_BUILD_SETTINGS:
             errors.append(f"[{FORBIDDEN_BUILD_SETTINGS[name]}] {target}: {key} を削除する")
         if name.startswith("INFOPLIST_KEY_"):
+            expand = expanders(key) if expanders is not None else None
             check_plist_entry(f"{target} の {key}", name[len("INFOPLIST_KEY_"):], value, errors, expand)
 
 
@@ -494,7 +549,8 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
             raise Unreadable(f"{project_path}: ターゲットの形式が違う")
     # プロジェクトの設定はすべてのターゲットのビルドに効くので、すべてのターゲットの構成・SDK で展開する
     expanders = [target_expander(target["build-settings"], shared, configurations) for target in targets]
-    check_build_settings("プロジェクト", shared, errors, combined_expander(expanders))
+    check_build_settings("プロジェクト", shared, errors, lambda key: combined_expander([
+        target_expander(target["build-settings"], shared, configurations, key, False) for target in targets]))
     # INFOPLIST_FILE の参照先 → それを使うターゲットの展開（参照するターゲットのビルド設定で値の変数を展開する）
     referenced: Dict[Path, List[Expander]] = {}
     entitlements: List[Path] = []
@@ -512,7 +568,8 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
             check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
             check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
             check_plist_orientation(project_path, name, target_name, own, shared, configurations, root, errors)
-        check_build_settings(name, own, errors, expander)
+        check_build_settings(name, own, errors,
+                             lambda key, own=own: target_expander(own, shared, configurations, key, True))
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")

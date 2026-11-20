@@ -297,6 +297,24 @@ def test_settings() -> None:
                   project=sharing("$(SHARING)", '\n        "SHARING": "YES",'))
     settings_case("ビルド設定の変数が NO に展開される", 0, "OK", project=sharing("$(SHARING)", '\n        "SHARING": "NO",'))
     settings_case("ビルド設定の変数を展開できない", 1, "UIFileSharingEnabled の値を展開できない", project=sharing("$(SHARING)"))
+    # $(inherited) は空にせず継承元の値で展開する。継承元を決められなければ展開できないものとして扱う
+    project_level = lambda define: lambda t: replaced(  # noqa: E731
+        t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n  },', f'"IPHONEOS_DEPLOYMENT_TARGET": "27.2",{define}\n  }},')
+    settings_case("$(inherited) がプロジェクトの YES を継承する", 1, "UIFileSharingEnabled を有効にしない",
+                  project=lambda t: project_level('\n    "SHARING": "YES",')(
+                      sharing("$(SHARING)", '\n        "SHARING": "$(inherited)",')(t)))
+    settings_case("$(inherited) がプロジェクトの NO を継承する", 0, "OK",
+                  project=lambda t: project_level('\n    "SHARING": "NO",')(
+                      sharing("$(SHARING)", '\n        "SHARING": "$(inherited)",')(t)))
+    settings_case("プロジェクトの段の $(inherited) は継承元を決められない", 1, "UIFileSharingEnabled の値を展開できない",
+                  project=project_level('\n    "INFOPLIST_KEY_UIFileSharingEnabled": "$(inherited)",'))
+    # 条件付きの書き方の値は、その条件に合う構成でだけ展開して判定する
+    for label, debug_value, want_code, want_text in (("Debug は NO", "NO", 0, "OK"), ("Debug は YES", "YES", 1, "有効にしない")):
+        settings_case(f"Debug だけの書き方を Release の値で判定しない（{label}）", want_code, want_text,
+                      project=lambda t, v=debug_value: replaced(
+                          t, '"GENERATE_INFOPLIST_FILE": "YES",',
+                          '"GENERATE_INFOPLIST_FILE": "YES",\n        "INFOPLIST_KEY_UIFileSharingEnabled[config=Debug]": "$(SHARING)",'
+                          f'\n        "SHARING[config=Debug]": "{v}",\n        "SHARING[config=Release]": "YES",'))
     settings_case("参照先の plist の変数が YES に展開される", 1, "UIFileSharingEnabled を有効にしない",
                   project=lambda t: replaced(info_plist_file("Config/App-Settings.plist")(t), '"GENERATE_INFOPLIST_FILE": "YES",',
                                              '"GENERATE_INFOPLIST_FILE": "YES",\n        "SHARING": "YES",'),
@@ -522,6 +540,12 @@ def test_dependencies() -> None:
     }.items():
         dependencies_case(f"補間の中のコメント（{label}）で宣言を隠さない", 1, "unlisted.git",
                           {"Package.swift": declare.format(declaration)})
+    # 補間の中の式は実行されるコードなので、中の宣言を検査する。本文の宣言らしい文字列は宣言と見なさない
+    dependencies_case("補間の中の宣言は検査する", 1, "unlisted.git", {"Package.swift": declare.format(f'"\\({unlisted})"')})
+    dependencies_case("生の文字列の補間の中の宣言は検査する", 1, "unlisted.git",
+                      {"Package.swift": declare.format(f'#"\\#({unlisted})"#')})
+    dependencies_case("文字列の本文の .binaryTarget は宣言と見なさない", 0, "OK",
+                      {"Package.swift": declare.format('"see .binaryTarget(name: B, url: x) here"')})
     dependencies_case("通常の補間の後ろのコメントは除く", 0, "OK",
                       {"Package.swift": declare.format(f'let s = "\\(f(x))"\n// {unlisted}')})
     # 行コメントは CR・LF・CRLF のどれでも終わる（CR だけの改行で後ろの宣言をコメントに含めない）
@@ -609,6 +633,17 @@ def test_dependencies() -> None:
                       {"Package.swift": declare.format('.package(path: "Local")')})
     dependencies_case("除外するディレクトリの中のローカルの Package", 1, "検査の対象外",
                       {"Package.swift": declare.format('.package(path: "build/Local")'), "build/Local/Package.swift": local_manifest})
+    # シンボリックリンクを解決した先が除外するディレクトリなら、リンクの名前が通常の場所でも認めない
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "build" / "Local").mkdir(parents=True)
+        (root / "build" / "Local" / "Package.swift").write_text(local_manifest, encoding="utf-8")
+        (root / "Local").symlink_to("build/Local")
+        (root / "Package.swift").write_text(declare.format('.package(path: "Local")'), encoding="utf-8")
+        allowlist = root / "allowlist.json"
+        allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}), encoding="utf-8")
+        expect("dependencies: 除外するディレクトリを指すリンクのローカルの Package", [
+            str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 1, "検査の対象外")
     # 参照先の manifest の未承認のバイナリも検査する（起点の中の manifest はすべて走査する）
     dependencies_case("ローカルの Package の中の未承認のバイナリ", 1, "ローカルのバイナリ Local/Frameworks/B.xcframework",
                       {"Package.swift": declare.format('.package(path: "Local")'), "Local/Package.swift": declare.format(binary)})
@@ -643,8 +678,10 @@ def test_dependencies() -> None:
             try:
                 module.content_digest(framework)
                 failures.append(f"dependencies: 成果物の外を指すリンク（{label}）を受け入れた")
-            except module.Unreadable:
-                pass
+            except module.Unreadable as error:
+                # 拒否した項目が Bad であること（連鎖では、外を指す Chain だけを拒否して Bad を通すと合格にしない）
+                if not str(error).startswith(f"{framework / 'Bad'}:"):
+                    failures.append(f"dependencies: 成果物の外を指すリンク（{label}）で Bad 以外を拒否した: {error}")
     dependencies_case("区間の上限は含まない", 1, "合わない",
                       {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", "1.0.0"..<"1.2.3")')},
                       [approved])
@@ -679,9 +716,10 @@ def test_versions() -> None:
     expect("versions: 導入済みの版が一致する", [setup, "--verify"], 0, "OK")
     # 版と SHA-256 の負例は、現在の swiftlint の行から値を取り出して変える（ツールを更新しても負例を作れるように）
     # この Mac に適用される行（setup-tools.sh と同じく、アーキテクチャが一致する行、なければ any の行）を変える
-    swiftlint_rows = [line for line in original.splitlines() if line.split()[:1] == ["swiftlint"]]
-    row = (next((line for line in swiftlint_rows if line.split()[2:3] == [platform.machine()]), None)
-           or next(line for line in swiftlint_rows if line.split()[2:3] == ["any"]))
+    # 行の位置も覚え、負例ではその行だけを書き換える（同じ内容のコメント行や別のアーキテクチャの行を変えない）
+    swiftlint_rows = [(at, line) for at, line in enumerate(original.splitlines()) if line.split()[:1] == ["swiftlint"]]
+    row_index, row = (next((item for item in swiftlint_rows if item[1].split()[2:3] == [platform.machine()]), None)
+                      or next(item for item in swiftlint_rows if item[1].split()[2:3] == ["any"]))
     columns = row.split()
     current_version, current_sha = columns[1], columns[-1]
     parts = current_version.split(".")
@@ -693,7 +731,10 @@ def test_versions() -> None:
             # 空白文字（タブを含む）で列に分け、index 番目の列だけを置き換える（一時の台帳なので空白の並びは保たない）
             fields = row.split()
             fields[index] = value
-            return replaced(text, row, " ".join(fields))
+            lines = text.splitlines()
+            assert lines[row_index] == row, f"置換の対象の行が変わった: {row}"
+            lines[row_index] = " ".join(fields)
+            return "\n".join(lines) + "\n"
         return change
 
     cases = {
@@ -710,7 +751,7 @@ def test_versions() -> None:
         ) + "\n", "向けの行がない"),
         # 台帳からツールの行がすべて消えても、検査が使う必須のツールとして欠落を検出する
         "必須のツールの行がない": (lambda t: "\n".join(
-            line for line in t.splitlines() if not line.startswith("swiftformat")
+            line for line in t.splitlines() if line.split()[:1] != ["swiftformat"]
         ) + "\n", "swiftformat に"),
     }
     # 末尾に改行のない最終行も読む（最終行のツールを読み落とすと「行がない」で失敗する）
@@ -825,7 +866,11 @@ def gitleaks_merge_case() -> None:
         repository.mkdir()
 
         # 開発者のグローバル・システムの設定とフック（core.hooksPath・テンプレートのフックを含む）の影響を受けないようにする
-        isolated = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        # フックなどから実行された場合に残る、リポジトリを指す変数（GIT_DIR・GIT_INDEX_FILE など）も外す
+        local_vars = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True,
+                                    check=True).stdout.split()
+        isolated = {key: value for key, value in os.environ.items() if key not in local_vars}
+        isolated.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
 
         def git(*arguments: str) -> None:
             subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
@@ -1083,6 +1128,15 @@ def run_docs_cases() -> None:
         # 区切りの行のない「|」の行のまとまりは表として数えない
         docs_case("対応表に区切りの行がない", 1, "対応表の行がない", detailed,
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 試験 |\n| FR-AAA-01 | 試験 |"),
+        # 区切りの行は列ごとに「任意のコロン・1 個以上のハイフン・任意のコロン」の形であること
+        docs_case("ハイフンのない区切りの行は表として数えない", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |", "| 要件 | 試験 |\n| : | :: |"),
+        docs_case("コロンつきの区切りの行は表として数える", 0, "OK", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |", "| 要件 | 試験 |\n| :-: | :--- |"),
+        # 要件の定義は表のデータ行からだけ集める。フェンスで切れた後の行は、前の表のフェーズの列で定義しない
+        docs_case("フェンスで切れた後の行は要件の定義にならない", 1, "定義されていない ID: FR-AAA-02", requirements,
+                  "| FR-AAA-01 | 一 | MVP |\n| FR-AAA-02 | 二 | MVP |",
+                  f"| FR-AAA-01 | 一 | MVP |\n{FENCE}text\n例\n{FENCE}\n| FR-AAA-02 | 二 | MVP |"),
         docs_case("申し送りの表に区切りの行がない", 1, "申し送り「一つ目」の解決が表にない", detailed,
                   "| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |", "| 申し送り | 解決 |\n| 一つ目 | 済 |"),
         # 字下げしたフェンスのコード片は、開始行の字下げの分を除いて照合する

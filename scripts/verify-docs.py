@@ -152,7 +152,12 @@ def table_cells(line: str) -> List[str]:
     return [cell.strip() for cell in re.split(r"(?<!\\)\|", text)]
 
 
-TABLE_SEPARATOR = re.compile(r"^\|[ :|-]+\|$")
+SEPARATOR_CELL = re.compile(r":?-+:?")
+
+
+def is_separator(line: str) -> bool:
+    """表の区切りの行（| --- | :-: |）か。各列の全体が「任意のコロン・1 個以上のハイフン・任意のコロン」の形であること。"""
+    return line.startswith("|") and all(SEPARATOR_CELL.fullmatch(cell) for cell in table_cells(line))
 
 
 def table_rows(body: List[str]) -> List[str]:
@@ -165,11 +170,32 @@ def table_rows(body: List[str]) -> List[str]:
         if line.startswith("|"):
             block.append(line)
             continue
-        if (len(block) >= 2 and TABLE_SEPARATOR.match(block[1]) and not TABLE_SEPARATOR.match(block[0])
-                and len(table_cells(block[0])) == len(table_cells(block[1]))):
-            rows.extend(row for row in block[2:] if not TABLE_SEPARATOR.match(row))
+        if is_table(block):
+            rows.extend(row for row in block[2:] if not is_separator(row))
         block = []
     return rows
+
+
+def is_table(block: List[str]) -> bool:
+    """連続した「|」の行のまとまりが表か（見出しの行の直後が区切りの行で、両者の列の数が同じ）。"""
+    return (len(block) >= 2 and is_separator(block[1]) and not is_separator(block[0])
+            and len(table_cells(block[0])) == len(table_cells(block[1])))
+
+
+def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
+    """コードフェンスの外の表ごとに、見出しの列と、データ行（行番号, 行）を返す。
+
+    連続した「|」の行のまとまりを表の候補とし、空行・「|」で始まらない行・コードフェンスで区切る。
+    表として成り立たないまとまり（is_table）は返さない。
+    """
+    block: List[Tuple[int, str]] = []
+    for number, line, inside, _ in list(fenced_lines(text)) + [(0, "", False, None)]:
+        if not inside and line.startswith("|"):
+            block.append((number, line))
+            continue
+        if is_table([row for _, row in block]):
+            yield table_cells(block[0][1]), [(at, row) for at, row in block[2:] if not is_separator(row)]
+        block = []
 
 
 def fence_indent(line: str) -> int:
@@ -205,37 +231,39 @@ class Checker:
     def collect_definitions(self) -> None:
         """定義文書の表から ID を集める。要件表の「フェーズ」列が MVP の FR / NFR / SEC も集める。"""
         for name, text in self.texts.items():
-            phase_column = -1
-            for number, line in prose_lines(text):
-                if not line.startswith("|"):
-                    phase_column = -1
-                    continue
-                cells = table_cells(line)
-                if "フェーズ" in cells and not DEFINITION_ROW.match(line):
-                    phase_column = cells.index("フェーズ")
-                found = DEFINITION_ROW.match(line)
-                if not found:
-                    continue
-                identifier = found.group(1)
-                prefix = identifier.split("-", 1)[0]
-                home = DEFINED_IN.get(prefix, BASIC if prefix == "BD" else "")
-                if not (name == home or (prefix == "BD" and name.startswith(BASIC + "/"))):
-                    continue
-                # 基本設計では、設計決定の表（先頭の列が ID）の行だけを定義として扱う
-                if prefix == "BD" and not re.match(r"^\| BD-[A-Z]+-\d+ \| ", line):
-                    continue
-                if identifier in self.defined:
-                    self.error(name, f"{identifier} の定義が重複している（{self.defined[identifier]}）", number)
-                    continue
-                self.defined[identifier] = f"{name}:{number}"
-                if prefix in ("FR", "NFR", "SEC"):
-                    # FR / NFR / SEC はフェーズ（MVP / P2 / P3）を必ず持つ（docs/README.md §3）
-                    phase = cells[phase_column] if 0 <= phase_column < len(cells) else ""
-                    if not PHASES.match(phase):
-                        what = "フェーズの列がない" if phase_column < 0 else f"フェーズ「{phase}」を MVP・P2・P3 として読めない"
-                        self.error(name, f"{identifier} の{what}", number)
-                    elif phase.startswith("MVP"):
-                        self.mvp.add(identifier)
+            # 定義は、見出しの行と区切りの行を確かめた表のデータ行からだけ集める。フェーズの列は、その表の見出しで決める
+            for header, rows in tables(text):
+                phase_column = header.index("フェーズ") if "フェーズ" in header else -1
+                for number, line in rows:
+                    self.collect_definition(name, number, line, phase_column)
+
+    def collect_definition(self, name: str, number: int, line: str, phase_column: int) -> None:
+        """表のデータ行 1 行から ID の定義を集める（collect_definitions から呼ぶ）。"""
+        cells = table_cells(line)
+        found = DEFINITION_ROW.match(line)
+        if not found:
+            return
+        identifier = found.group(1)
+        prefix = identifier.split("-", 1)[0]
+        home = DEFINED_IN.get(prefix, BASIC if prefix == "BD" else "")
+        if not (name == home or (prefix == "BD" and name.startswith(BASIC + "/"))):
+            return
+        # 基本設計では、設計決定の表（先頭の列が ID）の行だけを定義として扱う
+        if prefix == "BD" and not re.match(r"^\| BD-[A-Z]+-\d+ \| ", line):
+            return
+        if identifier in self.defined:
+            self.error(name, f"{identifier} の定義が重複している（{self.defined[identifier]}）", number)
+            return
+        self.defined[identifier] = f"{name}:{number}"
+        if prefix in ("FR", "NFR", "SEC"):
+            # FR / NFR / SEC はフェーズ（MVP / P2 / P3）を必ず持つ（docs/README.md §3）
+            phase = cells[phase_column] if 0 <= phase_column < len(cells) else ""
+            if not PHASES.match(phase):
+                what = "フェーズの列がない" if phase_column < 0 else f"フェーズ「{phase}」を MVP・P2・P3 として読めない"
+                self.error(name, f"{identifier} の{what}", number)
+            elif phase.startswith("MVP"):
+                self.mvp.add(identifier)
+
 
     def oversized_range(self, match: "re.Match[str]") -> bool:
         """範囲（〜）の要素数が、同じ接頭辞の定義済み ID の数を超えるか（巨大な範囲を展開しないため）。"""
@@ -517,13 +545,16 @@ class Checker:
         for name, text in sorted(self.texts.items()):
             if not name.startswith(DETAILED + "/"):
                 continue
-            lines = text.splitlines()
-            # 読み込み（load）は改行を LF にそろえるので、元の改行を行ごとに読み直して書き直しに使う（CRLF の行を変えない）
-            with (self.root / name).open(encoding="utf-8", newline="") as handle:
-                raw = handle.read().splitlines(keepends=True)
+            # 読み込み（load）は改行を LF にそろえるので、元の改行を知るためにファイルを改行の変換なしで読み直す。
+            # 読み直した内容が load の時点の内容と違えば（その間に変更された）、書き直さずに再実行を案内する。
+            # 本文の行と改行は、どちらもこの読み直した内容から取る（古い内容の本文に新しい内容の改行を組み合わせない）
+            raw_text = self.read_raw(name)
+            if raw_text.replace("\r\n", "\n").replace("\r", "\n") != text:
+                self.error(name, "読み込んだ後に変更された。コード片を書き直さないので、--update-snippets を実行し直す")
+                continue
+            raw = raw_text.splitlines(keepends=True)
+            lines = [line.rstrip("\r\n") for line in raw]
             endings = [line[len(line.rstrip("\r\n")):] for line in raw]
-            if len(endings) != len(lines):
-                endings = ["\n"] * len(lines)  # 行の数え方が合わない場合は LF とみなす（通常は起きない）
             # フェンスの外の行の位置（フェンスの中の印は説明用の例であり、書き直さない）
             outside = {number - 1 for number, _, inside, _ in fenced_lines(text) if not inside}
             out: List[str] = []
@@ -561,11 +592,20 @@ class Checker:
             if target is None:
                 self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
                 continue
+            # 書き込む直前にも、読み直した内容から変わっていないことを確かめる（変わっていれば上書きしない）
+            if self.read_raw(name) != raw_text:
+                self.error(name, "書き直しの途中で変更された。上書きしないので、--update-snippets を実行し直す")
+                continue
             with target.open("w", encoding="utf-8", newline="") as handle:
                 handle.write("".join(line + ending for line, ending in zip(out, out_endings)))
             updated = "\n".join(out) + ("\n" if text.endswith("\n") else "")
             self.texts[name] = updated
             print(f"コード片を書き直した: {name}")
+
+    def read_raw(self, name: str) -> str:
+        """文書を改行の変換なしで読む。"""
+        with (self.root / name).open(encoding="utf-8", newline="") as handle:
+            return handle.read()
 
     def check_freshness(self) -> None:
         """技術情報の確認日が 3 か月を過ぎた文書を警告する（失敗にはしない）。"""

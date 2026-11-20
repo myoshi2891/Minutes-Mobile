@@ -30,7 +30,12 @@ done
 # 削除だけの送信は、検査するコミットがないので検査を起動しない
 if [ "$updates" -eq 0 ]; then exit 0; fi
 # 元の作業ツリーに未コミットの変更（追跡していないファイルを含む）があれば、送信するコミットと手元が食い違うので止める
-if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+# 状態を取得できない場合（git status の失敗）は、変更がないと見なさずに止める
+status_output=$(git status --porcelain --untracked-files=normal) || {
+  echo "NG: 作業ツリーの状態を取得できない（git status が失敗した）" >&2
+  exit 1
+}
+if [ -n "$status_output" ]; then
   echo "NG: 未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから push する" >&2
   exit 1
 fi
@@ -63,7 +68,19 @@ else
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
 fi
-# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）
-[ -e "$snapshot/.tools" ] || ln -s "$source_root/.tools" "$snapshot/.tools"
+# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）。
+# 既存のリンクの先が現在の元の作業ツリーと違う場合（リンク切れを含む）は張り直す。ロックを持ったまま行う
+tools_link="$snapshot/.tools"
+if [ -L "$tools_link" ]; then
+  if [ "$(readlink "$tools_link")" != "$source_root/.tools" ]; then
+    rm -f -- "$tools_link"
+    ln -s "$source_root/.tools" "$tools_link"
+  fi
+elif [ -e "$tools_link" ]; then
+  echo "NG: 専用の作業ツリーの .tools がシンボリックリンクでない（${tools_link}）。削除してから push し直す" >&2
+  exit 1
+else
+  ln -s "$source_root/.tools" "$tools_link"
+fi
 
 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
