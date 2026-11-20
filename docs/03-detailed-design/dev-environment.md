@@ -45,6 +45,7 @@ scripts/
   setup.sh                    初期設定（ツールの導入。--hooks でフックも有効にする）
   setup-tools.sh              開発ツールの導入と版の照合
   check.sh                    検査の本体（手順 0〜10）
+  gitleaks-history.sh         全履歴の秘密情報の検査（手順 3 と自己試験が同じコマンドを使う）
   check-project-settings.py   プロジェクト設定・Info.plist・entitlements の検査
   check-dependencies.py       依存の検査
   coverage-report.py          Package のカバレッジの集計
@@ -129,6 +130,8 @@ gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwi
 | 7 | 実行して版を表示させ、写しと一致することを確かめる |
 
 `--verify` を付けると、取得せずに手順 2・7 の照合だけを行う（`check.sh` の手順 0）。版を表示するコマンドが失敗した場合は、表示の内容によらず不一致として扱う（導入済みとしても再利用しない）。台帳には、台帳に現れたツールに加えて、検査が使う 4 種（`gh`・`swiftlint`・`swiftformat`・`gitleaks`）の行がこの Mac 向けに 1 つずつ要る（台帳から行を消しても見落とさない）。一部だけの台帳で試験するときは `--require "<名前 …>"` で期待する集合を明示する。`gh` も同じく照合するので、取得に使う `gh` が記録した版であることを、取得のたびと手順 0 で確かめる（取得したファイルの SHA-256 の照合は、`gh` の版の固定の代わりにしない）。版の文字列だけでなく導入記録の SHA-256 も照合するので、「版は同じで中身が違う配布ファイル」に写しを差し替えた場合も、導入し直すまで失敗する。
+
+導入（`--verify` なし）は、同じ導入先への並行の導入を `<導入先>/.install.lock` のディレクトリで排他する。ロックを作れない場合は理由を区別し、ロックのディレクトリがあるときだけ別の導入の実行中として待つ（最大 600 秒）。ないのに作れない場合（書き込めない導入先など）は、作れなかった直後に解放された場合に備えて 1 回だけ作り直し、それでも作れなければ `mkdir` のエラーを示して止める。ロックの位置にディレクトリ以外のもの（ファイル・シンボリックリンク）がある場合も待たずに止める（待っても解消しないものを 600 秒待たない）。
 
 <!-- file: scripts/setup-tools.sh -->
 
@@ -340,14 +343,25 @@ if [ "$MODE" = install ]; then
   }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  # 作れない理由を区別する。ロックのディレクトリがあるときだけ別の導入の実行中として待ち、
+  # ないのに作れない場合（書き込めない導入先など）や、ディレクトリ以外のものがある場合は待たずに止める
   waited=0
-  until mkdir "$LOCK" 2>/dev/null && LOCK_HELD=1; do
-    if [ "$waited" -ge 600 ]; then
-      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+  retried=""
+  until lock_error=$(mkdir "$LOCK" 2>&1); do
+    if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then
+      if [ "$waited" -ge 600 ]; then
+        fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      retried=""
+    elif [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ] && [ -z "$retried" ]; then
+      retried=1  # 失敗の直後に先の実行がロックを解放した場合に備え、待たずに 1 回だけ作り直す
+    else
+      fail "ロック（${LOCK}）を作れない: ${lock_error}"
     fi
-    sleep 1
-    waited=$((waited + 1))
   done
+  LOCK_HELD=1
   WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
 fi
 
@@ -439,7 +453,7 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 | 0 | 開発ツールの版 | `setup-tools.sh --verify` | `test-checks.py versions` | 通過（1 秒） |
 | 1 | 整形 | `swiftformat --lint`（書き換えない） | — | **失敗**: テンプレートの `ContentView.swift` の import の並び順（`sortImports`） |
 | 2 | 静的解析 | `swiftlint lint`（警告もエラー） | `test-lint-rules.py` | 通過（3 秒） |
-| 3 | 秘密情報 | `gitleaks git`（全履歴。検出した値は伏せる） | `test-checks.py gitleaks` | 通過（1 秒。67 コミット） |
+| 3 | 秘密情報 | `gitleaks-history.sh`（`gitleaks git` で全履歴。検出した値は伏せる） | `test-checks.py gitleaks` | 通過（1 秒。67 コミット） |
 | 4 | プロジェクト設定 | `check-project-settings.py` | `test-checks.py settings` | **失敗**: 違反 7 件（§12 の変更で解消する） |
 | 5 | 依存 | `check-dependencies.py` | `test-checks.py dependencies` | 通過（1 秒） |
 | 6 | ビルド | `xcodebuild build`（機種を特定しないシミュレータ向け） | — | 通過（15 秒） |
@@ -510,11 +524,10 @@ MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
 # 手順 7 がカバレッジを測った入力の記録（手順 8 が集計の前に現在の入力と照合する）。
 # 1 行目は入力（未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」）、
-# 2 行目は測った結果のカバレッジの JSON の SHA-256（手順 7 と 8 の間に別の測定で JSON が書き換えられていないこと）
+# 2 行目は測った結果のカバレッジの JSON（COVERAGE_JSON）の SHA-256（手順 7 と 8 の間に JSON が書き換えられていないこと）
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
-# gitleaks の履歴の検査で git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、
-# 既定の 2 つも書く。-m でマージのコミットの差分も検査する（マージの解決で足した行を見落とさない）
-GITLEAKS_LOG_OPTS="--all --full-history -m"
+# 手順 7 がその測定の JSON を写して置く場所（手順 8 はこれだけを集計する。swift test の共有の出力先は読まない）
+COVERAGE_JSON="$PACKAGE/.build/minutes-coverage.json"
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
@@ -523,6 +536,8 @@ STEPS=""
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
+COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
+COVERAGE_COPY=""  # 手順 8 が照合と集計に使う、カバレッジの記録の写し（一時ファイル）
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean] [--expect-head <SHA>]" >&2
@@ -675,7 +690,8 @@ step_3() {
     git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
     "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
   else
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config .gitleaks.toml --log-opts="$GITLEAKS_LOG_OPTS" .
+    # 全履歴の検査は、自己試験（test-checks.py gitleaks）と同じコマンドで行う
+    scripts/gitleaks-history.sh .
     scripts/test-checks.py gitleaks
   fi
 }
@@ -693,8 +709,10 @@ step_5() {
 # カバレッジを測った入力の識別子。未コミットの変更がなければ HEAD のコミット、あれば作業ツリー全体（追跡していない
 # ファイルを含む。無視するファイルは除く）のツリーのハッシュ。作業ツリーの記録はコミットの合格の記録と区別する
 coverage_input() {
-  local index tree
-  if [ -z "$(git status --porcelain --untracked-files=normal)" ]; then
+  local changes index tree
+  # git status の失敗を「変更なし」と取り違えない（$(…) を条件の中に書くと失敗が見えないので、先に取得して確かめる）
+  changes=$(git status --porcelain --untracked-files=normal) || return 1
+  if [ -z "$changes" ]; then
     printf 'commit %s\n' "$(git rev-parse HEAD)"
     return 0
   fi
@@ -736,39 +754,54 @@ step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest
-  rm -f -- "$COVERAGE_HEAD"
+  mkdir -p "$PACKAGE/.build"
+  rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
   # 測る前の入力を控え、測った後も同じ場合だけ記録する（測定中に変わった入力の結果をどちらにも帰属させない）
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
-  swift test --package-path "$PACKAGE" --enable-code-coverage
+  # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
+  # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
+  COVERAGE_SCRATCH=$(mktemp -d)
+  swift test --package-path "$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --enable-code-coverage
   [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
-  report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
+  report=$(swift test --package-path "$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない（swift test の結果を確かめる）"
-  digest=$(coverage_digest "$report") || fail "カバレッジの記録のハッシュを計算できない"
-  printf '%s\n%s\n' "$measured" "$digest" > "$COVERAGE_HEAD"
+  # この測定の JSON を記録の場所へ写す。同じディレクトリの一時ファイルに写してから rename で置き換え、
+  # 写したものからハッシュを計算する。JSON を置いてから入力とハッシュの記録を置く（記録があれば JSON もある）
+  cp -- "$report" "$COVERAGE_JSON.$$"
+  digest=$(coverage_digest "$COVERAGE_JSON.$$") || fail "カバレッジの記録のハッシュを計算できない"
+  mv -f -- "$COVERAGE_JSON.$$" "$COVERAGE_JSON"
+  printf '%s\n%s\n' "$measured" "$digest" > "$COVERAGE_HEAD.$$"
+  mv -f -- "$COVERAGE_HEAD.$$" "$COVERAGE_HEAD"
+  rm -rf -- "$COVERAGE_SCRATCH"
+  COVERAGE_SCRATCH=""
   destination=$(test_destination)
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination "$destination" \
     -skip-testing:"$UI_TESTS" test
 }
 
 step_8() {
-  local report measured current recorded_digest
+  # current は EXIT の trap が使う手順の番号なので、局所変数の名前に使わない（隠すと失敗した手順の表示が壊れる）
+  local measured present recorded_digest
   scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
-  report=$(swift test --package-path "$PACKAGE" --show-codecov-path)
-  [ -f "$report" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
   [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
   measured=$(sed -n 1p "$COVERAGE_HEAD")
   recorded_digest=$(sed -n 2p "$COVERAGE_HEAD")
-  current=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
-  [ "$measured" = "$current" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  present=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
+  [ "$measured" = "$present" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
+  # 照合と集計で同じバイト列を使う。記録を一時ファイルへ写し、写しのハッシュを照合してから同じ写しを集計する
+  # （照合の後に記録が書き換えられても、照合していない内容を集計しない）
+  [ -f "$COVERAGE_JSON" ] || fail "カバレッジの記録がない。手順 7 を先に実行する"
+  COVERAGE_COPY=$(mktemp)
+  cp -- "$COVERAGE_JSON" "$COVERAGE_COPY"
   # 手順 7 の後に別の測定で記録が書き換えられていれば、入力が同じでも集計しない
-  [ -n "$recorded_digest" ] && [ "$(coverage_digest "$report")" = "$recorded_digest" ] \
+  [ -n "$recorded_digest" ] && [ "$(coverage_digest "$COVERAGE_COPY")" = "$recorded_digest" ] \
     || fail "カバレッジの記録が手順 7 で測ったものと違う。手順 7 を実行し直す"
   case "$measured" in
     worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
   esac
-  scripts/coverage-report.py "$report" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
+  scripts/coverage-report.py "$COVERAGE_COPY" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
 
@@ -800,6 +833,8 @@ on_exit() {
   if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
   if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
   if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
+  if [ -n "$COVERAGE_SCRATCH" ]; then rm -rf -- "$COVERAGE_SCRATCH"; fi
+  if [ -n "$COVERAGE_COPY" ]; then rm -f -- "$COVERAGE_COPY"; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
@@ -871,9 +906,10 @@ fi
 
 - Package: `swift test --enable-code-coverage` が出す JSON のうち、`Packages/MinutesKit/Sources/` 配下のファイルだけを数える。合計にはテストコードと自動生成のファイルが混ざるためである（実測で、合計 59%・本体 50% と食い違った）。目標は 90%（TST-CI-07）で、初期は警告だけを出す。
 - アプリ側（全体 70%）の集計は、アプリのテストターゲットを足す作業で実装する。それまで手順 8 は「未実装」の警告を出す。
-- 手順 7 は、カバレッジを測った入力を `Packages/MinutesKit/.build/minutes-coverage-head` に記録する。未コミットの変更がなければ `commit <HEAD>`、あれば `worktree <ツリーのハッシュ>`（一時のインデックスに作業ツリーを写して `git write-tree` で作る。本来のインデックスは変えない）とし、未コミットの測定にコミットの SHA を付けない。測定の前後で入力が変わった場合は記録しない。手順 8 は集計の前に現在の入力と照合し、記録がない・違う入力で測った場合は失敗する（古い記録を集計して合格にしない）。`worktree` の記録はコミットの記録として扱わない旨を表示する。 あわせて、測った結果のカバレッジの JSON の SHA-256 を 2 行目に記録し、手順 8 は入力に加えてこの SHA-256 も照合する（手順 7 の後に別の `swift test` で JSON が書き換えられた場合に、手順 7 の測定として集計しない）。この照合は Package を作る作業単位 2 で手順 7・8 を通すときに確かめる（現時点では未試験）。
+- 手順 7 は、測定ごとに専用の出力先（`swift test --scratch-path` に渡す一時ディレクトリ）で `swift test --enable-code-coverage` を実行し、その出力先の JSON（`--show-codecov-path` も同じ `--scratch-path` で求める）だけを `Packages/MinutesKit/.build/minutes-coverage.json` に写す。同じ Package を対象にした別の `swift test` が共有の出力先（`.build`）の JSON を上書きしても、手順 7 の記録に混ざらない（毎回ビルドし直すので時間はかかる）。写しは同じディレクトリの一時ファイルから rename で置き、写しを置いてから入力とハッシュの記録を置く。`--scratch-path` を渡すと `--show-codecov-path` もその出力先の中の JSON を返し、Package の `.build` には何も書かないことは、2026-11-20 に一時的に置いた Package で確かめた。
+- 手順 7 は、カバレッジを測った入力を `Packages/MinutesKit/.build/minutes-coverage-head` に記録する。未コミットの変更がなければ `commit <HEAD>`、あれば `worktree <ツリーのハッシュ>`（一時のインデックスに作業ツリーを写して `git write-tree` で作る。本来のインデックスは変えない）とし、未コミットの測定にコミットの SHA を付けない。測定の前後で入力が変わった場合は記録しない。手順 8 は集計の前に現在の入力と照合し、記録がない・違う入力で測った場合は失敗する（古い記録を集計して合格にしない）。`worktree` の記録はコミットの記録として扱わない旨を表示する。 あわせて、測った結果のカバレッジの JSON の SHA-256 を 2 行目に記録し、手順 8 は入力に加えてこの SHA-256 も照合する（手順 7 の後に JSON が書き換えられた場合に、手順 7 の測定として集計しない）。手順 8 は記録の JSON を一時ファイルへ写し、写しの SHA-256 を照合してから**同じ写し**を `coverage-report.py` に渡す（照合の後に記録が書き換えられても、照合していない内容を集計しない）。写しは EXIT の trap で消す。照合に失敗した場合・記録の JSON がない場合は集計せずに失敗する。この照合は、2026-11-20 に一時的に置いた Package で手順 7（`swift test` の部分）と手順 8 を通し、記録の JSON を書き換えると手順 8 が失敗し、消すと「手順 7 を先に実行する」で失敗することを確かめた（Package を作る作業単位 2 で本物の Package でも確かめる）。
 - `coverage-report.py` は、各ファイルの行数（`count`・`covered`）が整数（真偽値を除く）で `0 <= covered <= count` であることを確かめ、不正な記録は終了コード 2 で失敗する（手順 8 は `test-checks.py coverage` で自己試験してから集計する）。
-- 未コミットの変更の判定（`git status --porcelain`）には `--untracked-files=normal` を付け、`status.showUntrackedFiles` の設定によらず追跡していないファイルを数える。
+- 未コミットの変更の判定（`git status --porcelain`）には `--untracked-files=normal` を付け、`status.showUntrackedFiles` の設定によらず追跡していないファイルを数える。`coverage_input` は `git status` の出力を先に変数へ取得し、`git status` が失敗したら入力を確定せずに失敗を返す（`$(…)` を条件の中に書くと、失敗を「変更なし」と取り違えて HEAD の記録にするため）。
 
 ---
 
@@ -1371,7 +1407,7 @@ useDefault = true
 - SwiftFormat は `--lint` で確認だけを行い、検査の中でファイルを書き換えない。直すときは開発者が `.tools/bin/swiftformat .` を実行する。
 - gitleaks は既定の規則をそのまま使い、除外の指定を置かない。`--redact` を付け、検出した値そのものを出力に残さない（出力を PR に貼っても漏れない）。
 - gitleaks の全体の検査はコミット済みの履歴を対象にする。未コミットの変更は、コミット前のフック（ステージした差分）が受け持つ。
-- 履歴の検査には `--log-opts="--all --full-history -m"` を渡す（`check.sh` の `GITLEAKS_LOG_OPTS`）。既定の `git log` はマージのコミットの差分を出さず、マージの解決で足した行を見落とす。`--log-opts` は既定の指定を置き換えるので、既定の `--all --full-history` も書く。自己試験は、通常のコミットとマージのコミットだけで足した行の両方が検出され、指定がなければマージの行を見落とすことを確かめる。
+- 履歴の検査には `--log-opts="--all --full-history -m"` を渡す（`scripts/gitleaks-history.sh` の `GITLEAKS_LOG_OPTS`）。既定の `git log` はマージのコミットの差分を出さず、マージの解決で足した行を見落とす。`--log-opts` は既定の指定を置き換えるので、既定の `--all --full-history` も書く。手順 3 と自己試験は同じ `scripts/gitleaks-history.sh` を実行する（指定の文字列があることだけを確かめると、手順 3 が `--log-opts` を渡さなくなっても自己試験が通るため）。自己試験は、このコマンドで通常のコミットとマージのコミットだけで足した行の両方が検出され、対照として `gitleaks` を指定なしで直接実行するとマージの行を見落とすことを確かめる。`check.sh` の手順 3 がこのコマンドを呼んでいることも確かめる。
 
 ---
 
@@ -1391,7 +1427,7 @@ useDefault = true
 - 条件付きの設定（`SWIFT_VERSION[config=Debug]` など）は、構成（`configurations` の各要素）ごとに効く値を求めて検査する。効く値は、ターゲットの構成の条件が一致する書き方 → ターゲットの条件のない書き方 → プロジェクトの構成の条件が一致する書き方 → プロジェクトの条件のない書き方、の順で最初に見つかったもの。ターゲットにある書き方だけを見ると、ターゲットに Debug だけ、プロジェクトに Release だけがある場合に Release の値を見落とすためである。構成以外の条件（`sdk=`・`arch=`）の書き方は、そのビルドで効きうるのですべて検査する。SDK を指定して判定する場合（下の利用目的）は、`sdk=` の条件を版つきの SDK 名（`xcrun --sdk <SDK> --show-sdk-version` から作る `iphoneos27.2` など。Xcode が照合する名前）と照合し、空の条件はどの SDK にも当たらないとする。版つきの名前を取得できない場合は、条件を無視せず読めないもの（終了コード 2）とする。どの段にも値がない構成は「設定されていない」とする。
 - 空でない値が要る鍵（マイクの利用目的）は、ビルド設定の値ではなく、**各構成で最終的に生成される Info.plist** で判定する。`GENERATE_INFOPLIST_FILE` が `YES` の構成では `INFOPLIST_KEY_…` と `INFOPLIST_FILE` の参照先の両方を、`NO`（設定がない場合も `NO`）の構成では参照先だけを見る（`NO` では `INFOPLIST_KEY_…` が使われないため）。判定は構成と SDK（`iphoneos`・`iphonesimulator`）の組ごとに行い、`sdk=` の条件付きの書き方は条件に合う SDK でだけ効くとする。ビルド設定の値が一部の SDK の条件付きだけにある場合（例: `INFOPLIST_KEY_NSMicrophoneUsageDescription[sdk=iphonesimulator*]` だけ）、条件に合わない SDK では参照先の Info.plist が鍵を持たなければ欠落とする（`resolve` が返す「決まらない組」を捨てずに使う）。`GENERATE_INFOPLIST_FILE` が `arch=` などの条件付きだけで決まらない組では、生成しない場合も起こりうるとして参照先の Info.plist も求める。`INFOPLIST_FILE` の参照先が条件付きだけで決まらない組では、参照先で補ったことにしない（別の arch の参照先で補わない）。どこにも鍵がない組は欠落として報告する（例: 構成 Debug（iphoneos））。どちらが優先されるかに頼らないよう、効きうる値は**すべて**空でないこと（条件のない値に説明文があっても、Release の条件付きの値や参照先の値が空なら違反）。
 - 空でない値が要る鍵で、効きうる候補（ビルド設定の値・参照先の plist の値）のうち 1 つでも変数を展開できないものがあれば、ほかの候補で補えても違反とする（展開できない候補を、別の候補の合格で見逃さない）。
-- 有効にすると違反になる鍵（`UIFileSharingEnabled` など）の値が変数（`$(NAME)`）を含む場合は、その値を使うターゲットの各構成・各 SDK（`iphoneos`・`iphonesimulator`）のビルド設定で展開してから判定する。プロジェクトの設定はすべてのターゲット、`INFOPLIST_FILE` の参照先はそれを参照するターゲットで展開する。1 つでも有効な値に展開されれば違反、展開できなければ（どのターゲットも参照しない plist の値を含む）無効とみなさず違反として報告する。
+- 有効にすると違反になる鍵（`UIFileSharingEnabled` など）の値が変数（`$(NAME)`）を含む場合は、その値を使うターゲットの各構成・各 SDK（`iphoneos`・`iphonesimulator`）のビルド設定で展開してから判定する。プロジェクトの設定はすべてのターゲット、`INFOPLIST_FILE` の参照先はそれを参照するターゲットの、参照する構成・SDK のビルド設定だけで展開する（一部の構成だけが参照する plist を、参照しない構成の値で判定しない）。`GENERATE_INFOPLIST_FILE` の値も同じく構成・SDK ごとに展開してから生成の有無を判定し、展開できなければ生成する・しないの両方の経路を検査する。1 つでも有効な値に展開されれば違反、展開できなければ（どのターゲットも参照しない plist の値を含む）無効とみなさず違反として報告する。
 - **読めないものを合格にしない。** 形式が違う・壊れているファイルは、終了コード 2 で失敗する。
 
 ### 8.2 規則
@@ -1487,7 +1523,7 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 | `ledger` | 台帳の該当箇所 |
 | `ownerDecision` | `allowedLicenses` にないライセンスの場合に必須。オーナーの決定（`UD-nn`） |
 
-ローカルのバイナリ（`.binaryTarget(path:)`）を承認する要素は、`url` の代わりに `path`（リポジトリの起点からの相対パス。`Package.swift` のディレクトリと宣言の `path:` をつないで正規化したものと照合する）と `sha256`（承認したときの内容のハッシュ。ファイルはその内容の SHA-256、ディレクトリは配下の項目を相対パスの順に「種別・相対パス・内容の SHA-256（シンボリックリンクはたどらずにリンクの先の文字列）」として連ねた SHA-256。ビルドはリンクをたどるので、成果物の外を指すリンク（絶対パス、またはたどった先が成果物の外）は読めないものとして終了コード 2 で失敗する。`check-dependencies.py` の `content_digest`）を持ち、ほかの項目（`identity`・`version`・`license`・`approvedOn`・`ledger`、必要なら `ownerDecision`）は同じく必須とする。リモートのバイナリ（`.binaryTarget(url:checksum:)`）を承認する要素は、`url` に加えて `checksum`（承認した配布物の SHA-256）を持つ。`sha256`・`checksum` は 64 桁の小文字の 16 進数とし、形式が違えば終了コード 2。`url` と `path` の両方を持つ・どちらも持たない要素は、読めないものとして終了コード 2 で失敗する。
+ローカルのバイナリ（`.binaryTarget(path:)`）を承認する要素は、`url` の代わりに `path`（リポジトリの起点からの相対パス。`Package.swift` のディレクトリと宣言の `path:` をつないで正規化したものと照合する。前後の空白は除かず、前後に空白のある `path:` は照合せずに拒否する。依存のファイルの走査で読めないディレクトリがあれば終了コード 2）と `sha256`（承認したときの内容のハッシュ。ファイルはその内容の SHA-256、ディレクトリは配下の項目を相対パスの順に「種別・相対パス・内容の SHA-256（シンボリックリンクはたどらずにリンクの先の文字列）」として連ねた SHA-256。ビルドはリンクをたどるので、成果物の外を指すリンク（絶対パス、またはたどった先が成果物の外）は読めないものとして終了コード 2 で失敗する。`check-dependencies.py` の `content_digest`）を持ち、ほかの項目（`identity`・`version`・`license`・`approvedOn`・`ledger`、必要なら `ownerDecision`）は同じく必須とする。リモートのバイナリ（`.binaryTarget(url:checksum:)`）を承認する要素は、`url` に加えて `checksum`（承認した配布物の SHA-256）を持つ。`sha256`・`checksum` は 64 桁の小文字の 16 進数とし、形式が違えば終了コード 2。`url` と `path` の両方を持つ・どちらも持たない要素は、読めないものとして終了コード 2 で失敗する。
 
 ### 9.2 検査（`scripts/check-dependencies.py`）
 
@@ -1508,13 +1544,13 @@ MVP では承認済みの依存は 0 件である（BD-ARC-07）。依存を足�
 
 | 検査 | 内容 |
 | --- | --- |
-| ID の定義 | 定義文書の表から ID を集める。定義の重複を失敗にする |
+| ID の定義 | 定義文書の表から ID を集める（データ行の先頭の列を、列の区切りの前後の空白を除いてから判定する。空白のない表も読む）。定義の重複を失敗にする |
 | ID の参照 | すべての文書（`docs/`・`README.md`・`CLAUDE.md`）が参照する ID が定義されている。`SEC-SUP-01〜05`・`NFR-MNT-01・03`・`SEC-NET-03 / 04`（スラッシュ区切り。「/」の前後の空白は 1 つまで）・`FR-REC 群` のような省略した書き方も展開して調べる。範囲（〜）の要素数が同じ接頭辞の定義済みの ID の数を超える書き方は展開せず、不正として報告する（巨大な範囲の展開を防ぐ） |
 | フェーズ | 定義文書の FR / NFR / SEC の行は、フェーズの列を持ち、値が MVP・P2・P3 のいずれかで始まる。列がない・読めない行は行番号つきで失敗する |
 | MVP の網羅 | フェーズが MVP の FR / NFR / SEC が、基本設計の各文書（索引の README.md を除く）の「満たす要件」（節・小節の見出し（`##`・`###`）の直後の最初の本文行にある「満たす要件:」と、文書の冒頭（最初の `##` より前）の表の「\| 満たす要件 ID \|」の行だけ。節の後半にある同名の行や「満たす要件の例」などの説明文は数えない）の、「／」より前（決定・関連などの参照を除く）のどこかに現れる。索引は「SEC 全般」や群の表記でまとめて挙げるため、判定に含めると欠落を隠す |
 | 書式 | 相対リンクの先がある（リンク先を山括弧で囲んだ書き方は、山括弧を除いて解決する。リンク先の後ろのタイトル（`"…"`・`'…'`・`(…)`）は除いてリンク先だけを解決する）。表は、見出しの行の直後に区切りの行（`\| --- \|`）があり、見出しと区切りの行の列の数が同じものだけを表として数える（列はエスケープした `\|` で区切らない）（申し送りの解決と要件 ID ↔ テストの対応表に適用する）。コードフェンスに言語の指定がある。1 文書が 2,000 行未満である。フェンスは開始行の文字（バッククォートかチルダ）と長さを覚え、同じ文字が開始以上の長さで並び、その後が空白だけの行でだけ閉じる（長いフェンスの中の短いフェンスで切り替わらない）。開始・終了とも字下げは空白 0〜3 個に限り、4 個以上の字下げの行はコードの本文として扱う（CommonMark）。この判定は ID の走査・節の区切り・コード片の照合と書き直しで共通に使う |
 | 節の構成 | 基本設計・詳細設計（配下のディレクトリの文書を含む）の各節の冒頭に「満たす要件:」がある（コードブロックは節の冒頭を終わらせるので、コードブロックの後ろの「満たす要件:」は冒頭の行として数えず、MVP の網羅にも数えない）（「制約:」だけの行は認めない。制約は「／」の後に書く）。「満たす要件:」の後（「／」の前まで）には、定義済みの要件 ID（FR・NFR・SEC・TST・CON・INV）、要件の群、「SEC 全般」、満たす要件がないことを示す「—」のいずれかがある。各文書に「セキュリティ」節と「テスト観点」節がある。詳細設計には「申し送り」の節と「要件 ID ↔ テスト」の節もあり、後者には先頭の列に定義済みの要件 ID を個別に持ち（群の表記・「SEC 全般」だけの行は数えない）、検査・試験の列（先頭以外で、見出しに「試験」「検査」「テスト」を含む列）が空でない対応表の行が 1 行以上ある（「実行する場所」「状態」などほかの列の値だけでは数えない） |
-| 申し送りの解決 | 対応する基本設計（詳細設計からの相対パスが同じ文書）の「詳細設計への申し送り」の各項目が、詳細設計の「申し送り」の節の表の先頭の列に、項目名（前後の空白と末尾の「。」を除く）で一度ずつ現れる。欠落・重複・基本設計にない行を失敗にする（行数だけを比べると、重複した行が欠落を埋めて合格になるため） |
+| 申し送りの解決 | 対応する基本設計（詳細設計からの相対パスが同じ文書）の「詳細設計への申し送り」の各項目（「- 」の箇条書きと「1. 」の番号付きの行）が、詳細設計の「申し送り」の節の表の先頭の列に、項目名（前後の空白と末尾の「。」を除く）で一度ずつ現れる。欠落・重複・基本設計にない行を失敗にする（行数だけを比べると、重複した行が欠落を埋めて合格になるため） |
 | コード片 | フェンスの外にある印の直後のコード片が実ファイルと一致する（下）。フェンスの中の印は説明用の例として、照合にも書き直しにも使わない。字下げしたフェンスは、本文の行から開始行の字下げの分を除いて照合し、書き直しでは同じ字下げを付ける。書き直しはコード片の本文だけを置き換え、ほかの行の改行（CRLF など）を変えない。元のファイルは、シンボリックリンクを解決した後も `--root` の中にあるものに限る（外を指す印は不整合として報告し、書き直さない） |
 | 確認日 | 確認日から 3 か月を過ぎた記述のある文書を警告する（失敗にはしない） |
 | 読むもの | `--root` の下に `docs/` と定義文書（要件・SEC・TST・COST・`docs/README.md`）がなければ、何も調べずに通らないよう終了コード 2 で失敗する |
@@ -1783,12 +1819,12 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
 | 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 23 規則・60 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定は、通常は作業ツリーを走査して Git が無視するものも含めて列挙し（`.git` と、SwiftLint が解析しない excluded の場所は飛ばす。`tools/lint-fixtures` は試験で明示して解析するので走査する）、`--staged`（`check.sh --staged` が渡す）ではインデックスにあるものだけを列挙する。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。`custom_rules:` の行と規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする |
-| 設定の検査 | `scripts/test-checks.py settings` | 106 件 | 合格する設定で通り、項目ごとの違反で失敗する。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
-| 依存の検査 | `scripts/test-checks.py dependencies` | 102 件 | 除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
-| 版の照合 | `scripts/test-checks.py versions` | 19 件 | 実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンク・版のディレクトリの中の実行ファイルがシンボリックリンク（通常のファイルでない）で失敗する |
-| 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 5 件 | 実行時に組み立てた偽の鍵を検出する。履歴の検査の指定で、通常のコミットとマージのコミットだけで足した行の両方を検出する |
+| 設定の検査 | `scripts/test-checks.py settings` | 111 件 | 合格する設定で通り、項目ごとの違反で失敗する。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。`GENERATE_INFOPLIST_FILE` の変数（展開できない場合は生成する・しないの両方を検査する）と、一部の構成だけが参照する plist の変数をその構成・SDK の値だけで展開すること（参照しない構成の値で違反にしない）も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
+| 依存の検査 | `scripts/test-checks.py dependencies` | 105 件 | 読めないディレクトリ（走査の失敗）で終了コード 2、依存のファイルがなければ通ること、前後に空白のあるローカルのバイナリのパスを拒否することも確かめる。除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
+| 版の照合 | `scripts/test-checks.py versions` | 21 件 | 書き込めない導入先・ロックの位置のファイルではロックを待たずに止まることも確かめる。実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンク・版のディレクトリの中の実行ファイルがシンボリックリンク（通常のファイルでない）で失敗する |
+| 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 5 件 | 実行時に組み立てた偽の鍵を検出する。手順 3 と同じ `gitleaks-history.sh` で、通常のコミットとマージのコミットだけで足した行の両方を検出する |
 | カバレッジの集計 | `scripts/test-checks.py coverage` | 7 件 | 目標以上・未満（警告）の集計と、不正な行数の記録（整数でない・真偽値・範囲外）で終了コード 2 |
-| 文書の検査 | `scripts/test-checks.py docs` | 95 件 | 節の後半の「満たす要件:」を網羅に数えないこと（小節の冒頭は数える）・フェンスをまたいだ行を 1 つの表にしないこと・`--update-snippets` が末尾の改行だけでは書き直さず、`--root` の外の文書に書き込まず、書き直しを保存できない（一時ファイルを作れない）ときに元の文書を残すことも確かめる。対応表の行は、検査・試験の列が空なら「状態」などほかの列に値があっても数えないことも確かめる。山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
+| 文書の検査 | `scripts/test-checks.py docs` | 101 件 | 列の区切りの前後に空白のない表の定義（要件・設計決定・重複）と、番号付き（`1. `）の申し送りの項目の照合（解決の行の欠落・解決の表がない場合）も確かめる。節の後半の「満たす要件:」を網羅に数えないこと（小節の冒頭は数える）・フェンスをまたいだ行を 1 つの表にしないこと・`--update-snippets` が末尾の改行だけでは書き直さず、`--root` の外の文書に書き込まず、書き直しを保存できない（一時ファイルを作れない）ときに元の文書を残すことも確かめる。対応表の行は、検査・試験の列が空なら「状態」などほかの列に値があっても数えないことも確かめる。山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2 |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
@@ -1808,6 +1844,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | 2026-11-19 のレビュー対応の追加分（`no_empty_catch`・`no_direct_sleep_timer` の正規表現、`setup-tools.sh` のリンクの先の照合、`check-dependencies.py` の内容のハッシュと checksum の照合・CR の行コメント、`check-project-settings.py`・`xcproj.py`・`coverage-report.py`・`verify-docs.py` を変更前の版に戻す） | 8 | 追加した試験のうち、それぞれ検出できなかった入力の試験が失敗した |
 | 2026-11-19 のレビュー対応の追加分（2 回目。`xcproj.py` の入れ子の深さ、`setup.sh` の空文字列の引数、`check-dependencies.py` のバッククォートの宣言・`.package(path:)` の参照先・成果物の外を指すリンク、`check-project-settings.py` の候補の展開の失敗・有効にすると違反になる鍵の変数の展開、`test-lint-rules.py` の `allowed/` の対照、`verify-docs.py` の表の列の数・節の冒頭のコードブロック・タイトル付きのリンク・CRLF の書き直し） | 13 | 追加した試験は、変更前の版ではそれぞれ失敗した（`xcproj.py` は Xcode 同梱の python3（3.9）でだけ再現する。3.14 の `json` は深い入れ子でも RecursionError にならない）。`allowed/` の対照は、例外の場所のファイルを違反のない内容に置き換えると失敗することを確かめた。エスケープした `\|` を含む見出しの表の試験は、列の数の照合で誤って表から外さないことの回帰の確認で、変更前から通る。プッシュ前のフックの専用の作業ツリーは、複製したリポジトリで作成・再利用（追跡していないファイルの除去）・未コミットの変更での停止を確かめた。`check.sh` のカバレッジの記録のハッシュは未試験（手順 7・8 は Package の作成後） |
 | 2026-11-20 のレビュー対応の追加分（`no_url_content_loading` の型の注釈の `NS(Mutable)…` を外す、`verify-docs.py` を変更前の版に戻す〈対応表の列・書き直しの保存〉、`setup-tools.sh` の実行ファイルが通常のファイルであることの照合を外す） | 3 | 追加した試験は、それぞれ失敗した（違反例の 9・10 行目が検出されない、対応表と書けないディレクトリの 4 件、版のディレクトリの実行ファイルのリンク）。`setup-tools.sh` のロックは、他の実行のロックを置いた状態でロック待ちの間に TERM を送り、そのロックが残ることを手で確かめた |
+| 2026-11-20 のレビュー対応の追加分（2 回目。`check-project-settings.py`・`check-dependencies.py`・`verify-docs.py`・`setup-tools.sh` を変更前の版に戻す。`gitleaks-history.sh` から `--log-opts` を外す） | 5 | 追加した試験は、変更前の版ではそれぞれ失敗した（設定 2 件、依存 2 件、文書 3 件、`--log-opts` を外すと手順 3 のコマンドがマージの行を見落とす）。`setup-tools.sh` の変更前の版は、書き込めない導入先でロックを 600 秒待ち続けた。`check.sh` の手順 7・8 は一時的に置いた Package で通し、記録の JSON の書き換えと削除で手順 8 が失敗することを確かめた（その際、`step_8` の局所変数 `current` が EXIT の trap の手順番号を隠して失敗の表示が壊れることを見つけ、名前を変えた） |
 | `check.sh` を変更前の版に戻し、`print` を含む内容をステージして作業ツリーだけを直す | 1 | 変更前は手順 2 が通過し、変更後は失敗した（作業ツリーではなくインデックスを検査している） |
 | 文書の検査（未定義の ID を報告しない、範囲の省略を展開しない、MVP の網羅を調べない、コード片の不一致を報告しない など） | 15 | すべて失敗した |
 | 2026-11-17 の追加分（`no_empty_catch` の条件の文字列の読み飛ばしを外す。依存のコメントの除去を呼ばない・文字列を扱わない・入れ子を数えない・補間を追わない・補間の中の文字列を読み飛ばさない。設定の未設定の生成を有効と見なす・生成しない構成でビルド設定を数える・ビルド設定や参照先の Info.plist を見ない・`CODE_SIGN_ENTITLEMENTS` を見ない。文書の申し送りの重複や余分な行を見ない・照合や書き直しでフェンスを無視する・入れ子の文書を見ない） | 16 | すべて失敗した |
