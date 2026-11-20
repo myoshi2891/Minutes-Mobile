@@ -304,7 +304,18 @@ PENDING_BACKUP=""
 if [ "$MODE" = install ]; then
   # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
   mkdir -p "$DEST"
-  WORK=$(mktemp -d "$DEST/.work.XXXXXX")
+  # 同じ導入先への並行の導入を防ぐ。キャッシュの判定から退避・公開・リンクの更新までをロックの中で行う。
+  # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）
+  LOCK="$DEST/.install.lock"
+  waited=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    if [ "$waited" -ge 600 ]; then
+      fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || { rmdir "$LOCK"; fail "作業場所を作れない（${DEST}）"; }
   cleanup() {
     local status=$?
     # 置き換えの途中で終わった場合: 新しい導入がまだ置かれていなければ退避した旧い導入を戻し、
@@ -317,6 +328,7 @@ if [ "$MODE" = install ]; then
       fi
     fi
     rm -rf -- "${WORK:?}"
+    rmdir "$LOCK" 2>/dev/null || true
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
     exit "$status"
   }
@@ -894,7 +906,12 @@ done
 # 削除だけの送信は、検査するコミットがないので検査を起動しない
 if [ "$updates" -eq 0 ]; then exit 0; fi
 # 元の作業ツリーに未コミットの変更（追跡していないファイルを含む）があれば、送信するコミットと手元が食い違うので止める
-if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+# 状態を取得できない場合（git status の失敗）は、変更がないと見なさずに止める
+status_output=$(git status --porcelain --untracked-files=normal) || {
+  echo "NG: 作業ツリーの状態を取得できない（git status が失敗した）" >&2
+  exit 1
+}
+if [ -n "$status_output" ]; then
   echo "NG: 未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから push する" >&2
   exit 1
 fi
@@ -927,8 +944,20 @@ else
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
 fi
-# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）
-[ -e "$snapshot/.tools" ] || ln -s "$source_root/.tools" "$snapshot/.tools"
+# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）。
+# 既存のリンクの先が現在の元の作業ツリーと違う場合（リンク切れを含む）は張り直す。ロックを持ったまま行う
+tools_link="$snapshot/.tools"
+if [ -L "$tools_link" ]; then
+  if [ "$(readlink "$tools_link")" != "$source_root/.tools" ]; then
+    rm -f -- "$tools_link"
+    ln -s "$source_root/.tools" "$tools_link"
+  fi
+elif [ -e "$tools_link" ]; then
+  echo "NG: 専用の作業ツリーの .tools がシンボリックリンクでない（${tools_link}）。削除してから push し直す" >&2
+  exit 1
+else
+  ln -s "$source_root/.tools" "$tools_link"
+fi
 
 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
 ```
@@ -981,7 +1010,7 @@ fi
 
 ### 6.1 基本設計の表との対応
 
-基本設計 §7 の 14 行を、SwiftLint の組み込みの規則 3 つと独自ルール 19 個で実現する。
+基本設計 §7 の 14 行を、SwiftLint の組み込みの規則 3 つと独自ルール 19 個で実現する。基本設計の表にない規則として、`no_url_content_loading` を足す（下の「基本設計の文言より広げた点」）。
 
 | 基本設計 §7 の行 | 規則 | 例外を認める場所 |
 | --- | --- | --- |
@@ -1012,6 +1041,7 @@ fi
 | `no_direct_clock` | `ContinuousClock`・`SuspendingClock`・`CFAbsoluteTimeGetCurrent`・`DispatchTime.now`・`systemUptime` など | 単調時計も注入の対象である（TST-GEN-01） |
 | `no_direct_sleep_timer` | `Thread.sleep`・`sleep(`・`Timer.scheduledTimer`・`asyncAfter` など | タイマーも注入の対象である（TST-GEN-01） |
 | `no_spotlight_user_activity` | `.userActivity(`・`.onContinueUserActivity(` | SwiftUI から `NSUserActivity` を提供する経路になる（SEC-PLT-02） |
+| `no_url_content_loading`（新しい規則。例外の場所なし） | URL を受け取る読み込みの初期化子（`NSData(contentsOf:)`・`Data(contentsOf:)`・`String(contentsOf:)`・`NSDictionary(contentsOf:)`・`XMLParser(contentsOf:)` など。型の注釈つきの `.init(contentsOf:)` を含む） | `https://` の URL を渡すと通信する経路になり、`no_network_api` では検出できない（SEC-NET-01、TST-SEC-01）。ローカルのファイルはパスを受け取る API（`contentsOfFile:`・`FileManager.contents(atPath:)`・`FileHandle`）で読む。`append(contentsOf:)` などのコレクションの操作は対象外 |
 
 ### 6.2 設定（`.swiftlint.yml`）
 
@@ -1086,6 +1116,16 @@ custom_rules:
     regex: '\bimport\s+(\w+\s+)?(Network|CFNetwork)\b'
     match_kinds: *code
     message: "Network / CFNetwork を import しない（SEC-NET-01）"
+    severity: error
+
+  # URL を受け取る読み込みの初期化子は、https:// などのリモートの URL も読めるので使わない（通信の経路になる）。
+  # ローカルのファイルは、パスを受け取る API（contentsOfFile:・FileManager.contents(atPath:)・FileHandle）で読む。
+  # append(contentsOf:) などコレクションの操作は対象外にするため、型の名前を付けた呼び出しと、型の注釈つきの .init だけを検出する
+  no_url_content_loading:
+    name: "URL を受け取る読み込みの禁止"
+    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS)?(?:Data|String|XMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:'
+    match_kinds: *code
+    message: "URL を受け取る読み込みはリモートの URL も読める。ローカルのファイルはパスを受け取る API で読む（SEC-NET-01）"
     severity: error
 
   # 「.」の後に空白を挟むメンバーの呼び出し（store . connect()）は、有界の後読みで除く（ICU は可変長の後読みを持たない）
@@ -1722,7 +1762,7 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 
 | 対象 | 試験 | 件数 | 方法 |
 | --- | --- | --- | --- |
-| 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 22 規則・58 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定は、通常は作業ツリーを走査して Git が無視するものも含めて列挙し（`.git` と、SwiftLint が解析しない excluded の場所は飛ばす。`tools/lint-fixtures` は試験で明示して解析するので走査する）、`--staged`（`check.sh --staged` が渡す）ではインデックスにあるものだけを列挙する。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする |
+| 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 23 規則・60 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定は、通常は作業ツリーを走査して Git が無視するものも含めて列挙し（`.git` と、SwiftLint が解析しない excluded の場所は飛ばす。`tools/lint-fixtures` は試験で明示して解析するので走査する）、`--staged`（`check.sh --staged` が渡す）ではインデックスにあるものだけを列挙する。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする |
 | 設定の検査 | `scripts/test-checks.py settings` | 92 件 | 合格する設定で通り、項目ごとの違反で失敗する。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせで、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2 |
 | 依存の検査 | `scripts/test-checks.py dependencies` | 86 件 | 除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない |
 | 版の照合 | `scripts/test-checks.py versions` | 16 件 | 実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンクで失敗する |
