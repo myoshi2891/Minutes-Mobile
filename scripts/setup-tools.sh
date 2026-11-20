@@ -169,6 +169,11 @@ install_tool() {
     PENDING_BACKUP=""
   fi
   mkdir -p "$DEST/bin"
+  # 公開するリンクの位置に実体のディレクトリがあると、ln -sfn はその中にリンクを作り、位置のリンクを更新しない。
+  # 既存のシンボリックリンクは更新してよい
+  if [ -d "$DEST/bin/$name" ] && [ ! -L "$DEST/bin/$name" ]; then
+    fail "$DEST/bin/$name がディレクトリ（シンボリックリンクでない）。削除してから実行し直す"
+  fi
   ln -sfn "../$name/$version/$binary" "$DEST/bin/$name"
 }
 

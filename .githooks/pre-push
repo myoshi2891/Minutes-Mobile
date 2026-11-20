@@ -40,11 +40,23 @@ if [ -n "$status_output" ]; then
   exit 1
 fi
 
-source_root=$(git rev-parse --show-toplevel)
+source_root=$(cd -P "$(git rev-parse --show-toplevel)" && pwd)  # 実体のパス（シンボリックリンクを解決したもの）
 common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
 base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
+# 置き場所を作る前に実体のパスへ解決する（まだない部分を含んでよい。git worktree list が示す実体のパスとも比べる）。
+# 元のリポジトリの中（リンクを経由して指す場合を含む）は拒否する。中に置くと、SwiftFormat などが親のディレクトリの
+# 設定ファイルも読み、元の作業ツリーの設定が混ざるため。拒否してから作る（中にディレクトリを残さない）
+base=$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$base") || {
+  echo "NG: 専用の作業ツリーの置き場所を解決できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
+  exit 1
+}
+case "$base/" in
+  "$source_root/"*)
+    echo "NG: 専用の作業ツリーの置き場所（${base}）が元のリポジトリ（${source_root}）の中にある。リポジトリの外を指定する" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$base"
-base=$(cd -P "$base" && pwd)  # git worktree list が示す実体のパスと比べる
 key=$(printf '%s' "$common_dir" | shasum -a 256)
 snapshot="$base/${key%% *}"
 lock="$snapshot.lock"
@@ -62,7 +74,10 @@ trap 'exit 130' INT TERM
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
 if git -C "$source_root" worktree list --porcelain | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
   git -C "$snapshot" checkout -q --detach --force "$head"
-  git -C "$snapshot" clean -q -f -d  # 追跡していないファイル（無視するものは除く）を消し、送信するコミットと一致させる
+  # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールへのリンク（/.tools）と
+  # ビルドの成果物（.build）だけ
+  git -C "$snapshot" clean -q -f -d -x -e /.tools -e .build
 else
   rm -rf -- "$snapshot"  # 登録のない残骸（前回の作成の途中で止まったものなど）
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）

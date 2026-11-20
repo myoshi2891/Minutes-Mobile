@@ -69,6 +69,8 @@ LINK = re.compile(r"""\]\((<[^<>\n]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
 # 参照形式のリンクの使用（[文][ラベル] と、省略形の [ラベル][]）
 REFERENCE_LINK = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
+# インラインのコード（`…`・``…``。開始と同じ長さのバッククォートで閉じる）。中のリンクの書き方はリンクにならない
+CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 DETAILED_MAPPING = "要件 ID ↔ テスト"
 # 対応表で検査・試験を書く列の見出しに含まれる語
 TEST_COLUMN_WORDS = ("試験", "検査", "テスト")
@@ -168,52 +170,67 @@ def table_cells(line: str) -> List[str]:
 SEPARATOR_CELL = re.compile(r":?-+:?")
 
 
+UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
+
+
+def is_row(line: str) -> bool:
+    """表の行になりうる行か（エスケープしていない「|」を含む）。GFM と同じく、行頭・行末の「|」は省略できる。"""
+    return UNESCAPED_PIPE.search(line) is not None
+
+
 def is_separator(line: str) -> bool:
-    """表の区切りの行（| --- | :-: |）か。各列の全体が「任意のコロン・1 個以上のハイフン・任意のコロン」の形であること。"""
-    return line.startswith("|") and all(SEPARATOR_CELL.fullmatch(cell) for cell in table_cells(line))
+    """表の区切りの行（| --- | :-: |。行頭・行末の「|」は省略できる）か。
+    「|」を 1 つ以上含み、各列の全体が「任意のコロン・1 個以上のハイフン・任意のコロン」の形であること。"""
+    return is_row(line) and all(SEPARATOR_CELL.fullmatch(cell) for cell in table_cells(line))
 
 
-def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
-    """本文の中の表ごとに、見出しの列とデータ行を返す。連続した「|」の行のまとまりごとに区切り、見出しの行の直後が
-    区切りの行（| --- |）で、見出しと区切りの行の列の数が同じものだけを表として扱い、見出しと区切りの行を除いた行を返す。
-    区切りの行のないまとまり・列の数が合わないまとまりは表として数えない（GFM でも表にならない）。"""
-    found: List[Tuple[List[str], List[str]]] = []
-    block: List[str] = []
-    for line in body + [""]:
-        if line.startswith("|"):
-            block.append(line)
+def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tuple[int, str]]]]:
+    """（行番号, 行）の並びから表を探し、表ごとに見出しの列とデータ行を返す（tables と table_blocks が共用する）。
+
+    「|」を含む行の連続したまとまりを候補とし、区切りの行を起点に判定する。区切りの行の直前の行を見出しとし、
+    見出しと区切りの行の列の数が同じ場合だけ表として扱う（GFM でも、列の数が合わなければ表にならない）。
+    見出しより前の行は表に含めない。データ行は区切りの行の後の行で、区切りの形の行は除く。
+    区切りの行のないまとまり・列の数が合わないまとまりは表として数えない。
+    """
+    found: List[Tuple[List[str], List[Tuple[int, str]]]] = []
+    block: List[Tuple[int, str]] = []
+    for item in lines + [(0, "")]:
+        if is_row(item[1]):
+            block.append(item)
             continue
-        if is_table(block):
-            found.append((table_cells(block[0]), [row for row in block[2:] if not is_separator(row)]))
+        start = next((at for at in range(1, len(block)) if is_separator(block[at][1]) and not is_separator(block[at - 1][1])), None)
+        if start is not None and len(table_cells(block[start - 1][1])) == len(table_cells(block[start][1])):
+            found.append((table_cells(block[start - 1][1]), [row for row in block[start + 1:] if not is_separator(row[1])]))
         block = []
     return found
 
 
-def is_table(block: List[str]) -> bool:
-    """連続した「|」の行のまとまりが表か（見出しの行の直後が区切りの行で、両者の列の数が同じ）。"""
-    return (len(block) >= 2 and is_separator(block[1]) and not is_separator(block[0])
-            and len(table_cells(block[0])) == len(table_cells(block[1])))
+def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
+    """本文（節の行の並び）の中の表ごとに、見出しの列とデータ行を返す（find_tables と同じ判定）。"""
+    return [(header, [row for _, row in rows]) for header, rows in find_tables(list(enumerate(body, start=1)))]
 
 
 def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
     """コードフェンスの外の表ごとに、見出しの列と、データ行（行番号, 行）を返す。
 
-    連続した「|」の行のまとまりを表の候補とし、空行・「|」で始まらない行・コードフェンスで区切る。
-    表として成り立たないまとまり（is_table）は返さない。
+    コードフェンスの中の行は表の候補のまとまりを区切る（フェンスをまたいだ行を 1 つの表にしない）。
     """
-    block: List[Tuple[int, str]] = []
-    for number, line, inside, _ in list(fenced_lines(text)) + [(0, "", False, None)]:
-        if not inside and line.startswith("|"):
-            block.append((number, line))
-            continue
-        if is_table([row for _, row in block]):
-            yield table_cells(block[0][1]), [(at, row) for at, row in block[2:] if not is_separator(row)]
-        block = []
+    lines = [(number, "" if inside else line) for number, line, inside, _ in fenced_lines(text)]
+    yield from find_tables(lines)
 
 
 def reference_label(label: str) -> str:
     """参照形式のリンクのラベルを照合用にそろえる（大文字小文字と連続した空白を区別しない。CommonMark）。"""
     return " ".join(label.split()).casefold()
+
+
+def section_lead(body: List[str]) -> str:
+    """節の冒頭の行（空行を除く最初の行）を返す。節が小節（「### 」）から始まる場合は、最初の小節の冒頭の行を返し、
+    次の小節の見出しより後は見ない（最初の小節に本文がなければ空文字列。後ろの小節の行で節を合格にしない）。"""
+    lines = [line for line in body if line.strip()]
+    if not lines or not lines[0].startswith("### "):
+        return lines[0] if lines else ""
+    return lines[1] if len(lines) > 1 and not lines[1].startswith("### ") else ""
 
 
 def fence_indent(line: str) -> int:
@@ -392,6 +409,7 @@ class Checker:
                 if found:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
             for number, line in prose_lines(text):
+                line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
                 targets = LINK.findall(line)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
@@ -436,8 +454,7 @@ class Checker:
                 continue
             sections = self.sections(text)
             for number, heading, body in sections:
-                # 節が小節から始まる場合は、最初の小節の冒頭を見る
-                first = next((line for line in body if line.strip() and not line.startswith("### ")), "")
+                first = section_lead(body)
                 if not first.startswith("満たす要件:"):
                     self.error(name, f"節「{heading}」の冒頭に「満たす要件:」の行がない", number)
                 elif not self.names_requirements(first):

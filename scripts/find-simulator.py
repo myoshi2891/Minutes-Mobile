@@ -36,6 +36,12 @@ def main() -> int:
         # 形が違う一覧は取得の失敗として扱う（空の辞書は候補なしとして下で扱う）
         if not isinstance(devices_by_runtime, dict):
             raise TypeError(f"devices が辞書でない: {type(devices_by_runtime).__name__}")
+        # 各項目も辞書であること（項目が辞書でない一覧を、項目を読み飛ばして候補なしと取り違えない）
+        if not isinstance(data["runtimes"], list) or not all(isinstance(item, dict) for item in data["runtimes"]):
+            raise TypeError("runtimes が辞書の配列でない")
+        for runtime, devices in devices_by_runtime.items():
+            if not isinstance(devices, list) or not all(isinstance(device, dict) for device in devices):
+                raise TypeError(f"devices の {runtime} が辞書の配列でない")
         runtimes = {
             item["identifier"]: version_key(item["version"])
             for item in data["runtimes"]

@@ -248,6 +248,21 @@ def test_settings() -> None:
     settings_case("INFOPLIST_FILE の変数を展開する", 1, "UIFileSharingEnabled",
                   project=info_plist_file("$(SRCROOT)/$(TARGET_NAME)/Settings.plist"),
                   plists={"Sample/Settings.plist": {"UIFileSharingEnabled": True}})
+    # 相対パスの --project でも、絶対パスと同じファイルを $(SRCROOT) から解決する（SRCROOT は .xcodeproj の親）
+    with tempfile.TemporaryDirectory() as directory:
+        project = Path(directory) / "sub" / "A.xcodeproj" / "project.xcproj"
+        project.parent.mkdir(parents=True)
+        project.write_text(info_plist_file("$(SRCROOT)/$(TARGET_NAME)/Settings.plist")(OK_PROJECT), encoding="utf-8")
+        (Path(directory) / "sub" / "Sample").mkdir()
+        with (Path(directory) / "sub" / "Sample" / "Settings.plist").open("wb") as handle:
+            plistlib.dump({"UIFileSharingEnabled": True}, handle)
+        for label, given in (("相対パス", "sub/A.xcodeproj/project.xcproj"), ("絶対パス", str(project))):
+            count += 1
+            result = subprocess.run([str(SCRIPTS / "check-project-settings.py"), "--project", given, "--root", directory],
+                                    cwd=directory, capture_output=True, text=True)
+            if result.returncode != 1 or "UIFileSharingEnabled" not in result.stdout:
+                failures.append(f"settings: {label}の --project で $(SRCROOT) の参照先を解決できない（終了コード {result.returncode}）\n"
+                                f"{(result.stdout + result.stderr).strip()}")
     settings_case("INFOPLIST_FILE が指す合格のファイル", 0, "OK",
                   project=info_plist_file("Config/App-Settings.plist"), plists={"Config/App-Settings.plist": OK_INFO_PLIST})
     settings_case("INFOPLIST_FILE が指すファイルがない", 2, "読めない", project=info_plist_file("Config/Missing.plist"))
@@ -756,6 +771,36 @@ def test_dependencies() -> None:
                 # 拒否した項目が Bad であること（連鎖では、外を指す Chain だけを拒否して Bad を通すと合格にしない）
                 if not str(error).startswith(f"{framework / 'Bad'}:"):
                     failures.append(f"dependencies: 成果物の外を指すリンク（{label}）で Bad 以外を拒否した: {error}")
+        # 循環するリンクは、例外（RuntimeError）で落ちずに、リンクのパスを示して読めないものとして扱う
+        (framework / "Bad").unlink()
+        (framework / "Chain").unlink()
+        (framework / "Loop1").symlink_to("Loop2")
+        (framework / "Loop2").symlink_to("Loop1")
+        count += 1
+        try:
+            module.content_digest(framework)
+            failures.append("dependencies: 成果物の中の循環するリンクでハッシュを作った")
+        except module.Unreadable as error:
+            if str(framework / "Loop") not in str(error):
+                failures.append(f"dependencies: 循環するリンクの報告にリンクのパスがない: {error}")
+        except RuntimeError as error:
+            failures.append(f"dependencies: 循環するリンクで例外が送出された: {error!r}")
+    # ローカルの Package の参照先が循環するリンクなら、終了コード 2（読めない）にする
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "Loop").symlink_to("Loop")
+        (root / "Package.swift").write_text(declare.format('.package(path: "Loop")'), encoding="utf-8")
+        allowlist = root / "allowlist.json"
+        allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}), encoding="utf-8")
+        expect("dependencies: 循環するリンクのローカルの Package", [
+            str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 2, "Loop")
+    # URL の正規化はホストだけを小文字にし、authority のユーザー情報の大文字小文字は区別する
+    for left, right, same in (("https://User@EXAMPLE.com/owner/a", "https://user@example.com/owner/a", False),
+                              ("https://User@EXAMPLE.com/owner/a", "HTTPS://User@example.COM/owner/a", True),
+                              ("https://a@b@EXAMPLE.com/owner/a", "https://a@b@example.com/owner/a", True)):
+        count += 1
+        if (module.normalize(left) == module.normalize(right)) != same:
+            failures.append(f"dependencies: URL の正規化で {left} と {right} を{'別' if same else '同じ'}ものと見なした")
     dependencies_case("区間の上限は含まない", 1, "合わない",
                       {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", "1.0.0"..<"1.2.3")')},
                       [approved])
@@ -780,10 +825,79 @@ def applies_here(line: str, name: str) -> bool:
     return line.split()[:1] == [name] and line.split()[2:3] in ([platform.machine()], ["any"])
 
 
+def isolated_git_env() -> Dict[str, str]:
+    """開発者のグローバル・システムの設定と、リポジトリを指す変数（GIT_DIR など）の影響を受けない git の環境。"""
+    local_vars = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True).stdout.split()
+    isolated = {key: value for key, value in os.environ.items() if key not in local_vars and key != "GIT_CONFIG"}
+    isolated.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return isolated
+
+
+def setup_hooks_case() -> None:
+    """setup.sh --hooks が、環境変数 GIT_CONFIG が別のファイルを指していても、リポジトリの設定に書いて読み直すこと。
+
+    開発ツールの導入（setup-tools.sh）は何もしない代わりのスクリプトに置き換えた複製のリポジトリで実行する。
+    """
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        env = isolated_git_env()
+        subprocess.run(["git", "init", "-q", "--template=", str(repository)], env=env, check=True, capture_output=True)
+        (repository / "scripts" / "setup.sh").write_text((SCRIPTS / "setup.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "setup-tools.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        for name in ("setup.sh", "setup-tools.sh"):
+            (repository / "scripts" / name).chmod(0o755)
+        other = Path(directory) / "other.cfg"
+        other.write_text("", encoding="utf-8")
+        result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], env=dict(env, GIT_CONFIG=str(other)),
+                                capture_output=True, text=True)
+        local = subprocess.run(["git", "-C", str(repository), "config", "--local", "--get", "core.hooksPath"], env=env,
+                               capture_output=True, text=True).stdout.strip()
+        if result.returncode != 0 or local != ".githooks" or "hooksPath" in other.read_text(encoding="utf-8"):
+            failures.append(f"setup: GIT_CONFIG を設定した --hooks がリポジトリの設定に書かない（終了コード {result.returncode}・"
+                            f"リポジトリの値「{local}」・GIT_CONFIG のファイル「{other.read_text(encoding='utf-8').strip()}」）")
+
+
+def simulator_cases() -> None:
+    """find-simulator.py が、形の違う一覧を取得の失敗（終了コード 2）とし、正しい空の一覧を候補なし（1）とすること。"""
+    global count
+    runtime = {"identifier": "r", "version": "27.2", "platform": "iOS", "isAvailable": True}
+    for label, listing, want_code in (
+        ("runtimes の項目が辞書でない", {"runtimes": ["x"], "devices": {}}, 2),
+        ("devices の項目が辞書でない", {"runtimes": [runtime], "devices": {"r": ["x"]}}, 2),
+        ("devices の値が配列でない", {"runtimes": [runtime], "devices": {"r": "x"}}, 2),
+        ("空の一覧は候補なし", {"runtimes": [], "devices": {}}, 1),
+    ):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "listing.json").write_text(json.dumps(listing), encoding="utf-8")
+            stub = Path(directory) / "xcrun"
+            stub.write_text(f"#!/bin/sh\ncat '{Path(directory) / 'listing.json'}'\n", encoding="utf-8")
+            stub.chmod(0o755)
+            result = subprocess.run([str(SCRIPTS / "find-simulator.py")], capture_output=True, text=True,
+                                    env=dict(os.environ, PATH=f"{directory}:{os.environ.get('PATH', '')}"))
+            if result.returncode != want_code:
+                failures.append(f"simulator: {label}: 終了コードが {result.returncode}（期待 {want_code}）\n{result.stderr.strip()}")
+
+
 def test_versions() -> None:
     # 引数が 1 個あれば空文字列でも引数として扱い、--hooks との完全一致を求める（ツールの導入より前に止まる）
     expect("setup: 空文字列の引数", [str(SCRIPTS / "setup.sh"), ""], 2, "使い方")
     expect("setup: 知らない引数", [str(SCRIPTS / "setup.sh"), "--hook"], 2, "使い方")
+    setup_hooks_case()
+    # 明示した --steps が空なら、全手順を実行せずに使い方の誤りにする。
+    # リポジトリの外の一時ディレクトリに写した check.sh で試す（誤って全手順を実行しても、手順 0 がこの自己試験を
+    # 呼び直して再帰しないように。写しの周りには手順のスクリプトも Git のリポジトリもないので、すぐに失敗する）
+    with tempfile.TemporaryDirectory() as directory:
+        copy = Path(directory) / "scripts" / "check.sh"
+        copy.parent.mkdir()
+        copy.write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        copy.chmod(0o755)
+        for value in ("", ",", " "):
+            expect(f"check: 空の --steps（{value!r}）", [str(copy), "--steps", value], 2, "使い方", timeout=30)
+    simulator_cases()
     setup = str(SCRIPTS / "setup-tools.sh")
     tools = str(ROOT / ".tools")
     original = (ROOT / "tools" / "versions").read_text(encoding="utf-8")
@@ -911,6 +1025,15 @@ def test_versions() -> None:
         versions.write_text(" ".join(fields) + "\n", encoding="utf-8")
         expect("versions: 実行ファイル名が名前と違う", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                "--require", "gh"], 0, "OK: gh")
+        # 公開するリンクの位置が実体のディレクトリなら、その中にリンクを作らずに、その位置を示して止める
+        # （導入済みの版を再利用する経路なので取得しない）
+        (dest / "bin" / "gh").unlink()
+        (dest / "bin" / "gh").mkdir()
+        expect("versions: 公開するリンクの位置がディレクトリ", [setup, "--versions", str(versions), "--dest", str(dest),
+                                                    "--require", "gh"], 1, f"{dest / 'bin' / 'gh'} がディレクトリ",
+               timeout=LOCK_ERROR_TIMEOUT)
+        if any((dest / "bin" / "gh").iterdir()):
+            failures.append("versions: 公開するリンクの位置のディレクトリの中にリンクを作った")
     # ロックを作れない理由が競合でなければ、待たずに理由を示して止める（取得の前に止まるので通信しない）
     # 待ち続ける誤りを検出するため時間の上限を付ける（通常はすぐ終わる。遅い環境でも誤って失敗しない長さにする）
     with tempfile.TemporaryDirectory() as directory:
@@ -941,6 +1064,24 @@ def test_gitleaks() -> None:
         (Path(directory) / "config.txt").write_text('name = "sample"\n', encoding="utf-8")
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
     gitleaks_merge_case()
+    # 浅いクローンは、省いた履歴を検査しないまま通過させない
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        source, clone = Path(directory) / "source", Path(directory) / "clone"
+        source.mkdir()
+
+        def git(*arguments: str) -> None:
+            subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                            "-c", f"core.hooksPath={os.devnull}", *arguments], env=env, check=True, capture_output=True)
+
+        git("init", "-q", "--template=", "-b", "main", str(source))
+        for name in ("a.txt", "b.txt"):
+            (source / name).write_text(name, encoding="utf-8")
+            git("-C", str(source), "add", name)
+            git("-C", str(source), "commit", "-q", "-m", name)
+        git("clone", "-q", "--depth", "1", f"file://{source}", str(clone))
+        expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン")
+        expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found")
 
 
 def gitleaks_merge_case() -> None:
@@ -1128,6 +1269,20 @@ def run_docs_cases() -> None:
         docs_case("空白のない表の要件の定義", 0, "MVP の要件 3 件", requirements, "| FR-AAA-02 | 二 | MVP |", "|FR-AAA-02|二|MVP|"),
         docs_case("空白のない表の設計決定の定義", 0, "OK", basic, "| BD-SMP-01 | 決定 |", "|BD-SMP-01|決定|"),
         docs_case("空白のない表の重複した定義", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "|FR-AAA-01|二|MVP|"),
+        # 行頭の「|」を省いた表の行も、表の行として読む（GFM と同じ）
+        docs_case("行頭の | を省いた行の定義", 0, "MVP の要件 3 件", requirements, "| FR-AAA-02 | 二 | MVP |", "FR-AAA-02 | 二 | MVP"),
+        docs_case("行頭の | を省いた表の重複した定義", 1, "定義が重複", requirements, "| CON-01 | 制約 |\n",
+                  "| CON-01 | 制約 |\n\nID | 要件 | フェーズ\n--- | --- | ---\nFR-AAA-01 | 重複 | MVP\n"),
+        # インラインのコードの中のリンクの書き方は確かめない。コードの外の同じ書き方は確かめる
+        docs_case("インラインのコードの中のリンク", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "[要件](../01-requirements/requirements.md) `[例](missing.md)` ``[例](`missing.md`)``"),
+        docs_case("インラインのコードの外のリンク", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
+                  "`コード` [例](missing.md)"),
+        # 節が小節から始まる場合は、最初の小節の冒頭だけを見る（後ろの小節の「満たす要件:」で節を合格にしない）
+        docs_case("最初の小節に本文がない節", 1, "節「2. セキュリティ」の冒頭", basic, "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01",
+                  "## 2. セキュリティ\n\n### 2.1 前\n\n### 2.2 後\n\n満たす要件: SEC-AAA-01"),
+        docs_case("最初の小節の冒頭の満たす要件", 0, "OK", basic, "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01",
+                  "## 2. セキュリティ\n\n### 2.1 前\n\n満たす要件: SEC-AAA-01\n\n### 2.2 後\n\n本文"),
         # 申し送りは番号付きの項目も照合する（解決の表から行が欠けた・表がない場合も欠落として報告する）
         docs_case("番号付きの申し送り", 0, "OK", basic, "- 一つ目\n- 二つ目\n", "1. 一つ目\n2. 二つ目\n"),
         docs_case("番号付きの申し送りの解決が足りない", 1, "申し送り「二つ目」の解決が表にない", detailed, "| 二つ目 | 済 |\n", "",

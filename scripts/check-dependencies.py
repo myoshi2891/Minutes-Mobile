@@ -37,12 +37,14 @@ REMOTE_URL = re.compile(r"^(https?|ssh|git)://|^git@")
 def normalize(url: str) -> str:
     """同じリポジトリを指す書き方の違い（末尾の .git・スラッシュ、scheme とホストの大文字小文字）をそろえる。
 
-    パスの大文字小文字は区別する（パスだけが違う取得元を同じものと見なさない）。
+    パスと、authority のユーザー情報（user@ の部分）の大文字小文字は区別する（別の取得元を同じものと見なさない）。
     """
     text = url.strip().rstrip("/")
     found = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/]*)(.*)$", text)
     if found:
-        text = found.group(1).lower() + found.group(2).lower() + found.group(3)
+        # authority は最後の「@」でユーザー情報とホストに分ける（ユーザー情報に「@」を含みうるため）
+        userinfo, at, host = found.group(2).rpartition("@")
+        text = found.group(1).lower() + userinfo + at + host.lower() + found.group(3)
     else:
         scp = re.match(r"^([^@/:]+@)([^:/]+)(:.*)$", text)  # git@host:owner/repo の形
         if scp:
@@ -417,6 +419,13 @@ def content_digest(path: Path) -> str:
     def failed(error: OSError) -> None:
         raise Unreadable(f"{error.filename}: {error}")
 
+    def resolved(item: Path) -> Path:
+        """リンクを解決した実体のパス。循環するリンクは解決できないので、読めないものとして扱う。"""
+        try:
+            return item.resolve()
+        except RuntimeError as error:  # Python 3.9〜3.12 は循環するリンクで RuntimeError を送出する
+            raise Unreadable(f"{item}: リンクを解決できない（循環している）: {error}") from error
+
     def entries(base: Path) -> List[Path]:
         """配下のすべての項目を返す。読めないディレクトリは読めないものとして扱う
         （rglob は権限の失敗を黙って読み飛ばし、欠けた内容のハッシュを作るため使わない）。
@@ -440,7 +449,7 @@ def content_digest(path: Path) -> str:
                 # リンクは成果物の中を指すものだけを認める（ビルドはリンクをたどるので、外を指すリンクは
                 # 内容のハッシュに入らない外のファイルを成果物に取り込む）。連鎖したリンクもたどった先で判定する
                 link = item.readlink()
-                if link.is_absolute() or not item.resolve().is_relative_to(path.resolve()):
+                if link.is_absolute() or not resolved(item).is_relative_to(resolved(path)):
                     raise Unreadable(f"{item}: ローカルのバイナリの中のリンクが成果物の外を指す（{link}）")
                 entry = f"L\0{relative}\0{link}"
             elif item.is_file():
@@ -499,7 +508,10 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
         return [f"ローカルの Package {location} は検査の対象外のディレクトリにある: .package({summary})"]
     if root is None:
         return []
-    target = (root / location).resolve()
+    try:
+        target = (root / location).resolve()
+    except RuntimeError as error:  # 循環するリンク（Python 3.9〜3.12）
+        raise Unreadable(f"{root / location}: ローカルの Package の参照先のリンクを解決できない（循環している）: {error}") from error
     if not target.is_relative_to(root.resolve()):
         return [f"ローカルの Package {path} は起点の外にあり、中の依存を検査できない: .package({summary})"]
     # シンボリックリンクを解決した先にも同じ除外の規則を当てる（リンクで検査の対象外のディレクトリを指させない）

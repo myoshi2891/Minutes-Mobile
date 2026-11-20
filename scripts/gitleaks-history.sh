@@ -14,6 +14,13 @@ GITLEAKS_LOG_OPTS="--all --full-history -m"
 [ $# -ge 1 ] && [ -n "$1" ] || { echo "使い方: $0 <リポジトリ> [gitleaks の追加の引数…]" >&2; exit 2; }
 repository=$1
 shift
+# 浅いクローンは、省いた履歴を検査しないまま通過しうる。全履歴があるときだけ検査する
+# （判定できない場合も通さない。$(…) の失敗は set -e で終了する）
+shallow=$(git -C "$repository" rev-parse --is-shallow-repository)
+if [ "$shallow" != false ]; then
+  echo "NG: ${repository} は浅いクローンで、履歴の一部がない。git fetch --unshallow で全履歴を取得してから検査し直す" >&2
+  exit 1
+fi
 # --redact: 検出した値そのものを出力に残さない
 exec "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
   --log-opts="$GITLEAKS_LOG_OPTS" "$@" "$repository"

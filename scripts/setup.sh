@@ -22,10 +22,12 @@ fi
 
 scripts/setup-tools.sh
 if [ "$HOOKS" = 1 ]; then
-  git config core.hooksPath .githooks
+  # 環境変数 GIT_CONFIG は git config の読み書きを別のファイルへ向ける（設定したまま書くと、リポジトリの設定を
+  # 変えずに読み直しも同じファイルから行い、誤って成功する）。書き込みと読み直しの両方で外し、書き込みは --local に限る
+  env -u GIT_CONFIG git config --local core.hooksPath .githooks
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
-  # 別の値を指していれば、書き込んでもフックは有効にならない）
-  effective=$(git config --get core.hooksPath || true)
+  # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる
+  effective=$(env -u GIT_CONFIG git config --get core.hooksPath || true)
   if [ "$effective" != .githooks ]; then
     echo "NG: core.hooksPath を .githooks に設定したが、実際に効く値は「${effective}」。" \
       "設定の出所を git config --show-origin --get-all core.hooksPath で確かめる" >&2

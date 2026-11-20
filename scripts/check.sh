@@ -33,11 +33,17 @@ PACKAGE_COVERAGE_TARGET=90
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
 # 手順 7 がその測定の JSON を写して置く場所（手順 8 はこれだけを集計する。swift test の共有の出力先は読まない）
 COVERAGE_JSON="$PACKAGE/.build/minutes-coverage.json"
+# 手順 7 が測る入力の写し。記録する入力の識別子が指すツリーから Packages/ を展開し、swift test はこの写しに対して実行する
+# （測定中に作業ツリーが変わっても、測った内容と記録する識別子が食い違わない）。手順 8 はこの写しの Sources を数える。
+# 置き場所はリポジトリ直下の .build（整形・静的解析・入れ子の設定の列挙・Git がすべて除外する。Package の下の .build は
+# 静的解析などの除外が直下だけなので、写しの Swift ファイルと入れ子の設定が検査の対象になってしまう）
+COVERAGE_INPUT=".build/minutes-coverage-input"
 LAST_STEP=10
 STAGED=0
 REQUIRE_CLEAN=0
 EXPECT_HEAD=""
 STEPS=""
+STEPS_GIVEN=0  # --steps を指定したか（指定しなかったときだけ全手順を実行する）
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
@@ -76,7 +82,8 @@ expand_steps() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --steps) [ $# -ge 2 ] || usage; STEPS=$(expand_steps "$2"); shift 2 ;;
+    # 明示した --steps が空（"" や区切りだけ）なら使い方の誤りにする（空のまま下へ進むと全手順を実行してしまう）
+    --steps) [ $# -ge 2 ] || usage; STEPS=$(expand_steps "$2"); [ -n "${STEPS// /}" ] || usage; STEPS_GIVEN=1; shift 2 ;;
     --staged) STAGED=1; shift ;;
     --require-clean) REQUIRE_CLEAN=1; shift ;;
     --expect-head) [ $# -ge 2 ] && [ -n "$2" ] || usage; EXPECT_HEAD=$2; shift 2 ;;
@@ -85,9 +92,9 @@ while [ $# -gt 0 ]; do
 done
 if [ "$STAGED" = 1 ]; then
   # --staged はインデックスを検査する。作業ツリーの一致を求める --require-clean とは組み合わせない
-  [ -z "$STEPS" ] && [ "$REQUIRE_CLEAN" = 0 ] && [ -z "$EXPECT_HEAD" ] || usage
+  [ "$STEPS_GIVEN" = 0 ] && [ "$REQUIRE_CLEAN" = 0 ] && [ -z "$EXPECT_HEAD" ] || usage
   STEPS="1 2 3 10"
-elif [ -z "$STEPS" ]; then
+elif [ "$STEPS_GIVEN" = 0 ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
 fi
 
@@ -261,14 +268,21 @@ step_7() {
   local measured report digest
   mkdir -p "$PACKAGE/.build"
   rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
-  # 測る前の入力を控え、測った後も同じ場合だけ記録する（測定中に変わった入力の結果をどちらにも帰属させない）
+  rm -rf -- "$COVERAGE_INPUT"
+  # 測る入力を固定する。入力の識別子（コミット、または作業ツリーを写したツリー）が指すツリーから Packages/ を展開し、
+  # その写しを測る。展開できなければ測らない（識別子と違う内容を測った結果をコミットに帰属させない）
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
+  mkdir -p "$COVERAGE_INPUT"
+  git archive --format=tar "${measured#* }" -- Packages | tar -x -f - -C "$COVERAGE_INPUT" \
+    || fail "カバレッジを測る入力（${measured}）を展開できない"
   # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
   # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
   COVERAGE_SCRATCH=$(mktemp -d)
-  swift test --package-path "$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --enable-code-coverage
+  swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --enable-code-coverage
+  # 追加の安全策: 測った前後で作業ツリーが変わっていれば記録しない（写しを測るので結果は識別子と一致するが、
+  # 測定中に変わった作業ツリーの合格として扱われるのを避ける）
   [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
-  report=$(swift test --package-path "$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --show-codecov-path)
+  report=$(swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない（swift test の結果を確かめる）"
   # この測定の JSON を記録の場所へ写す。同じディレクトリの一時ファイルに写してから rename で置き換え、
   # 写したものからハッシュを計算する。JSON を置いてから入力とハッシュの記録を置く（記録があれば JSON もある）
@@ -309,7 +323,8 @@ step_8() {
   case "$measured" in
     worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
   esac
-  scripts/coverage-report.py "$COVERAGE_COPY" --sources "$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
+  # 手順 7 が測ったのは固定した入力の写しなので、写しの Sources の行を数える
+  scripts/coverage-report.py "$COVERAGE_COPY" --sources "$COVERAGE_INPUT/$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
 

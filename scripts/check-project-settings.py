@@ -512,7 +512,9 @@ def referenced_files(
     ファイル名や拡張子にかかわらず検査するために使う。
     相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
     """
-    parent = project_path.parent
+    # 絶対パスにしてから SRCROOT を決める（相対の --project では、展開した $(SRCROOT)/… が相対パスのまま残り、
+    # さらに source_root から解決されて二重になる）
+    parent = project_path.resolve().parent
     source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
     effective, undecided = resolve(own, shared, setting, [configuration], sdk)

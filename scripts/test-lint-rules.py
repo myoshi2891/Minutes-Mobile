@@ -39,6 +39,9 @@ TEST_CODE_DIRS = ("MinutesMobileTests", "MinutesMobileUITests", "Packages/Minute
 # SwiftLint が解析しない場所（設定が対象のソースに適用されない）と、Git の管理領域の .git。
 # tools/lint-fixtures は excluded にあるが、この試験が明示したパスで解析し入れ子の設定も効くので、走査の対象にする
 WALK_SKIPPED = {".git", ".tools", ".build", "build", "DerivedData"}
+# SwiftLint がファイルを読めなかったときに標準エラーへ出す診断（0.65.1 で、不正な UTF-8 のファイルと読み取り権限のない
+# ファイルを渡して採取した）。このときも終了コード 0 で、そのファイルを除いた正しい JSON を出すので、出力だけでは気づけない
+UNREADABLE_DIAGNOSTIC = re.compile(r"^Could not read contents of `(.+)`$", re.MULTILINE)
 # 規則名は custom_rules の規則名と同じ形（先頭は英小文字、以降は英小文字・数字・下線）
 MARKER = re.compile(r"//\s*expect:\s*([a-z][a-z0-9_]*)\s*$")
 
@@ -122,8 +125,13 @@ def collect(rules: Dict[str, bool], errors: List[str]) -> List[Tuple[Path, str, 
 
 def nested_configs_in_worktree() -> List[str]:
     """作業ツリーの .swiftlint.yml を、Git が無視するものも含めて列挙する（リポジトリ直下からの相対パス）。"""
+    def failed(error: OSError) -> None:
+        # 読めないディレクトリを黙って読み飛ばすと、その中の入れ子の設定（規則を外す抜け道）を見落とすので止める
+        print(f"NG: {error.filename} を走査できない（入れ子の設定を列挙できない）: {error}", file=sys.stderr)
+        sys.exit(2)
+
     found: List[str] = []
-    for current, directories, files in os.walk(ROOT):
+    for current, directories, files in os.walk(ROOT, onerror=failed):
         relative = Path(current).relative_to(ROOT).as_posix()
         directories[:] = sorted(
             name for name in directories
@@ -210,6 +218,13 @@ def run_swiftlint(paths: List[Path], config: Optional[Path] = None) -> List[dict
         sys.exit(2)
     if not isinstance(report, list):
         print("NG: SwiftLint の出力の形式が違う", file=sys.stderr)
+        sys.exit(2)
+    # 読めなかったファイルは検出が 0 件になり、正常例と区別できないので、試験を実行できなかったものとして止める。
+    # 標準エラーのほかの出力や終了コードでは判定しない（重大な違反があると終了コード 2 になるため）
+    unreadable = UNREADABLE_DIAGNOSTIC.findall(result.stderr)
+    if unreadable:
+        for path in unreadable:
+            print(f"NG: SwiftLint が {path} を読めなかった（試験にならない）", file=sys.stderr)
         sys.exit(2)
     return report
 
