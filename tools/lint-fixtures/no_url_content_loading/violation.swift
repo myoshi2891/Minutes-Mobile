@@ -6,3 +6,6 @@ let dictionary = NSDictionary(contentsOf: url) // expect: no_url_content_loading
 let parser = XMLParser(contentsOf: url) // expect: no_url_content_loading
 let initialized = try Data.init(contentsOf: url) // expect: no_url_content_loading
 let annotated: Data = try .init(contentsOf: url) // expect: no_url_content_loading
+let bytes: NSMutableData = try .init(contentsOf: url, options: []) // expect: no_url_content_loading
+let mutableText: NSMutableString? = try .init(contentsOf: url, encoding: 4) // expect: no_url_content_loading
+let list: NSArray? = .init(contentsOf: url) // expect: no_url_content_loading
