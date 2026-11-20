@@ -72,7 +72,7 @@ swift test --package-path Packages/MinutesKit --filter WAVHeaderTests   # Packag
 
 - テストを通す最小の変更だけを入れる。まだテストのない振る舞いを足さない。
 - 禁止事項（`print(`、`try!`、強制アンラップ、空の `catch {}`、通信の API、`.documentDirectory` など）は静的解析で止まる。回避の書き方を探さず、設計どおりの手段（`os.Logger`、注入した型）を使う。
-- 録音を止める実装にしない（Recording-First）。物理的に続けられない場合だけ例外（NFR-REL-05）。
+- 不調（文字起こし・UI・保存の失敗など）を理由に録音を自動で止める実装にしない（Recording-First）。利用者の停止操作（FR-FIN-01）による停止は止めてよい。自動の停止は、物理的に続けられない場合だけを例外とする（NFR-REL-05）。
 - 同じテストを再実行して通ることを確かめる。
 
 ### 3. Refactor
