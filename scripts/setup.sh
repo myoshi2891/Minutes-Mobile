@@ -23,7 +23,15 @@ fi
 scripts/setup-tools.sh
 if [ "$HOOKS" = 1 ]; then
   git config core.hooksPath .githooks
-  echo "OK: フックを有効にした（core.hooksPath = $(git config core.hooksPath)）"
+  # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
+  # 別の値を指していれば、書き込んでもフックは有効にならない）
+  effective=$(git config --get core.hooksPath || true)
+  if [ "$effective" != .githooks ]; then
+    echo "NG: core.hooksPath を .githooks に設定したが、実際に効く値は「${effective}」。" \
+      "設定の出所を git config --show-origin --get-all core.hooksPath で確かめる" >&2
+    exit 1
+  fi
+  echo "OK: フックを有効にした（core.hooksPath = ${effective}）"
 else
   echo "OK: 開発ツールを導入した。フックは有効にしていない（有効にするときは --hooks を付ける）"
 fi

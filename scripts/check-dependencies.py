@@ -343,13 +343,17 @@ def call_arguments(text: str, start: int) -> str:
 
 # 版の指定（文字列リテラルだけ）。ブランチ・コミットの指定は版で固定していないものとして認めない
 VERSION = r'"(\d+\.\d+\.\d+)"'
+# 版のリテラルの後ろは「,」「)」か引数の末尾だけを認める（「"1.0.0" + x」のような式の一部を版と見なさない）
+END = r"(?=\s*(?:,|\)|$))"
+# 範囲の下限のリテラルの前は「(」「,」「:」か引数の先頭だけを認める（「x + "1.0.0"..."2.0.0"」の下限は式になるため）
+START = r"(?:^|(?<=[(,:]))\s*"
 UNPINNED = re.compile(r"\b(branch|revision)\s*:|\.(branch|revision)\s*\(")
 REQUIREMENTS = (
-    ("exact", re.compile(rf"(?:\bexact:\s*|\.exact\(\s*){VERSION}")),
-    ("minor", re.compile(rf"\.upToNextMinor\(\s*from:\s*{VERSION}")),
-    ("major", re.compile(rf"(?:\.upToNextMajor\(\s*from:\s*|(?<![.\w])from:\s*){VERSION}")),
-    ("closed", re.compile(rf"{VERSION}\s*\.\.\.\s*{VERSION}")),
-    ("half-open", re.compile(rf"{VERSION}\s*\.\.<\s*{VERSION}")),
+    ("exact", re.compile(rf"(?:\bexact:\s*|\.exact\(\s*){VERSION}{END}")),
+    ("minor", re.compile(rf"\.upToNextMinor\(\s*from:\s*{VERSION}{END}")),
+    ("major", re.compile(rf"(?:\.upToNextMajor\(\s*from:\s*|(?<![.\w])from:\s*){VERSION}{END}")),
+    ("closed", re.compile(rf"{START}{VERSION}\s*\.\.\.\s*{VERSION}{END}")),
+    ("half-open", re.compile(rf"{START}{VERSION}\s*\.\.<\s*{VERSION}{END}")),
 )
 Version = Tuple[int, int, int]
 
@@ -410,6 +414,18 @@ def content_digest(path: Path) -> str:
                 digest.update(block)
         return digest.hexdigest()
 
+    def failed(error: OSError) -> None:
+        raise Unreadable(f"{error.filename}: {error}")
+
+    def entries(base: Path) -> List[Path]:
+        """配下のすべての項目を返す。読めないディレクトリは読めないものとして扱う
+        （rglob は権限の失敗を黙って読み飛ばし、欠けた内容のハッシュを作るため使わない）。
+        ディレクトリへのシンボリックリンクはたどらず、項目として返す。"""
+        found: List[Path] = []
+        for directory, subdirectories, files in os.walk(base, onerror=failed):
+            found.extend(Path(directory) / entry for entry in subdirectories + files)
+        return found
+
     try:
         if path.is_symlink():
             raise Unreadable(f"{path}: ローカルのバイナリの起点がシンボリックリンク")
@@ -418,7 +434,7 @@ def content_digest(path: Path) -> str:
         if not path.is_dir():
             raise Unreadable(f"{path}: ローカルのバイナリがない")
         digest = hashlib.sha256()
-        for item in sorted(path.rglob("*"), key=lambda found: found.relative_to(path).as_posix()):
+        for item in sorted(entries(path), key=lambda found: found.relative_to(path).as_posix()):
             relative = item.relative_to(path).as_posix()
             if item.is_symlink():
                 # リンクは成果物の中を指すものだけを認める（ビルドはリンクをたどるので、外を指すリンクは

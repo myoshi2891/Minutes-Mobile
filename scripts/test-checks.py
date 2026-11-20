@@ -61,20 +61,28 @@ OK_PROJECT = """{
 OK_INFO_PLIST = {"UIBackgroundModes": ["audio", "processing"], "BGTaskSchedulerPermittedIdentifiers": ["a.b"]}
 
 
-def run(command: List[str]) -> Tuple[int, str]:
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+def run(command: List[str], timeout: Optional[float] = None) -> Tuple[int, str]:
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
     return result.returncode, result.stdout + result.stderr
 
 
-def expect(label: str, command: List[str], want_code: int, want_text: str = "") -> None:
-    """終了コードと、出力に含まれるはずの文字列を確かめる。"""
+def expect(label: str, command: List[str], want_code: int, want_text: str = "", timeout: Optional[float] = None) -> None:
+    """終了コードと、出力に含まれるはずの文字列を確かめる。timeout（秒）を過ぎても終わらなければ失敗とする。"""
     global count
     count += 1
-    code, output = run(command)
+    try:
+        code, output = run(command, timeout)
+    except subprocess.TimeoutExpired:
+        failures.append(f"{label}: {timeout} 秒を過ぎても終わらない（待ち続けている）")
+        return
     if code != want_code:
         failures.append(f"{label}: 終了コードが {code}（期待 {want_code}）\n{output.strip()}")
     elif want_text and want_text not in output:
         failures.append(f"{label}: 出力に「{want_text}」がない\n{output.strip()}")
+
+
+# ロックを作れない場合の試験の時間の上限（秒）。ロックを待つ実装なら、この時間を過ぎて失敗する
+LOCK_ERROR_TIMEOUT = 15
 
 
 def replaced(text: str, old: str, new: str) -> str:
@@ -534,8 +542,18 @@ def test_dependencies() -> None:
         "upToNextMinor": f'.package(url: "{url}", .upToNextMinor(from: "1.2.0"))',
         "半開区間": f'.package(url: "{url}", "1.0.0"..<"2.0.0")',
         "閉区間": f'.package(url: "{url}", "1.0.0"..."1.2.3")',
+        "upToNextMajor": f'.package(url: "{url}", .upToNextMajor(from: "1.0.0"))',
     }.items():
         dependencies_case(f"確定版を含む版の指定（{label}）", 0, "OK",
+                          {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
+    # 版のリテラルが式の一部（連結など）なら、版の指定を判定できないものとして扱う
+    for label, declaration in {
+        "from の連結": f'.package(url: "{url}", from: "1.0.0" + suffix)',
+        "exact の連結": f'.package(url: "{url}", exact: "1.2.3" + suffix)',
+        "範囲の上限の連結": f'.package(url: "{url}", "1.0.0"..<"2.0.0" + suffix)',
+        "範囲の下限の連結": f'.package(url: "{url}", prefix + "1.0.0"..."1.2.3")',
+    }.items():
+        dependencies_case(f"式の一部の版のリテラル（{label}）", 1, "版の指定を判定できない",
                           {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
     # コメントの中の宣言は依存として数えない（文字列の中の「//」はコメントではない）
     unlisted = '.package(url: "https://example.org/other/unlisted.git", from: "1.0.0")'
@@ -612,6 +630,22 @@ def test_dependencies() -> None:
             (Path(directory) / name).parent.mkdir(parents=True, exist_ok=True)
             (Path(directory) / name).write_text(content, encoding="utf-8")
         binary_digest = module.content_digest(Path(directory) / "Sub/Frameworks/B.xcframework")
+        # 内容のハッシュの形式を固定する（走査の方法を変えても、承認済みの値が変わらないこと）
+        count += 1
+        if binary_digest != "a501cc49233680d6426eb1efbe09a78d7c98d9fc4de0d9c26bd2748ab7443a29":
+            failures.append(f"dependencies: ローカルのバイナリの内容のハッシュの形式が変わった（{binary_digest}）")
+        # 成果物の中の読めないディレクトリは、欠けた内容のハッシュにせず、読めないものとして扱う
+        locked = Path(directory) / "Sub/Frameworks/B.xcframework/ios"
+        locked.chmod(0)
+        try:
+            count += 1
+            try:
+                module.content_digest(Path(directory) / "Sub/Frameworks/B.xcframework")
+                failures.append("dependencies: 成果物の中の読めないディレクトリでハッシュを作った")
+            except module.Unreadable:
+                pass
+        finally:
+            locked.chmod(0o755)
     approved_binary = {"identity": "b", "path": "Sub/Frameworks/B.xcframework", "sha256": binary_digest, "version": "1.0.0",
                        "license": "MIT", "approvedOn": "2026-11-18", "ledger": "dependencies-and-costs.md §3"}
     dependencies_case("記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
@@ -878,18 +912,21 @@ def test_versions() -> None:
         expect("versions: 実行ファイル名が名前と違う", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                "--require", "gh"], 0, "OK: gh")
     # ロックを作れない理由が競合でなければ、待たずに理由を示して止める（取得の前に止まるので通信しない）
+    # 待ち続ける誤りを検出するため時間の上限を付ける（通常はすぐ終わる。遅い環境でも誤って失敗しない長さにする）
     with tempfile.TemporaryDirectory() as directory:
         dest = Path(directory) / "readonly"
         dest.mkdir()
         dest.chmod(0o555)
         try:
-            expect("versions: 書き込めない導入先ではロックを待たない", [setup, "--dest", str(dest)], 1, "ロック")
+            expect("versions: 書き込めない導入先ではロックを待たない", [setup, "--dest", str(dest)], 1, "ロック",
+                   timeout=LOCK_ERROR_TIMEOUT)
         finally:
             dest.chmod(0o755)
         dest = Path(directory) / "file-lock"
         dest.mkdir()
         (dest / ".install.lock").write_text("", encoding="utf-8")
-        expect("versions: ロックの位置にファイルがある", [setup, "--dest", str(dest)], 1, "ロック")
+        expect("versions: ロックの位置にファイルがある", [setup, "--dest", str(dest)], 1, "ロック",
+               timeout=LOCK_ERROR_TIMEOUT)
 
 
 def test_gitleaks() -> None:
@@ -1009,7 +1046,7 @@ DOCS = {
     "docs/01-requirements/test-requirements.md": "# TST\n\n| ID | 要件 |\n| --- | --- |\n| TST-AAA-01 | 一 |\n",
     "docs/01-requirements/dependencies-and-costs.md": "# COST\n\n| ID | 項目 |\n| --- | --- |\n| COST-01 | 一 |\n",
     "docs/02-basic-design/sample.md": (
-        "# 基本設計\n\n| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |\n\n"
+        "# 基本設計\n\n| 項目 | 内容 |\n| --- | --- |\n| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |\n\n"
         "## 1. 設計決定\n\n満たす要件: FR-AAA-01\n\n| ID | 決定 |\n| --- | --- |\n| BD-SMP-01 | 決定 |\n\n"
         "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n[要件](../01-requirements/requirements.md)\n\n"
         "## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n"
@@ -1247,6 +1284,22 @@ def run_docs_cases() -> None:
                   "](../01-requirements/requirements.md '要件')"),
         docs_case("山括弧とタイトル付きの切れたリンク", 1, "リンクの先がない: ../01-requirements/missing file.md", basic,
                   "](../01-requirements/requirements.md)", "](<../01-requirements/missing file.md> (要件))"),
+        # 参照形式のリンク（[文][ラベル]・[ラベル][]）も、定義を通してリンク先を確かめる
+        docs_case("参照形式のリンク", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "[要件][Req]\n\n[req]: ../01-requirements/requirements.md"),
+        docs_case("参照形式の切れたリンク", 1, "リンクの先がない: ../01-requirements/missing.md", basic,
+                  "[要件](../01-requirements/requirements.md)", "[要件][design]\n\n[design]: ../01-requirements/missing.md"),
+        docs_case("省略形の参照形式の切れたリンク", 1, "リンクの先がない: ../01-requirements/missing.md", basic,
+                  "[要件](../01-requirements/requirements.md)", "[design][]\n\n[design]: ../01-requirements/missing.md"),
+        docs_case("定義のないラベルはリンクとして扱わない", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "[要件][未定義]"),
+        # 申し送りの解決は、解決の列（2 列目）を見出しに持つ表の行だけを数える
+        docs_case("1 列の表の余分な列を解決と見なさない", 1, "申し送り「一つ目」の解決が表にない", detailed,
+                  "| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n",
+                  "| 申し送り |\n| --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n"),
+        # 冒頭の「| 満たす要件 ID |」は、表のデータ行の場合だけ網羅に数える（表の見出しに似た単独の行は数えない）
+        docs_case("冒頭の表でない満たす要件 ID の行は網羅に数えない", 1, "MVP の要件 FR-AAA-02", basic,
+                  "| 項目 | 内容 |\n| --- | --- |\n| 満たす要件 ID |", "| 満たす要件 ID |"),
     ]
     # シンボリックリンクで --root の外を指すコード片の元のファイルも認めない
     with tempfile.TemporaryDirectory() as outside:

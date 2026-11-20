@@ -291,8 +291,11 @@ step_8() {
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
   [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
-  measured=$(sed -n 1p "$COVERAGE_HEAD")
-  recorded_digest=$(sed -n 2p "$COVERAGE_HEAD")
+  # 2 行を同じ開いたファイルから読む（2 回開くと、その間に記録が置き換えられたとき別の記録の行を組み合わせうる）。
+  # 行がなければ空のまま続け、下の照合で失敗させる（set -e で黙って止めない）
+  measured=""
+  recorded_digest=""
+  { IFS= read -r measured || :; IFS= read -r recorded_digest || :; } < "$COVERAGE_HEAD"
   present=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
   [ "$measured" = "$present" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
   # 照合と集計で同じバイト列を使う。記録を一時ファイルへ写し、写しのハッシュを照合してから同じ写しを集計する

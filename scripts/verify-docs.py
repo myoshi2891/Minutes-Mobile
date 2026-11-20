@@ -65,6 +65,10 @@ PHASES = re.compile(r"^(MVP|P2|P3)\b")
 FENCE_LINE = "\0fence"
 # リンク先（山括弧で囲んだもの、または空白と「)」を含まないもの）と、続けて書けるタイトル（"…"・'…'・(…)）
 LINK = re.compile(r"""\]\((<[^<>\n]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)""")
+# 参照形式のリンクの定義（[ラベル]: リンク先）。字下げは空白 0〜3 個まで（CommonMark）
+REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
+# 参照形式のリンクの使用（[文][ラベル] と、省略形の [ラベル][]）
+REFERENCE_LINK = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 DETAILED_MAPPING = "要件 ID ↔ テスト"
 # 対応表で検査・試験を書く列の見出しに含まれる語
 TEST_COLUMN_WORDS = ("試験", "検査", "テスト")
@@ -185,11 +189,6 @@ def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
     return found
 
 
-def table_rows(body: List[str]) -> List[str]:
-    """本文の中の表のデータ行を返す（table_blocks の行をつないだもの）。"""
-    return [row for _, rows in table_blocks(body) for row in rows]
-
-
 def is_table(block: List[str]) -> bool:
     """連続した「|」の行のまとまりが表か（見出しの行の直後が区切りの行で、両者の列の数が同じ）。"""
     return (len(block) >= 2 and is_separator(block[1]) and not is_separator(block[0])
@@ -210,6 +209,11 @@ def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
         if is_table([row for _, row in block]):
             yield table_cells(block[0][1]), [(at, row) for at, row in block[2:] if not is_separator(row)]
         block = []
+
+
+def reference_label(label: str) -> str:
+    """参照形式のリンクのラベルを照合用にそろえる（大文字小文字と連続した空白を区別しない。CommonMark）。"""
+    return " ".join(label.split()).casefold()
 
 
 def fence_indent(line: str) -> int:
@@ -342,25 +346,28 @@ class Checker:
     def requirement_fields(text: str) -> List[str]:
         """正式な「満たす要件」の欄の行を返す。
 
-        数えるのは、文書の冒頭（最初の「## 」より前）の表の「| 満たす要件 ID |」の行と、見出し（「## 」「### 」）の
+        数えるのは、文書の冒頭（最初の「## 」「### 」より前）の表（見出しの行と区切りの行を持つもの）の、先頭の列が
+        「満たす要件 ID」のデータ行と、見出し（「## 」「### 」）の
         直後の最初の本文行にある「満たす要件:」の行だけ（節の冒頭の検査と同じ位置。節の後半にある同名の行や
         「満たす要件の例」などの説明文は数えない）。「## 」の直後が「### 」なら、その小節の冒頭を見る。
         """
         fields: List[str] = []
-        in_head = True
+        # 冒頭の終わり（最初の見出しの行番号）。見出しがなければ文書の全体が冒頭
+        head_end = next((number for number, line in prose_lines(text) if line.startswith(("## ", "### "))), None)
+        # 表の見出しの行だけ・区切りの行のない行など、表として成り立たない「| 満たす要件 ID |」の行は数えない
+        for _, rows in tables(text):
+            fields.extend(line for number, line in rows
+                          if (head_end is None or number < head_end) and table_cells(line)[0] == "満たす要件 ID")
         after_heading = False
         for _, line, inside, _ in fenced_lines(text):
             if inside:
                 after_heading = False  # コードブロックは節の冒頭を終わらせる（sections() と同じ境界）
                 continue
             if line.startswith("## ") or line.startswith("### "):
-                in_head = False
                 after_heading = True
                 continue
             if not line.strip():
                 continue
-            if in_head and line.startswith("| 満たす要件 ID |"):
-                fields.append(line)
             if after_heading and line.startswith("満たす要件:"):
                 fields.append(line)
             after_heading = False
@@ -378,16 +385,32 @@ class Checker:
                     self.error(name, "コードフェンスに言語の指定がない", number)
                 if fence_end(lines, number - 1) >= len(lines):
                     self.error(name, "コードフェンスが閉じていない", number)
+            # 参照形式のリンクは、定義（[ラベル]: リンク先）を通してリンク先を求め、インラインのリンクと同じく確かめる
+            definitions: Dict[str, str] = {}
+            for _, line in prose_lines(text):
+                found = REFERENCE_DEFINITION.match(line)
+                if found:
+                    definitions.setdefault(reference_label(found.group(1)), found.group(2))
             for number, line in prose_lines(text):
-                for target in LINK.findall(line):
-                    # 山括弧で囲んだリンク先（空白を含められる）は、山括弧を除いてから解決する
-                    if target.startswith("<") and target.endswith(">"):
-                        target = target[1:-1]
-                    if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
-                        continue
-                    path = (self.root / name).parent / target.split("#", 1)[0]
-                    if not path.exists():
-                        self.error(name, f"リンクの先がない: {target}", number)
+                targets = LINK.findall(line)
+                for text_part, label in REFERENCE_LINK.findall(line):
+                    # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
+                    target = definitions.get(reference_label(label or text_part))
+                    if target is not None:
+                        targets.append(target)
+                for target in targets:
+                    self.check_link(name, target, number)
+
+    def check_link(self, name: str, target: str, number: int) -> None:
+        """リンク先（外部の URL・節へのリンクを除く）が、文書からの相対パスで存在すること。"""
+        # 山括弧で囲んだリンク先（空白を含められる）は、山括弧を除いてから解決する
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1]
+        if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
+            return
+        path = (self.root / name).parent / target.split("#", 1)[0]
+        if not path.exists():
+            self.error(name, f"リンクの先がない: {target}", number)
 
     def sections(self, text: str) -> List[Tuple[int, str, List[str]]]:
         """「## 」の節ごとに、行番号・見出し・本文の行を返す。"""
@@ -496,11 +519,12 @@ class Checker:
             item_name(found.group(1)) for _, heading, body in self.sections(self.texts[basic_name]) if "申し送り" in heading
             for found in (HANDOVER_ITEM.match(line) for line in body) if found
         ]
-        # 表ごとに（連続した「|」の行のまとまりごとに）区切り、見出しと区切りの行を持つ表のデータ行だけを数える
+        # 表ごとに（連続した「|」の行のまとまりごとに）区切り、見出しと区切りの行を持つ表のデータ行だけを数える。
+        # 解決の列（2 列目）を見出しに持つ表の行だけを数える（1 列の表の本文の行に余分な列があっても、解決と見なさない）
         rows: List[str] = []
         for _, heading, body in sections:
             if "申し送り" in heading:
-                rows.extend(table_rows(body))
+                rows.extend(row for header, block in table_blocks(body) if len(header) >= 2 for row in block)
         # 解決の列（2 列目）が空・空白だけの行は、解決したことにしない
         resolved = []
         for line in rows:
