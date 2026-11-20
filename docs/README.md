@@ -14,6 +14,7 @@ MinutesMobile（iPhone 向け・端末内完結の議事録アプリ）の設計
 | 基本設計 | [02-basic-design/README.md](02-basic-design/README.md) | 初版（2026-11-15） | 基本設計書の索引。MVP の 7 文書（アーキテクチャ・録音・保存・文字起こし・画面・書き出し・開発環境）と、未解決事項の解決状況 |
 | 詳細設計 | [03-detailed-design/README.md](03-detailed-design/README.md) | 作成中（2026-11-16） | 詳細設計書の索引。1 文書目の [dev-environment.md](03-detailed-design/dev-environment.md)（開発環境と検査）を作成済み。残り 6 文書は未着手 |
 | 試験記録 | [04-test-records/README.md](04-test-records/README.md) | 様式のみ（2026-11-16） | 実機試験の記録の規則と様式。記録はまだない |
+| 試験記録 | [04-test-records/check-self-tests.md](04-test-records/check-self-tests.md) | 記録中（2026-11-20） | 検査の自己試験が効いていることの確認（突然変異）の記録。[dev-environment.md](03-detailed-design/dev-environment.md) §17.2 から移した |
 
 参照元（別リポジトリ・読み取り専用）: 別リポジトリ `Minutes` の `docs/design-local-phase*.md`（PC/Web 版 Minutes の設計書）。
 本書群で「Minutes P1 §n」は `design-local-phase1.md` の §n、「Minutes P2 §n」は `design-local-phase2.md` の §n を指す。Minutes の `archive/` は参照しない。
