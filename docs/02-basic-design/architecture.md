@@ -41,6 +41,8 @@
 
 ## 2. 全体構成
 
+満たす要件: SEC-NET-01・06、SEC-PLT-01、INV-03、NFR-MNT-01・02、TST-GEN-04・06、TST-CI-02
+
 ### 2.1 構成図と信頼境界
 
 満たす要件: SEC-NET-01、SEC-NET-06、SEC-PLT-01、INV-03

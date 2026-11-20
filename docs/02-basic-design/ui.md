@@ -83,6 +83,8 @@ flowchart TB
 
 ## 4. 画面ごとの設計
 
+満たす要件: FR-CNS-01・03、FR-MTG-01〜03、FR-INT-02・06、FR-REC-06、FR-SAV-05、FR-FIN-01・02、FR-TRV-01〜03、FR-STT-08・09、FR-SET-01〜03、FR-RCV-01・02、SEC-PRV-02・04、NFR-UX-02・04、NFR-PRF-04、NFR-CAP-02
+
 ### 4.1 初回説明（SC-01）
 
 満たす要件: FR-CNS-03、SEC-PRV-04
@@ -211,6 +213,8 @@ flowchart LR
 ---
 
 ## 7. プライバシー保護の UI
+
+満たす要件: SEC-APP-01、SEC-PLT-01・02・06、SEC-INP-01
 
 ### 7.1 スナップショットの保護
 
