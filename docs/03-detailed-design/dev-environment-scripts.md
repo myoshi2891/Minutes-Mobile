@@ -246,6 +246,8 @@ if [ -d "$DEST" ]; then
       if [ "$waited" -ge 600 ]; then
         fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
       fi
+      # 待ち始めたことを 1 回だけ知らせる（利用者と自己試験が、ロックの競合を観測したことを確かめられるようにする）
+      if [ "$waited" -eq 0 ]; then echo "待機: 別の導入・照合が実行中（${LOCK}）。終わるのを待つ" >&2; fi
       sleep 1
       waited=$((waited + 1))
       retried=""

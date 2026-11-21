@@ -334,7 +334,8 @@ if ! mkdir "$lock" 2>/dev/null; then
   echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
   exit 1
 fi
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
+trap 'if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null || true; fi; rmdir "$lock" 2>/dev/null || true' EXIT
 trap 'exit 130' INT TERM
 
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
@@ -346,7 +347,7 @@ worktrees=$(git -C "$source_root" worktree list --porcelain) || {
 if printf '%s\n' "$worktrees" | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
   git -C "$snapshot" checkout -q --detach --force "$head"
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
-  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールへのリンク（/.tools）と、
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールの写し（/.tools。下で作り直す）と、
   # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
   # ほかの階層の .build（docs/.build など）は消す
   git -C "$snapshot" clean -q -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
@@ -355,22 +356,43 @@ else
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
 fi
-# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）。
-# 既存のリンクの先が現在の元の作業ツリーと違う場合（リンク切れを含む）は張り直す。ロックを持ったまま行う
-tools_link="$snapshot/.tools"
-if [ -L "$tools_link" ]; then
-  if [ "$(readlink "$tools_link")" != "$source_root/.tools" ]; then
-    rm -f -- "$tools_link"
-    ln -s "$source_root/.tools" "$tools_link"
-  fi
-elif [ -e "$tools_link" ]; then
-  echo "NG: 専用の作業ツリーの .tools がシンボリックリンクでない（${tools_link}）。削除してから push し直す" >&2
+# 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
+# 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
+# そこで、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから元の .tools を専用の作業ツリーへ写し、ロックを外す。
+# 写しは APFS では複製の領域を使わない clone（cp -c）、対応しないファイルシステムでは通常の複写で作る。bin のリンクは
+# 相対パスなので写しの中を指す。以後の手順（手順 0 の照合を含む）はすべてこの写しを使い、元の .tools の変更の影響を受けない
+tools_source="$source_root/.tools"
+tools_copy="$snapshot/.tools"
+if [ ! -d "$tools_source" ]; then
+  echo "NG: 開発ツールが導入されていない（${tools_source}）。scripts/setup-tools.sh を実行してから push し直す" >&2
   exit 1
-else
-  ln -s "$source_root/.tools" "$tools_link"
 fi
+waited=0
+until mkdir "$tools_source/.install.lock" 2>/dev/null; do
+  if [ ! -d "$tools_source/.install.lock" ] || [ "$waited" -ge 600 ]; then
+    echo "NG: 開発ツールの導入のロック（${tools_source}/.install.lock）を取れない。導入の実行中でなければ削除してから push し直す" >&2
+    exit 1
+  fi
+  if [ "$waited" -eq 0 ]; then echo "待機: 開発ツールの導入・照合が実行中。終わるのを待つ" >&2; fi
+  sleep 1
+  waited=$((waited + 1))
+done
+tools_lock="$tools_source/.install.lock"
+rm -rf -- "$tools_copy"
+mkdir "$tools_copy"
+for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
+  if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi  # 一致するものがないときの glob の文字列
+  case "${entry##*/}" in .install.lock | .work.*) continue ;; esac  # ロックと導入の途中の作業場所は写さない
+  # -P: シンボリックリンクはたどらずにリンクとして写す
+  if ! cp -c -R -P -- "$entry" "$tools_copy/" 2>/dev/null; then
+    rm -rf -- "${tools_copy:?}/${entry##*/}"
+    cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
+  fi
+done
+rmdir "$tools_lock"
+tools_lock=""
 
-# 専用の作業ツリーは送信するコミットに合わせてあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
+# 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
 MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
 ```
 
@@ -450,7 +472,7 @@ fi
 ```
 
 - プッシュ前のフックは、削除の送信（ローカルの SHA がすべて 0）を照合の対象から外す。削除だけの送信は検査するコミットがないので、`check.sh` を起動せずに終了コード 0 で終える。削除と通常の更新が混ざる場合は、通常の更新だけを HEAD と照合し、従来どおり `check.sh` を実行する。
-- プッシュ前のフックは、送信するコミットをチェックアウトした**専用の作業ツリー**（`git worktree add --detach`）で `check.sh` を実行し、すべての手順が同じスナップショットを読むようにする（元の作業ツリーで検査中にブランチを切り替えて戻しても、検査の対象が変わらない。`--expect-head` の照合だけでは、開始と終了の HEAD が同じなら途中の切り替えを検出できない）。専用の作業ツリーはリポジトリの外（`<ホーム>/Library/Caches/MinutesMobile/pre-push/<git の共通ディレクトリのパスの SHA-256>`。環境変数 `MINUTES_PRE_PUSH_DIR` で変えられる）に置き、次の push で再利用する（`checkout --detach --force` と `clean -fdx -e /.tools -e /.build -e /Packages/MinutesKit/.build` で送信するコミットに合わせる。無視するファイル（`docs/` の下書き・`docs/.build` など）も消して文書の整合の検査に読ませず、`.tools` のリンクと、`check.sh` が使う直下と Package の `.build` だけを残す。作業ツリーの一覧（`git worktree list`）を取得できなければ、作業ツリーを消さずに失敗する）。置き場所は作る前に実体のパスへ解決し、元のリポジトリの中（リンクを経由する場合を含む）なら作らずに失敗する。リポジトリの中（`.git` の下など）に置くと、SwiftFormat が親のディレクトリの `.swiftformat` も読み、元の作業ツリーの設定が混ざるため置かない（複製したリポジトリで確かめた）。開発ツールは Git の管理外なので、元の作業ツリーの `.tools` へのシンボリックリンクを置く（`.gitignore` は末尾の `/` のない `/.tools` で、リンクも無視する）。同時の push はロック（`<作業ツリー>.lock` のディレクトリ）で止める。登録が残ったままディレクトリを消された場合は `worktree add --force` で作り直す（`git worktree prune` はほかの作業ツリーの登録も外すので使わない）。フックが設定する `GIT_DIR` などの変数は外してから専用の作業ツリーを操作する。送信するコミットが HEAD と同じで、元の作業ツリーに未コミットの変更がないことは、従来どおり求める。
+- プッシュ前のフックは、送信するコミットをチェックアウトした**専用の作業ツリー**（`git worktree add --detach`）で `check.sh` を実行し、すべての手順が同じスナップショットを読むようにする（元の作業ツリーで検査中にブランチを切り替えて戻しても、検査の対象が変わらない。`--expect-head` の照合だけでは、開始と終了の HEAD が同じなら途中の切り替えを検出できない）。専用の作業ツリーはリポジトリの外（`<ホーム>/Library/Caches/MinutesMobile/pre-push/<git の共通ディレクトリのパスの SHA-256>`。環境変数 `MINUTES_PRE_PUSH_DIR` で変えられる）に置き、次の push で再利用する（`checkout --detach --force` と `clean -fdx -e /.tools -e /.build -e /Packages/MinutesKit/.build` で送信するコミットに合わせる。無視するファイル（`docs/` の下書き・`docs/.build` など）も消して文書の整合の検査に読ませず、`.tools`（push のたびに写し直す）と、`check.sh` が使う直下と Package の `.build` だけを残す。作業ツリーの一覧（`git worktree list`）を取得できなければ、作業ツリーを消さずに失敗する）。置き場所は作る前に実体のパスへ解決し、元のリポジトリの中（リンクを経由する場合を含む）なら作らずに失敗する。リポジトリの中（`.git` の下など）に置くと、SwiftFormat が親のディレクトリの `.swiftformat` も読み、元の作業ツリーの設定が混ざるため置かない（複製したリポジトリで確かめた）。開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、導入のロック（`setup-tools.sh` と同じ `.install.lock`）を取ってから専用の作業ツリーの `.tools` に写し（APFS では `cp -c` の clone、対応しなければ通常の複写。ロックと導入の途中の作業場所は写さない）、ロックを外す。bin のリンクは相対パスなので写しの中を指し、手順 0 の照合と後の手順はすべてこの写しを使う（検査の途中に別の `setup.sh` が元の `.tools` の bin のリンクや版のディレクトリを差し替えても、照合した導入と使う導入が食い違わない）。ロックが取れなければ待ち（上限 600 秒）、待ち始めたことを表示する。同時の push はロック（`<作業ツリー>.lock` のディレクトリ）で止める。登録が残ったままディレクトリを消された場合は `worktree add --force` で作り直す（`git worktree prune` はほかの作業ツリーの登録も外すので使わない）。フックが設定する `GIT_DIR` などの変数は外してから専用の作業ツリーを操作する。送信するコミットが HEAD と同じで、元の作業ツリーに未コミットの変更がないことは、従来どおり求める。
 - **有効にする時期: 作業単位 2 の最後。** プッシュ前のフックは手順 0〜8 を回すので、プロジェクト設定とテストターゲットが揃う前に有効にすると、push できなくなる。作業単位 1 ではフックのファイルを置くだけにし、複製したリポジトリで動作を確かめた（§17）。
 - フックを飛ばす指定（`--no-verify`）は使わない。クラウドの CI がない間は、PR の説明に貼った検査結果（対象のコミットのハッシュ付き）が統合の条件になる（基本設計 §6.2）。
 - コミット前の検査の所要時間は、Swift ファイル 2 件の現状で約 1 秒である。遅くなると飛ばされるので、コードが増えたら測り直す（§17）。
@@ -710,9 +732,11 @@ custom_rules:
     message: "待機とタイマーは注入した型を経由する。実時間を待つテストは書かない（TST-GEN-01）"
     severity: error
 
+  # random・randomElement・shuffled・shuffle は、注入した生成器を渡す呼び出し（using: の引数）を認め、既定の生成器を使う
+  # 呼び出しだけを検出する。引数の中の括弧は 2 段の入れ子まで読む（それより深い引数の using: は見落とさず検出する側に倒れる）
   no_direct_random:
     name: "乱数の直接の利用の禁止"
-    regex: '\.random\s*\(|\.randomElement\s*\(|\.shuffled\s*\(|\.shuffle\s*\(|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
+    regex: '\.(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:[^()]|\((?:[^()]|\([^()]*\))*\))*\busing\s*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
