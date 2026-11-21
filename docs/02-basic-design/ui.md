@@ -269,6 +269,8 @@ OQ-04 の結論:
 - 実装の順序は UI の最後とし、Live Activity がなくても他の機能が完結するようにする。状態の表示は protocol の背後に置く（[architecture.md](architecture.md) §7）。
 - 経過時間は、更新の合間も進んで見えるよう OS の時間表示を使うが、中断したら直ちに「中断中」の静止した表示に更新する。Chunk の確定のたびに表示の基準を合わせ直す。
 - Live Activity からの停止の操作は MVP では提供しない（アプリを開いて停止する）。
+- **更新が止まった場合の表示。** アプリが更新できなくなる（サスペンド・終了・クラッシュ）と、ロック画面に古い「録音中」と進み続ける経過時間が残りうる。そこで、開始と更新のたびに内容（`ActivityContent`）に古くなる時刻（`staleDate`）を付ける。値は最後の更新の時刻に、通常の更新の間隔（Chunk の確定ごと。約 30 秒）より長い余裕を足したもの（初期値: 最後の更新から 90 秒。詳細設計で決め、実機で見直す）とする。古くなった表示（ウィジェットの `isStale`、状態の `stale`）では、経過時間の表示を止め、「状態を更新できていません。アプリを開いて確認してください」の固定の文だけを出す（D1〜D3 を出さない。§1 の BD-UI-04）。中断中の静止した表示も同じ規則で古くなる時刻を付ける。
+- **起動時の後始末。** 起動のたびに（復旧の後）、アプリが開始した Live Activity の一覧（`Activity.activities`）を読み、録音中でない会議（録音セッションのない会議、復旧で `stop_requested` にした会議を含む）に対応するものを、すぐに消える方法（`dismissalPolicy: .immediate`）で終了する（前回の終了で残った「録音中」の表示を消す）。録音中の会議は起動時には存在しない（プロセスが 1 つなので、起動の時点で録音中の会議は前回の終了の残り）ため、結果として起動時にすべての Live Activity を終了する。
 
 ---
 
@@ -344,6 +346,7 @@ OQ-04 の結論:
 | TST-SEC-09（覆い） | UI テスト: 前面でなくなると覆いが出ること | 会議一覧・会議詳細・録音中のそれぞれから切り替え、アプリ切り替え画面の OS の保存画像に D1〜D3 が写らないこと |
 | TST-SEC-10（キーボード） | 単体: デリゲートがキーボードの拡張を拒否すること | サードパーティー製キーボードが出ないこと |
 | ロック画面の文言 | 単体: 表示用の値にタイトル・本文の項目がないこと（型で保証） | TST-DEV-12 |
+| Live Activity の古い表示と起動時の後始末 | 単体: 開始・更新の内容に、最後の更新の時刻に余裕を足した古くなる時刻が付くこと（時計を注入する）。古くなった表示の値が固定の文だけで、経過時間を出さないこと。起動時に、状態表示を差し替えて残った Live Activity を与え、録音中でない会議のものがすぐに消える方法で終了されること | 更新を止めた後（アプリを強制終了する）に、ロック画面の表示が古くなる時刻の後に古い表示に変わり、次の起動で消えること（TST-DEV-12） |
 | アクセシビリティ | UI テスト: 開始・停止の名前が一意であること。最大の文字サイズでの表示 | VoiceOver での一連の操作 |
 
 **設計・実装時の注意点:**
@@ -372,5 +375,6 @@ OQ-04 の結論:
 満たす要件: —（出典の一覧。満たす要件はない）
 
 - iOS 27.2 SDK の `UIApplication.h`（キーボードの拡張の拒否、保護データの可否）、`UIPasteboard.h`（端末内限定・有効期限）、`ActivityKit.swiftinterface`（Push を使わない開始）（確認日 2026-11-14）
+- iOS 27.2 SDK の `ActivityKit.swiftinterface`（`ActivityContent` の `staleDate`、`ActivityState.stale`、`Activity.activities`、`end(_:dismissalPolicy:)` と `ActivityUIDismissalPolicy.immediate`）、`WidgetKit.swiftinterface`（`ActivityViewContext` の `isStale`）（確認日 2026-11-21）
 - [Apple: Supported capabilities (iOS)](https://developer.apple.com/help/account/reference/supported-capabilities-ios/)（確認日 2026-11-14）
 - Minutes `docs/design-local-phase1.md` §3.6・§3.9、`docs/design-local-phase2.md` §18

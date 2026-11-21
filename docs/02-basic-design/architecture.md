@@ -321,9 +321,12 @@ func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> (next: MeetingStat
 | T-07 改ざん・破損 | SHA-256 を保存時に記録し、確定・書き出し・文字起こしの前に検証する | [storage.md](storage.md) §5 |
 | T-09 パス操作 | パスは会議 ID（UUID）と連番だけで組み立てる。タイトルは書き出しのファイル名にだけ使い、無害化する | [storage.md](storage.md) §2、[export.md](export.md) §5 |
 | T-10 依存の混入 | 組み込み依存 0 件（BD-ARC-07）。開発ツールは版を固定して照合 | [dev-environment.md](dev-environment.md) §5 |
+| T-11 秘密情報の混入（リポジトリ） | コミット前と全履歴の秘密情報の検査。検出の抑止の仕組みを使わない | [dev-environment.md](dev-environment.md) §6 |
 | T-12 削除の取り残し | 会議のデータを 1 つのディレクトリに集め、削除を墓標で再開可能にする | [storage.md](storage.md) §9 |
 
-T-08（プロンプトインジェクション）と T-11（秘密情報）は P2・P3 の対象で、MVP には該当する経路がない。
+T-08（プロンプトインジェクション）は P2・P3 の対象で、MVP には該当する経路がない。
+
+T-11（秘密情報）は 2 つに分けて扱う。①**リポジトリに誤って入れた秘密情報**（ソースコード・設定ファイル・スクリプトに残った鍵やトークン）は MVP の脅威に含める。コミット前の検査（ステージした内容）と全履歴の検査で秘密情報を検出する（SEC-SUP-03、TST-CI-04。[dev-environment.md](dev-environment.md) §6 の手順 3）。②**実行時に扱う秘密情報**（将来の連携トークンなど。Keychain に置く。SEC-KEY-01）は、MVP のアプリが持たないので該当する経路がなく、P2・P3 で連携を足すときに設計する。
 
 ### 12.2 設計・実装で必ず確認する注意点
 
