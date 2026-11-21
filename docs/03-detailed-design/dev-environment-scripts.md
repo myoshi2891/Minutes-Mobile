@@ -221,10 +221,11 @@ if [ "$MODE" = install ]; then
       if [ ! -e "$PENDING_TARGET" ]; then
         mv "$PENDING_BACKUP" "$PENDING_TARGET" || echo "NG: 退避した導入を戻せない（${PENDING_BACKUP}）" >&2
       else
-        rm -rf -- "${PENDING_BACKUP:?}"
+        # 削除の失敗で終了処理を止めない（set -e でロックの解放を飛ばさない）。失敗はパスとともに記録する
+        rm -rf -- "${PENDING_BACKUP:?}" || echo "NG: 退避した導入を削除できない（${PENDING_BACKUP}）" >&2
       fi
     fi
-    if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}"; fi
+    if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}" || echo "NG: 作業場所を削除できない（${WORK}）" >&2; fi
     # 自分が取得したロックだけを解放する（ロックを待っている間に終わった場合は、他の実行のロックを消さない）
     if [ -n "$LOCK_HELD" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
@@ -387,6 +388,8 @@ expand_steps() {
     esac
     # 番号は先頭に 0 のない正規の形だけを認める（08 などは bash の算術で 8 進数として読まれ、範囲の判定を誤るため）
     [[ $first =~ ^(0|[1-9][0-9]*)$ && $last =~ ^(0|[1-9][0-9]*)$ ]] || usage
+    # 整数の比較の前に、桁数で上限を確かめる（桁の多い値は bash の整数の範囲を超え、比較が失敗して範囲を読み飛ばすため）
+    [ ${#first} -le ${#LAST_STEP} ] && [ ${#last} -le ${#LAST_STEP} ] || usage
     if [ "$first" -gt "$last" ] || [ "$last" -gt "$LAST_STEP" ]; then usage; fi
     number=$first
     while [ "$number" -le "$last" ]; do
