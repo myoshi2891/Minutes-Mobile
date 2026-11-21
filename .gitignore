@@ -1,0 +1,30 @@
+# 個人の設定とビルドの成果物
+xcuserdata/
+DerivedData/
+.build/
+# build はリポジトリ直下だけ（下位の build という名前のディレクトリの manifest・ソースは追跡して検査する）
+/build/
+*.xcresult
+# Python のバイトコードのキャッシュ（scripts/ の import で作られる）
+__pycache__/
+
+# 導入スクリプトが展開した開発ツール（版は tools/versions で管理する）。
+# 末尾の「/」を付けない（プッシュ前のフックが専用の作業ツリーに置く .tools のシンボリックリンクも無視する）
+/.tools
+
+# 録音データを誤って入れない（SEC-SUP-04・05）
+*.wav
+*.m4a
+*.caf
+*.zip
+
+# 試験で作った DB
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# 秘密情報
+.env
+.env.*
+
+.DS_Store

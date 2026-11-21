@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit の設定。レビューの対象から、レビューの要らないファイルを除く（PR のファイル数の上限 100 件に収めるため）
+reviews:
+  path_filters:
+    # 静的解析の規則の試験用の違反例・正常例。わざと規則に違反するコードで、正しさは scripts/test-lint-rules.py が確かめる
+    - "!tools/lint-fixtures/**"
+    # Xcode の個人の設定（.gitignore で無視する。main の初回のコミットに残っていたものの削除だけが差分に出る）
+    - "!**/xcuserdata/**"

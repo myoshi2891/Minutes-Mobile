@@ -1,0 +1,190 @@
+#!/bin/bash
+# プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
+# 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+# 送信するコミットが HEAD と同じで、未コミットの変更がないことを求める。
+# 検査は、送信するコミットだけをチェックアウトした専用の作業ツリーで行う。元の作業ツリーで検査中にブランチを
+# 切り替えても（切り替えて戻しても）、すべての手順が同じスナップショットを読む。専用の作業ツリーはリポジトリの外
+# （<ホーム>/Library/Caches/MinutesMobile/pre-push/<リポジトリごとの値>。MINUTES_PRE_PUSH_DIR で変えられる）に置く
+# （リポジトリの中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読み、元の作業ツリーの設定が混ざる）
+set -euo pipefail
+# HEAD は削除以外の参照の行を受け取ってから解決する（削除だけの送信では解決しない。HEAD がまだない場合にも失敗させない）。
+# 最初に解決した値を、後続の照合・専用の作業ツリーのチェックアウト・--expect-head に使う
+head=""
+updates=0  # 削除以外の参照の送信の数
+# 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # 削除の送信（ローカルの SHA がすべて 0）は検査するコミットがない
+  if [ -z "${local_sha//0/}" ]; then continue; fi
+  updates=$((updates + 1))
+  if [ -z "$head" ]; then head=$(git rev-parse --verify HEAD); fi
+  # 注釈付きのタグはタグのオブジェクトを指すので、コミットまでたどってから比べる
+  commit=$(git rev-parse --verify -q "${local_sha}^{commit}") || {
+    echo "NG: 送信する ${local_ref} (${local_sha}) がコミットを指していない" >&2
+    exit 1
+  }
+  if [ "$commit" != "$head" ]; then
+    echo "NG: 送信する ${local_ref} (${commit}) が HEAD (${head}) と違う。そのコミットをチェックアウトしてから push する" >&2
+    exit 1
+  fi
+done
+# 削除だけの送信は、検査するコミットがないので検査を起動しない
+if [ "$updates" -eq 0 ]; then exit 0; fi
+# 元の作業ツリーに未コミットの変更（追跡していないファイルを含む）があれば、送信するコミットと手元が食い違うので止める
+# 状態を取得できない場合（git status の失敗）は、変更がないと見なさずに止める
+status_output=$(git status --porcelain --untracked-files=normal) || {
+  echo "NG: 作業ツリーの状態を取得できない（git status が失敗した）" >&2
+  exit 1
+}
+if [ -n "$status_output" ]; then
+  echo "NG: 未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから push する" >&2
+  exit 1
+fi
+
+source_root=$(cd -P "$(git rev-parse --show-toplevel)" && pwd)  # 実体のパス（シンボリックリンクを解決したもの）
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
+# 置き場所を作る前に実体のパスへ解決する（まだない部分を含んでよい。git worktree list が示す実体のパスとも比べる）。
+# 元のリポジトリと、登録されたすべての作業ツリーの中（リンクを経由して指す場合を含む）は拒否する。中に置くと、
+# SwiftFormat などが親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る
+# （中にディレクトリを残さない）。どの作業ツリーの中でもない場所は認める
+base=$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$base") || {
+  echo "NG: 専用の作業ツリーの置き場所を解決できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
+  exit 1
+}
+# 一覧を取得できなければ、比べずに認めることはせず止める
+registered=$(git -C "$source_root" worktree list --porcelain) || {
+  echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
+  exit 1
+}
+# 比べるのはパスの文字列ではなく、ファイルシステム上の同一性（デバイスと inode）。置き場所の既存の祖先（自身を含む）の
+# どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら拒否する（大文字小文字を区別しないボリュームで
+# 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）。
+# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。終了コード: 0 = 外 / 1 = 中 / 2 = 判定できない
+inside_status=0
+inside=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' | /usr/bin/python3 -c '
+import os, sys
+base, source = sys.argv[1], sys.argv[2]
+
+def identity(path):
+    # デバイスと inode。ないパスは None。それ以外の失敗（権限など）は判定できないとして終了コード 2
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        print(f"{path}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return (info.st_dev, info.st_ino)
+
+roots = {}
+for path in [source] + [line.rstrip("\n") for line in sys.stdin if line.strip()]:
+    found = identity(path)
+    if found is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
+        roots[found] = path
+current = base
+while True:
+    info = identity(current)  # None はまだない部分（作る予定の場所）
+    if info is not None and info in roots:
+        print(roots[info])
+        sys.exit(1)
+    parent = os.path.dirname(current)
+    if parent == current:
+        break
+    current = parent
+' "$base" "$source_root") || inside_status=$?
+case $inside_status in
+  0) ;;
+  1)
+    echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${inside}）の中にある。どの作業ツリーの外も指定する" >&2
+    exit 1
+    ;;
+  *)
+    echo "NG: 専用の作業ツリーの置き場所が作業ツリーの中かを判定できない（${base}）" >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$base"
+key=$(printf '%s' "$common_dir" | shasum -a 256)
+snapshot="$base/${key%% *}"
+lock="$snapshot.lock"
+# フックの実行中に Git が設定する変数を外す（残すと、専用の作業ツリーでの git が元のリポジトリの作業ツリーを操作する）
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+
+# 同時に 2 つの push が同じ作業ツリーを使わないようにする
+if ! mkdir "$lock" 2>/dev/null; then
+  echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
+  exit 1
+fi
+tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
+# 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
+trap 'status=$?; if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null || true; fi; rmdir "$lock" 2>/dev/null || true; exit "$status"' EXIT
+trap 'exit 130' INT TERM
+
+# 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
+# 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）
+worktrees=$(git -C "$source_root" worktree list --porcelain) || {
+  echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
+  exit 1
+}
+if printf '%s\n' "$worktrees" | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
+  git -C "$snapshot" checkout -q --detach --force "$head"
+  # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールの写し（/.tools。下で作り直す）と、
+  # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
+  # ほかの階層の .build（docs/.build など）は消す
+  git -C "$snapshot" clean -q -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
+  # 残したビルドの成果物の場所には、中断した前回の検査のカバレッジのロック（check.sh の手順 7・8 が直下の .build に作る）が
+  # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
+  # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
+  rm -rf -- "$snapshot/.build/minutes-coverage.lock"
+else
+  rm -rf -- "$snapshot"  # 登録のない残骸（前回の作成の途中で止まったものなど）
+  # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
+  git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
+fi
+# 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
+# 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
+# そこで、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから元の .tools を専用の作業ツリーへ写し、ロックを外す。
+# 写しは APFS では複製の領域を使わない clone（cp -c）、対応しないファイルシステムでは通常の複写で作る。bin のリンクは
+# 相対パスなので写しの中を指す。以後の手順（手順 0 の照合を含む）はすべてこの写しを使い、元の .tools の変更の影響を受けない
+tools_source="$source_root/.tools"
+tools_copy="$snapshot/.tools"
+if [ ! -d "$tools_source" ]; then
+  echo "NG: 開発ツールが導入されていない（${tools_source}）。scripts/setup-tools.sh を実行してから push し直す" >&2
+  exit 1
+fi
+waited=0
+retried=0  # ロックが消えていたときに、直ちに取り直した（1 回だけ）
+until mkdir "$tools_source/.install.lock" 2>/dev/null; do
+  # mkdir の失敗の後にロックが外れた（別の導入が終わった）場合は、待たずに 1 回だけ取り直す。
+  # 取り直しても失敗し、ロックもない場合は、ロック以外の理由（書き込めないなど）として止める
+  if [ ! -d "$tools_source/.install.lock" ] && [ "$retried" -eq 0 ]; then
+    retried=1
+    continue
+  fi
+  if [ -d "$tools_source/.install.lock" ]; then retried=0; fi
+  if [ ! -d "$tools_source/.install.lock" ] || [ "$waited" -ge 600 ]; then
+    echo "NG: 開発ツールの導入のロック（${tools_source}/.install.lock）を取れない。導入の実行中でなければ削除してから push し直す" >&2
+    exit 1
+  fi
+  if [ "$waited" -eq 0 ]; then echo "待機: 開発ツールの導入・照合が実行中。終わるのを待つ" >&2; fi
+  sleep 1
+  waited=$((waited + 1))
+done
+tools_lock="$tools_source/.install.lock"
+rm -rf -- "$tools_copy"
+mkdir "$tools_copy"
+for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
+  if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi  # 一致するものがないときの glob の文字列
+  case "${entry##*/}" in .install.lock | .work.*) continue ;; esac  # ロックと導入の途中の作業場所は写さない
+  # -P: シンボリックリンクはたどらずにリンクとして写す
+  if ! cp -c -R -P -- "$entry" "$tools_copy/" 2>/dev/null; then
+    rm -rf -- "${tools_copy:?}/${entry##*/}"
+    cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
+  fi
+done
+rmdir "$tools_lock"
+tools_lock=""
+
+# 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
+MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
