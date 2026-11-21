@@ -122,7 +122,7 @@ stateDiagram-v2
     rebuilding --> interrupted: 再構築失敗（通知と画面で明示）
     rebuilding --> stopping: 使える入力がない
     rebuilding --> stopping: 利用者が停止（再構築を中止。空白区間を閉じる。§5.1）
-    capturing --> stopping: 利用者が停止・容量枯渇
+    capturing --> stopping: 利用者が停止・使える入力がない（no_input）・容量枯渇
     interrupted --> stopping: 利用者が停止（空白区間を停止時刻で閉じる）
     stopping --> idle: 末尾の Chunk を保存
 ```
