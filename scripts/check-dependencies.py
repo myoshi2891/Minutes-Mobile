@@ -399,10 +399,11 @@ UNPINNED = re.compile(r"\b(branch|revision)\s*:|\.(branch|revision)\s*\(")
 # 版の指定の引数（最上位の「,」で区切った 1 つ）の全体の形。引数の全体が一致するものだけを認める（「"1.0.0" + x」のような
 # 式の一部を版と見なさない）。呼び出しの名前と「(」の間の空白（コメントを除いた跡を含む）は Swift と同じく許す。
 # from: は、引数の先頭にあるもの（.package の引数）だけを upToNextMajor とする（.upToNextMinor(from:) などの中の from: と区別する）
+# ラベルとコロンの間の空白（コメントを除いた跡を含む。from /* … */ : "1.2.3"）も Swift と同じく許す
 REQUIREMENTS = (
-    ("exact", re.compile(rf"(?:exact:\s*{VERSION}|\.exact\s*\(\s*{VERSION}\s*\))\s*")),
-    ("minor", re.compile(rf"\.upToNextMinor\s*\(\s*from:\s*{VERSION}\s*\)\s*")),
-    ("major", re.compile(rf"(?:\.upToNextMajor\s*\(\s*from:\s*{VERSION}\s*\)|from:\s*{VERSION})\s*")),
+    ("exact", re.compile(rf"(?:exact\s*:\s*{VERSION}|\.exact\s*\(\s*{VERSION}\s*\))\s*")),
+    ("minor", re.compile(rf"\.upToNextMinor\s*\(\s*from\s*:\s*{VERSION}\s*\)\s*")),
+    ("major", re.compile(rf"(?:\.upToNextMajor\s*\(\s*from\s*:\s*{VERSION}\s*\)|from\s*:\s*{VERSION})\s*")),
     ("closed", re.compile(rf"{VERSION}\s*\.\.\.\s*{VERSION}\s*")),
     ("half-open", re.compile(rf"{VERSION}\s*\.\.<\s*{VERSION}\s*")),
 )

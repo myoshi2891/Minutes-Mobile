@@ -56,23 +56,53 @@ registered=$(git -C "$source_root" worktree list --porcelain) || {
   echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
   exit 1
 }
-roots=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' \
-  | /usr/bin/python3 -c 'import os, sys; [print(os.path.realpath(line.rstrip("\n"))) for line in sys.stdin if line.strip()]') || {
-  echo "NG: 作業ツリーの実体のパスを解決できない" >&2
-  exit 1
-}
-while IFS= read -r root; do
-  [ -n "$root" ] || continue
-  case "$base/" in
-    "$root/"*)
-      echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${root}）の中にある。どの作業ツリーの外も指定する" >&2
-      exit 1
-      ;;
-  esac
-done <<ROOTS
-$source_root
-$roots
-ROOTS
+# 比べるのはパスの文字列ではなく、ファイルシステム上の同一性（デバイスと inode）。置き場所の既存の祖先（自身を含む）の
+# どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら拒否する（大文字小文字を区別しないボリュームで
+# 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）。
+# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。終了コード: 0 = 外 / 1 = 中 / 2 = 判定できない
+inside_status=0
+inside=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' | /usr/bin/python3 -c '
+import os, sys
+base, source = sys.argv[1], sys.argv[2]
+
+def identity(path):
+    # デバイスと inode。ないパスは None。それ以外の失敗（権限など）は判定できないとして終了コード 2
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        print(f"{path}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return (info.st_dev, info.st_ino)
+
+roots = {}
+for path in [source] + [line.rstrip("\n") for line in sys.stdin if line.strip()]:
+    found = identity(path)
+    if found is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
+        roots[found] = path
+current = base
+while True:
+    info = identity(current)  # None はまだない部分（作る予定の場所）
+    if info is not None and info in roots:
+        print(roots[info])
+        sys.exit(1)
+    parent = os.path.dirname(current)
+    if parent == current:
+        break
+    current = parent
+' "$base" "$source_root") || inside_status=$?
+case $inside_status in
+  0) ;;
+  1)
+    echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${inside}）の中にある。どの作業ツリーの外も指定する" >&2
+    exit 1
+    ;;
+  *)
+    echo "NG: 専用の作業ツリーの置き場所が作業ツリーの中かを判定できない（${base}）" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$base"
 key=$(printf '%s' "$common_dir" | shasum -a 256)
 snapshot="$base/${key%% *}"

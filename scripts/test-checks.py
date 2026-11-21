@@ -636,6 +636,10 @@ def test_dependencies() -> None:
         "半開区間": f'.package(url: "{url}", "1.0.0"..<"2.0.0")',
         "閉区間": f'.package(url: "{url}", "1.0.0"..."1.2.3")',
         "upToNextMajor": f'.package(url: "{url}", .upToNextMajor(from: "1.0.0"))',
+        # ラベルとコロンの間の空白・コメントの跡も、版の指定として読む（判定できないものとして落とさない）
+        "exact のラベルの後の空白": f'.package(url: "{url}", exact : "1.2.3")',
+        "from のラベルの後のコメント": f'.package(url: "{url}", from /* 下限 */ : "1.0.0")',
+        "upToNextMinor の from の後の空白": f'.package(url: "{url}", .upToNextMinor(from : "1.2.0"))',
     }.items():
         dependencies_case(f"確定版を含む版の指定（{label}）", 0, "OK",
                           {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
@@ -1246,6 +1250,45 @@ def coverage_record_message_case() -> None:
                                 f"{result.stderr.strip()}")
 
 
+def staged_raw_blob_case() -> None:
+    """check.sh --staged の整形・静的解析が、smudge のフィルタを通さずに、ステージした blob そのものを検査すること。
+
+    一時のリポジトリで、.gitattributes の smudge のフィルタが内容を書き換える Swift ファイルをステージし、整形の代わり
+    （.tools/bin/swiftformat。渡されたファイルの内容を記録して失敗する）が読んだ内容を確かめる。
+    """
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools" / "bin").mkdir(parents=True)
+        out = Path(directory) / "recorded"
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "check.sh").chmod(0o755)
+        # 整形の代わり: 渡された最後のファイルの内容を記録し、手順 1 で止める（後の手順を実行しない）
+        formatter = repository / ".tools" / "bin" / "swiftformat"
+        formatter.write_text('#!/bin/sh\nfor last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\nexit 1\n',
+                             encoding="utf-8")
+        formatter.chmod(0o755)
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        (repository / ".gitattributes").write_text("*.swift filter=rewrite\n", encoding="utf-8")
+        (repository / "Sample.swift").write_text("let raw = 1\n", encoding="utf-8")
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        # clean は設定しない（ステージした blob は作業ツリーの内容のまま）。smudge だけが書き出しの内容を書き換える
+        subprocess.run(["git", "-C", str(repository), "config", "filter.rewrite.smudge", "sed s/raw/smudged/"], env=env, check=True)
+        subprocess.run(["git", "-C", str(repository), *identity, "add", "-A"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
+                                env=dict(env, MINUTES_TEST_OUT=str(out)), timeout=60)
+        recorded = out.read_text(encoding="utf-8") if out.is_file() else None
+        if recorded != "let raw = 1\n":
+            failures.append(f"check: --staged の整形がステージした blob そのものを検査しない（読んだ内容 {recorded!r}・"
+                            f"終了コード {result.returncode}）\n{(result.stdout + result.stderr).strip()}")
+
+
 def staged_symlink_case() -> None:
     """check.sh --staged が、種類を変えて（通常のファイル → シンボリックリンク）ステージした Swift のパスを、
     整形・静的解析に渡す前に、インデックスで通常のファイルでないとして失敗にすること（手順を始める前に止まる）。"""
@@ -1333,17 +1376,27 @@ def simulator_cases() -> None:
                 failures.append(f"simulator: {label}: 出力が {result.stdout!r}（期待 'x\\n'）")
 
 
-def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
-    """setup-tools.sh --verify が導入のロックを待ち、ロックが外れてから照合を終えること。"""
+def verify_lock_case(setup: str, versions: Path, dest: Path, stub: Path) -> None:
+    """setup-tools.sh --verify が導入のロックを待ち、ロックを取ってから照合し（照合の間ロックを持つ）、終えたら外すこと。
+
+    stub は照合が実行する gh の代わり。版を表示する前に、その時点で導入のロックがあるかを記録させる（待った後に
+    ロックを取らずに照合する実装を見逃さない）。
+    """
     global count
     count += 1
     import time
     lock = dest / ".install.lock"
+    seen = dest.parent / "lock-seen"
+    original_stub = stub.read_text(encoding="utf-8")
+    shebang, _, body = original_stub.partition("\n")
+    stub.write_text(f'{shebang}\nif [ -d "$MINUTES_TEST_LOCK" ]; then echo held; else echo missing; fi >> "$MINUTES_TEST_SEEN"\n'
+                    f"{body}", encoding="utf-8")
     lock.mkdir()
     import queue
     import threading
     process = subprocess.Popen([setup, "--verify", "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
-                               cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                               cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               env=dict(os.environ, MINUTES_TEST_LOCK=str(lock), MINUTES_TEST_SEEN=str(seen)))
     lines: "queue.Queue[Optional[str]]" = queue.Queue()
 
     def reader() -> None:
@@ -1370,6 +1423,9 @@ def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
             collected.append(line)
             waiting = "待機:" in line
         waiting = waiting and process.poll() is None
+        # 試験のロックを外した時点を記録に残す（外す前の gh の実行は、試験のロックを見て held と記録しうるので数えない）
+        with seen.open("a", encoding="utf-8") as handle:
+            handle.write("released\n")
         lock.rmdir()
         process.wait(timeout=30)
         thread.join(timeout=30)
@@ -1391,9 +1447,14 @@ def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
     finally:
         if lock.exists():
             lock.rmdir()
+        stub.write_text(original_stub, encoding="utf-8")
+    observed = seen.read_text(encoding="utf-8").split() if seen.is_file() else []
     if not waiting or process.returncode != 0 or leftover:
         failures.append(f"versions: 照合が導入のロックを待たない、またはロックの後に通らない（待った {waiting}・"
                         f"終了コード {process.returncode}）\n{output.strip()}")
+    elif observed[:1] != ["released"] or len(observed) < 2 or any(state != "held" for state in observed[1:]):
+        # 照合（gh の版の表示）は試験のロックが外れた後にだけ行い、その間は照合の実行が自分で取ったロックを持っていること
+        failures.append(f"versions: 照合の間に導入のロックを持っていない（gh の実行時の記録 {observed}）")
 
 
 def test_versions() -> None:
@@ -1406,6 +1467,7 @@ def test_versions() -> None:
     setup_missing_hook_case()
     require_clean_case()
     staged_symlink_case()
+    staged_raw_blob_case()
     coverage_record_message_case()
     # 明示した --steps が空なら、全手順を実行せずに使い方の誤りにする。
     # リポジトリの外の一時ディレクトリに写した check.sh で試す（誤って全手順を実行しても、手順 0 がこの自己試験を
@@ -1520,7 +1582,7 @@ def test_versions() -> None:
         expect("versions: 導入記録のある版を指すリンク", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                  "--require", "gh"], 0, "OK")
         # 照合も導入と同じロックを取る。導入の実行中（ロックがある間）は照合を終えず、ロックが外れてから照合して通る
-        verify_lock_case(setup, versions, dest)
+        verify_lock_case(setup, versions, dest, stub)
         other = dest / "gh" / "other" / executable
         other.parent.mkdir()
         other.write_text(stub.read_text(encoding="utf-8"), encoding="utf-8")
@@ -2479,6 +2541,9 @@ def run_docs_cases() -> None:
         # 冒頭の「| 満たす要件 ID |」は、表のデータ行の場合だけ網羅に数える（表の見出しに似た単独の行は数えない）
         docs_case("冒頭の表でない満たす要件 ID の行は網羅に数えない", 1, "MVP の要件 FR-AAA-02", basic,
                   "| 項目 | 内容 |\n| --- | --- |\n| 満たす要件 ID |", "| 満たす要件 ID |"),
+        # 冒頭の表は値の列（2 列目）だけを数える。見出しの列の数を超える余分な列（GFM は表示しない）の ID は網羅に数えない
+        docs_case("冒頭の表の余分な列の ID は網羅に数えない", 1, "MVP の要件 FR-AAA-02", basic,
+                  "| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |", "| 満たす要件 ID | FR-AAA-01、SEC-AAA-01 | FR-AAA-02 |"),
         # 「満たす要件」の HTML のコメントの中の ID は表示されないので、網羅にも節の冒頭の要件にも数えない
         docs_case("冒頭の表のコメントの中の ID は網羅に数えない", 1, "MVP の要件 FR-AAA-02", basic,
                   "| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |", "| 満たす要件 ID | FR-AAA-01、SEC-AAA-01 <!-- FR-AAA-02 --> |"),

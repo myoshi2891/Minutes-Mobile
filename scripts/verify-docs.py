@@ -543,11 +543,19 @@ class Checker:
         fields: List[str] = []
         # 冒頭の終わり（最初の見出しの行番号）。見出しがなければ文書の全体が冒頭
         head_end = next((number for number, line in prose_lines(text) if heading(line)), None)
-        # 表の見出しの行だけ・区切りの行のない行など、表として成り立たない「| 満たす要件 ID |」の行は数えない
-        for _, rows in tables(text):
-            # 同じ行のコメントの中の ID は表示されないので数えない
-            fields.extend(visible(line) for number, line in rows
-                          if (head_end is None or number < head_end) and table_cells(line)[0] == "満たす要件 ID")
+        # 表の見出しの行だけ・区切りの行のない行など、表として成り立たない「| 満たす要件 ID |」の行は数えない。
+        # 数えるのは値の列（2 列目）の表示される内容だけ。値の列のない表（1 列）の行と、見出しの列の数を超える余分な列
+        # （GFM は表示しない）は数えない
+        for header, rows in tables(text):
+            if len(header) < 2:
+                continue
+            for number, line in rows:
+                if head_end is not None and number >= head_end:
+                    continue
+                # 同じ行のコメントの中の ID は表示されないので数えない
+                cells = table_cells(visible(line))
+                if cells[0] == "満たす要件 ID" and len(cells) >= 2:
+                    fields.append(cells[1])
         after_heading = False
         for _, line, inside, _, commented in scanned_lines(text):
             if commented:
