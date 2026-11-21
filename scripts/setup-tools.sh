@@ -199,10 +199,11 @@ if [ "$MODE" = install ]; then
       if [ ! -e "$PENDING_TARGET" ]; then
         mv "$PENDING_BACKUP" "$PENDING_TARGET" || echo "NG: 退避した導入を戻せない（${PENDING_BACKUP}）" >&2
       else
-        rm -rf -- "${PENDING_BACKUP:?}"
+        # 削除の失敗で終了処理を止めない（set -e でロックの解放を飛ばさない）。失敗はパスとともに記録する
+        rm -rf -- "${PENDING_BACKUP:?}" || echo "NG: 退避した導入を削除できない（${PENDING_BACKUP}）" >&2
       fi
     fi
-    if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}"; fi
+    if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}" || echo "NG: 作業場所を削除できない（${WORK}）" >&2; fi
     # 自分が取得したロックだけを解放する（ロックを待っている間に終わった場合は、他の実行のロックを消さない）
     if [ -n "$LOCK_HELD" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
     # 終了コードを明示的に返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）

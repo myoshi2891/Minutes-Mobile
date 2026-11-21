@@ -187,6 +187,11 @@ def is_separator(line: str) -> bool:
     return is_row(line) and all(SEPARATOR_CELL.fullmatch(cell) for cell in table_cells(line))
 
 
+# 新しいブロックの始まりの行（引用・ATX の見出し・箇条書き・番号付きの箇条書き。字下げは空白 0〜3 個）。
+# GFM では表はこれらのブロックの始まりで終わるので、「|」を含んでいても表の行にしない
+BLOCK_START = re.compile(r"^ {0,3}(?:>|#{1,6}(?:\s|$)|[-+*]\s|\d{1,9}[.)]\s)")
+
+
 def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tuple[int, str]]]]:
     """（行番号, 行）の並びから表を探し、表ごとに見出しの列とデータ行を返す（tables と table_blocks が共用する）。
 
@@ -198,8 +203,9 @@ def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tupl
     found: List[Tuple[List[str], List[Tuple[int, str]]]] = []
     block: List[Tuple[int, str]] = []
     for item in lines + [(0, "")]:
-        # 字下げしたコードブロックの行は表の行にしない（コードの中の対応表の例を、表として数えない）
-        if is_row(item[1]) and not INDENTED_CODE.match(item[1]):
+        # 字下げしたコードブロックの行は表の行にしない（コードの中の対応表の例を、表として数えない）。
+        # 新しいブロック（引用など）の始まりの行は表を終わらせ、表の行にしない
+        if is_row(item[1]) and not INDENTED_CODE.match(item[1]) and not BLOCK_START.match(item[1]):
             block.append(item)
             continue
         start = next((at for at in range(1, len(block)) if is_separator(block[at][1]) and not is_separator(block[at - 1][1])), None)
@@ -490,10 +496,13 @@ class Checker:
         relative = name[len(DETAILED) + 1:]
         if f"{BASIC}/{relative}" in self.texts or not relative.endswith(".md"):
             return None
+        # 配下のディレクトリの基本設計も、相対パスのまま候補にする（sub/foo.md の分冊は sub/foo-<名前>.md）
         stems = [basic[len(BASIC) + 1:-len(".md")] for basic in self.texts
-                 if basic.startswith(BASIC + "/") and basic.endswith(".md") and "/" not in basic[len(BASIC) + 1:]]
+                 if basic.startswith(BASIC + "/") and basic.endswith(".md")]
         for stem in sorted(stems, key=len, reverse=True):
-            if relative.startswith(stem + "-") and f"{DETAILED}/{stem}.md" in self.texts:
+            # 分冊は本冊と同じディレクトリにあること（foo-x/bar.md を foo.md の分冊と見なさない）
+            if (relative.startswith(stem + "-") and "/" not in relative[len(stem) + 1:]
+                    and f"{DETAILED}/{stem}.md" in self.texts):
                 return f"{DETAILED}/{stem}.md"
         return None
 
@@ -558,11 +567,13 @@ class Checker:
             for found in (HANDOVER_ITEM.match(line) for line in body) if found
         ]
         # 表ごとに（連続した「|」の行のまとまりごとに）区切り、見出しと区切りの行を持つ表のデータ行だけを数える。
-        # 解決の列（2 列目）を見出しに持つ表の行だけを数える（1 列の表の本文の行に余分な列があっても、解決と見なさない）
+        # 解決の列（2 列目。見出しに「解決」を含む）を持つ表の行だけを数える（1 列の表の本文の行に余分な列があっても、
+        # 2 列目が「担当者」など別の列の表でも、解決と見なさない）
         rows: List[str] = []
         for _, heading, body in sections:
             if "申し送り" in heading:
-                rows.extend(row for header, block in table_blocks(body) if len(header) >= 2 for row in block)
+                rows.extend(row for header, block in table_blocks(body) if len(header) >= 2 and "解決" in header[1]
+                            for row in block)
         # 解決の列（2 列目）が空・空白だけの行は、解決したことにしない
         resolved = []
         for line in rows:
@@ -611,7 +622,11 @@ class Checker:
             if not path.is_file():
                 self.error(name, f"コード片の元のファイルがない: {marker.group(2)}", index + 1)
                 continue
-            actual = path.read_text(encoding="utf-8").splitlines()
+            try:
+                actual = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError) as error:
+                self.error(name, f"コード片の元のファイルを読めない: {marker.group(2)}: {error}", index + 1)
+                continue
             if marker.group(1) == "file":
                 matches = snippet == actual
             else:
@@ -669,7 +684,11 @@ class Checker:
                 end = fence_end(lines, start)
                 # 字下げしたフェンスには、開始行と同じ字下げを付けて書く（空行には付けない）
                 indent = " " * fence_indent(lines[start])
-                content = [indent + line if line else line for line in path.read_text(encoding="utf-8").splitlines()]
+                try:
+                    source = path.read_text(encoding="utf-8").splitlines()
+                except (OSError, UnicodeDecodeError):
+                    continue  # このコード片は書き直さない。検査の側（check_snippets）が印の行とともに報告する
+                content = [indent + line if line else line for line in source]
                 # このフェンスを閉じてしまう行を含む内容は書き込まない（長いフェンスに手で直す）
                 if end >= len(lines) or any(fence_closes(line, opened[0]) for line in content):
                     continue

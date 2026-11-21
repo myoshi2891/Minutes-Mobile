@@ -42,6 +42,10 @@ def main() -> int:
         for runtime, devices in devices_by_runtime.items():
             if not isinstance(devices, list) or not all(isinstance(device, dict) for device in devices):
                 raise TypeError(f"devices の {runtime} が辞書の配列でない")
+            # 機種の識別子は文字列であること（配列や辞書に「iPhone」を含めた一覧を iPhone と取り違えない）
+            for device in devices:
+                if not isinstance(device.get("deviceTypeIdentifier", ""), str):
+                    raise TypeError(f"devices の {runtime} の deviceTypeIdentifier が文字列でない")
         runtimes = {
             item["identifier"]: version_key(item["version"])
             for item in data["runtimes"]

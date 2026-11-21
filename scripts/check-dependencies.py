@@ -121,7 +121,11 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
         skipped = SKIPPED_ANYWHERE | (SKIPPED_AT_ROOT if Path(directory) == root else set())
         subdirectories[:] = [entry for entry in subdirectories if entry not in skipped]
         found.extend(Path(directory) / entry for entry in files if fnmatch.fnmatchcase(entry, name))
-    yield from sorted(path for path in found if path.is_file())
+    # 名前が合うのに通常のファイルとして確かめられないもの（壊れたシンボリックリンクなど）は、黙って除かず読めないものとする
+    for path in found:
+        if not path.is_file():
+            raise Unreadable(f"{path}: 通常のファイルとして読めない（壊れたシンボリックリンクなど）")
+    yield from sorted(found)
 
 
 def resolved_pins(path: Path) -> List[dict]:

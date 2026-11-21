@@ -171,6 +171,10 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
         errors.append(f"{TEST_CODE_FIXTURE}/ に .swiftlint.yml と Sample.swift がない")
         return []
     template = nested.read_bytes()
+    # 入れ子の設定が外してよいのは組み込みの 3 規則だけ（独自の規則などを外す抜け道にさせない）
+    for rule in disabled_rules(template.decode("utf-8", errors="replace"), errors):
+        if rule not in BUILTIN_RULES:
+            errors.append(f"{TEST_CODE_FIXTURE}/.swiftlint.yml が組み込みの 3 規則以外の規則 {rule} を外している")
     # 実際のテストのディレクトリには、試験した設定と同じ内容だけを置ける
     for name in TEST_CODE_DIRS:
         real = ROOT / name / ".swiftlint.yml"
@@ -185,7 +189,33 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
     for relative in listed:
         if ROOT / relative not in allowed:
             errors.append(f"許可していない場所に入れ子の設定がある: {relative}")
-    return [(sample, rule, set()) for rule in BUILTIN_RULES]
+    # 入れ子の設定の下でも独自の規則は効いていること（試験用のファイルの print( の行で no_print_logging が検出される）
+    print_lines = {number for number, line in enumerate(sample.read_text(encoding="utf-8").splitlines(), start=1)
+                   if re.search(r"\bprint\s*\(", line)}
+    if not print_lines:
+        errors.append(f"{sample.relative_to(ROOT)}: print( の行がない（入れ子の設定で独自の規則が効くことを試験できない）")
+    return [(sample, rule, set()) for rule in BUILTIN_RULES] + [(sample, "no_print_logging", print_lines)]
+
+
+def disabled_rules(config_text: str, errors: List[str]) -> List[str]:
+    """設定の disabled_rules の項目を返す。字下げした「- 規則名」の並びだけを読み、読めない行は errors に入れる。"""
+    rules: List[str] = []
+    in_block = False
+    for line in config_text.splitlines():
+        if re.match(r"^disabled_rules:\s*(?:#.*)?$", line):
+            in_block = True
+            continue
+        if not in_block or not line.strip() or re.match(r"^\s*#", line):
+            continue
+        if re.match(r"^\S", line):  # 次の最上位の鍵で終わる
+            in_block = False
+            continue
+        item = re.match(r"^\s+-\s+([a-z][a-z0-9_]*)\s*(?:#.*)?$", line)
+        if item:
+            rules.append(item.group(1))
+        else:
+            errors.append(f"{TEST_CODE_FIXTURE}/.swiftlint.yml の disabled_rules の行を読めない: {line.strip()}")
+    return rules
 
 
 def check_sample_violates(errors: List[str]) -> None:

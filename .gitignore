@@ -4,6 +4,8 @@ DerivedData/
 .build/
 build/
 *.xcresult
+# Python のバイトコードのキャッシュ（scripts/ の import で作られる）
+__pycache__/
 
 # 導入スクリプトが展開した開発ツール（版は tools/versions で管理する）。
 # 末尾の「/」を付けない（プッシュ前のフックが専用の作業ツリーに置く .tools のシンボリックリンクも無視する）

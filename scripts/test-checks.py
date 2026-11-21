@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import plistlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -61,17 +62,19 @@ OK_PROJECT = """{
 OK_INFO_PLIST = {"UIBackgroundModes": ["audio", "processing"], "BGTaskSchedulerPermittedIdentifiers": ["a.b"]}
 
 
-def run(command: List[str], timeout: Optional[float] = None) -> Tuple[int, str]:
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+def run(command: List[str], timeout: Optional[float] = None, env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=timeout, env=env)
     return result.returncode, result.stdout + result.stderr
 
 
-def expect(label: str, command: List[str], want_code: int, want_text: str = "", timeout: Optional[float] = None) -> None:
-    """終了コードと、出力に含まれるはずの文字列を確かめる。timeout（秒）を過ぎても終わらなければ失敗とする。"""
+def expect(label: str, command: List[str], want_code: int, want_text: str = "", timeout: Optional[float] = None,
+           env: Optional[Dict[str, str]] = None) -> None:
+    """終了コードと、出力に含まれるはずの文字列を確かめる。timeout（秒）を過ぎても終わらなければ失敗とする。
+    env を渡すと、その環境で実行する（git のリポジトリを指す外側の変数（GIT_DIR など）を引き継がせないときに使う）。"""
     global count
     count += 1
     try:
-        code, output = run(command, timeout)
+        code, output = run(command, timeout, env)
     except subprocess.TimeoutExpired:
         failures.append(f"{label}: {timeout} 秒を過ぎても終わらない（待ち続けている）")
         return
@@ -523,6 +526,16 @@ def test_dependencies() -> None:
                       {"Package.resolved": resolved}, [dict(approved, license="GPL-3.0", ownerDecision="UD-99")])
     dependencies_case("承認日のない項目は読まない", 2, "approvedOn", {}, [{k: v for k, v in approved.items() if k != "approvedOn"}])
     dependencies_case("読めない Package.resolved は合格にしない", 2, "読めない", {"Package.resolved": "{"})
+    # 名前が合うのに通常のファイルでないもの（壊れたシンボリックリンク）は、黙って除かず読めないものとする
+    for name in ("Package.resolved", "Package.swift"):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Sub").mkdir()
+            (Path(directory) / "Sub" / name).symlink_to("missing")
+            allowlist = Path(directory) / "allowlist.json"
+            allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}),
+                                 encoding="utf-8")
+            expect(f"dependencies: 壊れたシンボリックリンクの {name}", [
+                str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 2, "読めない")
     moved = json.dumps({"pins": [dict(pin, location="https://example.org/other/sample-lib.git")], "version": 3})
     dependencies_case("identity と版が同じでも取得元が違う", 1, "取得元", {"Package.resolved": moved}, [approved])
     unknown_source = json.dumps({"pins": [{k: v for k, v in pin.items() if k != "location"}], "version": 3})
@@ -898,6 +911,11 @@ def simulator_cases() -> None:
         ("udid が文字列でない", {"runtimes": [runtime], "devices": {"r": [
             {"name": "iPhone A", "udid": 1, "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
             {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+        # 機種の識別子が文字列でない一覧は取得の失敗（「iPhone」を含む配列を iPhone と取り違えない）
+        ("deviceTypeIdentifier が配列", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": ["iPhone"]}]}}, 2),
+        ("iPad だけの一覧は候補なし", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPad A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPad"}]}}, 1),
         ("name が文字列でない", {"runtimes": [runtime], "devices": {"r": [
             {"name": None, "udid": "y", "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
             {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
@@ -930,6 +948,9 @@ def test_versions() -> None:
         copy.chmod(0o755)
         for value in ("", ",", " "):
             expect(f"check: 空の --steps（{value!r}）", [str(copy), "--steps", value], 2, "使い方", timeout=30)
+        # 範囲外の番号（bash の整数の範囲を超える桁数を含む）は、ほかの正しい番号があっても手順を始めずに使い方の誤りにする
+        for value in ("11", "0,99999999999999999999", "0-99999999999999999999", "99999999999999999999-0", "0,010"):
+            expect(f"check: 範囲外の --steps（{value!r}）", [str(copy), "--steps", value], 2, "使い方", timeout=30)
     simulator_cases()
     setup = str(SCRIPTS / "setup-tools.sh")
     tools = str(ROOT / ".tools")
@@ -1114,8 +1135,10 @@ def test_gitleaks() -> None:
             git("-C", str(source), "add", name)
             git("-C", str(source), "commit", "-q", "-m", name)
         git("clone", "-q", "--depth", "1", f"file://{source}", str(clone))
-        expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン")
-        expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found")
+        # 外側の GIT_DIR などを引き継ぐと、一時のリポジトリではなく外側のリポジトリを検査してしまうので、同じ環境で実行する
+        expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン", env=env)
+        expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found",
+               env=env)
     # 最初のコミットで足した行も、設定 log.showRoot=false によらず検査する
     count += 1
     with tempfile.TemporaryDirectory() as directory:
@@ -1134,6 +1157,25 @@ def test_gitleaks() -> None:
                                 env=dict(env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="log.showRoot", GIT_CONFIG_VALUE_0="false"))
         if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
             failures.append(f"gitleaks: log.showRoot=false で最初のコミットの鍵を検出しない（終了コード {result.returncode}）")
+    # .gitattributes の textconv（差分の表示の前の変換）で鍵を消しても、元の内容の差分を検査する（--no-textconv）
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        repository = Path(directory) / "repository"
+        hidden_key = "ghp_" + "t8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"  # 実行時に組み立てる
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        for name, content in ((".gitattributes", "*.txt diff=hide\n"), ("config.txt", f'token = "{hidden_key}"\n')):
+            (repository / name).write_text(content, encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), *identity, "add", name], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), *identity, "commit", "-q", "-m", name], env=env, check=True,
+                           capture_output=True)
+        # 変換のコマンドは何も出力しない（変換を使うと、差分から鍵の行が消える）
+        result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository)], capture_output=True, text=True,
+                                env=dict(env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="diff.hide.textconv", GIT_CONFIG_VALUE_0="true"))
+        if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
+            failures.append(f"gitleaks: textconv で変換した差分を検査し、鍵を見落とした（終了コード {result.returncode}）")
 
 
 def gitleaks_merge_case() -> None:
@@ -1301,10 +1343,40 @@ def cyclic_snippet_case() -> Path:
     path = directory / "docs/03-detailed-design/sample.md"
     path.write_text(path.read_text(encoding="utf-8") + f"\n<!-- file: scripts/loop.sh -->\n\n{FENCE}bash\necho loop\n{FENCE}\n",
                     encoding="utf-8")
+    # 循環するリンクの後に検査する別の文書（sample.md より後に読む名前）の不一致も報告されること（検査が続くこと）。
+    # 一部のコード片は --update-snippets でも書き直されないので、両方の実行で残る
+    (directory / "docs/03-detailed-design/sample2.md").write_text(
+        f"# 別の文書\n\n## 1. 実装\n\n満たす要件: FR-AAA-01\n\n<!-- excerpt: scripts/sample.sh -->\n\n{FENCE}bash\necho other\n{FENCE}\n",
+        encoding="utf-8")
     for options in ([], ["--update-snippets"]):
-        expect(f"docs: 循環するリンクのコード片{' '.join(options)}", [str(SCRIPTS / "verify-docs.py"), "--root", str(directory)]
-               + options, 1, "パスを解決できない")
+        label = f"docs: 循環するリンクのコード片{' '.join(options)}"
+        count += 1
+        code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory)] + options)
+        separate = any("sample2.md" in line and "一致しない" in line for line in output.splitlines())
+        if code != 1 or "パスを解決できない" not in output or not separate:
+            failures.append(f"{label}: 循環するリンクと、その後の別の文書の不一致の両方が報告されない（終了コード {code}）\n"
+                            f"{output.strip()}")
     return directory
+
+
+def unreadable_snippet_case() -> None:
+    """コード片の元のファイルが UTF-8 として読めなくても、例外で止まらずに印の行で報告し、ほかの文書の検査を続けること
+    （通常と --update-snippets の両方。--update-snippets はそのコード片を書き直さない）。"""
+    global count
+    directory = docs_case("読めないコード片の準備（整合した文書）", 0, "OK")
+    (directory / "scripts" / "sample.sh").write_bytes(b"\xff\xfe\n")
+    detailed = directory / "docs/03-detailed-design/sample.md"
+    before = detailed.read_bytes()
+    for options in ([], ["--update-snippets"]):
+        label = f"docs: 読めないコード片の元のファイル{' '.join(options)}"
+        count += 1
+        code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory)] + options)
+        # 詳細設計の本文と、別の文書（索引）のコード片の両方で報告される
+        reported = {found.group(1) for found in re.finditer(r"^NG: (\S+?):\d+: コード片の元のファイルを読めない", output, re.MULTILINE)}
+        if code != 1 or "Traceback" in output or len(reported) < 2:
+            failures.append(f"{label}: 読めない元のファイルを各文書の印の行で報告しない（終了コード {code}）\n{output.strip()}")
+        if detailed.read_bytes() != before:
+            failures.append(f"{label}: 読めない元のファイルのコード片を書き直した")
 
 
 def test_docs() -> None:
@@ -1431,6 +1503,22 @@ def run_docs_cases() -> None:
         docs_case("入れ子の基本設計と詳細設計の組", 0, "OK",
                   extra={"docs/02-basic-design/sub/nested.md": nested_basic,
                          "docs/03-detailed-design/sub/nested.md": DOCS[detailed]}),
+        # 配下のディレクトリの分冊も、同じディレクトリの本冊があれば分冊として扱う（本冊がなければ認めない）
+        docs_case("入れ子の分冊", 0, "OK",
+                  extra={"docs/02-basic-design/sub/nested.md": nested_basic,
+                         "docs/03-detailed-design/sub/nested.md": DOCS[detailed],
+                         "docs/03-detailed-design/sub/nested-scripts.md": "# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n"}),
+        docs_case("本冊のない入れ子の分冊", 1, "sub/nested-scripts.md: 対応する基本設計",
+                  extra={"docs/02-basic-design/sub/nested.md": nested_basic,
+                         "docs/03-detailed-design/sub/nested-scripts.md": "# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n"}),
+        # 申し送りの解決は、2 列目の見出しが「解決」の表だけを数える（担当者などの列を解決と見なさない）
+        docs_case("2 列目が解決でない申し送りの表", 1, "申し送り「一つ目」の解決が表にない", detailed,
+                  "| 申し送り | 解決 |", "| 申し送り | 担当者 |"),
+        # 引用などの新しいブロックの始まりで表は終わる（引用の中の「|」を含む行を対応表の行として数えない）
+        docs_case("表の後の引用の行は対応表に数えない", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 試験 |\n| --- | --- |\n> FR-AAA-01 | 試験 |"),
+        docs_case("行頭の | を省いた対応表の行は数える", 0, "OK", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 試験 |\n| --- | --- |\nFR-AAA-01 | 試験"),
         docs_case("入れ子の基本設計の必須の節", 1, "docs/02-basic-design/sub/nested.md: 「テスト観点」の節がない",
                   extra={"docs/02-basic-design/sub/nested.md": replaced(
                       nested_basic, "## 3. テスト観点", "## 3. その他")}),
@@ -1554,6 +1642,7 @@ def run_docs_cases() -> None:
                                        encoding="utf-8")
         expect("docs: シンボリックリンクで --root の外を指すコード片", [str(SCRIPTS / "verify-docs.py"), "--root", str(linked)],
                1, "--root の外にある")
+    unreadable_snippet_case()
     # --update-snippets は、字下げしたフェンスに同じ字下げを付けて書き直す
     indented = docs_case("字下げしたフェンスの書き直し", 0, "コード片を書き直した", detailed,
                          f"{FENCE}bash\necho one\necho two\necho three\n{FENCE}", f"  {FENCE}bash\n  echo old\n  {FENCE}",
