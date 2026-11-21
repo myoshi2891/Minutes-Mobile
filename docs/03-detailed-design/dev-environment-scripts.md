@@ -203,11 +203,13 @@ install_tool() {
 PENDING_TARGET=""
 PENDING_BACKUP=""
 
-if [ "$MODE" = install ]; then
-  # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
-  mkdir -p "$DEST"
+# 導入（install）は作業場所を導入先と同じファイルシステムに作る（置き換えの mv を rename にする）。
+# 照合（--verify）は導入先を作らない（導入先がなければ照合で「導入されていない」として失敗する）
+if [ "$MODE" = install ]; then mkdir -p "$DEST"; fi
+if [ -d "$DEST" ]; then
   # 同じ導入先への並行の導入を防ぐ。キャッシュの判定から退避・公開・リンクの更新までをロックの中で行う。
-  # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）
+  # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）。
+  # 照合も同じロックを取り、台帳との照合を終えるまで持つ（導入の途中の、旧い導入を退避した状態などを照合しない）
   LOCK="$DEST/.install.lock"
   LOCK_HELD=""
   WORK=""
@@ -252,7 +254,9 @@ if [ "$MODE" = install ]; then
     fi
   done
   LOCK_HELD=1
-  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
+  if [ "$MODE" = install ]; then
+    WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
+  fi
 fi
 
 ARCH=$(uname -m)
@@ -314,7 +318,9 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 #   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
 #                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
 #   scripts/check.sh --require-clean 未コミットの変更（追跡していないファイルを含む）があれば、手順を始めずに失敗する。
-#                                   検査中に HEAD が変わった・変更が生じた場合も失敗する（プッシュ前のフックが使う）
+#                                   開始時のコミットを専用の作業ツリー（リポジトリの外の一時ディレクトリ）に展開し、
+#                                   そこで検査する（元の作業ツリーを検査中に書き換えて戻しても、検査する内容は変わらない）。
+#                                   コミットの合格（PR の説明に貼る結果）はこの指定で得る。プッシュ前のフックも使う
 #   scripts/check.sh --expect-head <SHA> 開始時の HEAD が指定したコミットでなければ、手順を始めずに失敗する
 #                                   （フックが送信する参照と照合した HEAD を、検査の開始までに差し替えられないようにする）
 #
@@ -365,6 +371,8 @@ STEPS_GIVEN=0  # --steps を指定したか（指定しなかったときだけ�
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
+ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
+ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
 COVERAGE_COPY=""  # 手順 8 が照合と集計に使う、カバレッジの記録の写し（一時ファイル）
 
@@ -400,6 +408,7 @@ expand_steps() {
   printf '%s\n' "$out"
 }
 
+ARGUMENTS=("$@")  # --require-clean のとき、専用の作業ツリーの check.sh に同じ引数を渡す
 while [ $# -gt 0 ]; do
   case "$1" in
     # 明示した --steps が空（"" や区切りだけ）なら使い方の誤りにする（空のまま下へ進むと全手順を実行してしまう）
@@ -423,7 +432,8 @@ fi
 STAGED_SWIFT=()
 if [ "$STAGED" = 1 ]; then
   staged_list=$(mktemp)
-  if ! git diff --cached --name-only --diff-filter=ACMR -z -- '*.swift' > "$staged_list"; then
+  # 種類の変更（T。通常のファイルとシンボリックリンクの入れ替えなど）も含める（下でインデックスのモードを確かめる）
+  if ! git diff --cached --name-only --diff-filter=ACMRT -z -- '*.swift' > "$staged_list"; then
     rm -f -- "$staged_list"
     fail "ステージしたファイルの一覧を取得できない"
   fi
@@ -432,6 +442,25 @@ if [ "$STAGED" = 1 ]; then
     STAGED_SWIFT+=("$file")
   done < "$staged_list"
   rm -f -- "$staged_list"
+  # 整形・静的解析に渡すのは、インデックスで通常のファイル（モード 100644・100755）のものだけ。シンボリックリンク（120000）
+  # やサブモジュール（160000）を黙って除かず、失敗にする（追加・変更した Swift のファイルと同じ確認を、種類の変更にも行う）
+  if [ ${#STAGED_SWIFT[@]} -gt 0 ]; then
+    staged_modes=$(mktemp)
+    if ! git --literal-pathspecs ls-files -s -z -- "${STAGED_SWIFT[@]}" > "$staged_modes"; then
+      rm -f -- "$staged_modes"
+      fail "ステージしたファイルのモードを取得できない"
+    fi
+    while IFS= read -r -d '' entry; do
+      case "${entry%% *}" in
+        100644 | 100755) ;;
+        *)
+          rm -f -- "$staged_modes"
+          fail "ステージした ${entry#*$'\t'} はインデックスで通常のファイルでない（モード ${entry%% *}）"
+          ;;
+      esac
+    done < "$staged_modes"
+    rm -f -- "$staged_modes"
+  fi
 fi
 
 # ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
@@ -710,6 +739,12 @@ on_exit() {
   if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then rm -rf -- "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then rm -f -- "$COVERAGE_COPY"; fi
+  if [ -n "$ISOLATED_TREE" ]; then
+    # 登録ごと消す。消せなければディレクトリを消して登録の残骸を片付ける
+    git -C "$ROOT" worktree remove --force "$ISOLATED_TREE" 2>/dev/null \
+      || { rm -rf -- "$ISOLATED_TREE"; git -C "$ROOT" worktree prune 2>/dev/null || true; }
+  fi
+  if [ -n "$ISOLATED_BASE" ]; then rm -rf -- "$ISOLATED_BASE"; fi
   release_coverage_lock
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
@@ -740,6 +775,20 @@ if [ "$STAGED" = 0 ]; then
     fail "未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから再実行する（検査するのは HEAD のコミットだけ）"
   fi
 fi
+# コミットの合格を求める実行は、開始時のコミットを専用の作業ツリーに展開し、その中の check.sh で検査する（元の作業ツリーを
+# 検査中に書き換えて戻しても、検査する内容は変わらない）。専用の作業ツリーで実行中であることは MINUTES_CHECK_ISOLATED で
+# 示す（プッシュ前のフックは自身の専用の作業ツリーで実行するので、これを設定して二重に展開しない）。置き場所は
+# リポジトリの外（中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読む）
+if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
+  ISOLATED_BASE=$(mktemp -d)
+  ISOLATED_TREE="$ISOLATED_BASE/tree"
+  git worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
+  # 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）
+  ln -s "$ROOT/.tools" "$ISOLATED_TREE/.tools"
+  echo "== 開始時のコミット ${START_HEAD} を専用の作業ツリー（${ISOLATED_TREE}）に展開して検査する"
+  MINUTES_CHECK_ISOLATED=1 "$ISOLATED_TREE/scripts/check.sh" "${ARGUMENTS[@]}"
+  exit 0
+fi
 
 for step in $STEPS; do
   echo "== 手順 $step: $(title "$step")"
@@ -755,15 +804,21 @@ if [ "$STAGED" = 1 ]; then
 else
   end_head=$(git rev-parse HEAD)
   end_changes=$(git status --porcelain --untracked-files=normal)
-  if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
-    # 未コミットの変更を含む作業ツリーを検査した（または検査中にコミットが変わった）。コミットの合格にはしない
-    if [ "$REQUIRE_CLEAN" = 1 ]; then
+  if [ "$REQUIRE_CLEAN" = 1 ]; then
+    # 専用の作業ツリーでの検査。展開したコミットから変わっていなければ、そのコミットの合格とする
+    if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
       fail "検査中に HEAD が変わった、または未コミットの変更が生じた。検査したツリーがコミットと一致しないので合格にしない"
     fi
-    echo "OK: 手順$STEPS を通過（未コミットの変更あり。コミットの合格としては記録しない）"
-    echo "注意: PR の説明に貼る結果は、変更をすべてコミットした状態で再実行して得る" >&2
+    echo "OK: 手順$STEPS を通過（コミット ${end_head} を専用の作業ツリーで検査）"
   else
-    echo "OK: 手順$STEPS を通過（コミット ${end_head}、未コミットの変更なし）"
+    # 通常の実行は作業ツリーを検査する。検査中に書き換えて戻した内容も検査しうるので、変更の有無によらず
+    # コミットの合格にはしない
+    if [ -n "$START_CHANGES" ] || [ -n "$end_changes" ] || [ "$START_HEAD" != "$end_head" ]; then
+      echo "OK: 手順$STEPS を通過（作業ツリーを検査。未コミットの変更あり。コミットの合格としては記録しない）"
+    else
+      echo "OK: 手順$STEPS を通過（作業ツリーを検査。コミットの合格としては記録しない）"
+    fi
+    echo "注意: PR の説明に貼る結果（コミットの合格）は scripts/check.sh --require-clean で得る（開始時のコミットを専用の作業ツリーで検査する）" >&2
   fi
 fi
 ```
