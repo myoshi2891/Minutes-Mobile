@@ -72,7 +72,18 @@
 
 開発ツール 3 種の版とライセンス（MIT）は、2026-11-14 に GitHub の公式 API（releases と license）と Homebrew の formula 情報で確認した。使い方は [../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §5〜§7 にある。
 
-**導入の記録（2026-11-16）:** 3 種とも、確認時点の最新の安定版（上の表の版と同じ）を導入した。各タグの LICENSE ファイルを直接読み、MIT であることを確かめた（§4 の手順 3）。配布ファイルの SHA-256 は、自分で計算した値が GitHub の release API の `digest` と一致し、gitleaks は配布の `checksums.txt` とも一致した。値は `tools/versions` に記録している。新たな費用は発生していない。
+**導入の記録（2026-11-16）:** 3 種とも、確認時点の最新の安定版（上の表の版と同じ）を導入した。各タグの LICENSE ファイルを直接読み、MIT であることを確かめた（§4 の手順 3）。配布ファイルの SHA-256 は、自分で計算した値が GitHub の release API の `digest` と一致し、gitleaks は配布の `checksums.txt` とも一致した。値は下の表に記録し、機械可読の写しを `tools/versions` に置く（版を変えるときは両方を同じ PR で直し、値が一致することを確かめる）。新たな費用は発生していない。
+
+**開発ツールの配布ファイルと SHA-256（§4 の手順 5）:** 取得元は各リポジトリの GitHub releases の、表のタグの配布ファイル（`https://github.com/<リポジトリ>/releases/download/<タグ>/<配布ファイル>`）。
+
+| ツール | 版 | 対象 | 配布ファイル | SHA-256 |
+| --- | --- | --- | --- | --- |
+| gh（cli/cli） | 2.104.0（タグ `v2.104.0`） | Apple シリコンの Mac（arm64） | `gh_2.104.0_macOS_arm64.zip` | `23b12706219b9892e44236f988444a24adcf29284e16b35e03ba5b863fb6eb8e` |
+| gh（cli/cli） | 2.104.0（タグ `v2.104.0`） | Intel の Mac（x86_64） | `gh_2.104.0_macOS_amd64.zip` | `a8c2a708dbae89dc7c05ba7b0beafc95bd8d09ab4a3505467b77d32ebf364dc6` |
+| SwiftLint（realm/SwiftLint） | 0.65.1（タグ `0.65.1`） | すべての Mac | `portable_swiftlint.zip` | `c1e429b0599cf1b516f369a2d9ec04eaf0e436f3c12b637df8851fa52ff694d0` |
+| SwiftFormat（nicklockwood/SwiftFormat） | 0.64.7（タグ `0.64.7`） | すべての Mac | `swiftformat.zip` | `e82e224325cbd3403fc7b68caf6c917926dc106de3af875fca4b87e3c4634038` |
+| gitleaks（gitleaks/gitleaks） | 8.30.1（タグ `v8.30.1`） | Apple シリコンの Mac（arm64） | `gitleaks_8.30.1_darwin_arm64.tar.gz` | `b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5` |
+| gitleaks（gitleaks/gitleaks） | 8.30.1（タグ `v8.30.1`） | Intel の Mac（x86_64） | `gitleaks_8.30.1_darwin_x64.tar.gz` | `dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709` |
 
 **`gh` の版の固定（2026-11-16）:** それまで版を固定せず開発機の `gh` を使っていたが、SEC-SUP-01 に合わせて版を固定した。確認時点の最新の安定版 2.104.0（プレリリースではない）を選び、タグ `v2.104.0` の LICENSE を直接読んで MIT であることを確かめた。配布ファイル（`gh_2.104.0_macOS_arm64.zip`・`gh_2.104.0_macOS_amd64.zip`）の SHA-256 は、自分で計算した値が release API の `digest` と配布の `gh_2.104.0_checksums.txt` の両方と一致した。新たな費用は発生していない。検査スクリプトは、これらと OS・Xcode に同梱のもの（bash・python3 など）だけで動く（[../03-detailed-design/dev-environment.md](../03-detailed-design/dev-environment.md) §2・§3）。
 
