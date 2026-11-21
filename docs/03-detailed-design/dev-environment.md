@@ -317,18 +317,54 @@ base=$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))
   echo "NG: 専用の作業ツリーの置き場所を解決できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
   exit 1
 }
-# 一覧を取得できなければ、比べずに認めることはせず止める
-registered=$(git -C "$source_root" worktree list --porcelain) || {
-  echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
-  exit 1
-}
+# SwiftFormat は検査するディレクトリの親のディレクトリの設定（.swiftformat・.swift-version）も読み、読む範囲を
+# 止める指定を持たない。置き場所（自身を含む）か、その祖先のどれかに設定があれば、専用の作業ツリーの検査に
+# リポジトリの外の設定が混ざるので認めずに止める（専用の作業ツリーの中の設定は、リポジトリの設定としてそのまま読む）
+ancestor=$base
+while :; do
+  for name in .swiftformat .swift-version; do
+    if [ -e "$ancestor/$name" ] || [ -L "$ancestor/$name" ]; then
+      echo "NG: 専用の作業ツリーの置き場所（${base}）の上に SwiftFormat の設定（${ancestor}/${name}）がある。設定のない場所を指定する" >&2
+      exit 1
+    fi
+  done
+  if [ "$ancestor" = / ]; then break; fi
+  ancestor=$(dirname "$ancestor")
+done
+# 作業ツリーの一覧（git worktree list --porcelain -z）を読む Python の関数。2 つの判定で共用する。
+# 一覧は NUL で区切った項目の並びで、記録（作業ツリー 1 つ）は空の項目で終わり、先頭の項目が「worktree <パス>」。
+# 改行を含むパスも 1 つのパスとして読む。git が失敗した・形が違う場合は、比べずに認めることはせず終了コード 2
+worktrees_py='
+import os, subprocess, sys
+
+def registered_worktrees(source):
+    listed = subprocess.run(["git", "-C", source, "worktree", "list", "--porcelain", "-z"], stdout=subprocess.PIPE)
+    if listed.returncode != 0:
+        print(f"git worktree list が失敗した（終了コード {listed.returncode}）", file=sys.stderr)
+        sys.exit(2)
+    paths, first = [], True
+    fields = listed.stdout.split(b"\0")
+    if fields[-1] != b"":
+        print("git worktree list の出力が NUL で終わらない", file=sys.stderr)
+        sys.exit(2)
+    for field in fields[:-1]:
+        if not field:
+            first = True
+            continue
+        if first:
+            if not field.startswith(b"worktree "):
+                print("git worktree list の記録が worktree の項目で始まらない", file=sys.stderr)
+                sys.exit(2)
+            paths.append(field[len(b"worktree "):])
+            first = False
+    return paths
+'
 # 比べるのはパスの文字列ではなく、ファイルシステム上の同一性（デバイスと inode）。置き場所の既存の祖先（自身を含む）の
 # どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら拒否する（大文字小文字を区別しないボリュームで
 # 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）。
 # 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。終了コード: 0 = 外 / 1 = 中 / 2 = 判定できない
 inside_status=0
-inside=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' | /usr/bin/python3 -c '
-import os, sys
+inside=$(/usr/bin/python3 -c "${worktrees_py}"'
 base, source = sys.argv[1], sys.argv[2]
 
 def identity(path):
@@ -343,7 +379,7 @@ def identity(path):
     return (info.st_dev, info.st_ino)
 
 roots = {}
-for path in [source] + [line.rstrip("\n") for line in sys.stdin if line.strip()]:
+for path in [source] + [os.fsdecode(listed) for listed in registered_worktrees(source)]:
     found = identity(path)
     if found is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
         roots[found] = path
@@ -387,26 +423,65 @@ trap 'status=$?; if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null |
 trap 'exit 130' INT TERM
 
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
-# 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）
-worktrees=$(git -C "$source_root" worktree list --porcelain) || {
-  echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
-  exit 1
+# 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）。
+# 照合は記録の worktree の項目（パスの全体）との完全な一致。終了コード: 0 = 登録あり / 1 = 登録なし / 2 = 取得できない
+registration=0
+/usr/bin/python3 -c "${worktrees_py}"'
+source, snapshot = sys.argv[1], os.fsencode(sys.argv[2])
+sys.exit(0 if snapshot in registered_worktrees(source) else 1)
+' "$source_root" "$snapshot" || registration=$?
+case $registration in
+  0 | 1) ;;
+  *)
+    echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
+    exit 1
+    ;;
+esac
+# 再利用するのは、登録があり、ディレクトリの git が専用の作業ツリーそのもの（作業ツリーの起点がこの場所で、
+# 共通のディレクトリが元のリポジトリのもの）を指す場合だけ。.git のファイルを失ったなどで別のリポジトリや
+# 親のディレクトリを指す場合に、そちらを checkout・clean しない（その場合は下で作り直す）
+owned=0
+if [ "$registration" -eq 0 ] && [ -d "$snapshot" ]; then
+  top=$(git -C "$snapshot" rev-parse --show-toplevel 2>/dev/null) && top=$(cd -P "$top" && pwd) \
+    && common=$(git -C "$snapshot" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    && common=$(cd -P "$common" && pwd) && source_common=$(cd -P "$common_dir" && pwd) \
+    && [ "$top" = "$snapshot" ] && [ "$common" = "$source_common" ] && owned=1
+fi
+# 元の作業ツリーが sparse checkout なら、専用の作業ツリーもその指定を引き継ぎ（git worktree add が写す）、一部のファイル
+# しかない状態で検査することになる。専用の作業ツリーで sparse checkout を有効にしていれば、そこでだけ解除して全体を
+# 展開する（作業ツリーごとの設定に書くので、元の作業ツリーは sparse のまま）。有効でなければ解除しない（解除の操作は
+# sparse でないリポジトリにも作業ツリーごとの設定の拡張を書き足すため）。設定を読めない場合は止める
+full_checkout() {
+  local sparse status=0
+  sparse=$(git -C "$snapshot" config --type=bool --get core.sparseCheckout) || status=$?
+  case $status in
+    0) if [ "$sparse" = true ]; then git -C "$snapshot" sparse-checkout disable; fi ;;
+    1) ;;  # 設定がない（sparse でない）
+    *)
+      echo "NG: 専用の作業ツリーの sparse checkout の設定を読めない（${snapshot}）" >&2
+      exit 1
+      ;;
+  esac
 }
-if printf '%s\n' "$worktrees" | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
+if [ "$owned" -eq 1 ]; then
   git -C "$snapshot" checkout -q --detach --force "$head"
+  full_checkout
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
-  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールの写し（/.tools。下で作り直す）と、
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。-f を 2 回付け、中に .git を持つ
+  # 入れ子のリポジトリ（追跡していない複製など）も消す（1 回では残る）。残すのは開発ツールの写し（/.tools。下で作り直す）と、
   # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
-  # ほかの階層の .build（docs/.build など）は消す
-  git -C "$snapshot" clean -q -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
+  # ほかの階層の .build（docs/.build など）は消す。上で専用の作業ツリーそのものであることを確かめてから実行する
+  git -C "$snapshot" clean -q -f -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
   # 残したビルドの成果物の場所には、中断した前回の検査のカバレッジのロック（check.sh の手順 7・8 が直下の .build に作る）が
   # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
   # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
   rm -rf -- "$snapshot/.build/minutes-coverage.lock"
 else
-  rm -rf -- "$snapshot"  # 登録のない残骸（前回の作成の途中で止まったものなど）
+  # 登録のない残骸（前回の作成の途中で止まったものなど）と、専用の作業ツリーとして確かめられなかったもの
+  rm -rf -- "$snapshot"
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
+  full_checkout
 fi
 # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
 # 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
@@ -532,7 +607,7 @@ fi
 ```
 
 - プッシュ前のフックは、削除の送信（ローカルの SHA がすべて 0）を照合の対象から外す。削除だけの送信は検査するコミットがないので、`check.sh` を起動せずに終了コード 0 で終える。削除と通常の更新が混ざる場合は、通常の更新だけを HEAD と照合し、従来どおり `check.sh` を実行する。
-- プッシュ前のフックは、送信するコミットをチェックアウトした**専用の作業ツリー**（`git worktree add --detach`）で `check.sh` を実行し、すべての手順が同じスナップショットを読むようにする（元の作業ツリーで検査中にブランチを切り替えて戻しても、検査の対象が変わらない。`--expect-head` の照合だけでは、開始と終了の HEAD が同じなら途中の切り替えを検出できない）。専用の作業ツリーはリポジトリの外（`<ホーム>/Library/Caches/MinutesMobile/pre-push/<git の共通ディレクトリのパスの SHA-256>`。環境変数 `MINUTES_PRE_PUSH_DIR` で変えられる）に置き、次の push で再利用する（`checkout --detach --force` と `clean -fdx -e /.tools -e /.build -e /Packages/MinutesKit/.build` で送信するコミットに合わせる。無視するファイル（`docs/` の下書き・`docs/.build` など）も消して文書の整合の検査に読ませず、`.tools`（push のたびに写し直す）と、`check.sh` が使う直下と Package の `.build` だけを残す。残した直下の `.build` に、中断した前回の検査のカバレッジのロック（`.build/minutes-coverage.lock`。強制終了では `check.sh` の後始末が動かない）が残っていれば、作業ツリーのロックを取った後に持ち主のいない残骸として消す（この作業ツリーで検査するのは作業ツリーのロックを持つ実行だけなので、ほかの実行のロックを消すことはない。ビルドの成果物は消さない）。作業ツリーの一覧（`git worktree list`）を取得できなければ、作業ツリーを消さずに失敗する）。置き場所は作る前に実体のパスへ解決し、元のリポジトリと登録されたすべての作業ツリー（`git worktree list`）の中（リンクを経由する場合を含む）なら作らずに失敗する。中かどうかはパスの文字列ではなく、置き場所の既存の祖先（自身を含む）のどれかが作業ツリーとファイルシステム上で同じディレクトリ（デバイスと inode が一致）かで判定する（大文字小文字を区別しないボリュームの綴りの違いを見逃さず、区別するボリュームの別のディレクトリは別物として認める。判定できなければ失敗する。一覧を取得できなければ比べずに認めることはせず失敗する。どの作業ツリーの中でもない場所は認める）。リポジトリの中（`.git` の下など）に置くと、SwiftFormat が親のディレクトリの `.swiftformat` も読み、元の作業ツリーの設定が混ざるため置かない（複製したリポジトリで確かめた）。開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、導入のロック（`setup-tools.sh` と同じ `.install.lock`）を取ってから専用の作業ツリーの `.tools` に写し（APFS では `cp -c` の clone、対応しなければ通常の複写。ロックと導入の途中の作業場所は写さない）、ロックを外す。bin のリンクは相対パスなので写しの中を指し、手順 0 の照合と後の手順はすべてこの写しを使う（検査の途中に別の `setup.sh` が元の `.tools` の bin のリンクや版のディレクトリを差し替えても、照合した導入と使う導入が食い違わない）。ロックが取れなければ待ち（上限 600 秒）、待ち始めたことを表示する。作れなかった直後にロックが外れていた場合は、待たずに 1 回だけ取り直し、それでも作れずロックもなければ止める（`setup-tools.sh` と同じ扱い）。同時の push はロック（`<作業ツリー>.lock` のディレクトリ）で止める。終了の trap は入口で終了の状態を控え、ロックの解放の後にその状態で明示的に終了する（後始末のコマンドの状態で検査の失敗を上書きしない）。登録が残ったままディレクトリを消された場合は `worktree add --force` で作り直す（`git worktree prune` はほかの作業ツリーの登録も外すので使わない）。フックが設定する `GIT_DIR` などの変数は外してから専用の作業ツリーを操作する。送信するコミットが HEAD と同じで、元の作業ツリーに未コミットの変更がないことは、従来どおり求める。
+- プッシュ前のフックは、送信するコミットをチェックアウトした**専用の作業ツリー**（`git worktree add --detach`）で `check.sh` を実行し、すべての手順が同じスナップショットを読むようにする（元の作業ツリーで検査中にブランチを切り替えて戻しても、検査の対象が変わらない。`--expect-head` の照合だけでは、開始と終了の HEAD が同じなら途中の切り替えを検出できない）。専用の作業ツリーはリポジトリの外（`<ホーム>/Library/Caches/MinutesMobile/pre-push/<git の共通ディレクトリのパスの SHA-256>`。環境変数 `MINUTES_PRE_PUSH_DIR` で変えられる）に置き、次の push で再利用する（登録があり、ディレクトリの git の作業ツリーの起点がその場所で共通のディレクトリが元のリポジトリのものと確かめた場合だけ、`checkout --detach --force` と `clean -ffdx -e /.tools -e /.build -e /Packages/MinutesKit/.build` で送信するコミットに合わせる。確かめられなければ消して作り直す。`-f` を 2 回付け、中に `.git` を持つ入れ子のリポジトリも消す。元の作業ツリーが sparse checkout なら `git worktree add` がその指定を写すので、専用の作業ツリーで `core.sparseCheckout` が有効な場合だけ、そこで `sparse-checkout disable` を実行して全体を展開する（作業ツリーごとの設定に書くので元の作業ツリーは sparse のまま。有効でない場合に実行すると、sparse でないリポジトリにも作業ツリーごとの設定の拡張を書き足すので実行しない）。無視するファイル（`docs/` の下書き・`docs/.build` など）も消して文書の整合の検査に読ませず、`.tools`（push のたびに写し直す）と、`check.sh` が使う直下と Package の `.build` だけを残す。残した直下の `.build` に、中断した前回の検査のカバレッジのロック（`.build/minutes-coverage.lock`。強制終了では `check.sh` の後始末が動かない）が残っていれば、作業ツリーのロックを取った後に持ち主のいない残骸として消す（この作業ツリーで検査するのは作業ツリーのロックを持つ実行だけなので、ほかの実行のロックを消すことはない。ビルドの成果物は消さない）。作業ツリーの一覧は `git worktree list --porcelain -z` で取得し、NUL で区切った記録の `worktree` の項目（パスの全体）を比べる（改行を含むパスを分けない）。一覧を取得できなければ（git の失敗・形の違う出力）、作業ツリーを消さずに失敗する）。置き場所は作る前に実体のパスへ解決し、元のリポジトリと登録されたすべての作業ツリー（`git worktree list`）の中（リンクを経由する場合を含む）なら作らずに失敗する。中かどうかはパスの文字列ではなく、置き場所の既存の祖先（自身を含む）のどれかが作業ツリーとファイルシステム上で同じディレクトリ（デバイスと inode が一致）かで判定する（大文字小文字を区別しないボリュームの綴りの違いを見逃さず、区別するボリュームの別のディレクトリは別物として認める。判定できなければ失敗する。一覧を取得できなければ比べずに認めることはせず失敗する。どの作業ツリーの中でもない場所は認める）。リポジトリの中（`.git` の下など）に置くと、SwiftFormat が親のディレクトリの `.swiftformat` も読み、元の作業ツリーの設定が混ざるため置かない（複製したリポジトリで確かめた）。同じ理由で、置き場所（自身を含む）かその祖先のどれかに `.swiftformat`・`.swift-version` があれば失敗する（SwiftFormat は読む範囲を止める指定を持たない。専用の作業ツリーの中の設定はリポジトリの設定としてそのまま読む）。開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、導入のロック（`setup-tools.sh` と同じ `.install.lock`）を取ってから専用の作業ツリーの `.tools` に写し（APFS では `cp -c` の clone、対応しなければ通常の複写。ロックと導入の途中の作業場所は写さない）、ロックを外す。bin のリンクは相対パスなので写しの中を指し、手順 0 の照合と後の手順はすべてこの写しを使う（検査の途中に別の `setup.sh` が元の `.tools` の bin のリンクや版のディレクトリを差し替えても、照合した導入と使う導入が食い違わない）。ロックが取れなければ待ち（上限 600 秒）、待ち始めたことを表示する。作れなかった直後にロックが外れていた場合は、待たずに 1 回だけ取り直し、それでも作れずロックもなければ止める（`setup-tools.sh` と同じ扱い）。同時の push はロック（`<作業ツリー>.lock` のディレクトリ）で止める。終了の trap は入口で終了の状態を控え、ロックの解放の後にその状態で明示的に終了する（後始末のコマンドの状態で検査の失敗を上書きしない）。登録が残ったままディレクトリを消された場合は `worktree add --force` で作り直す（`git worktree prune` はほかの作業ツリーの登録も外すので使わない）。フックが設定する `GIT_DIR` などの変数は外してから専用の作業ツリーを操作する。送信するコミットが HEAD と同じで、元の作業ツリーに未コミットの変更がないことは、従来どおり求める。
 - **有効にする時期: 作業単位 2 の最後。** プッシュ前のフックは手順 0〜8 を回すので、プロジェクト設定とテストターゲットが揃う前に有効にすると、push できなくなる。作業単位 1 ではフックのファイルを置くだけにし、複製したリポジトリで動作を確かめた（§17）。
 - フックを飛ばす指定（`--no-verify`）は使わない。クラウドの CI がない間は、PR の説明に貼った検査結果（対象のコミットのハッシュ付き）が統合の条件になる（基本設計 §6.2）。
 - コミット前の検査の所要時間は、Swift ファイル 2 件の現状で約 1 秒である。遅くなると飛ばされるので、コードが増えたら測り直す（§17）。
@@ -573,7 +648,7 @@ fi
 | `no_direct_user_defaults` | `@AppStorage` | SwiftUI から `UserDefaults` に直接書く経路になる（SEC-DAT-07） |
 | `no_documents_directory` | `URL.documentsDirectory` | 同じ場所を指す新しい書き方がある |
 | `no_direct_directory_access` | `temporaryDirectory` | 同じ場所を指す新しい書き方がある |
-| `no_direct_clock` | `ContinuousClock`・`SuspendingClock`・`CFAbsoluteTimeGetCurrent`・`DispatchTime.now`・`systemUptime` など | 単調時計も注入の対象である（TST-GEN-01） |
+| `no_direct_clock` | `ContinuousClock`・`SuspendingClock`・`CFAbsoluteTimeGetCurrent`・`DispatchTime.now`・`ProcessInfo.processInfo.systemUptime` など | 単調時計も注入の対象である（TST-GEN-01） |
 | `no_direct_sleep_timer` | `Thread.sleep`・`sleep(`・`Timer.scheduledTimer`・`asyncAfter` など | タイマーも注入の対象である（TST-GEN-01） |
 | `no_spotlight_user_activity` | `.userActivity(`・`.onContinueUserActivity(` | SwiftUI から `NSUserActivity` を提供する経路になる（SEC-PLT-02） |
 | `no_url_content_loading`（新しい規則。例外の場所なし） | URL を受け取る読み込みの初期化子（`NSData(contentsOf:)`・`Data(contentsOf:)`・`String(contentsOf:)`・`NSDictionary(contentsOf:)`・`XMLParser(contentsOf:)` など。型の注釈つきの `.init(contentsOf:)` を含む） | `https://` の URL を渡すと通信する経路になり、`no_network_api` では検出できない（SEC-NET-01、TST-SEC-01）。ローカルのファイルはパスを受け取る API（`contentsOfFile:`・`FileManager.contents(atPath:)`・`FileHandle`）で読む。`append(contentsOf:)` などのコレクションの操作は対象外 |
@@ -765,7 +840,8 @@ custom_rules:
     name: "時計の直接の利用の禁止"
     # Date()・Date.init()・Date(timeIntervalSinceNow:) と、プロパティの .timeIntervalSinceNow（deadline.timeIntervalSinceNow）は
     # 現在時刻を読む。Date(timeIntervalSince1970:)・deadline.timeIntervalSince(now) などは認める
-    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|\.\s*timeIntervalSinceNow\b|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\bsystemUptime\b'
+    # 起動からの時間は ProcessInfo.processInfo.systemUptime の呼び出しで検出する（systemUptime という名前の変数・プロパティは認める）
+    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|\.\s*timeIntervalSinceNow\b|\bDate\.now\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\.\s*processInfo\s*\.\s*systemUptime\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
@@ -995,7 +1071,7 @@ FORBIDDEN_ENTITLEMENT_PREFIXES = {
 ```json
 {
   "formatVersion": 1,
-  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause"],
+  "allowedLicenses": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "0BSD"],
   "approvedPackages": []
 }
 ```
