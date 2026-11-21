@@ -171,7 +171,7 @@
 
 **CI の実行環境について（費用の確認が必要）:**
 
-- 当面は、上の検査をまとめて実行するスクリプトを用意し、コミット前とプッシュ前に**ローカルの Mac で実行する**（無償）。
+- 当面は、上の検査をまとめて実行するスクリプトを用意し、コミット前とプッシュ前に**ローカルの Mac で実行する**（無償）。実行する範囲はフックごとに分ける（[../03-detailed-design/dev-environment.md](../03-detailed-design/dev-environment.md) §5・基本設計 [../02-basic-design/dev-environment.md](../02-basic-design/dev-environment.md) §6.2）。コミット前のフック（`scripts/check.sh --staged`）は、ステージしたファイルに対する手順 1〜3（整形・静的解析・秘密情報）と手順 10（文書の整合）だけを実行し、手順 0・4〜9（ツールの版の照合・プロジェクト設定・依存・ビルドとテスト・カバレッジ・UI テスト）はコミットの時点では実行しない。プッシュ前のフックは手順 0〜8 と 10 を実行し、UI テスト（手順 9）は PR の作成前に手動で行う。
 - GitHub Actions の macOS ランナーは、非公開リポジトリでは利用時間に応じて課金され、macOS は単価が高い（COST-02）。Xcode Cloud も無償枠を超えると課金される（COST-03）。どちらも**オーナーの確認を得るまで使わない**（[dependencies-and-costs.md](dependencies-and-costs.md)）。
 
 ---
