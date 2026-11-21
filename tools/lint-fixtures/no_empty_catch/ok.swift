@@ -32,4 +32,7 @@ func sample() throws {
     // 条件の括弧の中の空のクロージャーを空の本体と取り違えない
     do { try work() } catch let error where handlers.allSatisfy(where: {}) { recorder.record(.failed) }
     do { try work() } catch let error where check(error, label: "(", { _ in }) { recorder.record(.failed) }
+    // 条件の括弧の中のコメントの「)」で括弧が閉じたと見なさない（コメントの中の「{ }」を空の本体と取り違えない）
+    do { try work() } catch let error where check(/* ) { } */ error) { recorder.record(.failed) }
+    do { try work() } catch let error where check(error, [/* ] { } */ 5]) { recorder.record(.failed) }
 }
