@@ -10,3 +10,5 @@ let mixed = Int.random(in: 0..<10) + pick(using: &generator) // expect: no_direc
 // コメントの中の using: は引数ではない
 let inComment = Int.random(in: 0..<10 /* using: &generator */) // expect: no_direct_random
 let withComment = Int.random(in: 0..<10 /* ( */) // expect: no_direct_random
+// 文字列の中の using: は引数ではない
+let inString = Int.random(in: 0..<length(of: "using: (")) // expect: no_direct_random

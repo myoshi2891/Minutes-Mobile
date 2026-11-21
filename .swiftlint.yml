@@ -207,10 +207,11 @@ custom_rules:
   # random・randomElement・shuffled・shuffle は、注入した生成器を渡す呼び出し（using: の引数）を認め、既定の生成器を使う
   # 呼び出しだけを検出する。引数の中の括弧は 2 段の入れ子まで読む（それより深い引数の using: は見落とさず検出する側に倒れる）
   # 引数の中のブロックコメントと行コメントは 1 つの単位として読み飛ばす（コメントの中の「(」「)」で括弧の対を取り違えて
-  # 後ろの using: を見落とさず、コメントの中の「using:」を引数と見なさない）
+  # 後ろの using: を見落とさず、コメントの中の「using:」を引数と見なさない）。文字列リテラル（1 行の "…"）も 1 つの単位として
+  # 読み飛ばす（文字列の中の「(」「)」で括弧の対を取り違えず、文字列の中の「using:」を引数と見なさない）
   no_direct_random:
     name: "乱数の直接の利用の禁止"
-    regex: '\.(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|[^()/]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|[^()/]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|[^()/]|/(?![/*]))*\))*\))*\busing\s*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
+    regex: '\.(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|"(?:[^"\\\n]|\\.)*"|[^()/"]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|"(?:[^"\\\n]|\\.)*"|[^()/"]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|"(?:[^"\\\n]|\\.)*"|[^()/"]|/(?![/*]))*\))*\))*\busing\s*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code

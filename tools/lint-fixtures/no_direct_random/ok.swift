@@ -11,3 +11,5 @@ let lineCommented = Int.random(
     in: 0..<10, // 範囲 (0 以上)
     using: &generator
 )
+// 引数の中の文字列（括弧を含む）があっても、後ろの using: を認める
+let quoted = Int.random(in: 0..<length(of: ")"), using: &generator)
