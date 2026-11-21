@@ -159,8 +159,10 @@ def nested_configs_in_worktree() -> List[str]:
             name for name in directories
             if (name if relative == "." else f"{relative}/{name}") not in WALK_SKIPPED
         )
-        if ".swiftlint.yml" in files:
-            found.append(".swiftlint.yml" if relative == "." else f"{relative}/.swiftlint.yml")
+        # 大文字小文字を区別しない（既定の APFS では .SwiftLint.yml も SwiftLint が .swiftlint.yml として読む）。
+        # 結果には実際のファイル名を入れる
+        for name in sorted(name for name in files if name.casefold() == ".swiftlint.yml"):
+            found.append(name if relative == "." else f"{relative}/{name}")
     return found
 
 
@@ -340,7 +342,13 @@ def main() -> int:
     for rule in BUILTIN_RULES:
         rules[rule] = False
     known = set(rules) | {TEST_CODE_FIXTURE}
-    for directory in sorted(p for p in FIXTURES.iterdir() if p.is_dir()):
+    # 試験用のファイルの置き場所を列挙できなければ、規則の不一致（終了コード 1）と区別して実行できないとして止める
+    try:
+        fixture_directories = sorted(p for p in FIXTURES.iterdir() if p.is_dir())
+    except OSError as error:
+        print(f"NG: 試験用のファイルの置き場所 {FIXTURES} を列挙できない: {error}", file=sys.stderr)
+        return 2
+    for directory in fixture_directories:
         if directory.name not in known:
             errors.append(f"tools/lint-fixtures/{directory.name}/ に対応する規則がない")
     cases = collect(rules, errors) + check_test_code(errors, staged)

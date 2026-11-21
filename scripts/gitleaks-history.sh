@@ -37,6 +37,15 @@ if [ "$shallow" != false ]; then
   echo "NG: ${repository} は浅いクローンで、履歴の一部がない。git fetch --unshallow で全履歴を取得してから検査し直す" >&2
   exit 1
 fi
+# 旧来の grafts（info/grafts）は GIT_NO_REPLACE_OBJECTS では外れず、コミットの親を付け替えて履歴の一部を隠せる
+# （git 2.55.0 で確かめた。GIT_GRAFT_FILE は上で外したので、読まれるのは共通のディレクトリの info/grafts だけ）。
+# コメントと空行だけのファイルでも、git が非推奨の案内を標準エラーに出し、gitleaks（8.30.1）が履歴を読まずに
+# 「no leaks found」で通すので、ファイルがあれば内容によらず検査せずに失敗する
+grafts=$(git -C "$repository" rev-parse --path-format=absolute --git-path info/grafts)
+if [ -e "$grafts" ] || [ -L "$grafts" ]; then
+  echo "NG: ${grafts} がある。grafts はコミットの親を付け替えるので全履歴を検査できない。git replace --convert-graft-file で置き換えのオブジェクトに変えるか削除してから検査し直す" >&2
+  exit 1
+fi
 if [ -e "$repository/.gitleaksignore" ] || [ -L "$repository/.gitleaksignore" ]; then
   echo "NG: ${repository}/.gitleaksignore がある。検出の抑止の記録は使わない（gitleaks が指定によらず読むため）。削除してから検査し直す" >&2
   exit 1

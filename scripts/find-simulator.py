@@ -41,6 +41,10 @@ def main() -> int:
             raise TypeError("runtimes が辞書の配列でない")
         # 版は文字列であること（数値などを version_key の split で例外にせず、取得の失敗として扱う）
         for item in data["runtimes"]:
+            # platform は空でない文字列であること（ない・数値・空の項目を、iOS でないとして読み飛ばして候補なしと取り違えない。
+            # 正しい形の iOS 以外のランタイム（watchOS など）は下の絞り込みで除く）
+            if not isinstance(item.get("platform"), str) or not item.get("platform"):
+                raise TypeError(f"runtimes の {item.get('identifier')!r} の platform が空でない文字列でない")
             # 使えるかの値は真偽値であること（文字列の "false" などを真と取り違えない）
             if not isinstance(item.get("isAvailable"), bool):
                 raise TypeError(f"runtimes の {item.get('identifier')!r} の isAvailable が真偽値でない")

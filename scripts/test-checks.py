@@ -1189,7 +1189,8 @@ def require_clean_case() -> None:
         if result.returncode != 0 or not isolated or "専用の作業ツリーで検査" not in result.stdout:
             failures.append(f"check: --require-clean が専用の作業ツリーで検査しない（終了コード {result.returncode}・記録 {recorded}）\n"
                             f"{(result.stdout + result.stderr).strip()}")
-        elif worktrees.count("worktree ") != 1 or (recorded and Path(recorded[0]).exists()):
+        # 作業ツリーの数は「worktree 」で始まる行だけを数える（パスの途中の「worktree 」を数えない）
+        elif sum(line.startswith("worktree ") for line in worktrees.splitlines()) != 1 or (recorded and Path(recorded[0]).exists()):
             failures.append(f"check: --require-clean の専用の作業ツリーが残った\n{worktrees.strip()}")
 
 
@@ -1282,6 +1283,13 @@ def simulator_cases() -> None:
             {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": ["iPhone"]}]}}, 2),
         ("iPad だけの一覧は候補なし", {"runtimes": [runtime], "devices": {"r": [
             {"name": "iPad A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPad"}]}}, 1),
+        # ランタイムの platform は空でない文字列であること（形の違う項目を、iOS でないとして読み飛ばして候補なしにしない）
+        ("runtimes の platform がない", {"runtimes": [{k: v for k, v in runtime.items() if k != "platform"}], "devices": {}}, 2),
+        ("runtimes の platform が数値", {"runtimes": [dict(runtime, platform=1)], "devices": {}}, 2),
+        ("runtimes の platform が空", {"runtimes": [dict(runtime, platform="")], "devices": {}}, 2),
+        # 正しい形の iOS 以外のランタイム（watchOS）は、これまでどおり読み飛ばす
+        ("watchOS だけの一覧は候補なし", {"runtimes": [dict(runtime, platform="watchOS")], "devices": {"r": [
+            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 1),
         ("name が文字列でない", {"runtimes": [runtime], "devices": {"r": [
             {"name": None, "udid": "y", "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
             {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
@@ -1658,6 +1666,37 @@ def test_gitleaks() -> None:
                                 env=dict(env, GIT_NO_REPLACE_OBJECTS=""))
         if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
             failures.append(f"gitleaks: 置き換えのオブジェクトで隠した鍵を見落とした（終了コード {result.returncode}）")
+    # 旧来の grafts（info/grafts）は GIT_NO_REPLACE_OBJECTS では外れず、親を付け替えて履歴の一部を隠せる。
+    # grafts のファイルがあれば検査せずに失敗する。コメントと空行だけの grafts も止める（git が非推奨の案内を標準エラーに出し、
+    # gitleaks 8.30.1 は「stderr is not empty」で履歴の読み取りをやめたまま「no leaks found」・終了コード 0 で通すため）
+    for label, grafts, want_code, want_text in (
+        ("有効な grafts", None, 1, "grafts"),
+        ("コメントと空行だけの grafts", "# memo\n\n", 1, "grafts"),
+    ):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository = Path(directory) / "repository"
+            grafted_key = "ghp_" + "g8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"  # 実行時に組み立てる
+            identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", f"core.hooksPath={os.devnull}"]
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True,
+                           capture_output=True)
+            for name, content in (("config.txt", f'token = "{grafted_key}"\n'), ("a.txt", "a\n"), ("b.txt", "b\n")):
+                (repository / name).write_text(content, encoding="utf-8")
+                for arguments in (["add", name], ["commit", "-q", "-m", name]):
+                    subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+            if grafts is None:
+                # 2 つ目のコミットを親のないコミットに見せ、鍵を足した最初のコミットを履歴から外す
+                grafts = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD~1"], env=env, check=True,
+                                        capture_output=True, text=True).stdout
+            (repository / ".git" / "info").mkdir(exist_ok=True)  # --template= では info/ がない
+            (repository / ".git" / "info" / "grafts").write_text(grafts, encoding="utf-8")
+            result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository)], capture_output=True, text=True,
+                                    env=env)
+            if result.returncode != want_code or want_text not in result.stdout + result.stderr:
+                failures.append(f"gitleaks: {label}: 終了コード {result.returncode}（期待 {want_code}・「{want_text}」）\n"
+                                f"{(result.stdout + result.stderr).strip()}")
 
 
 def gitleaks_suppression_cases() -> None:
@@ -1894,6 +1933,15 @@ def test_coverage() -> None:
     coverage_case("目標にわずかに届かない", 0, "行 89.96%", 10000, 8996, target="90")
     coverage_case("小数の目標", 0, "目標の 90.5% に届いていない", 20, 18, target="90.5")
     coverage_case("深い入れ子の記録", 2, "RecursionError", 20, 19, nested=True)
+
+
+# 設計決定を §3 に置く基本設計（architecture.md）
+ARCHITECTURE = (
+    "# 全体構成\n\n## 1. 概要\n\n満たす要件: FR-AAA-01\n\n"
+    "## 2. セキュリティ\n\n満たす要件: SEC-AAA-01\n\n"
+    "## 3. 設計決定\n\n満たす要件: FR-AAA-01\n\n| ID | 決定 |\n| --- | --- |\n| BD-ARC-01 | 決定 |\n\n"
+    "## 4. テスト観点\n\n満たす要件: TST-AAA-01\n"
+)
 
 
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）
@@ -2374,6 +2422,27 @@ def run_docs_cases() -> None:
         # 冒頭の「| 満たす要件 ID |」は、表のデータ行の場合だけ網羅に数える（表の見出しに似た単独の行は数えない）
         docs_case("冒頭の表でない満たす要件 ID の行は網羅に数えない", 1, "MVP の要件 FR-AAA-02", basic,
                   "| 項目 | 内容 |\n| --- | --- |\n| 満たす要件 ID |", "| 満たす要件 ID |"),
+        # 「満たす要件」の HTML のコメントの中の ID は表示されないので、網羅にも節の冒頭の要件にも数えない
+        docs_case("冒頭の表のコメントの中の ID は網羅に数えない", 1, "MVP の要件 FR-AAA-02", basic,
+                  "| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |", "| 満たす要件 ID | FR-AAA-01、SEC-AAA-01 <!-- FR-AAA-02 --> |"),
+        docs_case("節の冒頭のコメントの中の ID は網羅に数えない", 1, "MVP の要件 FR-AAA-02", extra={basic: replaced(replaced(
+            DOCS[basic], "| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |", "| 満たす要件 ID | FR-AAA-01、SEC-AAA-01 |"),
+            "満たす要件: FR-AAA-01\n", "満たす要件: FR-AAA-01 <!-- FR-AAA-02 -->\n")}),
+        docs_case("コメントの中の ID だけの節の冒頭", 1, "要件 ID も「—」の指定もない", detailed,
+                  "満たす要件: SEC-AAA-01\n\n## 3. テスト観点", "満たす要件: <!-- SEC-AAA-01 -->\n\n## 3. テスト観点"),
+        docs_case("コメントの後の「—」は認める", 0, "OK", basic, "満たす要件: —\n", "満たす要件: <!-- 補足 --> —\n"),
+        docs_case("コメントの後の見える ID は認める", 0, "OK", basic, "満たす要件: SEC-AAA-01\n", "満たす要件: <!-- 補足 --> SEC-AAA-01\n"),
+        # 設計決定（BD）の定義は、各文書の §1（architecture.md は §3）の表だけから集める（docs/README.md）
+        docs_case("§1 の外の BD は定義にしない", 1, "定義されていない ID: BD-SMP-09", extra={
+            basic: replaced(DOCS[basic], "[要件](../01-requirements/requirements.md)\n",
+                            "[要件](../01-requirements/requirements.md)\n\n| ID | 決定 |\n| --- | --- |\n| BD-SMP-09 | 決定 |\n"),
+            detailed: replaced(DOCS[detailed], "決定: BD-SMP-01", "決定: BD-SMP-01、BD-SMP-09")}),
+        docs_case("architecture.md は §3 の BD を定義にする", 0, "OK", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、BD-ARC-01",
+                  extra={"docs/02-basic-design/architecture.md": ARCHITECTURE}),
+        docs_case("architecture.md の §1 の BD は定義にしない", 1, "定義されていない ID: BD-ARC-02", detailed, "決定: BD-SMP-01",
+                  "決定: BD-SMP-01、BD-ARC-02", extra={"docs/02-basic-design/architecture.md": replaced(
+                      ARCHITECTURE, "満たす要件: FR-AAA-01\n\n## 2.",
+                      "満たす要件: FR-AAA-01\n\n| ID | 決定 |\n| --- | --- |\n| BD-ARC-02 | 決定 |\n\n## 2.")}),
     ]
     # シンボリックリンクで --root の外を指すコード片の元のファイルも認めない
     with tempfile.TemporaryDirectory() as outside:

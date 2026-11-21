@@ -54,6 +54,9 @@ DEFINED_IN = {
 # 「満たす要件:」に書ける要件 ID の接頭辞（設計決定・未解決事項・オーナー決定は要件ではない）
 REQUIREMENT_PREFIX = r"(FR|NFR|SEC|TST|CON|INV)-"
 BASIC = "docs/02-basic-design"
+# 設計決定（BD）を定義する節の番号（docs/README.md §3。各文書の §1、architecture.md は §3）
+BD_SECTION = "1"
+BD_SECTION_OF = {f"{BASIC}/architecture.md": "3"}
 DETAILED = "docs/03-detailed-design"
 
 
@@ -126,6 +129,11 @@ def fence_end(lines: List[str], start: int) -> int:
 COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
 # 同じ行で閉じる HTML のコメント。表示されないので、中のリンクは確かめない（コード片の印の照合は印の行で別に行う）
 INLINE_COMMENT = re.compile(r"<!--.*?-->")
+
+
+def visible(line: str) -> str:
+    """同じ行で閉じる HTML のコメントを除いた、表示される部分（「満たす要件」の ID・「—」の判定に使う）。"""
+    return INLINE_COMMENT.sub("", line)
 # 節（「## 」）と小節（「### 」）の見出し。字下げは空白 0〜3 個まで（CommonMark。4 個以上は字下げしたコードブロック）。
 # sections() と requirement_fields() が同じ判定を使う
 HEADING = re.compile(r"^ {0,3}(#{2,3}) (.*)$")
@@ -346,6 +354,20 @@ def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
     yield from find_tables(lines)
 
 
+def section_numbers(text: str) -> Dict[int, str]:
+    """各行を含む節（「## 」。フェンスとコメントの中の見出しは数えない）の番号（「## 3. 設計決定」なら "3"）。
+    番号のない節と最初の節より前の行は空文字列。"""
+    result: Dict[int, str] = {}
+    current = ""
+    for number, line, inside, _, _ in scanned_lines(text):
+        found = None if inside else heading(line)
+        if found and found[0] == 2:
+            numbered = re.match(r"(\d+)\.", found[1])
+            current = numbered.group(1) if numbered else ""
+        result[number] = current
+    return result
+
+
 def commented_lines(text: str) -> Set[int]:
     """複数行の HTML のコメントの行番号（scanned_lines と同じ判定）。表示されない内容なので、節・表の検査に数えない。"""
     return {number for number, _, _, _, commented in scanned_lines(text) if commented}
@@ -415,13 +437,14 @@ class Checker:
         """定義文書の表から ID を集める。要件表の「フェーズ」列が MVP の FR / NFR / SEC も集める。"""
         for name, text in self.texts.items():
             # 定義は、見出しの行と区切りの行を確かめた表のデータ行からだけ集める。フェーズの列は、その表の見出しで決める
+            section_of = section_numbers(text)
             for header, rows in tables(text):
                 phase_column = header.index("フェーズ") if "フェーズ" in header else -1
                 for number, line in rows:
-                    self.collect_definition(name, number, line, phase_column)
+                    self.collect_definition(name, number, line, phase_column, section_of.get(number, ""))
 
-    def collect_definition(self, name: str, number: int, line: str, phase_column: int) -> None:
-        """表のデータ行 1 行から ID の定義を集める（collect_definitions から呼ぶ）。"""
+    def collect_definition(self, name: str, number: int, line: str, phase_column: int, section: str) -> None:
+        """表のデータ行 1 行から ID の定義を集める（collect_definitions から呼ぶ）。section は行を含む節（「## 」）の番号。"""
         cells = table_cells(line)
         # 先頭の列の空白の有無（|FR-AAA-01| と | FR-AAA-01 |）によらず、正規化した値で判定する
         found = DEFINITION_CELL.fullmatch(cells[0]) if cells else None
@@ -432,8 +455,8 @@ class Checker:
         home = DEFINED_IN.get(prefix, BASIC if prefix == "BD" else "")
         if not (name == home or (prefix == "BD" and name.startswith(BASIC + "/"))):
             return
-        # 基本設計では、設計決定の表（先頭の列が ID）の行だけを定義として扱う
-        if prefix == "BD" and cells[0] != identifier:
+        # 基本設計では、設計決定の節（各文書の §1、architecture.md は §3）の表で、先頭の列が ID の行だけを定義として扱う
+        if prefix == "BD" and (cells[0] != identifier or section != BD_SECTION_OF.get(name, BD_SECTION)):
             return
         if identifier in self.defined:
             self.error(name, f"{identifier} の定義が重複している（{self.defined[identifier]}）", number)
@@ -521,7 +544,8 @@ class Checker:
         head_end = next((number for number, line in prose_lines(text) if heading(line)), None)
         # 表の見出しの行だけ・区切りの行のない行など、表として成り立たない「| 満たす要件 ID |」の行は数えない
         for _, rows in tables(text):
-            fields.extend(line for number, line in rows
+            # 同じ行のコメントの中の ID は表示されないので数えない
+            fields.extend(visible(line) for number, line in rows
                           if (head_end is None or number < head_end) and table_cells(line)[0] == "満たす要件 ID")
         after_heading = False
         for _, line, inside, _, commented in scanned_lines(text):
@@ -536,7 +560,7 @@ class Checker:
             if not line.strip():
                 continue
             if after_heading and line.startswith("満たす要件:"):
-                fields.append(line)
+                fields.append(visible(line))
             after_heading = False
         return fields
 
@@ -683,7 +707,8 @@ class Checker:
 
     def names_requirements(self, line: str) -> bool:
         """「満たす要件:」の後（「／」の前まで）に、定義済みの要件 ID・要件の群・「SEC 全般」・「—」（満たす要件なし）のどれかがあるか。"""
-        spec = line.split(":", 1)[1].split("／", 1)[0].strip()
+        # 同じ行のコメントの中の ID・「—」は表示されないので数えない
+        spec = visible(line).split(":", 1)[1].split("／", 1)[0].strip()
         if spec.startswith("—") or "SEC 全般" in spec:
             return True
         for match in ID_PATTERN.finditer(spec):

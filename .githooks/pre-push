@@ -102,7 +102,15 @@ if [ ! -d "$tools_source" ]; then
   exit 1
 fi
 waited=0
+retried=0  # ロックが消えていたときに、直ちに取り直した（1 回だけ）
 until mkdir "$tools_source/.install.lock" 2>/dev/null; do
+  # mkdir の失敗の後にロックが外れた（別の導入が終わった）場合は、待たずに 1 回だけ取り直す。
+  # 取り直しても失敗し、ロックもない場合は、ロック以外の理由（書き込めないなど）として止める
+  if [ ! -d "$tools_source/.install.lock" ] && [ "$retried" -eq 0 ]; then
+    retried=1
+    continue
+  fi
+  if [ -d "$tools_source/.install.lock" ]; then retried=0; fi
   if [ ! -d "$tools_source/.install.lock" ] || [ "$waited" -ge 600 ]; then
     echo "NG: 開発ツールの導入のロック（${tools_source}/.install.lock）を取れない。導入の実行中でなければ削除してから push し直す" >&2
     exit 1
