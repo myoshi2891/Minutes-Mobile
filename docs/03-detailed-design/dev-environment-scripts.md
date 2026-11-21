@@ -375,6 +375,7 @@ STEPS_GIVEN=0  # --steps を指定したか（指定しなかったときだけ�
 STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対位置で書き出す一時ディレクトリ
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
+STAGED_SECRETS_TREE=""  # --staged のとき、秘密情報の検査のためにステージした blob をそのまま書き出す一時ディレクトリ
 ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
 ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
@@ -493,6 +494,45 @@ prepare_rules_tree() {
   [ -e "$STAGED_TREE/.tools" ] || ln -s "$ROOT/.tools" "$STAGED_TREE/.tools"
 }
 
+# ステージした（追加・変更・名前の変更・種類の変更をした）ファイルの blob を、加工せずに元の相対位置で書き出す。
+# git diff・checkout-index を通さないので、.gitattributes の binary・textconv・clean/smudge のフィルタ・改行の変換の
+# 影響を受けない（git cat-file blob は保存した内容をそのまま出す）。サブモジュール（160000）は blob がないので書き出さない。
+# シンボリックリンク（120000）はリンク先の文字列を通常のファイルとして書く（リンクをたどらない）
+prepare_staged_secrets_tree() {
+  local list entries entry mode object path
+  STAGED_SECRETS_TREE=$(mktemp -d)
+  list=$(mktemp)
+  entries=$(mktemp)
+  # 一覧の取得の失敗を空の一覧として扱わない
+  if ! git diff --cached --name-only --diff-filter=ACMRT -z > "$list"; then
+    rm -f -- "$list" "$entries"
+    fail "ステージしたファイルの一覧を取得できない"
+  fi
+  if [ -s "$list" ] && ! xargs -0 git --literal-pathspecs ls-files -s -z -- < "$list" > "$entries"; then
+    rm -f -- "$list" "$entries"
+    fail "ステージしたファイルのモードを取得できない"
+  fi
+  rm -f -- "$list"
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    [ "$mode" = 160000 ] && continue
+    # gitleaks は検査する場所の直下の .gitleaksignore を指定によらず読むので、ステージしたものも書き出さずに失敗する
+    if [ "$path" = .gitleaksignore ]; then
+      rm -f -- "$entries"
+      fail ".gitleaksignore をステージしている。検出の抑止の記録は使わない（gitleaks が指定によらず読むため）"
+    fi
+    mkdir -p "$STAGED_SECRETS_TREE/$(dirname "$path")"
+    if ! git cat-file blob "$object" > "$STAGED_SECRETS_TREE/$path"; then
+      rm -f -- "$entries"
+      fail "ステージした ${path} の内容を読めない"
+    fi
+  done < "$entries"
+  rm -f -- "$entries"
+}
+
 title() {
   case "$1" in
     0) echo "開発ツールの版" ;;
@@ -558,8 +598,12 @@ step_3() {
     if [ -e .gitleaksignore ] || [ -L .gitleaksignore ]; then
       fail ".gitleaksignore がある。検出の抑止の記録は使わない（gitleaks が指定によらず読むため）。削除してから実行し直す"
     fi
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" \
-      --gitleaks-ignore-path /dev/null --ignore-gitleaks-allow --pre-commit --staged .
+    # ステージした内容は、git の差分（gitleaks git --pre-commit --staged）ではなく、書き出した blob を gitleaks dir で検査する。
+    # 8.30.1 の --staged は git diff を使い、--log-opts（履歴の検査の --no-textconv・--text）は効かないので、.gitattributes の
+    # binary・textconv で鍵の行を隠せる。dir は .gitignore・.gitattributes によらず書き出したファイルの全体を検査する
+    prepare_staged_secrets_tree
+    (cd "$STAGED_SECRETS_TREE" && "$TOOLS/gitleaks" dir --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" \
+      --gitleaks-ignore-path /dev/null --ignore-gitleaks-allow .)
   else
     # 全履歴の検査は、自己試験（test-checks.py gitleaks）と同じコマンドで行う
     scripts/gitleaks-history.sh .
@@ -759,6 +803,7 @@ on_exit() {
   if [ -n "$STAGED_TREE" ]; then remove_or_report "$STAGED_TREE"; fi
   if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then remove_or_report "$STAGED_GITLEAKS_CONFIG"; fi
   if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
+  if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
   if [ -n "$ISOLATED_TREE" ]; then
