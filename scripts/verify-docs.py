@@ -704,7 +704,8 @@ class Checker:
                            if at > 0 and any(word in cell for word in TEST_COLUMN_WORDS)]
                 for line in rows:
                     cells = table_cells(line)
-                    if not any(at < len(cells) and cells[at].strip() for at in columns):
+                    # 同じ行で閉じるコメントは表示されないので、コメントだけの検査・試験の列は空と見なす
+                    if not any(at < len(cells) and visible(cells[at]).strip() for at in columns):
                         continue
                     # 先頭の列は個々の要件 ID を持つこと（群の表記・「SEC 全般」は対応の行として数えない）
                     if self.names_individual_requirement(cells[0]):
@@ -757,11 +758,11 @@ class Checker:
             if "申し送り" in heading:
                 rows.extend(row for header, block in table_blocks(body) if len(header) >= 2 and "解決" in header[1]
                             for row in block)
-        # 解決の列（2 列目）が空・空白だけの行は、解決したことにしない
+        # 解決の列（2 列目）が空・空白だけ・コメントだけ（表示されない）の行は、解決したことにしない
         resolved = []
         for line in rows:
             cells = table_cells(line)
-            if len(cells) < 2 or not cells[1].strip():
+            if len(cells) < 2 or not visible(cells[1]).strip():
                 self.error(name, f"申し送り「{item_name(cells[0])}」の解決の列が空")
                 continue
             resolved.append(item_name(cells[0]))

@@ -1254,7 +1254,8 @@ def staged_raw_blob_case() -> None:
     """check.sh --staged の整形・静的解析が、smudge のフィルタを通さずに、ステージした blob そのものを検査すること。
 
     一時のリポジトリで、.gitattributes の smudge のフィルタが内容を書き換える Swift ファイルをステージし、整形の代わり
-    （.tools/bin/swiftformat。渡されたファイルの内容を記録して失敗する）が読んだ内容を確かめる。
+    （.tools/bin/swiftformat。渡されたファイルの内容を記録して成功する）と静的解析の代わり（.tools/bin/swiftlint。
+    渡されたファイルの内容を記録して失敗し、手順 2 で止める）の両方が読んだ内容を確かめる。
     """
     global count
     count += 1
@@ -1265,13 +1266,19 @@ def staged_raw_blob_case() -> None:
         (repository / "scripts").mkdir(parents=True)
         (repository / ".tools" / "bin").mkdir(parents=True)
         out = Path(directory) / "recorded"
+        lint_out = Path(directory) / "recorded-lint"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "check.sh").chmod(0o755)
-        # 整形の代わり: 渡された最後のファイルの内容を記録し、手順 1 で止める（後の手順を実行しない）
+        # 整形の代わり: 渡された最後のファイルの内容を記録し、成功する（手順 2 の静的解析へ進む）
         formatter = repository / ".tools" / "bin" / "swiftformat"
-        formatter.write_text('#!/bin/sh\nfor last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\nexit 1\n',
+        formatter.write_text('#!/bin/sh\nfor last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\nexit 0\n',
                              encoding="utf-8")
         formatter.chmod(0o755)
+        # 静的解析の代わり: 渡された最後のファイルの内容を記録し、手順 2 で止める（後の手順を実行しない）
+        linter = repository / ".tools" / "bin" / "swiftlint"
+        linter.write_text('#!/bin/sh\nfor last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_LINT_OUT"\nexit 1\n',
+                          encoding="utf-8")
+        linter.chmod(0o755)
         (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
         (repository / ".gitattributes").write_text("*.swift filter=rewrite\n", encoding="utf-8")
         (repository / "Sample.swift").write_text("let raw = 1\n", encoding="utf-8")
@@ -1282,11 +1289,12 @@ def staged_raw_blob_case() -> None:
         subprocess.run(["git", "-C", str(repository), "config", "filter.rewrite.smudge", "sed s/raw/smudged/"], env=env, check=True)
         subprocess.run(["git", "-C", str(repository), *identity, "add", "-A"], env=env, check=True, capture_output=True)
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
-                                env=dict(env, MINUTES_TEST_OUT=str(out)), timeout=60)
-        recorded = out.read_text(encoding="utf-8") if out.is_file() else None
-        if recorded != "let raw = 1\n":
-            failures.append(f"check: --staged の整形がステージした blob そのものを検査しない（読んだ内容 {recorded!r}・"
-                            f"終了コード {result.returncode}）\n{(result.stdout + result.stderr).strip()}")
+                                env=dict(env, MINUTES_TEST_OUT=str(out), MINUTES_TEST_LINT_OUT=str(lint_out)), timeout=60)
+        for label, path in (("整形", out), ("静的解析", lint_out)):
+            recorded = path.read_text(encoding="utf-8") if path.is_file() else None
+            if recorded != "let raw = 1\n":
+                failures.append(f"check: --staged の{label}がステージした blob そのものを検査しない（読んだ内容 {recorded!r}・"
+                                f"終了コード {result.returncode}）\n{(result.stdout + result.stderr).strip()}")
 
 
 def staged_symlink_case() -> None:
@@ -1948,8 +1956,9 @@ def step3_history_case() -> None:
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "3"], capture_output=True, text=True,
                                 env=dict(env, MINUTES_TEST_OUT=str(out)), timeout=60)
         recorded = out.read_text(encoding="utf-8").splitlines() if out.is_file() else []
+        # 空の引数は Path(repository, "") が起点そのものになり一致してしまうので、解決する前に拒否する（「.」などは認める）
         if result.returncode != 0 or len(recorded) != 2 or Path(recorded[0]) != repository.resolve() \
-                or Path(repository, recorded[1]).resolve() != repository.resolve():
+                or not recorded[1] or Path(repository, recorded[1]).resolve() != repository.resolve():
             failures.append(f"gitleaks: check.sh の手順 3 が scripts/gitleaks-history.sh で全履歴を検査していない"
                             f"（終了コード {result.returncode}・記録 {recorded}）\n{(result.stdout + result.stderr).strip()}")
 
@@ -2399,6 +2408,8 @@ def run_docs_cases() -> None:
         docs_case("重複した行で欠落した申し送りを埋めても合格にしない", 1, "申し送り「二つ目」の解決が表にない",
                   detailed, "| 二つ目 | 済 |", "| 一つ目 | 済 |"),
         docs_case("申し送りの解決の列が空", 1, "申し送り「二つ目」の解決の列が空", detailed, "| 二つ目 | 済 |", "| 二つ目 |   |"),
+        docs_case("申し送りの解決の列がコメントだけ", 1, "申し送り「二つ目」の解決の列が空", detailed, "| 二つ目 | 済 |",
+                  "| 二つ目 | <!-- 済 --> |"),
         docs_case("申し送りの解決の重複", 1, "申し送り「一つ目」の解決が表に 2 行ある",
                   detailed, "| 二つ目 | 済 |", "| 二つ目 | 済 |\n| 一つ目 | 再掲 |"),
         # 申し送りの節に表が 2 つある場合も、各表の見出しの行を除く（2 つ目の見出しを項目と見なさない）
@@ -2444,6 +2455,10 @@ def run_docs_cases() -> None:
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", ""),
         docs_case("対応表の行に要件 ID がない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| 未定 | 試験 |"),
         docs_case("対応表の行にテストがない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| FR-AAA-01 |  |"),
+        docs_case("対応表の行のテストがコメントだけ", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |",
+                  "| FR-AAA-01 | <!-- 試験 --> |"),
+        docs_case("対応表の行のテストにコメントと表示される名前がある", 0, "OK", detailed, "| FR-AAA-01 | 試験 |",
+                  "| FR-AAA-01 | 試験 <!-- 補足 --> |"),
         # 検査・試験の列が空なら、「状態」などほかの列に値があっても数えない
         docs_case("対応表の行の検査・試験が空で状態だけがある", 1, "対応表の行がない", detailed,
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 検査・試験 | 状態 |\n| --- | --- | --- |\n| FR-AAA-01 |  | 通過 |"),
