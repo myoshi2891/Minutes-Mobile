@@ -432,12 +432,24 @@ def combined_expander(expanders: List[Expander]) -> Expander:
     return lambda text: [value for expand in expanders for value in expand(text)]
 
 
-def check_enabled(source: str, key: str, value: object, errors: List[str], expand: Optional[Expander]) -> None:
+# Info.plist の鍵の、iPhone のビルドで使われうる修飾子（<鍵>-<OS>・<鍵>~<機種>・<鍵>-<OS>~<機種>）。
+# 修飾子つきの鍵も元の鍵と同じ規則で判定する（UIFileSharingEnabled~iphone で禁止を迂回させない）
+IPHONE_KEY_MODIFIERS = re.compile(r"(?P<base>[A-Za-z]\w*?)(?:-iphoneos)?(?:~iphone)?")
+
+
+def unmodified_key(key: str) -> str:
+    """iPhone の修飾子を除いた鍵の名前（修飾子がない・iPhone 以外の修飾子なら、そのままの名前）。"""
+    found = IPHONE_KEY_MODIFIERS.fullmatch(key)
+    return found.group("base") if found else key
+
+
+def check_enabled(source: str, key: str, value: object, errors: List[str], expand: Optional[Expander],
+                  rule: Optional[str] = None) -> None:
     """有効にすると違反になる鍵の値を判定する。変数を含む値は、構成・SDK ごとに展開してから判定する。
 
     展開できない値（どのターゲットのビルド設定で展開するか決まらない plist の値を含む）は、無効とみなさず違反として報告する。
     """
-    reason = FORBIDDEN_WHEN_ENABLED[key]
+    reason = FORBIDDEN_WHEN_ENABLED[rule if rule is not None else key]
     if not (isinstance(value, str) and VARIABLE.search(value)):
         if enabled(value):
             errors.append(f"[{reason}] {source}: {key} を有効にしない")
@@ -459,8 +471,8 @@ def check_plist_entry(source: str, key: str, value: object, errors: List[str], e
     for prefix, reason in FORBIDDEN_PLIST_KEY_PREFIXES.items():
         if key.startswith(prefix):
             errors.append(f"[{reason}] {source}: {key} を設定しない")
-    if key in FORBIDDEN_WHEN_ENABLED:
-        check_enabled(source, key, value, errors, expand)
+    if unmodified_key(key) in FORBIDDEN_WHEN_ENABLED:
+        check_enabled(source, key, value, errors, expand, unmodified_key(key))
     if re.fullmatch(r"NS\w*UsageDescription", key) and key not in ALLOWED_USAGE_DESCRIPTIONS:
         errors.append(f"[TST-SEC-03] {source}: 使わない権限の文言 {key} を置かない")
     if key == "UIBackgroundModes":

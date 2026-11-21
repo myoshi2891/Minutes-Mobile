@@ -210,6 +210,12 @@ def test_settings() -> None:
                   plists={"App/Info.plist": {"NSAppTransportSecurity": {"NSExceptionDomains": {"example.com": {}}}}})
     settings_case("ファイル共有を有効にしている（Info.plist）", 1, "UIFileSharingEnabled",
                   plists={"App/Info.plist": {"UIFileSharingEnabled": True}})
+    # iPhone の修飾子つきの鍵も同じ規則で判定する
+    for modified in ("UIFileSharingEnabled~iphone", "UIFileSharingEnabled-iphoneos~iphone", "UIFileSharingEnabled-iphoneos"):
+        settings_case(f"ファイル共有を有効にしている（Info.plist・{modified}）", 1, modified,
+                      plists={"App/Info.plist": {modified: True}})
+    settings_case("修飾子つきのファイル共有の無効は認める", 0, "OK",
+                  plists={"App/Info.plist": {"UIFileSharingEnabled~iphone": False}})
     settings_case("ファイル共有を無効と明記するのは認める", 0, "OK",
                   plists={"App/Info.plist": {"UIFileSharingEnabled": False}})
     settings_case("文書ブラウザ", 1, "UISupportsDocumentBrowser",
@@ -543,6 +549,9 @@ def test_dependencies() -> None:
     dependencies_case("Packages/ の外のローカルの Package", 1, "Packages/ の外",
                       {"Package.swift": local, "Local/Package.swift": local_manifest})
     dependencies_case("許可リストにない依存（project.xcproj）", 1, "example.com", {"App.xcodeproj/project.xcproj": project})
+    # scheme の大文字小文字によらず取得元の URL として照合する（HTTPS:// を読み飛ばして合格にしない）
+    upper = project.replace("https://", "HTTPS://", 1)
+    dependencies_case("許可リストにない依存（project.xcproj・大文字の scheme）", 1, "HTTPS://", {"App.xcodeproj/project.xcproj": upper})
     # project.xcproj の承認済みの依存は、同じ .xcodeproj の中の Package.resolved に確定版が要る
     workspace_resolved = "App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
     dependencies_case("project.xcproj の依存に確定版がない", 1, "の確定版がない",
@@ -779,6 +788,14 @@ def test_dependencies() -> None:
                        "license": "MIT", "approvedOn": "2026-11-18", "ledger": "dependencies-and-costs.md §3"}
     dependencies_case("記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
                       {"Sub/Package.swift": declare.format(binary)})
+    # 入れ子の呼び出しの url: を宣言の取得元と見なさず、ローカルのバイナリとして path と内容のハッシュを照合する
+    nested_binary = '.binaryTarget(name: targetName(url: "https://example.com/x"), path: "Frameworks/B.xcframework")'
+    dependencies_case("入れ子の url: を持つ記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
+                      {"Sub/Package.swift": declare.format(nested_binary)})
+    nested_changed = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/B": "replaced",
+                                           "Sub/Package.swift": declare.format(nested_binary)})
+    dependencies_case("入れ子の url: を持つローカルのバイナリの内容の照合", 1, "内容が承認したものと違う", nested_changed,
+                      [approved_binary])
     dependencies_case("承認済みのローカルのバイナリ", 0, "OK", dict(binary_files, **{"Sub/Package.swift": declare.format(binary)}),
                       [approved_binary])
     # 場所が一致しても、承認の後に内容（配下のファイルを含む）が変われば再承認を求める
@@ -1169,11 +1186,15 @@ def require_clean_case() -> None:
         # （読む前に元の作業ツリーを変えても、専用の作業ツリーの内容が開始時のコミットのままであることを確かめる）
         (repository / "scripts" / "verify-docs.py").write_text(
             '#!/bin/sh\nprintf changed > "$MINUTES_TEST_ORIGINAL/marker.txt"\n'
-            '{ pwd -P; cat marker.txt; } > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+            '{ pwd -P; cat marker.txt; echo; if [ -L .tools ]; then echo link; elif [ -f .tools/marker ]; then echo copy; '
+            'else echo missing; fi; } > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
         for name in ("check.sh", "test-checks.py", "verify-docs.py"):
             (repository / "scripts" / name).chmod(0o755)
         (repository / ".gitignore").write_text((ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "marker.txt").write_text("committed", encoding="utf-8")
+        # 開発ツールの代わり（Git の管理外）。専用の作業ツリーにはリンクではなく写しが置かれること（導入のロックを取って写す）
+        (repository / ".tools").mkdir()
+        (repository / ".tools" / "marker").write_text("tools", encoding="utf-8")
         identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
                     "-c", f"core.hooksPath={os.devnull}"]
         for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
@@ -1184,7 +1205,7 @@ def require_clean_case() -> None:
         recorded = out.read_text(encoding="utf-8").splitlines() if out.is_file() else []
         worktrees = subprocess.run(["git", "-C", str(repository), "worktree", "list", "--porcelain"], env=env, capture_output=True,
                                    text=True).stdout
-        isolated = (len(recorded) == 2 and recorded[1] == "committed"
+        isolated = (len(recorded) == 3 and recorded[1] == "committed" and recorded[2] == "copy"
                     and not recorded[0].startswith(os.path.realpath(repository)))
         if result.returncode != 0 or not isolated or "専用の作業ツリーで検査" not in result.stdout:
             failures.append(f"check: --require-clean が専用の作業ツリーで検査しない（終了コード {result.returncode}・記録 {recorded}）\n"
@@ -1192,6 +1213,8 @@ def require_clean_case() -> None:
         # 作業ツリーの数は「worktree 」で始まる行だけを数える（パスの途中の「worktree 」を数えない）
         elif sum(line.startswith("worktree ") for line in worktrees.splitlines()) != 1 or (recorded and Path(recorded[0]).exists()):
             failures.append(f"check: --require-clean の専用の作業ツリーが残った\n{worktrees.strip()}")
+        elif (repository / ".tools" / ".install.lock").exists():
+            failures.append("check: --require-clean が開発ツールの導入のロックを残した")
 
 
 def coverage_record_message_case() -> None:
@@ -1586,7 +1609,7 @@ def test_gitleaks() -> None:
             (source / name).write_text(name, encoding="utf-8")
             git("-C", str(source), "add", name)
             git("-C", str(source), "commit", "-q", "-m", name)
-        git("clone", "-q", "--depth", "1", f"file://{source}", str(clone))
+        git("clone", "-q", "--depth", "1", source.as_uri(), str(clone))
         # 外側の GIT_DIR などを引き継ぐと、一時のリポジトリではなく外側のリポジトリを検査してしまうので、同じ環境で実行する
         expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン", env=env)
         expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found",
@@ -1833,6 +1856,42 @@ def gitleaks_suppression_cases() -> None:
             failures.append(f"gitleaks: 引き継いだ GIT_DIR のリポジトリを検査した（終了コード {result.returncode}）")
 
 
+def step3_history_case() -> None:
+    """check.sh の手順 3 が、履歴の検査に scripts/gitleaks-history.sh を作業ツリーの起点で呼ぶこと。
+
+    手順 3 が別のコマンドに変わると、下の陽性の試験（gitleaks-history.sh を直接実行する）が手順 3 を試験しなくなる。
+    本文の文字列ではなく、一時のリポジトリに写した check.sh の手順 3 を実行し、代わりのスクリプトが記録した
+    呼び出し（実行した場所と引数）で確かめる（引用符や書き方の違いに左右されない）。
+    """
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        out = Path(directory) / "recorded"
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        # 履歴の検査の代わり: 実行した場所と引数（1 行に 1 つ）を記録する
+        (repository / "scripts" / "gitleaks-history.sh").write_text(
+            '#!/bin/sh\n{ pwd -P; for argument in "$@"; do printf \'%s\\n\' "$argument"; done; } > "$MINUTES_TEST_OUT"\n',
+            encoding="utf-8")
+        for name in ("check.sh", "test-checks.py", "gitleaks-history.sh"):
+            (repository / "scripts" / name).chmod(0o755)
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "--allow-empty",
+                        "-m", "base"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "3"], capture_output=True, text=True,
+                                env=dict(env, MINUTES_TEST_OUT=str(out)), timeout=60)
+        recorded = out.read_text(encoding="utf-8").splitlines() if out.is_file() else []
+        if result.returncode != 0 or len(recorded) != 2 or Path(recorded[0]) != repository.resolve() \
+                or Path(repository, recorded[1]).resolve() != repository.resolve():
+            failures.append(f"gitleaks: check.sh の手順 3 が scripts/gitleaks-history.sh で全履歴を検査していない"
+                            f"（終了コード {result.returncode}・記録 {recorded}）\n{(result.stdout + result.stderr).strip()}")
+
+
 def gitleaks_merge_case() -> None:
     """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
 
@@ -1843,10 +1902,8 @@ def gitleaks_merge_case() -> None:
     global count
     gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
     history = str(SCRIPTS / "gitleaks-history.sh")
+    step3_history_case()
     count += 1
-    # 手順 3 が同じコマンドで全履歴を検査していること（手順 3 が別のコマンドに変わると、陽性の試験が手順 3 を試験しなくなる）
-    if 'scripts/gitleaks-history.sh .\n' not in (SCRIPTS / "check.sh").read_text(encoding="utf-8"):
-        failures.append("gitleaks: check.sh の手順 3 が scripts/gitleaks-history.sh で全履歴を検査していない")
     # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
     normal_key = "ghp_" + "a8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
     merge_key = "ghp_" + "b9Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"

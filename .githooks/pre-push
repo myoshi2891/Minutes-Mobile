@@ -44,18 +44,35 @@ source_root=$(cd -P "$(git rev-parse --show-toplevel)" && pwd)  # 実体のパ�
 common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
 base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
 # 置き場所を作る前に実体のパスへ解決する（まだない部分を含んでよい。git worktree list が示す実体のパスとも比べる）。
-# 元のリポジトリの中（リンクを経由して指す場合を含む）は拒否する。中に置くと、SwiftFormat などが親のディレクトリの
-# 設定ファイルも読み、元の作業ツリーの設定が混ざるため。拒否してから作る（中にディレクトリを残さない）
+# 元のリポジトリと、登録されたすべての作業ツリーの中（リンクを経由して指す場合を含む）は拒否する。中に置くと、
+# SwiftFormat などが親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る
+# （中にディレクトリを残さない）。どの作業ツリーの中でもない場所は認める
 base=$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$base") || {
   echo "NG: 専用の作業ツリーの置き場所を解決できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
   exit 1
 }
-case "$base/" in
-  "$source_root/"*)
-    echo "NG: 専用の作業ツリーの置き場所（${base}）が元のリポジトリ（${source_root}）の中にある。リポジトリの外を指定する" >&2
-    exit 1
-    ;;
-esac
+# 一覧を取得できなければ、比べずに認めることはせず止める
+registered=$(git -C "$source_root" worktree list --porcelain) || {
+  echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
+  exit 1
+}
+roots=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' \
+  | /usr/bin/python3 -c 'import os, sys; [print(os.path.realpath(line.rstrip("\n"))) for line in sys.stdin if line.strip()]') || {
+  echo "NG: 作業ツリーの実体のパスを解決できない" >&2
+  exit 1
+}
+while IFS= read -r root; do
+  [ -n "$root" ] || continue
+  case "$base/" in
+    "$root/"*)
+      echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${root}）の中にある。どの作業ツリーの外も指定する" >&2
+      exit 1
+      ;;
+  esac
+done <<ROOTS
+$source_root
+$roots
+ROOTS
 mkdir -p "$base"
 key=$(printf '%s' "$common_dir" | shasum -a 256)
 snapshot="$base/${key%% *}"
@@ -69,7 +86,8 @@ if ! mkdir "$lock" 2>/dev/null; then
   exit 1
 fi
 tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
-trap 'if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null || true; fi; rmdir "$lock" 2>/dev/null || true' EXIT
+# 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
+trap 'status=$?; if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null || true; fi; rmdir "$lock" 2>/dev/null || true; exit "$status"' EXIT
 trap 'exit 130' INT TERM
 
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
@@ -85,6 +103,10 @@ if printf '%s\n' "$worktrees" | grep -Fqx "worktree $snapshot" && [ -d "$snapsho
   # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
   # ほかの階層の .build（docs/.build など）は消す
   git -C "$snapshot" clean -q -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
+  # 残したビルドの成果物の場所には、中断した前回の検査のカバレッジのロック（check.sh の手順 7・8 が直下の .build に作る）が
+  # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
+  # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
+  rm -rf -- "$snapshot/.build/minutes-coverage.lock"
 else
   rm -rf -- "$snapshot"  # 登録のない残骸（前回の作成の途中で止まったものなど）
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）

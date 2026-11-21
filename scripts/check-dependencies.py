@@ -31,7 +31,8 @@ PACKAGE_FIELDS = ("identity", "url", "version", "license", "approvedOn", "ledger
 # 承認したときの内容のハッシュ sha256（content_digest の値）を持つ
 BINARY_FIELDS = ("identity", "path", "sha256", "version", "license", "approvedOn", "ledger")
 SHA256 = re.compile(r"[0-9a-f]{64}")
-REMOTE_URL = re.compile(r"^(https?|ssh|git)://|^git@")
+# scheme は大文字小文字を区別しない（RFC 3986。HTTPS:// も取得元の URL として照合する）。URL の本体は変えない
+REMOTE_URL = re.compile(r"^(https?|ssh|git)://|^git@", re.IGNORECASE)
 
 
 def normalize(url: str) -> str:
@@ -554,13 +555,30 @@ def content_digest(path: Path) -> str:
         raise Unreadable(f"{path}: {error}") from error
 
 
+def top_level_only(masked: str) -> str:
+    """引数（文字列リテラルの本文を除いた内容）のうち、括弧の中（入れ子の呼び出し・配列・クロージャー）を空白に置き換える。
+
+    長さと改行の位置は変えない（見つけた位置で元の引数を読むため）。最上位の括弧の文字そのものは残す。
+    """
+    out: List[str] = []
+    depth = 0
+    for char in masked:
+        if char in ")]}" and depth > 0:
+            depth -= 1
+        out.append(char if depth == 0 or char in "\r\n" else " ")
+        if char in "([{":
+            depth += 1
+    return "".join(out)
+
+
 def literal_argument(arguments: str, masked: str, label: str, pattern: "re.Pattern[str]") -> Tuple[bool, Optional[str]]:
     """引数のうちコードに現れる「label:」を探し、その値が文字列リテラルだけならその内容を返す。
 
     戻り値は（キーワードがコードにあるか, 文字列リテラルの内容。リテラルでなければ None）。
     """
-    # コメントを除いた跡の空白（url /* … */ : "…"）があってもラベルとして読む
-    found = re.search(rf"\b{label}\s*:", masked)
+    # コメントを除いた跡の空白（url /* … */ : "…"）があってもラベルとして読む。探すのは宣言の最上位の引数だけ
+    # （入れ子の呼び出しの引数、例えば name: targetName(url: …) の url: を、宣言の取得元と見なさない）
+    found = re.search(rf"\b{label}\s*:", top_level_only(masked))
     if not found:
         return False, None
     literal = pattern.match(arguments, found.start())

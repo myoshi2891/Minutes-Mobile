@@ -67,6 +67,7 @@ ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展�
 ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
 COVERAGE_COPY=""  # 手順 8 が照合と集計に使う、カバレッジの記録の写し（一時ファイル）
+TOOLS_LOCK=""  # --require-clean のとき、元の .tools の導入のロック（写している間だけ持つ）
 
 usage() {
   echo "使い方: $0 [--steps <0-10 の番号。例: 0-8,10>] [--staged] [--require-clean] [--expect-head <SHA>]" >&2
@@ -359,6 +360,44 @@ materialize_coverage_input() {
   return "$status"
 }
 
+# 元の作業ツリーの開発ツール（$1。Git の管理外）を、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから
+# 専用の作業ツリー（$2）へ写す（.githooks/pre-push と同じ手順）。共有のリンクで指すと、検査の途中に別の setup-tools.sh が
+# bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。写しは APFS では
+# clone（cp -c）、対応しないファイルシステムでは通常の複写で作る。bin のリンクは相対パスなので写しの中を指し、
+# 手順 0 の照合と後の手順はすべてこの写しを使う
+copy_tools() {
+  local source=$1 copy=$2 waited=0 retried=0 entry
+  [ -d "$source" ] || fail "開発ツールが導入されていない（${source}）。scripts/setup-tools.sh を実行してから実行し直す"
+  until mkdir "$source/.install.lock" 2>/dev/null; do
+    # 作れなかった直後にロックが外れた場合は、待たずに 1 回だけ取り直す。取り直しても作れずロックもなければ止める
+    if [ ! -d "$source/.install.lock" ] && [ "$retried" -eq 0 ]; then
+      retried=1
+      continue
+    fi
+    if [ -d "$source/.install.lock" ]; then retried=0; fi
+    if [ ! -d "$source/.install.lock" ] || [ "$waited" -ge 600 ]; then
+      fail "開発ツールの導入のロック（${source}/.install.lock）を取れない。導入の実行中でなければ削除してから実行し直す"
+    fi
+    if [ "$waited" -eq 0 ]; then echo "待機: 開発ツールの導入・照合が実行中。終わるのを待つ" >&2; fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  TOOLS_LOCK="$source/.install.lock"
+  rm -rf -- "$copy"
+  mkdir "$copy"
+  for entry in "$source"/* "$source"/.[!.]*; do
+    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi  # 一致するものがないときの glob の文字列
+    case "${entry##*/}" in .install.lock | .work.*) continue ;; esac  # ロックと導入の途中の作業場所は写さない
+    # -P: シンボリックリンクはたどらずにリンクとして写す
+    if ! cp -c -R -P -- "$entry" "$copy/" 2>/dev/null; then
+      rm -rf -- "${copy:?}/${entry##*/}"
+      cp -R -P -- "$entry" "$copy/" || fail "開発ツールを写せない（${entry}）"
+    fi
+  done
+  rmdir "$TOOLS_LOCK"
+  TOOLS_LOCK=""
+}
+
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
 test_destination() {
   local udid
@@ -493,6 +532,7 @@ on_exit() {
   if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
+  if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" 2>/dev/null || true; fi
   if [ -n "$ISOLATED_TREE" ]; then
     # 登録ごと消す。消せなければディレクトリを消して登録の残骸を片付ける
     git -C "$ROOT" worktree remove --force "$ISOLATED_TREE" 2>/dev/null \
@@ -538,8 +578,9 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   ISOLATED_BASE=$(mktemp -d)
   ISOLATED_TREE="$ISOLATED_BASE/tree"
   git worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
-  # 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）
-  ln -s "$ROOT/.tools" "$ISOLATED_TREE/.tools"
+  # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。導入のロックを取って写し、手順 0 の照合と
+  # 後の手順はすべてこの写しを使う（検査の途中の setup-tools.sh による差し替えの影響を受けない）
+  copy_tools "$ROOT/.tools" "$ISOLATED_TREE/.tools"
   echo "== 開始時のコミット ${START_HEAD} を専用の作業ツリー（${ISOLATED_TREE}）に展開して検査する"
   MINUTES_CHECK_ISOLATED=1 "$ISOLATED_TREE/scripts/check.sh" "${ARGUMENTS[@]}"
   exit 0

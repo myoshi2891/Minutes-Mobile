@@ -22,6 +22,7 @@ import re
 import stat
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -601,7 +602,9 @@ class Checker:
             target = target[1:-1]
         if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
             return
-        path = (self.root / name).parent / target.split("#", 1)[0]
+        # パーセント符号化（%20 など）は、節へのリンクを分けた後に戻してから解決する（GitHub の表示と同じく、符号化した
+        # 名前のリンクも実際のファイルを指す）
+        path = (self.root / name).parent / urllib.parse.unquote(target.split("#", 1)[0])
         if not path.exists():
             self.error(name, f"リンクの先がない: {target}", number)
 
