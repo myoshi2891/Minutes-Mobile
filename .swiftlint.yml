@@ -203,9 +203,11 @@ custom_rules:
     message: "待機とタイマーは注入した型を経由する。実時間を待つテストは書かない（TST-GEN-01）"
     severity: error
 
+  # random・randomElement・shuffled・shuffle は、注入した生成器を渡す呼び出し（using: の引数）を認め、既定の生成器を使う
+  # 呼び出しだけを検出する。引数の中の括弧は 2 段の入れ子まで読む（それより深い引数の using: は見落とさず検出する側に倒れる）
   no_direct_random:
     name: "乱数の直接の利用の禁止"
-    regex: '\.random\s*\(|\.randomElement\s*\(|\.shuffled\s*\(|\.shuffle\s*\(|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
+    regex: '\.(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:[^()]|\((?:[^()]|\([^()]*\))*\))*\busing\s*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
