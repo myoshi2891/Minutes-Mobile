@@ -35,10 +35,10 @@ REQUIRED_ALL_TARGETS: Dict[str, Tuple[Tuple[str, ...], str]] = {
     "SWIFT_TREAT_WARNINGS_AS_ERRORS": (("YES",), "TST-CI-01"),
     "IPHONEOS_DEPLOYMENT_TARGET": (("27.2",), "CON-01"),
 }
-# アプリのターゲットだけで満たす値
-REQUIRED_APPLICATION: Dict[str, Tuple[Tuple[str, ...], str]] = {
-    "INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone": (("UIInterfaceOrientationPortrait",), "BD-UI-10"),
-}
+# アプリのターゲットで、Info.plist を生成する構成の向きのビルド設定（BD-UI-10）。生成するかは構成・SDK ごとに決まるので、
+# 一律の必須の設定にせず check_plist_orientation で生成の有無に合わせて確かめる
+ORIENTATION_SETTING = "INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone"
+ORIENTATION_SETTING_VALUES = ("UIInterfaceOrientationPortrait",)
 # アプリのターゲットで、各構成で最終的に生成される Info.plist に空でない文字列が要る鍵
 REQUIRED_PLIST_VALUES_APPLICATION = {"NSMicrophoneUsageDescription": "SEC-PRV-01"}
 # あってはならないビルド設定
@@ -360,11 +360,13 @@ def check_plist_orientation(
     project_path: Path, target: str, target_name: str, own: dict, shared: dict, configurations: List[str],
     root: Path, errors: List[str]
 ) -> None:
-    """画面の向きを縦だけにする（BD-UI-10）。生成しない構成では、使われる plist 自体に縦だけの指定を求める。
+    """画面の向きを縦だけにする（BD-UI-10）。構成・SDK ごとの Info.plist の生成の有無に合わせて確かめる。
 
     GENERATE_INFOPLIST_FILE = NO の構成では INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone は使われないので、
     INFOPLIST_FILE の参照先に UISupportedInterfaceOrientations~iphone か UISupportedInterfaceOrientations が要る。
-    どの構成でも、参照先にある向きの指定は縦だけであること（ビルド設定の値と合わさっても横向きを足さない）。
+    生成する構成では、ビルド設定の値か参照先の plist の指定のどちらかで縦だけに決まること（参照先の plist が縦だけを
+    持てば、ビルド設定がなくても違反にしない）。生成する・しないの両方がありうる構成では、両方の条件を求める。
+    どの構成でも、効きうるビルド設定の値と参照先にある向きの指定は縦だけであること（合わさっても横向きを足さない）。
     """
     missing: List[str] = []
     wrong: Dict[str, List[str]] = {}
@@ -380,12 +382,20 @@ def check_plist_orientation(
             for key in present:
                 if data[key] != PORTRAIT_ONLY:
                     wrong.setdefault(f"{source} の {key}", []).append(build)
-        if False in modes and not covered:
+        settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
+        if True in modes:
+            effective, undecided = resolve(own, shared, ORIENTATION_SETTING, [configuration], sdk)
+            for (key, value), _ in effective.items():
+                if value not in ORIENTATION_SETTING_VALUES:
+                    wrong.setdefault(f"{key} = {value}", []).append(build)
+            settings_cover = bool(effective) and not undecided
+        if (False in modes and not covered) or (True in modes and not (settings_cover or covered)):
             missing.append(build)
     if missing:
         errors.append(
-            f"[BD-UI-10] {target}: Info.plist を生成しない構成で、使われる plist に縦だけの向きの指定がない"
-            f"（構成 {'・'.join(missing)}。UISupportedInterfaceOrientations~iphone を [UIInterfaceOrientationPortrait] にする）"
+            f"[BD-UI-10] {target}: 縦だけの向きの指定がない（構成 {'・'.join(missing)}。Info.plist を生成する構成では "
+            f"{ORIENTATION_SETTING} を UIInterfaceOrientationPortrait にするか、使われる plist に置く。生成しない構成では、"
+            "使われる plist の UISupportedInterfaceOrientations~iphone を [UIInterfaceOrientationPortrait] にする）"
         )
     for label, used in wrong.items():
         errors.append(f"[BD-UI-10] {target}: {label} が縦だけでない（構成 {'・'.join(used)}。必要な値: [UIInterfaceOrientationPortrait]）")
@@ -592,7 +602,6 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
                 referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS")[0])
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
         if target.get("product-type") == "application":
-            check_required(name, own, shared, configurations, REQUIRED_APPLICATION, errors)
             check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
             check_plist_orientation(project_path, name, target_name, own, shared, configurations, root, errors)
         check_build_settings(name, own, errors,

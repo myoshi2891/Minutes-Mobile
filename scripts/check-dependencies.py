@@ -108,8 +108,14 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[s
             by_path[location] = package
             continue
         # 同じ identity と版でも取得元が違えば別の承認とする（取得元ごとに承認する）
-        by_pin[(package["identity"].lower(), package["version"], normalize(package["url"]))] = package
-        by_url[normalize(package["url"])] = package
+        url = normalize(package["url"])
+        # リモートのバイナリの承認は URL ごとに 1 つ（checksum を URL で引くので、2 つ目で 1 つ目を黙って上書きしない）。
+        # Package の承認（checksum を持たない）は版ごとに複数を持てる（版の照合は by_pin で行う）
+        previous = by_url.get(url)
+        if previous is not None and ("checksum" in package or "checksum" in previous):
+            raise Unreadable(f"{path}: リモートのバイナリの承認が同じ URL で重複している（{package['url']}）")
+        by_pin[(package["identity"].lower(), package["version"], url)] = package
+        by_url[url] = package
     return by_pin, by_url, by_path
 
 
@@ -343,6 +349,10 @@ def interpolation_end(text: str, start: int) -> int:
             continue
         if text.startswith("/*", cursor):
             cursor = block_comment_end(text, cursor)
+            continue
+        if starts_regex(text, cursor):
+            # 正規表現のリテラル（#/…/#）の中の「(」「)」「"」を括弧・文字列として数えない
+            cursor = regex_end(text, cursor)
             continue
         if starts_string(text, cursor):
             cursor = string_end(text, cursor)
@@ -760,6 +770,8 @@ def check(root: Path, allowlist: Path) -> List[str]:
                                     path.parent.relative_to(root).as_posix(), root)
         except Unreadable as error:
             raise Unreadable(f"{path}: {error}") from error
+        except RecursionError as error:  # 深い入れ子の補間は RecursionError（JSON の読み込みと同じく読めないものとする）
+            raise Unreadable(f"{path}: 入れ子が深すぎて読めない: {error!r}") from error
         errors.extend(f"{path.relative_to(root)}: {message}" for message in found)
     for path in find_files(root, "project.xcproj"):
         source = path.relative_to(root)

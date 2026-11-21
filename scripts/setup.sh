@@ -33,6 +33,28 @@ if [ "$HOOKS" = 1 ]; then
   done
   # 環境変数 GIT_CONFIG は git config の読み書きを別のファイルへ向ける（設定したまま書くと、リポジトリの設定を
   # 変えずに読み直しも同じファイルから行い、誤って成功する）。書き込みと読み直しの両方で外し、書き込みは --local に限る
+  # git が選ぶ作業ツリー（GIT_DIR・GIT_WORK_TREE などの変数で別のリポジトリを指しうる）が、このスクリプトのある
+  # リポジトリ（ROOT）であること。通常のクローンとリンクした作業ツリーの両方で、リンクを解決した作業ツリーのパスで比べる
+  # （.git の配置を仮定しない）。違えば設定を変えない
+  toplevel=$(env -u GIT_CONFIG git rev-parse --show-toplevel) || { echo "NG: git の作業ツリーを特定できない。フックを有効にしない" >&2; exit 1; }
+  selected=$(cd -P "$toplevel" 2>/dev/null && pwd) || { echo "NG: 作業ツリー ${toplevel} を解決できない。フックを有効にしない" >&2; exit 1; }
+  expected=$(cd -P "$ROOT" && pwd)
+  if [ "$selected" != "$expected" ]; then
+    echo "NG: git が選ぶ作業ツリー（${selected}）がこのリポジトリ（${expected}）と違う。GIT_DIR・GIT_WORK_TREE などの変数を外してから実行し直す。フックを有効にしない" >&2
+    exit 1
+  fi
+  # 共有の設定（--local）より優先される設定（作業ツリーの設定・-c・GIT_CONFIG_* の環境変数）が別の値を指していれば、
+  # 共有の値を書いても有効にならない。共有の値を変える前に止める
+  current=$(env -u GIT_CONFIG git config --show-scope --get core.hooksPath || true)
+  case "${current%%$'\t'*}" in
+    worktree | command)
+      if [ "${current#*$'\t'}" != .githooks ]; then
+        echo "NG: より優先される設定（${current%%$'\t'*}）の core.hooksPath が「${current#*$'\t'}」を指している。共有の設定を変えずに止める。" \
+          "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
+        exit 1
+      fi
+      ;;
+  esac
   env -u GIT_CONFIG git config --local core.hooksPath .githooks
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる

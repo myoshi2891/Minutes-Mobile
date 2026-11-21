@@ -124,6 +124,17 @@ def fence_end(lines: List[str], start: int) -> int:
 
 # 複数行の HTML のコメントの始まり（字下げは空白 0〜3 個）
 COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
+# 同じ行で閉じる HTML のコメント。表示されないので、中のリンクは確かめない（コード片の印の照合は印の行で別に行う）
+INLINE_COMMENT = re.compile(r"<!--.*?-->")
+# 節（「## 」）と小節（「### 」）の見出し。字下げは空白 0〜3 個まで（CommonMark。4 個以上は字下げしたコードブロック）。
+# sections() と requirement_fields() が同じ判定を使う
+HEADING = re.compile(r"^ {0,3}(#{2,3}) (.*)$")
+
+
+def heading(line: str) -> Optional[Tuple[int, str]]:
+    """節・小節の見出しの行なら（段の深さ 2 か 3, 見出しの文）を返す。"""
+    found = HEADING.match(line)
+    return (len(found.group(1)), found.group(2).strip()) if found else None
 
 
 def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]], bool]]:
@@ -208,6 +219,9 @@ def link_destinations(line: str) -> List[str]:
     found: List[str] = []
     for start in LINK_START.finditer(line):
         at = start.end()
+        # 「(」の直後の空白は読み飛ばす（CommonMark。「[設計]( missing.md)」もリンクとして確かめる）
+        while at < len(line) and line[at] in " \t":
+            at += 1
         if line.startswith("<", at):
             close = line.find(">", at)
             if close < 0 or re.search(r"[<\n]", line[at + 1:close]) or close == at + 1:
@@ -377,7 +391,17 @@ class Checker:
         self.errors.append(f"{where}: {message}")
 
     def load(self) -> None:
-        paths = sorted((self.root / "docs").rglob("*.md"))
+        # 走査の失敗（読めないディレクトリ）は黙って読み飛ばさず、そのディレクトリで報告する（rglob は権限の失敗を
+        # 黙って読み飛ばし、配下の文書を検査しないまま通すため使わない）。読めるほかの文書の検査は続ける
+        def failed(error: OSError) -> None:
+            where = Path(error.filename) if error.filename else self.root / "docs"
+            relative = where.relative_to(self.root).as_posix() if where.is_relative_to(self.root) else str(where)
+            self.error(relative, f"ディレクトリを読めない: {error.strerror or error}")
+
+        paths: List[Path] = []
+        for directory, _, files in os.walk(self.root / "docs", onerror=failed):
+            paths.extend(Path(directory) / name for name in files if name.endswith(".md"))
+        paths.sort()
         paths += [self.root / name for name in ("README.md", "CLAUDE.md") if (self.root / name).is_file()]
         for path in paths:
             relative = path.relative_to(self.root).as_posix()
@@ -494,7 +518,7 @@ class Checker:
         """
         fields: List[str] = []
         # 冒頭の終わり（最初の見出しの行番号）。見出しがなければ文書の全体が冒頭
-        head_end = next((number for number, line in prose_lines(text) if line.startswith(("## ", "### "))), None)
+        head_end = next((number for number, line in prose_lines(text) if heading(line)), None)
         # 表の見出しの行だけ・区切りの行のない行など、表として成り立たない「| 満たす要件 ID |」の行は数えない
         for _, rows in tables(text):
             fields.extend(line for number, line in rows
@@ -506,7 +530,7 @@ class Checker:
             if inside:
                 after_heading = False  # コードブロックは節の冒頭を終わらせる（sections() と同じ境界）
                 continue
-            if line.startswith("## ") or line.startswith("### "):
+            if heading(line):
                 after_heading = True
                 continue
             if not line.strip():
@@ -536,6 +560,7 @@ class Checker:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
             for number, line in prose_lines(text):
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
+                line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない
                 targets = link_destinations(line)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
@@ -572,8 +597,9 @@ class Checker:
                 if result:
                     result[-1][2].append(FENCE_LINE)
                 continue
-            if line.startswith("## "):
-                result.append((number, line[3:].strip(), []))
+            found = heading(line)
+            if found and found[0] == 2:
+                result.append((number, found[1], []))
             elif result:
                 result[-1][2].append(line)
         return result

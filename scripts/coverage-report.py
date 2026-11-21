@@ -26,6 +26,21 @@ def percentage(text: str) -> float:
     return value
 
 
+def shown(value: float, target: float) -> str:
+    """表示する % の値。目標との大小が丸めで逆に見えない桁数まで出す（89.96% を 90.0% と表示して目標 90% に届いたと
+    見せない）。比較そのものは丸めない値で行う。"""
+    for digits in range(1, 16):
+        text = f"{value:.{digits}f}"
+        if (float(text) < target) == (value < target):
+            return text
+    return repr(value)
+
+
+def target_text(value: float) -> str:
+    """目標の % を丸めずに表示する（90.5 を 90 や 91 と表示しない）。"""
+    return f"{value:.15g}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Package のカバレッジの集計")
     parser.add_argument("report", type=Path)
@@ -44,7 +59,9 @@ def main() -> int:
             if type(count) is not int or type(covered) is not int or not 0 <= covered <= count:
                 raise ValueError(f"{item['filename']}: 行数の記録が不正（count={count!r}, covered={covered!r}）")
             lines.append((count, covered))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
+    # 深い入れ子の JSON は RecursionError になる（読めない記録として扱う）
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, KeyError, IndexError, TypeError,
+            ValueError) as error:
         print(f"NG: カバレッジの記録を読めない: {error!r}", file=sys.stderr)
         return 2
     total = sum(count for count, _ in lines)
@@ -52,9 +69,10 @@ def main() -> int:
         print(f"NG: {arguments.sources} 配下に数える行がない", file=sys.stderr)
         return 2
     percent = 100.0 * sum(covered for _, covered in lines) / total
-    print(f"カバレッジ（{arguments.sources}）: 行 {percent:.1f}%（{len(lines)} ファイル・目標 {arguments.target:.0f}%）")
+    target = target_text(arguments.target)
+    print(f"カバレッジ（{arguments.sources}）: 行 {shown(percent, arguments.target)}%（{len(lines)} ファイル・目標 {target}%）")
     if percent < arguments.target:
-        print(f"警告: カバレッジが目標の {arguments.target:.0f}% に届いていない（TST-CI-07。初期は警告のみ）")
+        print(f"警告: カバレッジが目標の {target}% に届いていない（TST-CI-07。初期は警告のみ）")
     return 0
 
 

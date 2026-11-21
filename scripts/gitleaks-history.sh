@@ -27,6 +27,9 @@ shift
 # git log が引数のリポジトリではなく、その変数が指すリポジトリを読む
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR \
   GIT_NAMESPACE GIT_PREFIX GIT_SHALLOW_FILE GIT_GRAFT_FILE GIT_REPLACE_REF_BASE GIT_NO_REPLACE_OBJECTS
+# 置き換えのオブジェクト（git replace の refs/replace/）を使わず、元のオブジェクトの履歴を検査する（置き換えで鍵を含む
+# blob・コミットを別の内容に見せて隠させない）。外した後に明示的に設定する
+export GIT_NO_REPLACE_OBJECTS=1
 # 浅いクローンは、省いた履歴を検査しないまま通過しうる。全履歴があるときだけ検査する
 # （判定できない場合も通さない。$(…) の失敗は set -e で終了する）
 shallow=$(git -C "$repository" rev-parse --is-shallow-repository)
