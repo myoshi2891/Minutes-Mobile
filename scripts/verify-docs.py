@@ -122,19 +122,45 @@ def fence_end(lines: List[str], start: int) -> int:
     return end
 
 
-def fenced_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]]]]:
-    """各行を（行番号, 行, フェンスの中か, この行で開いたフェンス）で返す。フェンスの開始・終了の行は「中」とする。"""
+# 複数行の HTML のコメントの始まり（字下げは空白 0〜3 個）
+COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
+
+
+def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]], bool]]:
+    """各行を（行番号, 行, フェンスかコメントの中か, この行で開いたフェンス, 複数行の HTML のコメントの中か）で返す。
+
+    コードフェンスと複数行の HTML のコメント（同じ行で閉じない「<!--」から「-->」を含む行まで）の状態を同じ走査で追う。
+    コメントの中のフェンスの印は、フェンスとして扱わない（コメントが閉じた後に通常の判定に戻る）。
+    フェンスの中の「<!--」は、コードの本文として扱う。同じ行で閉じるコメント（コード片の印 <!-- file: … --> など）は含めない。
+    """
     fence: Optional[Fence] = None
+    comment = False
     for number, line in enumerate(split_lines(text), start=1):
+        if comment:
+            comment = "-->" not in line
+            yield number, line, True, None, True
+            continue
         if fence is not None:
             if fence_closes(line, fence):
                 fence = None
-            yield number, line, True, None
+            yield number, line, True, None, False
+            continue
+        found = COMMENT_OPEN.match(line)
+        if found and "-->" not in line[found.end():]:
+            comment = True
+            yield number, line, True, None, True
             continue
         opened = fence_open(line)
         if opened:
             fence = opened[0]
-        yield number, line, opened is not None, opened
+        yield number, line, opened is not None, opened, False
+
+
+def fenced_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]]]]:
+    """各行を（行番号, 行, 中か, この行で開いたフェンス）で返す。フェンスの開始・終了の行と、複数行の HTML のコメントの
+    行は「中」とする（本文として検査しない）。"""
+    for number, line, inside, opened, _ in scanned_lines(text):
+        yield number, line, inside, opened
 
 
 def prose_lines(text: str) -> Iterator[Tuple[int, str]]:
@@ -306,30 +332,9 @@ def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
     yield from find_tables(lines)
 
 
-# 複数行の HTML のコメントの始まり（字下げは空白 0〜3 個）
-COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
-
-
 def commented_lines(text: str) -> Set[int]:
-    """コードフェンスの外で始まる複数行の HTML のコメント（同じ行で閉じない「<!--」から「-->」を含む行まで）の行番号。
-
-    表示されない内容なので、節・表の検査に数えない（コメントにした対応表で検査を通さない）。
-    同じ行で閉じるコメント（コード片の印 <!-- file: … --> など）は含めない。
-    """
-    hidden: Set[int] = set()
-    opened = False
-    for number, line, inside, _ in fenced_lines(text):
-        if opened:
-            hidden.add(number)
-            opened = "-->" not in line
-            continue
-        if inside:
-            continue
-        found = COMMENT_OPEN.match(line)
-        if found and "-->" not in line[found.end():]:
-            hidden.add(number)
-            opened = True
-    return hidden
+    """複数行の HTML のコメントの行番号（scanned_lines と同じ判定）。表示されない内容なので、節・表の検査に数えない。"""
+    return {number for number, _, _, _, commented in scanned_lines(text) if commented}
 
 
 def reference_label(label: str) -> str:
@@ -495,7 +500,9 @@ class Checker:
             fields.extend(line for number, line in rows
                           if (head_end is None or number < head_end) and table_cells(line)[0] == "満たす要件 ID")
         after_heading = False
-        for _, line, inside, _ in fenced_lines(text):
+        for _, line, inside, _, commented in scanned_lines(text):
+            if commented:
+                continue  # 複数行の HTML のコメントは空行と同じに扱う（sections() と同じ。中の「満たす要件:」は数えない）
             if inside:
                 after_heading = False  # コードブロックは節の冒頭を終わらせる（sections() と同じ境界）
                 continue
@@ -766,7 +773,11 @@ class Checker:
             # 読み込み（load）は改行を LF にそろえるので、元の改行を知るためにファイルを改行の変換なしで読み直す。
             # 読み直した内容が load の時点の内容と違えば（その間に変更された）、書き直さずに再実行を案内する。
             # 本文の行と改行は、どちらもこの読み直した内容から取る（古い内容の本文に新しい内容の改行を組み合わせない）
-            raw_text = self.read_raw(name)
+            try:
+                raw_text = self.read_raw(name)
+            except (OSError, UnicodeDecodeError) as error:
+                self.error(name, f"読み直せないので、コード片を書き直さない: {error}")
+                continue
             if raw_text.replace("\r\n", "\n").replace("\r", "\n") != text:
                 self.error(name, "読み込んだ後に変更された。コード片を書き直さないので、--update-snippets を実行し直す")
                 continue
@@ -822,7 +833,12 @@ class Checker:
                 self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
                 continue
             # 書き込む直前にも、読み直した内容から変わっていないことを確かめる（変わっていれば上書きしない）
-            if self.read_raw(name) != raw_text:
+            try:
+                current = self.read_raw(name)
+            except (OSError, UnicodeDecodeError) as error:
+                self.error(name, f"書き直しの直前に読み直せないので、上書きしない: {error}")
+                continue
+            if current != raw_text:
                 self.error(name, "書き直しの途中で変更された。上書きしないので、--update-snippets を実行し直す")
                 continue
             # 元の文書を切り詰めないよう、同じディレクトリの一時ファイルに書いて閉じてから置き換える。

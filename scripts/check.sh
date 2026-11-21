@@ -17,6 +17,8 @@
 # 開発ツールは .tools/bin のものだけを使う（PATH にある別の版を使わない。BD-DEV-03）。
 set -euo pipefail
 
+# CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
+unset CDPATH
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # 部分的なコミット（git commit <パス>）のフックでは、Git が一時のインデックスを GIT_INDEX_FILE で渡す。相対パスは
 # 実行時の作業ディレクトリから解決されるので、ディレクトリを移る前に絶対パスにする（--staged の規則の試験は別の
@@ -238,7 +240,13 @@ step_3() {
     # 書き出しの失敗は set -e で手順の失敗になる（条件の中で実行しない）
     STAGED_GITLEAKS_CONFIG=$(mktemp)
     git cat-file blob :.gitleaks.toml > "$STAGED_GITLEAKS_CONFIG"
-    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" --pre-commit --staged .
+    # 抑止の仕組み（.gitleaksignore・行の gitleaks:allow）は使わない（全履歴の検査と同じ。gitleaks-history.sh）。
+    # gitleaks は検査する場所の直下の .gitleaksignore を指定によらず読むので、作業ツリーにあれば検査せずに失敗する
+    if [ -e .gitleaksignore ] || [ -L .gitleaksignore ]; then
+      fail ".gitleaksignore がある。検出の抑止の記録は使わない（gitleaks が指定によらず読むため）。削除してから実行し直す"
+    fi
+    "$TOOLS/gitleaks" git --no-banner --no-color --redact --config "$STAGED_GITLEAKS_CONFIG" \
+      --gitleaks-ignore-path /dev/null --ignore-gitleaks-allow --pre-commit --staged .
   else
     # 全履歴の検査は、自己試験（test-checks.py gitleaks）と同じコマンドで行う
     scripts/gitleaks-history.sh .
@@ -373,7 +381,13 @@ step_8() {
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
   take_coverage_lock
-  [ -f "$COVERAGE_HEAD" ] || fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
+  if [ ! -f "$COVERAGE_HEAD" ]; then
+    # 専用の作業ツリーは実行のたびに作り直すので、前の実行の測定は残らない。手順 7 と 8 を同じ実行で行う
+    if [ -n "${MINUTES_CHECK_ISOLATED:-}" ]; then
+      fail "カバレッジを測った入力の記録がない。専用の作業ツリーでは scripts/check.sh --require-clean --steps 7,8 のように手順 7 と 8 を一緒に実行する"
+    fi
+    fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
+  fi
   # 2 行を同じ開いたファイルから読む（2 回開くと、その間に記録が置き換えられたとき別の記録の行を組み合わせうる）。
   # 行がなければ空のまま続け、下の照合で失敗させる（set -e で黙って止めない）
   measured=""
@@ -421,20 +435,27 @@ step_10() {
 # 手順の関数は条件（if・&&・||）の中で呼ばない。条件の中では set -e が効かず、
 # 途中のコマンドが失敗しても最後のコマンドが成功すれば通過になってしまう。失敗の表示は EXIT の trap で行う。
 current=""
+# 後始末の削除。失敗は場所とともに報告し、set -e で後始末を止めない（後続の削除とロックの解放を飛ばさない）。
+# 失敗したら CLEANUP_FAILED を立て、終了コードを失敗にする
+CLEANUP_FAILED=""
+remove_or_report() {
+  rm -rf -- "$1" || { echo "NG: 一時の場所を削除できない（${1}）" >&2; CLEANUP_FAILED=1; }
+}
 on_exit() {
   local status=$?
-  if [ -n "$STAGED_TREE" ]; then rm -rf -- "$STAGED_TREE"; fi
-  if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then rm -f -- "$STAGED_GITLEAKS_CONFIG"; fi
-  if [ -n "$STAGED_DOCS_TREE" ]; then rm -rf -- "$STAGED_DOCS_TREE"; fi
-  if [ -n "$COVERAGE_SCRATCH" ]; then rm -rf -- "$COVERAGE_SCRATCH"; fi
-  if [ -n "$COVERAGE_COPY" ]; then rm -f -- "$COVERAGE_COPY"; fi
+  if [ -n "$STAGED_TREE" ]; then remove_or_report "$STAGED_TREE"; fi
+  if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then remove_or_report "$STAGED_GITLEAKS_CONFIG"; fi
+  if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
+  if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
+  if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
   if [ -n "$ISOLATED_TREE" ]; then
     # 登録ごと消す。消せなければディレクトリを消して登録の残骸を片付ける
     git -C "$ROOT" worktree remove --force "$ISOLATED_TREE" 2>/dev/null \
-      || { rm -rf -- "$ISOLATED_TREE"; git -C "$ROOT" worktree prune 2>/dev/null || true; }
+      || { remove_or_report "$ISOLATED_TREE"; git -C "$ROOT" worktree prune 2>/dev/null || true; }
   fi
-  if [ -n "$ISOLATED_BASE" ]; then rm -rf -- "$ISOLATED_BASE"; fi
+  if [ -n "$ISOLATED_BASE" ]; then remove_or_report "$ISOLATED_BASE"; fi
   release_coverage_lock
+  if [ "$status" -eq 0 ] && [ -n "$CLEANUP_FAILED" ]; then exit 1; fi
   if [ "$status" -eq 0 ]; then return 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）

@@ -41,6 +41,9 @@ def main() -> int:
             raise TypeError("runtimes が辞書の配列でない")
         # 版は文字列であること（数値などを version_key の split で例外にせず、取得の失敗として扱う）
         for item in data["runtimes"]:
+            # 使えるかの値は真偽値であること（文字列の "false" などを真と取り違えない）
+            if not isinstance(item.get("isAvailable"), bool):
+                raise TypeError(f"runtimes の {item.get('identifier')!r} の isAvailable が真偽値でない")
             if item.get("platform") == "iOS" and item.get("isAvailable") and not isinstance(item.get("version"), str):
                 raise TypeError(f"runtimes の {item.get('identifier')!r} の version が文字列でない")
         for runtime, devices in devices_by_runtime.items():
@@ -48,6 +51,8 @@ def main() -> int:
                 raise TypeError(f"devices の {runtime} が辞書の配列でない")
             # 機種の識別子は文字列であること（配列や辞書に「iPhone」を含めた一覧を iPhone と取り違えない）
             for device in devices:
+                if not isinstance(device.get("isAvailable"), bool):
+                    raise TypeError(f"devices の {runtime} の isAvailable が真偽値でない")
                 if not isinstance(device.get("deviceTypeIdentifier", ""), str):
                     raise TypeError(f"devices の {runtime} の deviceTypeIdentifier が文字列でない")
         runtimes = {

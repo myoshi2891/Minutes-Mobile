@@ -282,6 +282,16 @@ def test_settings() -> None:
                   project=info_plist_file("Config/App-Settings.plist"),
                   plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, **{
                       "UISupportedInterfaceOrientations-iphoneos~iphone": ["UIInterfaceOrientationPortrait"]})})
+    # OS の修飾子だけの鍵（-iphoneos）も iPhone で使われる。標準の鍵が縦だけでも、こちらの横向きは違反
+    settings_case("OS の修飾子の向きの鍵に横向き", 1, "UISupportedInterfaceOrientations-iphoneos が縦だけでない",
+                  project=info_plist_file("Config/App-Settings.plist"),
+                  plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, **{
+                      "UISupportedInterfaceOrientations": ["UIInterfaceOrientationPortrait"],
+                      "UISupportedInterfaceOrientations-iphoneos": ["UIInterfaceOrientationLandscapeRight"]})})
+    settings_case("標準の鍵だけで縦だけ", 0, "OK",
+                  project=info_plist_file("Config/App-Settings.plist"),
+                  plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, **{
+                      "UISupportedInterfaceOrientations": ["UIInterfaceOrientationPortrait"]})})
     settings_case("INFOPLIST_FILE が指す合格のファイル", 0, "OK",
                   project=info_plist_file("Config/App-Settings.plist"), plists={"Config/App-Settings.plist": OK_INFO_PLIST})
     settings_case("INFOPLIST_FILE が指すファイルがない", 2, "読めない", project=info_plist_file("Config/Missing.plist"))
@@ -515,7 +525,11 @@ def test_dependencies() -> None:
     dependencies_case("承認した版と違う", 1, "sample-lib 1.2.3", {"Package.resolved": resolved}, [dict(approved, version="1.2.2")])
     dependencies_case("版で固定していない", 1, "版で固定されていない", {"Package.resolved": branch}, [approved])
     dependencies_case("許可リストにない依存（Package.swift）", 1, "sample-lib.git", {"Sub/Package.swift": manifest})
-    dependencies_case("ローカルの Package は認める", 0, "OK", {"Package.swift": local, "Local/Package.swift": local_manifest})
+    # ローカルの Package は Packages/ の下に置く（check.sh の手順 7 がカバレッジを測る写しは Packages/ だけを展開する）
+    dependencies_case("ローカルの Package は認める", 0, "OK",
+                      {"Packages/A/Package.swift": local.replace('"Local"', '"../Local"'), "Packages/Local/Package.swift": local_manifest})
+    dependencies_case("Packages/ の外のローカルの Package", 1, "Packages/ の外",
+                      {"Package.swift": local, "Local/Package.swift": local_manifest})
     dependencies_case("許可リストにない依存（project.xcproj）", 1, "example.com", {"App.xcodeproj/project.xcproj": project})
     # project.xcproj の承認済みの依存は、同じ .xcodeproj の中の Package.resolved に確定版が要る
     workspace_resolved = "App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
@@ -542,6 +556,14 @@ def test_dependencies() -> None:
                                  encoding="utf-8")
             expect(f"dependencies: 壊れたシンボリックリンクの {name}", [
                 str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 2, "読めない")
+    # 同じ identity と版を取得元ごとに承認できる（後の項目が前の項目の取得元を上書きしない）
+    mirror = dict(approved, url="https://example.org/mirror/sample-lib")
+    dependencies_case("同じ identity と版の別の取得元の承認", 0, "OK",
+                      {"Package.resolved": json.dumps({"pins": [dict(pin, location="https://example.org/mirror/sample-lib.git")],
+                                                       "version": 3})}, [mirror, approved])
+    dependencies_case("同じ identity と版の承認があっても未承認の取得元", 1, "取得元",
+                      {"Package.resolved": json.dumps({"pins": [dict(pin, location="https://example.net/x/sample-lib.git")],
+                                                       "version": 3})}, [mirror, approved])
     moved = json.dumps({"pins": [dict(pin, location="https://example.org/other/sample-lib.git")], "version": 3})
     dependencies_case("identity と版が同じでも取得元が違う", 1, "取得元", {"Package.resolved": moved}, [approved])
     unknown_source = json.dumps({"pins": [{k: v for k, v in pin.items() if k != "location"}], "version": 3})
@@ -634,6 +656,10 @@ def test_dependencies() -> None:
     dependencies_case("範囲の境界の先行版", 1, "版の指定を判定できない",
                       {"Package.resolved": pre_resolved, "Package.swift": declare.format(f'.package(url: "{url}", from: "1.2.0-rc.1")')},
                       [pre_approved])
+    # コメントを除いた跡の空白がラベルと「:」の間にあっても、取得元のラベルとして読む
+    dependencies_case("コメントを挟んだ url のラベル", 0, "OK",
+                      {"Package.resolved": resolved, "Package.swift": declare.format(
+                          '.package(url /* 取得元 */ : "https://example.com/owner/sample-lib.git", exact: "1.2.3")')}, [approved])
     # 版のリテラルが式の一部（連結など）なら、版の指定を判定できないものとして扱う
     for label, declaration in {
         "from の連結": f'.package(url: "{url}", from: "1.0.0" + suffix)',
@@ -745,6 +771,25 @@ def test_dependencies() -> None:
     dependencies_case("承認の後に内容が変わったローカルのバイナリ", 1, "内容が承認したものと違う", changed, [approved_binary])
     added = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/extra": "x", "Sub/Package.swift": declare.format(binary)})
     dependencies_case("承認の後にファイルが増えたローカルのバイナリ", 1, "内容が承認したものと違う", added, [approved_binary])
+    # 承認の path は起点からの相対パスだけ（絶対パス・起点の外は許可リストとして読まない）
+    for label, value in (("絶対パス", "/tmp/B.xcframework"), ("起点の外", "../B.xcframework")):
+        dependencies_case(f"承認のローカルのバイナリの path が{label}", 2, "起点からの相対パス", {}, [dict(approved_binary, path=value)])
+    dependencies_case("起点の外のローカルのバイナリの宣言", 1, "起点の外",
+                      {"Package.swift": declare.format('.binaryTarget(name: "B", path: "../B.xcframework")')}, [approved_binary])
+    # 承認した場所がリンクで起点の外を指すなら、内容のハッシュを読まずに認めない
+    with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as directory:
+        for name, content in binary_files.items():
+            target = Path(outside) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        (Path(directory) / "Sub" / "Frameworks").mkdir(parents=True)
+        (Path(directory) / "Sub" / "Frameworks" / "B.xcframework").symlink_to(Path(outside) / "Sub/Frameworks/B.xcframework")
+        (Path(directory) / "Sub" / "Package.swift").write_text(declare.format(binary), encoding="utf-8")
+        allowlist = Path(directory) / "allowlist.json"
+        allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": [approved_binary]}),
+                             encoding="utf-8")
+        expect("dependencies: 起点の外を指すリンクのローカルのバイナリ", [
+            str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 1, "実体が起点の外")
     # 前後に空白のあるパスは、空白を除いた承認済みのバイナリと取り違えずに拒否する
     spaced = dict(binary_files, **{"Sub/Package.swift": declare.format(binary.replace('.xcframework"', '.xcframework "'))})
     dependencies_case("前後に空白のあるローカルのバイナリのパス", 1, "前後に空白のあるパス", spaced, [approved_binary])
@@ -787,28 +832,44 @@ def test_dependencies() -> None:
     dependencies_case("url と path の両方を持つ項目は読まない", 2, "どちらか一方",
                       {}, [dict(approved_binary, url="https://example.com/owner/b")])
     dependencies_case("起点の中のローカルの Package（.package(path:)）は認める", 0, "OK",
-                      {"Sub/Package.swift": declare.format('.package(path: "../Local")'), "Local/Package.swift": local_manifest})
+                      {"Packages/Sub/Package.swift": declare.format('.package(path: "../Local")'),
+                       "Packages/Local/Package.swift": local_manifest})
     # ローカルの Package の参照先は、起点の中で検査される manifest であること（検査できない参照先を合格にしない）
     dependencies_case("起点の外のローカルの Package", 1, "起点の外",
                       {"Package.swift": declare.format('.package(path: "../Outside")')})
     dependencies_case("manifest のないローカルの Package", 1, "manifest がない",
-                      {"Package.swift": declare.format('.package(path: "Local")')})
+                      {"Packages/A/Package.swift": declare.format('.package(path: "../Local")')})
     dependencies_case("除外するディレクトリの中のローカルの Package", 1, "検査の対象外",
-                      {"Package.swift": declare.format('.package(path: "build/Local")'), "build/Local/Package.swift": local_manifest})
+                      {"Packages/A/Package.swift": declare.format('.package(path: "../.build/Local")'),
+                       "Packages/.build/Local/Package.swift": local_manifest})
     # シンボリックリンクを解決した先が除外するディレクトリなら、リンクの名前が通常の場所でも認めない
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / "build" / "Local").mkdir(parents=True)
-        (root / "build" / "Local" / "Package.swift").write_text(local_manifest, encoding="utf-8")
-        (root / "Local").symlink_to("build/Local")
-        (root / "Package.swift").write_text(declare.format('.package(path: "Local")'), encoding="utf-8")
+        (root / "Packages" / ".build" / "Local").mkdir(parents=True)
+        (root / "Packages" / ".build" / "Local" / "Package.swift").write_text(local_manifest, encoding="utf-8")
+        (root / "Packages" / "Local").symlink_to(".build/Local")
+        (root / "Packages" / "A").mkdir()
+        (root / "Packages" / "A" / "Package.swift").write_text(declare.format('.package(path: "../Local")'), encoding="utf-8")
         allowlist = root / "allowlist.json"
         allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}), encoding="utf-8")
         expect("dependencies: 除外するディレクトリを指すリンクのローカルの Package", [
             str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 1, "検査の対象外")
     # 参照先の manifest の未承認のバイナリも検査する（起点の中の manifest はすべて走査する）
-    dependencies_case("ローカルの Package の中の未承認のバイナリ", 1, "ローカルのバイナリ Local/Frameworks/B.xcframework",
-                      {"Package.swift": declare.format('.package(path: "Local")'), "Local/Package.swift": declare.format(binary)})
+    dependencies_case("ローカルの Package の中の未承認のバイナリ", 1, "ローカルのバイナリ Packages/Local/Frameworks/B.xcframework",
+                      {"Packages/A/Package.swift": declare.format('.package(path: "../Local")'),
+                       "Packages/Local/Package.swift": declare.format(binary)})
+    # リンクを解決した先が Packages/ の外なら、リンクの名前が Packages/ の中でも認めない
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "Outside").mkdir()
+        (root / "Outside" / "Package.swift").write_text(local_manifest, encoding="utf-8")
+        (root / "Packages" / "A").mkdir(parents=True)
+        (root / "Packages" / "Local").symlink_to("../Outside")
+        (root / "Packages" / "A" / "Package.swift").write_text(declare.format('.package(path: "../Local")'), encoding="utf-8")
+        allowlist = root / "allowlist.json"
+        allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}), encoding="utf-8")
+        expect("dependencies: Packages/ の外を指すリンクのローカルの Package", [
+            str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 1, "Packages/ の外")
     # バッククォートで囲んだ識別子（.`package`(…)）も同じ宣言として検査する
     for label, declaration in {
         "package": '.`package`(url: "https://example.org/other/unlisted.git", from: "1.0.0")',
@@ -861,8 +922,9 @@ def test_dependencies() -> None:
     # ローカルの Package の参照先が循環するリンクなら、終了コード 2（読めない）にする
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / "Loop").symlink_to("Loop")
-        (root / "Package.swift").write_text(declare.format('.package(path: "Loop")'), encoding="utf-8")
+        (root / "Packages" / "A").mkdir(parents=True)
+        (root / "Packages" / "Loop").symlink_to("Loop")
+        (root / "Packages" / "A" / "Package.swift").write_text(declare.format('.package(path: "../Loop")'), encoding="utf-8")
         allowlist = root / "allowlist.json"
         allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": []}), encoding="utf-8")
         expect("dependencies: 循環するリンクのローカルの Package", [
@@ -932,6 +994,10 @@ def setup_hooks_case() -> None:
         (repository / "scripts" / "setup-tools.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
         for name in ("setup.sh", "setup-tools.sh"):
             (repository / "scripts" / name).chmod(0o755)
+        (repository / ".githooks").mkdir()
+        for name in ("pre-commit", "pre-push"):
+            (repository / ".githooks" / name).write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+            (repository / ".githooks" / name).chmod(0o755)
         other = Path(directory) / "other.cfg"
         other.write_text("", encoding="utf-8")
         result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], env=dict(env, GIT_CONFIG=str(other)),
@@ -941,6 +1007,33 @@ def setup_hooks_case() -> None:
         if result.returncode != 0 or local != ".githooks" or "hooksPath" in other.read_text(encoding="utf-8"):
             failures.append(f"setup: GIT_CONFIG を設定した --hooks がリポジトリの設定に書かない（終了コード {result.returncode}・"
                             f"リポジトリの値「{local}」・GIT_CONFIG のファイル「{other.read_text(encoding='utf-8').strip()}」）")
+
+
+def setup_missing_hook_case() -> None:
+    """setup.sh --hooks が、フックのファイルがない・実行できない場合に、設定を書かずに失敗すること。"""
+    global count
+    for label, prepare in (("ない", lambda hook: hook.unlink()), ("実行できない", lambda hook: hook.chmod(0o644))):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            env = isolated_git_env()
+            subprocess.run(["git", "init", "-q", "--template=", str(repository)], env=env, check=True, capture_output=True)
+            (repository / "scripts" / "setup.sh").write_text((SCRIPTS / "setup.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "setup-tools.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+            for name in ("setup.sh", "setup-tools.sh"):
+                (repository / "scripts" / name).chmod(0o755)
+            (repository / ".githooks").mkdir()
+            for name in ("pre-commit", "pre-push"):
+                (repository / ".githooks" / name).write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+                (repository / ".githooks" / name).chmod(0o755)
+            prepare(repository / ".githooks" / "pre-push")
+            result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], env=env, capture_output=True, text=True)
+            configured = subprocess.run(["git", "-C", str(repository), "config", "--local", "--get", "core.hooksPath"], env=env,
+                                        capture_output=True, text=True).stdout.strip()
+            if result.returncode != 1 or configured or "pre-push" not in result.stderr:
+                failures.append(f"setup: フックが{label}のに --hooks が失敗しない、または設定を書いた（終了コード {result.returncode}・"
+                                f"設定「{configured}」）")
 
 
 def setup_relative_case() -> None:
@@ -1013,6 +1106,34 @@ def require_clean_case() -> None:
             failures.append(f"check: --require-clean の専用の作業ツリーが残った\n{worktrees.strip()}")
 
 
+def coverage_record_message_case() -> None:
+    """check.sh の手順 8 が、測定の記録がないとき、専用の作業ツリーでは手順 7 と 8 を一緒に実行する案内を、通常の実行では
+    手順 7 を先に実行する案内を出すこと（専用の作業ツリーは実行のたびに作り直すので、前の測定が残らない）。"""
+    global count
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / "Packages" / "MinutesKit").mkdir(parents=True)
+        (repository / "Packages" / "MinutesKit" / "Package.swift").write_text("// 試験用\n", encoding="utf-8")
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for name in ("check.sh", "test-checks.py"):
+            (repository / "scripts" / name).chmod(0o755)
+        env = isolated_git_env()
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "base"], env=env, check=True,
+                       capture_output=True)
+        for label, extra, want in (("専用の作業ツリー", {"MINUTES_CHECK_ISOLATED": "1"}, "--require-clean --steps 7,8"),
+                                   ("通常の実行", {}, "手順 7 を先に実行する")):
+            count += 1
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "8"], capture_output=True, text=True,
+                                    env=dict(env, **extra), timeout=60)
+            if result.returncode != 1 or want not in result.stderr:
+                failures.append(f"check: 測定の記録がないときの案内（{label}）が違う（終了コード {result.returncode}）\n"
+                                f"{result.stderr.strip()}")
+
+
 def staged_symlink_case() -> None:
     """check.sh --staged が、種類を変えて（通常のファイル → シンボリックリンク）ステージした Swift のパスを、
     整形・静的解析に渡す前に、インデックスで通常のファイルでないとして失敗にすること（手順を始める前に止まる）。"""
@@ -1053,6 +1174,13 @@ def simulator_cases() -> None:
         ("devices の項目が辞書でない", {"runtimes": [runtime], "devices": {"r": ["x"]}}, 2),
         ("devices の値が配列でない", {"runtimes": [runtime], "devices": {"r": "x"}}, 2),
         ("空の一覧は候補なし", {"runtimes": [], "devices": {}}, 1),
+        # 使えるかの値は真偽値であること（文字列の "false" を真と取り違えない）
+        ("runtimes の isAvailable が文字列", {"runtimes": [dict(runtime, isAvailable="false")], "devices": {}}, 2),
+        ("devices の isAvailable が数値", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "x", "isAvailable": 1, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+        ("使えない機種は候補にしない", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "y", "isAvailable": False, "deviceTypeIdentifier": "iPhone"},
+            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
         # 版が文字列でないランタイムは取得の失敗（split の例外で止まらない）
         ("runtimes の version が数値", {"runtimes": [dict(runtime, version=27.2)], "devices": {}}, 2),
         # 27.2 と 27.2.0 は同じ版として最低 OS を満たす
@@ -1081,6 +1209,9 @@ def simulator_cases() -> None:
                                     env=dict(os.environ, PATH=f"{directory}:{os.environ.get('PATH', '')}"))
             if result.returncode != want_code:
                 failures.append(f"simulator: {label}: 終了コードが {result.returncode}（期待 {want_code}）\n{result.stderr.strip()}")
+            elif want_code == 0 and result.stdout != "x\n":
+                # 成功の場合は、選んだ機種の UDID（試験用の一覧の x）だけを出力すること
+                failures.append(f"simulator: {label}: 出力が {result.stdout!r}（期待 'x\\n'）")
 
 
 def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
@@ -1097,6 +1228,8 @@ def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
         waiting = process.poll() is None
         lock.rmdir()
         output, _ = process.communicate(timeout=30)
+        # 後始末（finally）の前に、照合の終了時点でロックが残っていないことを控える（後始末で消えた残骸を見逃さない）
+        leftover = lock.exists()
     except subprocess.TimeoutExpired:
         process.kill()
         process.communicate()
@@ -1105,7 +1238,7 @@ def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
     finally:
         if lock.exists():
             lock.rmdir()
-    if not waiting or process.returncode != 0 or lock.exists():
+    if not waiting or process.returncode != 0 or leftover:
         failures.append(f"versions: 照合が導入のロックを待たない、またはロックの後に通らない（待った {waiting}・"
                         f"終了コード {process.returncode}）\n{output.strip()}")
 
@@ -1116,8 +1249,10 @@ def test_versions() -> None:
     expect("setup: 知らない引数", [str(SCRIPTS / "setup.sh"), "--hook"], 2, "使い方")
     setup_hooks_case()
     setup_relative_case()
+    setup_missing_hook_case()
     require_clean_case()
     staged_symlink_case()
+    coverage_record_message_case()
     # 明示した --steps が空なら、全手順を実行せずに使い方の誤りにする。
     # リポジトリの外の一時ディレクトリに写した check.sh で試す（誤って全手順を実行しても、手順 0 がこの自己試験を
     # 呼び直して再帰しないように。写しの周りには手順のスクリプトも Git のリポジトリもないので、すぐに失敗する）
@@ -1304,6 +1439,7 @@ def test_gitleaks() -> None:
         (Path(directory) / "config.txt").write_text('name = "sample"\n', encoding="utf-8")
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
     gitleaks_merge_case()
+    gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
     with tempfile.TemporaryDirectory() as directory:
         env = isolated_git_env()
@@ -1380,6 +1516,95 @@ def test_gitleaks() -> None:
             failures.append(f"gitleaks: binary の属性のファイルの差分を検査せず、鍵を見落とした（終了コード {result.returncode}）")
 
 
+def gitleaks_suppression_cases() -> None:
+    """全履歴の検査（gitleaks-history.sh）とコミット前の検査（check.sh --staged の手順 3）が、抑止の仕組みに検出を隠させないこと。
+
+    作業ツリーにだけある .gitleaksignore（検出の指紋を書いたもの）と、行の「gitleaks:allow」のコメントの両方で確かめる。
+    対照として、指定のない gitleaks では同じ入力が抑止されること（試験が効いていること）も確かめる。
+    外から引き継いだ GIT_DIR が別のリポジトリを指していても、引数のリポジトリを検査することも確かめる。
+    """
+    global count
+    gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
+    config = str(ROOT / ".gitleaks.toml")
+    identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                "-c", f"core.hooksPath={os.devnull}"]
+    env = isolated_git_env()
+    key = "ghp_" + "s8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"  # 実行時に組み立てる
+
+    def git(repository: Path, *arguments: str) -> None:
+        subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+
+    def fingerprints(command: List[str], cwd: Path, report: Path) -> List[str]:
+        subprocess.run(command + ["--report-format", "json", "--report-path", str(report)], cwd=cwd, env=env, capture_output=True)
+        return [str(item.get("Fingerprint", "")) for item in json.loads(report.read_text(encoding="utf-8"))]
+
+    for label, content, ignore in (("作業ツリーの .gitleaksignore", f'token = "{key}"\n', True),
+                                   ("gitleaks:allow のコメント", f'token = "{key}"  # gitleaks:allow\n', False)):
+        # 全履歴の検査
+        count += 2
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True,
+                           capture_output=True)
+            (repository / "config.txt").write_text(content, encoding="utf-8")
+            git(repository, "add", "config.txt")
+            git(repository, "commit", "-q", "-m", "config")
+            direct = [gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config", config, str(repository)]
+            if ignore:
+                found = fingerprints(direct, repository, Path(directory) / "report.json")
+                (repository / ".gitleaksignore").write_text("\n".join(found) + "\n", encoding="utf-8")
+            control = subprocess.run(direct, cwd=repository, env=env, capture_output=True, text=True)
+            if control.returncode != 0:
+                failures.append(f"gitleaks: 対照（{label}）で、指定のない gitleaks が抑止しない（試験にならない）")
+            result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository)], cwd=repository, env=env,
+                                    capture_output=True, text=True)
+            # .gitleaksignore は gitleaks が指定によらず読むので、あれば検査せずに失敗する。コメントは無視して検出する
+            want = ".gitleaksignore がある" if ignore else "leaks found: 1"
+            if result.returncode != 1 or want not in result.stdout + result.stderr:
+                failures.append(f"gitleaks: 全履歴の検査が {label} で検出を隠した（終了コード {result.returncode}）")
+        # コミット前の検査（check.sh --staged の手順 3）。check.sh と設定を写した一時のリポジトリで、鍵をステージする
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True,
+                           capture_output=True)
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "check.sh").chmod(0o755)
+            (repository / ".gitleaks.toml").write_text((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / ".gitignore").write_text("/.tools\n.gitleaksignore\n", encoding="utf-8")
+            (repository / ".tools").symlink_to(ROOT / ".tools")
+            git(repository, "add", "-A")
+            git(repository, "commit", "-q", "-m", "base")
+            (repository / "config.txt").write_text(content, encoding="utf-8")
+            git(repository, "add", "config.txt")
+            direct = [gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config", config, "--pre-commit", "--staged", "."]
+            if ignore:
+                found = fingerprints(direct, repository, Path(directory) / "report.json")
+                (repository / ".gitleaksignore").write_text("\n".join(found) + "\n", encoding="utf-8")
+            control = subprocess.run(direct, cwd=repository, env=env, capture_output=True, text=True)
+            if control.returncode != 0:
+                failures.append(f"gitleaks: 対照（{label}・ステージ）で、指定のない gitleaks が抑止しない（試験にならない）")
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], cwd=repository, env=env,
+                                    capture_output=True, text=True, timeout=120)
+            if result.returncode != 1 or "手順 3" not in result.stderr:
+                failures.append(f"gitleaks: コミット前の検査が {label} で検出を隠した（終了コード {result.returncode}）\n"
+                                f"{(result.stdout + result.stderr).strip()[-500:]}")
+    # 外から引き継いだ GIT_DIR（鍵のないリポジトリ）に引きずられず、引数のリポジトリ（鍵がある）を検査する
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        target, other = Path(directory) / "target", Path(directory) / "other"
+        for repository, content in ((target, f'token = "{key}"\n'), (other, "clean\n")):
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True,
+                           capture_output=True)
+            (repository / "config.txt").write_text(content, encoding="utf-8")
+            git(repository, "add", "config.txt")
+            git(repository, "commit", "-q", "-m", "config")
+        result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(target)], capture_output=True, text=True,
+                                env=dict(env, GIT_DIR=str(other / ".git"), GIT_WORK_TREE=str(other)))
+        if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
+            failures.append(f"gitleaks: 引き継いだ GIT_DIR のリポジトリを検査した（終了コード {result.returncode}）")
+
+
 def gitleaks_merge_case() -> None:
     """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
 
@@ -1448,14 +1673,15 @@ def gitleaks_merge_case() -> None:
                 failures.append(f"gitleaks: マージの差分（{label}）で検出したファイルが {sorted(found)}（期待 {sorted(want)}）")
 
 
-def coverage_case(label: str, want_code: int, want_text: str, count_value: object, covered_value: object) -> None:
+def coverage_case(label: str, want_code: int, want_text: str, count_value: object, covered_value: object,
+                  target: str = "90") -> None:
     with tempfile.TemporaryDirectory() as directory:
         sources = Path(directory) / "Sources"
         sources.mkdir()
         report = Path(directory) / "report.json"
         report.write_text(json.dumps({"data": [{"files": [{"filename": str(sources / "A.swift"), "summary": {
             "lines": {"count": count_value, "covered": covered_value}}}]}]}), encoding="utf-8")
-        expect(f"coverage: {label}", [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", "90"],
+        expect(f"coverage: {label}", [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", target],
                want_code, want_text)
 
 
@@ -1468,6 +1694,11 @@ def test_coverage() -> None:
     coverage_case("count が文字列", 2, "不正", "10", 5)
     coverage_case("count が真偽値", 2, "不正", True, 0)
     coverage_case("covered が小数", 2, "不正", 10, 5.0)
+    # 目標は 0〜100 の有限の数だけ（NaN・無限大・範囲外で比較を壊さない）。境界の 0 と 100 は認める
+    for value in ("nan", "inf", "-1", "100.5", "x"):
+        coverage_case(f"目標が {value}", 2, "--target", 20, 19, target=value)
+    coverage_case("目標が 0", 0, "行 95.0%", 20, 19, target="0")
+    coverage_case("目標が 100（未満は警告）", 0, "警告", 20, 19, target="100")
 
 
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）
@@ -1599,6 +1830,31 @@ def line_separator_cases() -> None:
     # 文書の U+2028 と実ファイルの改行は別の内容（U+2028 で区切ると一致したことにしてしまう）
     docs_case("U+2028 と改行の違い", 1, "一致しない", extra={**files, "scripts/sample.sh": DOCS["scripts/sample.sh"].replace(
         "echo one", "echo one\nx")})
+
+
+def reread_failure_case() -> None:
+    """--update-snippets で文書を読み直せない（OSError）とき、その文書のパスで報告して書き直さず、ほかの文書を続けること。"""
+    global count
+    count += 1
+    directory = docs_case("読み直しの失敗の準備（整合した文書）", 0, "OK")
+    spec = importlib.util.spec_from_file_location("verify_docs", SCRIPTS / "verify-docs.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    checker = module.Checker(directory.resolve())
+    checker.load()
+
+    def failing(name: str) -> str:
+        raise OSError(f"読めない: {name}")
+
+    checker.read_raw = failing
+    try:
+        checker.update_snippets()
+    except OSError as error:
+        failures.append(f"docs: 読み直しの失敗で例外が送出された: {error!r}")
+        return
+    if not any("docs/03-detailed-design/sample.md" in message and "読み直せない" in message for message in checker.errors):
+        failures.append(f"docs: 読み直しの失敗を文書のパスで報告しない（{checker.errors}）")
 
 
 def unreadable_document_case() -> None:
@@ -1946,6 +2202,13 @@ def run_docs_cases() -> None:
     if outside.read_text(encoding="utf-8") != stale:
         failures.append("docs: --root の外にある文書が書き直された")
     line_separator_cases()
+    # 複数行の HTML のコメントの中のフェンスの印は、フェンスとして扱わない（後ろの文書をコードとして隠さない）
+    docs_case("コメントの中のフェンスの印", 0, "OK", basic, "## 2. セキュリティ", f"<!--\n{FENCE}\n-->\n\n## 2. セキュリティ")
+    # コメントの中の見出しと「満たす要件:」は、MVP の網羅に数えない（sections() と同じ判定）
+    docs_case("コメントの中の満たす要件", 1, "MVP の要件 FR-AAA-02", extra={basic: replaced(
+        DOCS[basic], "| 満たす要件 ID | FR-AAA-01・02、SEC-AAA-01 |", "| 満たす要件 ID | FR-AAA-01、SEC-AAA-01 |")
+        + "\n<!--\n### 4.1 小節\n\n満たす要件: FR-AAA-02\n-->\n"})
+    reread_failure_case()
     unreadable_document_case()
     # リンク先の括弧は対をとって読む（design(v2).txt の「)」をリンクの終わりと取り違えない）
     docs_case("括弧を含むリンク先", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",

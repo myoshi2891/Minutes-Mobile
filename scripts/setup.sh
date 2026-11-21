@@ -24,6 +24,13 @@ fi
 
 "$ROOT/scripts/setup-tools.sh"
 if [ "$HOOKS" = 1 ]; then
+  # フックのファイルが揃っていて実行できることを、設定を書く前に確かめる（ないフックを指す設定で有効にしたと表示しない）
+  for hook in .githooks/pre-commit .githooks/pre-push; do
+    if [ ! -f "$hook" ] || [ ! -x "$hook" ]; then
+      echo "NG: フック ${hook} がない、または実行できない。フックを有効にしない" >&2
+      exit 1
+    fi
+  done
   # 環境変数 GIT_CONFIG は git config の読み書きを別のファイルへ向ける（設定したまま書くと、リポジトリの設定を
   # 変えずに読み直しも同じファイルから行い、誤って成功する）。書き込みと読み直しの両方で外し、書き込みは --local に限る
   env -u GIT_CONFIG git config --local core.hooksPath .githooks

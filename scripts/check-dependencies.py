@@ -60,8 +60,8 @@ def normalize_path(path: str) -> str:
     return posixpath.normpath(path).rstrip("/")
 
 
-def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, dict], Dict[str, dict]]:
-    """許可リストを読み、(identity, 版) → 項目、URL → 項目、ローカルのバイナリのパス → 項目 を返す。
+def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[str, dict], Dict[str, dict]]:
+    """許可リストを読み、(identity, 版, 正規化した URL) → 項目、URL → 項目、ローカルのバイナリのパス → 項目 を返す。
     形式が違えば読めないものとして扱う。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -75,7 +75,7 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
         raise Unreadable(f"{path}: allowedLicenses の形式が違う")
     if not isinstance(packages, list):
         raise Unreadable(f"{path}: approvedPackages の形式が違う")
-    by_pin: Dict[Tuple[str, str], dict] = {}
+    by_pin: Dict[Tuple[str, str, str], dict] = {}
     by_url: Dict[str, dict] = {}
     by_path: Dict[str, dict] = {}
     for package in packages:
@@ -101,9 +101,14 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str], dict], Dict[str, d
                 "ownerDecision にオーナーの決定（UD-nn）を記録する"
             )
         if "path" in package:
-            by_path[normalize_path(package["path"])] = package
+            # 承認の path はリポジトリの起点からの相対パスだけ（絶対パス・起点の外を指すものは照合の基準にできない）
+            location = normalize_path(package["path"])
+            if posixpath.isabs(location) or location == ".." or location.startswith("../"):
+                raise Unreadable(f"{path}: {package['identity']} の path は起点からの相対パスで、起点の中を指す（{package['path']}）")
+            by_path[location] = package
             continue
-        by_pin[(package["identity"].lower(), package["version"])] = package
+        # 同じ identity と版でも取得元が違えば別の承認とする（取得元ごとに承認する）
+        by_pin[(package["identity"].lower(), package["version"], normalize(package["url"]))] = package
         by_url[normalize(package["url"])] = package
     return by_pin, by_url, by_path
 
@@ -471,9 +476,9 @@ SOURCE_DECLARATION = re.compile(r"\.(`?)(package|binaryTarget)\1\s*\(")
 # 取得元を判定できないので合格にしない。変数名の package（let package = Package(…)）は「.」がないので当たらない
 MEMBER_REFERENCE = re.compile(r"\.(`?)(package|binaryTarget)\1(?![\w`])")
 # 文字列リテラルだけの引数（連結・補間・変数を含まない）。引数の終わりは「,」か末尾
-LITERAL_URL = re.compile(r'url:\s*"([^"\\]*)"\s*(?:,|$)')
-LITERAL_PATH = re.compile(r'path:\s*"([^"\\]*)"\s*(?:,|$)')
-LITERAL_CHECKSUM = re.compile(r'checksum:\s*"([^"\\]*)"\s*(?:,|$)')
+LITERAL_URL = re.compile(r'url\s*:\s*"([^"\\]*)"\s*(?:,|$)')
+LITERAL_PATH = re.compile(r'path\s*:\s*"([^"\\]*)"\s*(?:,|$)')
+LITERAL_CHECKSUM = re.compile(r'checksum\s*:\s*"([^"\\]*)"\s*(?:,|$)')
 
 
 def content_digest(path: Path) -> str:
@@ -544,7 +549,8 @@ def literal_argument(arguments: str, masked: str, label: str, pattern: "re.Patte
 
     戻り値は（キーワードがコードにあるか, 文字列リテラルの内容。リテラルでなければ None）。
     """
-    found = re.search(rf"\b{label}:", masked)
+    # コメントを除いた跡の空白（url /* … */ : "…"）があってもラベルとして読む
+    found = re.search(rf"\b{label}\s*:", masked)
     if not found:
         return False, None
     literal = pattern.match(arguments, found.start())
@@ -569,6 +575,19 @@ def version_errors(arguments: str, masked: str, summary: str, approved: Set[str]
     return errors
 
 
+def contained(root: Path, location: str) -> bool:
+    """起点からの相対パス location が、リンクを解決した後も起点の中を指すか。循環するリンクは読めないものとして扱う。"""
+    try:
+        return (root / location).resolve().is_relative_to(root.resolve())
+    except RuntimeError as error:  # 循環するリンク（Python 3.9〜3.12）
+        raise Unreadable(f"{root / location}: リンクを解決できない（循環している）: {error}") from error
+
+
+# ローカルの Package を置ける場所（check.sh の手順 7 がカバレッジを測る写しに Packages/ だけを展開するので、その外の
+# Package を参照すると、写しの中で解決できない）
+LOCAL_PACKAGE_ROOT = "Packages"
+
+
 def local_package_errors(directory: str, path: str, summary: str, root: Optional[Path]) -> List[str]:
     """.package(path:) の参照先を、参照元の Package.swift のディレクトリから解決して確かめる。
 
@@ -578,6 +597,9 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
     if posixpath.isabs(location) or location == ".." or location.startswith("../"):
         return [f"ローカルの Package {path} は起点の外にあり、中の依存を検査できない: .package({summary})"]
     parts = location.split("/")
+    if parts[0] != LOCAL_PACKAGE_ROOT:
+        return [f"ローカルの Package {location} は {LOCAL_PACKAGE_ROOT}/ の外にある（カバレッジの測定の写しに含まれない）: "
+                f".package({summary})"]
     if parts[0] in SKIPPED_AT_ROOT or SKIPPED_ANYWHERE.intersection(parts):
         return [f"ローカルの Package {location} は検査の対象外のディレクトリにある: .package({summary})"]
     if root is None:
@@ -590,6 +612,8 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
         return [f"ローカルの Package {path} は起点の外にあり、中の依存を検査できない: .package({summary})"]
     # シンボリックリンクを解決した先にも同じ除外の規則を当てる（リンクで検査の対象外のディレクトリを指させない）
     resolved = target.relative_to(root.resolve()).parts
+    if not resolved or resolved[0] != LOCAL_PACKAGE_ROOT:
+        return [f"ローカルの Package {location} の実体（{'/'.join(resolved)}）は {LOCAL_PACKAGE_ROOT}/ の外にある: .package({summary})"]
     if resolved and (resolved[0] in SKIPPED_AT_ROOT or SKIPPED_ANYWHERE.intersection(resolved)):
         return [f"ローカルの Package {location} の実体（{'/'.join(resolved)}）は検査の対象外のディレクトリにある: .package({summary})"]
     if not (target / "Package.swift").is_file():
@@ -658,8 +682,12 @@ def manifest_errors(
         elif kind == "binaryTarget":
             # ローカルのバイナリは、承認済みの項目（版・ライセンス・承認日を持つ）がある場合だけ認める
             location = normalize_path(posixpath.join(directory, path))
-            if location not in by_path:
+            if posixpath.isabs(location) or location == ".." or location.startswith("../"):
+                errors.append(f"ローカルのバイナリ {path} は起点の外にある: .binaryTarget({summary})")
+            elif location not in by_path:
                 errors.append(f"ローカルのバイナリ {location} は許可リストにない: .binaryTarget({summary})")
+            elif root is not None and not contained(root, location):
+                errors.append(f"ローカルのバイナリ {location} の実体が起点の外にある（シンボリックリンクなど）: .binaryTarget({summary})")
             elif root is not None:
                 # 場所が一致しても、承認したときの内容と違えば認めない（再承認を求める）
                 actual = content_digest(root / location)
@@ -687,8 +715,8 @@ def check(root: Path, allowlist: Path) -> List[str]:
     by_pin, by_url, by_path = load_allowlist(allowlist)
     # by_url は URL ごとに 1 項目しか持たないので、版の照合には by_pin から作った URL → 承認した版を使う
     approved_versions: Dict[str, Set[str]] = {}
-    for package in by_pin.values():
-        approved_versions.setdefault(normalize(package["url"]), set()).add(package["version"])
+    for (_, version, url) in by_pin:
+        approved_versions.setdefault(url, set()).add(version)
     # ディレクトリ → URL → 確定版（Package.swift と同じディレクトリの Package.resolved とだけ照合する）
     pins_by_directory: Dict[Path, Dict[str, List[object]]] = {}
     # Package.resolved の位置 → 確定した取得元（project.xcproj の依存の照合に使う）
@@ -709,16 +737,18 @@ def check(root: Path, allowlist: Path) -> List[str]:
             version = state.get("version")
             if not identity:
                 raise Unreadable(f"{path}: 名前のない依存がある")
+            location = pin.get("location") or pin.get("repositoryURL")  # repositoryURL は古い形式（version 1）
             if not isinstance(version, str) or not version:
                 errors.append(f"{source}: {identity} は版で固定されていない（ブランチやコミットの指定は認めない）")
-            elif (identity, version) not in by_pin:
-                errors.append(f"{source}: {identity} {version} は許可リストにない")
+            elif isinstance(location, str) and (identity, version, normalize(location)) in by_pin:
+                pass  # identity・版・取得元のすべてが承認と一致する
             else:
                 # identity と版が同じでも、取得元が承認したものと違えば認めない
-                location = pin.get("location") or pin.get("repositoryURL")  # repositoryURL は古い形式（version 1）
-                approved = by_pin[(identity, version)]["url"]
-                if not isinstance(location, str) or normalize(location) != normalize(approved):
-                    errors.append(f"{source}: {identity} {version} の取得元 {location} が許可リスト（{approved}）と違う")
+                same = sorted(item["url"] for (name, pinned, _), item in by_pin.items() if (name, pinned) == (identity, version))
+                if same:
+                    errors.append(f"{source}: {identity} {version} の取得元 {location} が許可リスト（{'・'.join(same)}）と違う")
+                else:
+                    errors.append(f"{source}: {identity} {version} は許可リストにない")
     for path in manifests(root):
         try:
             manifest = path.read_text(encoding="utf-8")

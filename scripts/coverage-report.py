@@ -9,16 +9,28 @@ swift test --enable-code-coverage が出す JSON から、指定したディレ�
 """
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
+
+
+def percentage(text: str) -> float:
+    """目標の %。有限の数で 0〜100 だけを認める（NaN・無限大・範囲外の値で比較を壊さない）。"""
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"数でない: {text}") from error
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError(f"0〜100 の有限の数でない: {text}")
+    return value
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Package のカバレッジの集計")
     parser.add_argument("report", type=Path)
     parser.add_argument("--sources", type=Path, required=True)
-    parser.add_argument("--target", type=float, required=True)
+    parser.add_argument("--target", type=percentage, required=True)
     arguments = parser.parse_args()
     try:
         files = json.loads(arguments.report.read_text(encoding="utf-8"))["data"][0]["files"]

@@ -191,7 +191,7 @@ MAX_EXPANSION_DEPTH = 8
 PORTRAIT_ONLY = ["UIInterfaceOrientationPortrait"]
 # 機種・OS の修飾子つきの鍵（<鍵>-<OS>~<機種>）も、iPhone で使われうるものは同じく縦だけを求める
 ORIENTATION_KEYS = ("UISupportedInterfaceOrientations~iphone", "UISupportedInterfaceOrientations",
-                    "UISupportedInterfaceOrientations-iphoneos~iphone")
+                    "UISupportedInterfaceOrientations-iphoneos", "UISupportedInterfaceOrientations-iphoneos~iphone")
 
 
 def setting_value(own: dict, shared: dict, name: str, configuration: str, sdk: str) -> Optional[Tuple[str, bool]]:

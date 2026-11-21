@@ -12,6 +12,8 @@
 # ほかのツールの取得には、その版の gh（.tools/bin/gh）だけを使う（PATH や Homebrew の gh は使わない）
 set -euo pipefail
 
+# CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
+unset CDPATH
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSIONS="$ROOT/tools/versions"
 DEST="$ROOT/.tools"

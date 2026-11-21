@@ -76,14 +76,18 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
     return rules
 
 
-def expected_lines(path: Path, rule: str, errors: List[str]) -> Set[int]:
-    lines: Set[int] = set()
+def read_fixture(path: Path) -> str:
+    """試験用のファイルを読む。読めない試験用のファイルは、検出行の不一致（終了コード 1）と区別して、実行できないとして止める。"""
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
-        # 読めない試験用のファイルは、検出行の不一致（終了コード 1）と区別して、実行できないとして止める
         print(f"NG: 試験用のファイル {path} を読めない: {error}", file=sys.stderr)
         sys.exit(2)
+
+
+def expected_lines(path: Path, rule: str, errors: List[str]) -> Set[int]:
+    lines: Set[int] = set()
+    text = read_fixture(path)
     for number, line in enumerate(text.splitlines(), start=1):
         found = MARKER.search(line)
         if not found:
@@ -190,7 +194,7 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
         if ROOT / relative not in allowed:
             errors.append(f"許可していない場所に入れ子の設定がある: {relative}")
     # 入れ子の設定の下でも独自の規則は効いていること（試験用のファイルの print( の行で no_print_logging が検出される）
-    print_lines = {number for number, line in enumerate(sample.read_text(encoding="utf-8").splitlines(), start=1)
+    print_lines = {number for number, line in enumerate(read_fixture(sample).splitlines(), start=1)
                    if re.search(r"\bprint\s*\(", line)}
     if not print_lines:
         errors.append(f"{sample.relative_to(ROOT)}: print( の行がない（入れ子の設定で独自の規則が効くことを試験できない）")
