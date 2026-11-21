@@ -181,11 +181,13 @@ install_tool() {
 PENDING_TARGET=""
 PENDING_BACKUP=""
 
-if [ "$MODE" = install ]; then
-  # 作業場所は導入先と同じファイルシステムに作る（置き換えの mv を rename にする）
-  mkdir -p "$DEST"
+# 導入（install）は作業場所を導入先と同じファイルシステムに作る（置き換えの mv を rename にする）。
+# 照合（--verify）は導入先を作らない（導入先がなければ照合で「導入されていない」として失敗する）
+if [ "$MODE" = install ]; then mkdir -p "$DEST"; fi
+if [ -d "$DEST" ]; then
   # 同じ導入先への並行の導入を防ぐ。キャッシュの判定から退避・公開・リンクの更新までをロックの中で行う。
-  # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）
+  # 後から来た実行はロックを待ち、取得してからキャッシュを判定する（先の実行が導入したものはそのまま使う）。
+  # 照合も同じロックを取り、台帳との照合を終えるまで持つ（導入の途中の、旧い導入を退避した状態などを照合しない）
   LOCK="$DEST/.install.lock"
   LOCK_HELD=""
   WORK=""
@@ -230,7 +232,9 @@ if [ "$MODE" = install ]; then
     fi
   done
   LOCK_HELD=1
-  WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
+  if [ "$MODE" = install ]; then
+    WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
+  fi
 fi
 
 ARCH=$(uname -m)

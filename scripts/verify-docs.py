@@ -64,8 +64,9 @@ PHASES = re.compile(r"^(MVP|P2|P3)\b")
 # sections() が節の本文でコードフェンスの行の代わりに置く行。空行と違って節の冒頭を終わらせ、
 # 「|」で始まらないので表のまとまりも区切る（「- 」「### 」「満たす要件:」とも一致しない）
 FENCE_LINE = "\0fence"
-# リンク先（山括弧で囲んだもの、または空白と「)」を含まないもの）と、続けて書けるタイトル（"…"・'…'・(…)）
-LINK = re.compile(r"""\]\((<[^<>\n]+>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)""")
+# インラインのリンクの始まり（「](」）と、リンク先の後に続けて書けるタイトル（"…"・'…'・(…)）
+LINK_START = re.compile(r"\]\(")
+LINK_TITLE = re.compile(r"""\s+(?:"[^"]*"|'[^']*'|\([^)]*\))""")
 # 参照形式のリンクの定義（[ラベル]: リンク先）。字下げは空白 0〜3 個まで（CommonMark）
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
 # 参照形式のリンクの使用（[文][ラベル] と、省略形の [ラベル][]）
@@ -75,6 +76,23 @@ CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 DETAILED_MAPPING = "要件 ID ↔ テスト"
 # 対応表で検査・試験を書く列の見出しに含まれる語
 TEST_COLUMN_WORDS = ("試験", "検査", "テスト")
+
+
+# 行の区切りは LF・CRLF・CR だけ（str.splitlines は U+2028 などでも区切り、行の本文を分けてしまう）
+LINE_BREAK = re.compile(r"\r\n|\r|\n")
+
+
+def split_lines(text: str, keepends: bool = False) -> List[str]:
+    """LF・CRLF・CR だけで行に分ける（str.splitlines と同じく、末尾の改行の後に空の行を作らない）。
+    照合と --update-snippets の書き直しで同じ規則を使う。"""
+    lines: List[str] = []
+    start = 0
+    for found in LINE_BREAK.finditer(text):
+        lines.append(text[start:found.end() if keepends else found.start()])
+        start = found.end()
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
 
 
 def fence_open(line: str) -> Optional[Tuple[Fence, str]]:
@@ -107,7 +125,7 @@ def fence_end(lines: List[str], start: int) -> int:
 def fenced_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]]]]:
     """各行を（行番号, 行, フェンスの中か, この行で開いたフェンス）で返す。フェンスの開始・終了の行は「中」とする。"""
     fence: Optional[Fence] = None
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(split_lines(text), start=1):
         if fence is not None:
             if fence_closes(line, fence):
                 fence = None
@@ -158,6 +176,41 @@ def expand(match: "re.Match[str]") -> List[str]:
     return identifiers
 
 
+def link_destinations(line: str) -> List[str]:
+    """行の中のインラインのリンクのリンク先を返す。リンク先は山括弧で囲んだもの（<…>）か、空白を含まず括弧の対が
+    とれたもの（design(v2).md の「)」をリンクの終わりと取り違えない。CommonMark と同じ）。その後にタイトルを書ける。"""
+    found: List[str] = []
+    for start in LINK_START.finditer(line):
+        at = start.end()
+        if line.startswith("<", at):
+            close = line.find(">", at)
+            if close < 0 or re.search(r"[<\n]", line[at + 1:close]) or close == at + 1:
+                continue
+            destination = line[at:close + 1]
+            at = close + 1
+        else:
+            begin, depth = at, 0
+            while at < len(line) and not line[at].isspace():
+                if line[at] == "(":
+                    depth += 1
+                elif line[at] == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                at += 1
+            if depth != 0 or at == begin:
+                continue
+            destination = line[begin:at]
+        title = LINK_TITLE.match(line, at)
+        if title:
+            at = title.end()
+        while at < len(line) and line[at].isspace():
+            at += 1
+        if line.startswith(")", at):
+            found.append(destination)
+    return found
+
+
 def table_cells(line: str) -> List[str]:
     """表の行を列に分ける。エスケープした「\\|」は列の区切りにしない（GFM と同じ）。"""
     text = line.strip()
@@ -192,32 +245,55 @@ def is_separator(line: str) -> bool:
 BLOCK_START = re.compile(r"^ {0,3}(?:>|#{1,6}(?:\s|$)|[-+*]\s|\d{1,9}[.)]\s)")
 
 
+# 表を終わらせる行（空行・新しいブロックの始まり・HTML のコメントの始まり・区切りの線）。GFM と同じく、表は
+# 見出しと区切りの行で始まった後、空行か別のブロックの始まりまで続く（「|」を含まない行もデータ行になる）
+TABLE_END = re.compile(r"^\s*$|^ {0,3}<!--|^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+
+
 def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tuple[int, str]]]]:
     """（行番号, 行）の並びから表を探し、表ごとに見出しの列とデータ行を返す（tables と table_blocks が共用する）。
 
-    「|」を含む行の連続したまとまりを候補とし、区切りの行を起点に判定する。区切りの行の直前の行を見出しとし、
-    見出しと区切りの行の列の数が同じ場合だけ表として扱う（GFM でも、列の数が合わなければ表にならない）。
-    見出しより前の行は表に含めない。データ行は区切りの行の後の行で、区切りの形の行は除く。
+    「|」を含む行の連続したまとまりの中で、区切りの行の直前の行を見出しとし、見出しと区切りの行の列の数が同じ場合だけ
+    表として扱う（GFM でも、列の数が合わなければ表にならない）。見出しより前の行は表に含めない。
+    表が始まった後は、空行・新しいブロックの始まりの行（引用・見出し・箇条書きなど）・HTML のコメントの始まり・区切りの線
+    で終わり、それまでの行は「|」を含まなくてもデータ行とする（GFM と同じ）。区切りの形の行はデータ行から除く。
     区切りの行のないまとまり・列の数が合わないまとまりは表として数えない。
     """
     found: List[Tuple[List[str], List[Tuple[int, str]]]] = []
     block: List[Tuple[int, str]] = []
+    failed = False  # このまとまりの最初の区切りの行で列の数が合わなかった（以後はまとまりが終わるまで表にしない）
+    table: Optional[Tuple[List[str], List[Tuple[int, str]]]] = None
     for item in lines + [(0, "")]:
+        text = item[1]
+        if table is not None:
+            if not TABLE_END.match(text) and not BLOCK_START.match(text):
+                if not is_separator(text):
+                    table[1].append(item)
+                continue
+            found.append(table)
+            table = None
         # 字下げしたコードブロックの行は表の行にしない（コードの中の対応表の例を、表として数えない）。
-        # 新しいブロック（引用など）の始まりの行は表を終わらせ、表の行にしない
-        if is_row(item[1]) and not INDENTED_CODE.match(item[1]) and not BLOCK_START.match(item[1]):
+        # 新しいブロック（引用など）の始まりの行は表の行にしない
+        if is_row(text) and not INDENTED_CODE.match(text) and not BLOCK_START.match(text):
             block.append(item)
+            if (not failed and len(block) >= 2 and is_separator(block[-1][1])
+                    and not is_separator(block[-2][1])):
+                if len(table_cells(block[-2][1])) == len(table_cells(block[-1][1])):
+                    table = (table_cells(block[-2][1]), [])
+                    block = []
+                else:
+                    failed = True
             continue
-        start = next((at for at in range(1, len(block)) if is_separator(block[at][1]) and not is_separator(block[at - 1][1])), None)
-        if start is not None and len(table_cells(block[start - 1][1])) == len(table_cells(block[start][1])):
-            found.append((table_cells(block[start - 1][1]), [row for row in block[start + 1:] if not is_separator(row[1])]))
         block = []
+        failed = False
     return found
 
 
 def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
     """本文（節の行の並び）の中の表ごとに、見出しの列とデータ行を返す（find_tables と同じ判定）。"""
-    return [(header, [row for _, row in rows]) for header, rows in find_tables(list(enumerate(body, start=1)))]
+    # コードフェンスの代わりの行（FENCE_LINE）は空行と同じく表を終わらせる（「|」のない行をデータ行にしない）
+    lines = [(number, "" if line == FENCE_LINE else line) for number, line in enumerate(body, start=1)]
+    return [(header, [row for _, row in rows]) for header, rows in find_tables(lines)]
 
 
 def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
@@ -225,8 +301,35 @@ def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
 
     コードフェンスの中の行は表の候補のまとまりを区切る（フェンスをまたいだ行を 1 つの表にしない）。
     """
-    lines = [(number, "" if inside else line) for number, line, inside, _ in fenced_lines(text)]
+    hidden = commented_lines(text)
+    lines = [(number, "" if inside or number in hidden else line) for number, line, inside, _ in fenced_lines(text)]
     yield from find_tables(lines)
+
+
+# 複数行の HTML のコメントの始まり（字下げは空白 0〜3 個）
+COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
+
+
+def commented_lines(text: str) -> Set[int]:
+    """コードフェンスの外で始まる複数行の HTML のコメント（同じ行で閉じない「<!--」から「-->」を含む行まで）の行番号。
+
+    表示されない内容なので、節・表の検査に数えない（コメントにした対応表で検査を通さない）。
+    同じ行で閉じるコメント（コード片の印 <!-- file: … --> など）は含めない。
+    """
+    hidden: Set[int] = set()
+    opened = False
+    for number, line, inside, _ in fenced_lines(text):
+        if opened:
+            hidden.add(number)
+            opened = "-->" not in line
+            continue
+        if inside:
+            continue
+        found = COMMENT_OPEN.match(line)
+        if found and "-->" not in line[found.end():]:
+            hidden.add(number)
+            opened = True
+    return hidden
 
 
 def reference_label(label: str) -> str:
@@ -272,7 +375,12 @@ class Checker:
         paths = sorted((self.root / "docs").rglob("*.md"))
         paths += [self.root / name for name in ("README.md", "CLAUDE.md") if (self.root / name).is_file()]
         for path in paths:
-            self.texts[path.relative_to(self.root).as_posix()] = path.read_text(encoding="utf-8")
+            relative = path.relative_to(self.root).as_posix()
+            # 読めない文書は、その文書のパスで報告して読み飛ばし、ほかの文書の検査を続ける（検査の対象にも書き直しの対象にもしない）
+            try:
+                self.texts[relative] = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as error:
+                self.error(relative, f"文書を読めない: {error}")
 
     def collect_definitions(self) -> None:
         """定義文書の表から ID を集める。要件表の「フェーズ」列が MVP の FR / NFR / SEC も集める。"""
@@ -403,7 +511,7 @@ class Checker:
 
     def check_format(self) -> None:
         for name, text in self.texts.items():
-            lines = text.splitlines()
+            lines = split_lines(text)
             if len(lines) >= MAX_LINES:
                 self.error(name, f"{len(lines)} 行ある（{MAX_LINES} 行未満に分割する）")
             for number, _, _, opened in fenced_lines(text):
@@ -421,7 +529,7 @@ class Checker:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
             for number, line in prose_lines(text):
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
-                targets = LINK.findall(line)
+                targets = link_destinations(line)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
@@ -444,7 +552,13 @@ class Checker:
     def sections(self, text: str) -> List[Tuple[int, str, List[str]]]:
         """「## 」の節ごとに、行番号・見出し・本文の行を返す。"""
         result: List[Tuple[int, str, List[str]]] = []
+        hidden = commented_lines(text)
         for number, line, inside, _ in fenced_lines(text):
+            if number in hidden:
+                # 複数行の HTML のコメントの中は表示されないので、空行として扱う（節の見出し・表として数えない）
+                if result:
+                    result[-1][2].append("")
+                continue
             if inside:
                 # フェンスの中は検査の対象外。位置は FENCE_LINE として残し、フェンスをまたいだ行を 1 つの表として扱わず、
                 # 節の冒頭のコードブロックの後ろの行を節の冒頭として扱わない
@@ -593,7 +707,7 @@ class Checker:
                 self.error(name, f"基本設計にない申し送り「{row}」の行が表にある")
 
     def check_snippets(self, name: str, text: str) -> None:
-        lines = text.splitlines()
+        lines = split_lines(text)
         for number, line, inside, _ in fenced_lines(text):
             if inside:
                 continue  # フェンスの中の印は説明用の例であり、照合しない
@@ -623,7 +737,7 @@ class Checker:
                 self.error(name, f"コード片の元のファイルがない: {marker.group(2)}", index + 1)
                 continue
             try:
-                actual = path.read_text(encoding="utf-8").splitlines()
+                actual = split_lines(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError) as error:
                 self.error(name, f"コード片の元のファイルを読めない: {marker.group(2)}: {error}", index + 1)
                 continue
@@ -656,7 +770,7 @@ class Checker:
             if raw_text.replace("\r\n", "\n").replace("\r", "\n") != text:
                 self.error(name, "読み込んだ後に変更された。コード片を書き直さないので、--update-snippets を実行し直す")
                 continue
-            raw = raw_text.splitlines(keepends=True)
+            raw = split_lines(raw_text, keepends=True)
             lines = [line.rstrip("\r\n") for line in raw]
             endings = [line[len(line.rstrip("\r\n")):] for line in raw]
             # フェンスの外の行の位置（フェンスの中の印は説明用の例であり、書き直さない）
@@ -685,7 +799,7 @@ class Checker:
                 # 字下げしたフェンスには、開始行と同じ字下げを付けて書く（空行には付けない）
                 indent = " " * fence_indent(lines[start])
                 try:
-                    source = path.read_text(encoding="utf-8").splitlines()
+                    source = split_lines(path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError):
                     continue  # このコード片は書き直さない。検査の側（check_snippets）が印の行とともに報告する
                 content = [indent + line if line else line for line in source]

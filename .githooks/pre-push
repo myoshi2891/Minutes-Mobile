@@ -104,4 +104,5 @@ else
   ln -s "$source_root/.tools" "$tools_link"
 fi
 
-"$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
+# 専用の作業ツリーは送信するコミットに合わせてあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
+MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

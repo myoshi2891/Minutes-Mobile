@@ -7,6 +7,8 @@
 #   scripts/setup.sh --hooks  開発ツールを導入し、フックを有効にする（check.sh の全手順が通るようになってから使う）
 set -euo pipefail
 
+# CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
+unset CDPATH
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
@@ -20,7 +22,7 @@ if [ $# -eq 1 ]; then
   HOOKS=1
 fi
 
-scripts/setup-tools.sh
+"$ROOT/scripts/setup-tools.sh"
 if [ "$HOOKS" = 1 ]; then
   # 環境変数 GIT_CONFIG は git config の読み書きを別のファイルへ向ける（設定したまま書くと、リポジトリの設定を
   # 変えずに読み直しも同じファイルから行い、誤って成功する）。書き込みと読み直しの両方で外し、書き込みは --local に限る
@@ -30,7 +32,7 @@ if [ "$HOOKS" = 1 ]; then
   effective=$(env -u GIT_CONFIG git config --get core.hooksPath || true)
   if [ "$effective" != .githooks ]; then
     echo "NG: core.hooksPath を .githooks に設定したが、実際に効く値は「${effective}」。" \
-      "設定の出所を git config --show-origin --get-all core.hooksPath で確かめる" >&2
+      "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
     exit 1
   fi
   echo "OK: フックを有効にした（core.hooksPath = ${effective}）"

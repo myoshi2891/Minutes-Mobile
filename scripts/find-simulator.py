@@ -39,6 +39,10 @@ def main() -> int:
         # 各項目も辞書であること（項目が辞書でない一覧を、項目を読み飛ばして候補なしと取り違えない）
         if not isinstance(data["runtimes"], list) or not all(isinstance(item, dict) for item in data["runtimes"]):
             raise TypeError("runtimes が辞書の配列でない")
+        # 版は文字列であること（数値などを version_key の split で例外にせず、取得の失敗として扱う）
+        for item in data["runtimes"]:
+            if item.get("platform") == "iOS" and item.get("isAvailable") and not isinstance(item.get("version"), str):
+                raise TypeError(f"runtimes の {item.get('identifier')!r} の version が文字列でない")
         for runtime, devices in devices_by_runtime.items():
             if not isinstance(devices, list) or not all(isinstance(device, dict) for device in devices):
                 raise TypeError(f"devices の {runtime} が辞書の配列でない")

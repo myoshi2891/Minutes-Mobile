@@ -376,51 +376,93 @@ def call_arguments(text: str, start: int) -> str:
     return text[start + 1:]
 
 
-# 版の指定（文字列リテラルだけ）。ブランチ・コミットの指定は版で固定していないものとして認めない
-VERSION = r'"(\d+\.\d+\.\d+)"'
-# 版のリテラルの後ろは「,」「)」か引数の末尾だけを認める（「"1.0.0" + x」のような式の一部を版と見なさない）
-END = r"(?=\s*(?:,|\)|$))"
-# 範囲の下限のリテラルの前は「(」「,」「:」か引数の先頭だけを認める（「x + "1.0.0"..."2.0.0"」の下限は式になるため）
-START = r"(?:^|(?<=[(,:]))\s*"
+# 版の指定（文字列リテラルだけ）。ブランチ・コミットの指定は版で固定していないものとして認めない。
+# 版は SwiftPM と同じく、先行版（-rc.1 など）とビルドのメタデータ（+build）の接尾辞を持てる
+VERSION = r'"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"'
 UNPINNED = re.compile(r"\b(branch|revision)\s*:|\.(branch|revision)\s*\(")
+# 版の指定の引数（最上位の「,」で区切った 1 つ）の全体の形。引数の全体が一致するものだけを認める（「"1.0.0" + x」のような
+# 式の一部を版と見なさない）。呼び出しの名前と「(」の間の空白（コメントを除いた跡を含む）は Swift と同じく許す。
+# from: は、引数の先頭にあるもの（.package の引数）だけを upToNextMajor とする（.upToNextMinor(from:) などの中の from: と区別する）
 REQUIREMENTS = (
-    ("exact", re.compile(rf"(?:\bexact:\s*|\.exact\(\s*){VERSION}{END}")),
-    ("minor", re.compile(rf"\.upToNextMinor\(\s*from:\s*{VERSION}{END}")),
-    ("major", re.compile(rf"(?:\.upToNextMajor\(\s*from:\s*|(?<![.\w])from:\s*){VERSION}{END}")),
-    ("closed", re.compile(rf"{START}{VERSION}\s*\.\.\.\s*{VERSION}{END}")),
-    ("half-open", re.compile(rf"{START}{VERSION}\s*\.\.<\s*{VERSION}{END}")),
+    ("exact", re.compile(rf"(?:exact:\s*{VERSION}|\.exact\s*\(\s*{VERSION}\s*\))\s*")),
+    ("minor", re.compile(rf"\.upToNextMinor\s*\(\s*from:\s*{VERSION}\s*\)\s*")),
+    ("major", re.compile(rf"(?:\.upToNextMajor\s*\(\s*from:\s*{VERSION}\s*\)|from:\s*{VERSION})\s*")),
+    ("closed", re.compile(rf"{VERSION}\s*\.\.\.\s*{VERSION}\s*")),
+    ("half-open", re.compile(rf"{VERSION}\s*\.\.<\s*{VERSION}\s*")),
 )
+# 版の指定ではない引数のラベル（取得元・名前・trait）
+OTHER_ARGUMENTS = re.compile(r"(?:url|name|traits)\s*:")
 Version = Tuple[int, int, int]
+# 版の指定: (exact で指定した版の文字列。範囲なら None, 下限, 上限, 上限を含むか)
+Rule = Tuple[Optional[str], Version, Version, bool]
 
 
 def parse_version(text: object) -> Optional[Version]:
+    """接尾辞のない版（1.2.3）だけを読む。先行版などの接尾辞のある版は範囲の比較に使わない（None）。"""
     found = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", text) if isinstance(text, str) else None
     return (int(found.group(1)), int(found.group(2)), int(found.group(3))) if found else None
 
 
-def requirement(arguments: str) -> Optional[Tuple[Version, Version, bool]]:
-    """.package の版の指定を（下限, 上限, 上限を含むか）で返す。判定できなければ None。"""
+def top_level_arguments(arguments: str, masked: str) -> List[str]:
+    """引数を最上位の「,」で区切る。括弧の深さは文字列リテラルの本文を除いた内容（masked）で数え、
+    区切った位置で元の引数（arguments。長さは masked と同じ）を切り出す。"""
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(masked):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(arguments[start:index])
+            start = index + 1
+    parts.append(arguments[start:])
+    return parts
+
+
+def requirement(arguments: str, masked: str) -> Optional[Rule]:
+    """.package の版の指定を返す。判定できなければ None。
+
+    版の指定になりうる引数（取得元・名前・trait 以外の最上位の引数）がちょうど 1 つで、その全体が既知の形に一致する場合だけ
+    判定する。先行版の接尾辞を持つ版は exact でだけ認め、確定版と文字列で照合する（1.2.0-rc.1 と 1.2.0 を区別する）。
+    範囲（from・upToNext…・区間）の境界に接尾辞がある指定は、順序を確実に決められないので判定できないものとする。
+    """
+    candidates = [part for part, masked_part in zip(top_level_arguments(arguments, masked), top_level_arguments(masked, masked))
+                  if masked_part.strip() and not OTHER_ARGUMENTS.match(masked_part.strip())]
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0].strip()
     for kind, pattern in REQUIREMENTS:
-        found = pattern.search(arguments)
+        found = pattern.fullmatch(candidate)
         if not found:
             continue
-        low = parse_version(found.group(1))
-        assert low is not None
+        values = [value for value in found.groups() if value is not None]
         if kind == "exact":
-            return low, low, True
+            return values[0], (0, 0, 0), (0, 0, 0), True
+        bounds = [parse_version(value) for value in values]
+        if any(bound is None for bound in bounds):
+            return None  # 範囲の境界に接尾辞がある
+        low = bounds[0]
+        assert low is not None
         if kind == "minor":
-            return low, (low[0], low[1] + 1, 0), False
+            return None, low, (low[0], low[1] + 1, 0), False
         if kind == "major":
-            return low, (low[0] + 1, 0, 0), False
-        high = parse_version(found.group(2))
+            return None, low, (low[0] + 1, 0, 0), False
+        high = bounds[1]
         assert high is not None
-        return low, high, kind == "closed"
+        return None, low, high, kind == "closed"
     return None
 
 
-def satisfies(version: Version, rule: Tuple[Version, Version, bool]) -> bool:
-    low, high, inclusive = rule
-    return low <= version and (version <= high if inclusive else version < high)
+def satisfies(version: str, rule: Rule) -> bool:
+    exact, low, high, inclusive = rule
+    if exact is not None:
+        return version == exact
+    parsed = parse_version(version)
+    if parsed is None:
+        return False  # 先行版などの確定版は、範囲の指定では認めない
+    return low <= parsed and (parsed <= high if inclusive else parsed < high)
 
 
 # 取得元を持つ宣言（Package の依存と、バイナリのターゲット）。識別子はバッククォートで囲んでも同じ（.`package`(…)）
@@ -513,15 +555,14 @@ def version_errors(arguments: str, masked: str, summary: str, approved: Set[str]
     """.package(url:) の版の指定を、承認した版と、同じディレクトリの Package.resolved の確定版で照合する。"""
     if UNPINNED.search(masked):
         return [f"版で固定されていない（ブランチやコミットの指定は認めない）: .package({summary})"]
-    rule = requirement(arguments)
+    rule = requirement(arguments, masked)
     if rule is None:
         return [f"版の指定を判定できない（版を文字列リテラルで書く）: .package({summary})"]
     if not pinned:
         return [f"確定版がない（同じディレクトリの Package.resolved に記録する）: .package({summary})"]
     errors: List[str] = []
     for version in pinned:
-        parsed = parse_version(version)
-        if parsed is None or not satisfies(parsed, rule):
+        if not isinstance(version, str) or not satisfies(version, rule):
             errors.append(f"宣言の版の指定と確定版 {version} が合わない: .package({summary})")
         elif version not in approved:
             errors.append(f"確定版 {version} は許可リストにない: .package({summary})")

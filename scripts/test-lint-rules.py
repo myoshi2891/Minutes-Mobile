@@ -198,19 +198,33 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
 
 
 def disabled_rules(config_text: str, errors: List[str]) -> List[str]:
-    """設定の disabled_rules の項目を返す。字下げした「- 規則名」の並びだけを読み、読めない行は errors に入れる。"""
+    """入れ子の設定の内容を確かめ、disabled_rules の項目を返す。
+
+    認める最上位の鍵は disabled_rules だけで、値は字下げした「- 規則名」の並び（ブロックの形）に限る。
+    ほかの鍵（custom_rules で許可した規則を上書きする・only_rules・excluded など）、流れの形（[a, b]）や同じ行の値、
+    読めない行は errors に入れる（読み飛ばすと、規則を外す抜け道を見落とすため）。
+    """
     rules: List[str] = []
-    in_block = False
+    state = ""  # "rules" = disabled_rules の中、"rejected" = 認めない鍵の中（中の行は重ねて報告しない）
     for line in config_text.splitlines():
-        if re.match(r"^disabled_rules:\s*(?:#.*)?$", line):
-            in_block = True
+        if not line.strip() or re.match(r"^\s*#", line):
             continue
-        if not in_block or not line.strip() or re.match(r"^\s*#", line):
+        if re.match(r"^\S", line):  # 最上位の行
+            state = "rejected"
+            key = re.match(r"^([A-Za-z_][\w-]*)\s*:(.*)$", line)
+            if not key:
+                errors.append(f"{TEST_CODE_FIXTURE}/.swiftlint.yml の最上位の行を読めない: {line.strip()}")
+            elif key.group(1) != "disabled_rules":
+                errors.append(f"{TEST_CODE_FIXTURE}/.swiftlint.yml に認めない設定 {key.group(1)} がある（disabled_rules だけを置く）")
+            elif re.sub(r"\s+#.*$", "", key.group(2)).strip():
+                errors.append(f"{TEST_CODE_FIXTURE}/.swiftlint.yml の disabled_rules は字下げした「- 規則名」の並びで書く"
+                              f"（読めない形: {line.strip()}）")
+            else:
+                state = "rules"
             continue
-        if re.match(r"^\S", line):  # 次の最上位の鍵で終わる
-            in_block = False
+        if state == "rejected":
             continue
-        item = re.match(r"^\s+-\s+([a-z][a-z0-9_]*)\s*(?:#.*)?$", line)
+        item = re.match(r"^\s+-\s+([a-z][a-z0-9_]*)\s*(?:#.*)?$", line) if state == "rules" else None
         if item:
             rules.append(item.group(1))
         else:

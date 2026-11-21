@@ -169,13 +169,21 @@ def check_required(
     target: str, own: dict, shared: dict, configurations: List[str],
     rules: Dict[str, Tuple[Tuple[str, ...], str]], errors: List[str]
 ) -> None:
+    """各設定を、構成ごと・SDK（SDKS）ごとに求めて確かめる。どれかの SDK で値が決まらない・許す値でなければ違反とする
+    （SDK の条件付きの書き方だけで、片方の SDK の値を欠く・違う値にすることを見逃さない）。"""
     for name, (allowed, reason) in rules.items():
-        effective, missing = resolve(own, shared, name, configurations)
+        missing: List[str] = []
+        wrong: Dict[str, List[str]] = {}
+        for sdk in SDKS:
+            effective, undecided = resolve(own, shared, name, configurations, sdk)
+            missing.extend(f"{configuration}（{sdk}）" for configuration in undecided)
+            for (key, value), used in effective.items():
+                if value not in allowed:
+                    wrong.setdefault(f"{key} = {value}", []).extend(f"{configuration}（{sdk}）" for configuration in used)
         if missing:
             errors.append(f"[{reason}] {target}: {name} が設定されていない（構成 {'・'.join(missing)}。必要な値: {allowed[0]}）")
-        for (key, value), used in effective.items():
-            if value not in allowed:
-                errors.append(f"[{reason}] {target}: {key} = {value}（構成 {'・'.join(used)}。必要な値: {allowed[0]}）")
+        for label, used in wrong.items():
+            errors.append(f"[{reason}] {target}: {label}（構成 {'・'.join(used)}。必要な値: {allowed[0]}）")
 
 
 # 変数の展開の深さの上限（循環する参照で止まらないように）

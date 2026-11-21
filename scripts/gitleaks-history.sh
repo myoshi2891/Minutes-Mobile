@@ -10,8 +10,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、既定の 2 つも書く。
 # --diff-merges=separate でマージのコミットの差分を親ごとに検査する（マージの解決で足した行を見落とさない。-m は
 # 形式が設定 log.diffMerges に左右されるので使わない）。--root で最初のコミットの差分も検査する（設定 log.showRoot=false
-# でも省かない）。--no-textconv で .gitattributes の textconv を使わずに元の内容の差分を検査する（変換で鍵を隠させない）
-GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textconv"
+# でも省かない）。--no-textconv で .gitattributes の textconv を使わずに元の内容の差分を検査する（変換で鍵を隠させない）。
+# --text で .gitattributes の binary（-diff）の属性のファイルも本文の差分として出す（「Binary files differ」で鍵を隠させない）
+GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textconv --text"
 
 [ $# -ge 1 ] && [ -n "$1" ] || { echo "使い方: $0 <リポジトリ> [gitleaks の追加の引数…]" >&2; exit 2; }
 repository=$1
