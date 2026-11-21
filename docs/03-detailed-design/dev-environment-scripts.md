@@ -472,13 +472,32 @@ if [ "$STAGED" = 1 ]; then
 fi
 
 # ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
-# 設定（.swiftformat・各階層の .swiftlint.yml）もインデックスから同じ位置へ書き出し、入れ子の設定を作業ツリーと同じに解決させる
+# 設定（.swiftformat・各階層の .swiftlint.yml）もインデックスから同じ位置へ書き出し、入れ子の設定を作業ツリーと同じに解決させる。
+# 書き出すのはインデックスの blob そのもの（git cat-file blob。prepare_staged_secrets_tree と同じ）。checkout-index を通すと
+# .gitattributes の smudge のフィルタ・改行の変換が掛かり、整形・静的解析がステージした内容と違うものを検査しうる
 prepare_staged_tree() {
+  local entries entry mode object path
   STAGED_TREE=$(mktemp -d)
-  {
-    git ls-files -z -- ':(glob)**/.swiftformat' ':(glob)**/.swiftlint.yml' ':(glob)**/.swift-version'
-    printf '%s\0' "${STAGED_SWIFT[@]}"
-  } | git checkout-index -z --stdin --prefix="$STAGED_TREE/"
+  entries=$(mktemp)
+  # 一覧の取得の失敗を空の一覧として扱わない
+  if ! git ls-files -s -z -- ':(glob)**/.swiftformat' ':(glob)**/.swiftlint.yml' ':(glob)**/.swift-version' > "$entries" \
+    || ! git --literal-pathspecs ls-files -s -z -- "${STAGED_SWIFT[@]}" >> "$entries"; then
+    rm -f -- "$entries"
+    fail "ステージしたファイルの一覧を取得できない"
+  fi
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    [ "$mode" = 160000 ] && continue  # サブモジュールは blob がない
+    mkdir -p "$STAGED_TREE/$(dirname "$path")"
+    if ! git cat-file blob "$object" > "$STAGED_TREE/$path"; then
+      rm -f -- "$entries"
+      fail "ステージした ${path} の内容を読めない"
+    fi
+  done < "$entries"
+  rm -f -- "$entries"
 }
 
 # 規則の試験に使うもの（規則・試験用のファイル・試験のスクリプト）をインデックスから同じ一時ディレクトリへ書き出す。

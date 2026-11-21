@@ -212,7 +212,7 @@ gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwi
 
 | 手順 | `--staged` での動作 |
 | --- | --- |
-| 1・2 | ステージした Swift ファイルだけを見る（規則の試験用のファイルは除く）。**作業ツリーではなく、ステージした内容（インデックス）を検査する。** `git checkout-index --prefix` で、ステージした Swift ファイルと、インデックスにある設定（`.swiftformat`・各階層の `.swiftlint.yml`）を、元の相対位置のまま一時ディレクトリへ書き出し、そこを起点に実行する（入れ子の設定と、パスで指定した除外が作業ツリーと同じに解決される）。SwiftLint には `--force-exclude` を付け、明示したファイルにも除外の指定を効かせる。一時ディレクトリは終了時に消す |
+| 1・2 | ステージした Swift ファイルだけを見る（規則の試験用のファイルは除く）。**作業ツリーではなく、ステージした内容（インデックス）を検査する。** ステージした Swift ファイルと、インデックスにある設定（`.swiftformat`・各階層の `.swiftlint.yml`）の blob そのもの（`git cat-file blob`。手順 3 と同じく `checkout-index` を通さず、`.gitattributes` の smudge のフィルタ・改行の変換を掛けない）を、元の相対位置のまま一時ディレクトリへ書き出し、そこを起点に実行する（入れ子の設定と、パスで指定した除外が作業ツリーと同じに解決される。検査する内容はステージした内容とバイト単位で同じ）。SwiftLint には `--force-exclude` を付け、明示したファイルにも除外の指定を効かせる。一時ディレクトリは終了時に消す |
 | 2 | 規則・試験用のファイル・入れ子の設定・テストのディレクトリ（`MinutesMobileTests`・`MinutesMobileUITests`・`Packages/MinutesKit/Tests`。入れ子の設定の置き忘れを検査するため）をステージしたときだけ、規則の試験を回す。**規則の試験もステージした内容で行う。** 規則（各階層の `.swiftlint.yml`）・試験用のファイル（`tools/lint-fixtures/`）・試験のスクリプトをインデックスから同じ一時ディレクトリへ書き出し、その中のスクリプトを実行する（スクリプトは自身の位置をリポジトリ直下とみなす）。開発ツールは作業ツリーの `.tools` へのリンクで使い、入れ子の設定の列挙（`git ls-files`）は `GIT_DIR` と `GIT_WORK_TREE` でインデックスに対して行う |
 | 3 | ステージした（追加・変更・名前の変更・種類の変更をした）ファイルの blob を `git cat-file blob` で加工せずに一時ディレクトリへ書き出し、`gitleaks dir` で検査する（ファイルの全体を見る）。8.30.1 の `gitleaks git --pre-commit --staged` は `git diff` を使い、`--log-opts` が効かないので、`.gitattributes` の `binary`・textconv で鍵の行を隠せるため使わない（8.30.1 で確かめた）。`.gitleaksignore` をステージしていれば検査せずに失敗する。一時ディレクトリは終了時に消す |
 | 10 | **文書の整合もステージした内容で検査する。** `git checkout-index -a --prefix` でインデックス全体を一時ディレクトリへ書き出し、その中の `scripts/verify-docs.py` を `--root` にその一時ディレクトリを指定して実行する。文書・コード片の元の実装・検査スクリプトがすべてインデックスの内容になるので、文書と実装の両方をステージした一致する変更は通り、片方だけをステージした変更はコード片の不一致で止まる。検査スクリプトの自己試験（`test-checks.py docs`）は通常の実行だけで回す |
@@ -322,23 +322,53 @@ registered=$(git -C "$source_root" worktree list --porcelain) || {
   echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
   exit 1
 }
-roots=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' \
-  | /usr/bin/python3 -c 'import os, sys; [print(os.path.realpath(line.rstrip("\n"))) for line in sys.stdin if line.strip()]') || {
-  echo "NG: 作業ツリーの実体のパスを解決できない" >&2
-  exit 1
-}
-while IFS= read -r root; do
-  [ -n "$root" ] || continue
-  case "$base/" in
-    "$root/"*)
-      echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${root}）の中にある。どの作業ツリーの外も指定する" >&2
-      exit 1
-      ;;
-  esac
-done <<ROOTS
-$source_root
-$roots
-ROOTS
+# 比べるのはパスの文字列ではなく、ファイルシステム上の同一性（デバイスと inode）。置き場所の既存の祖先（自身を含む）の
+# どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら拒否する（大文字小文字を区別しないボリュームで
+# 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）。
+# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。終了コード: 0 = 外 / 1 = 中 / 2 = 判定できない
+inside_status=0
+inside=$(printf '%s\n' "$registered" | sed -n 's/^worktree //p' | /usr/bin/python3 -c '
+import os, sys
+base, source = sys.argv[1], sys.argv[2]
+
+def identity(path):
+    # デバイスと inode。ないパスは None。それ以外の失敗（権限など）は判定できないとして終了コード 2
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        print(f"{path}: {error}", file=sys.stderr)
+        sys.exit(2)
+    return (info.st_dev, info.st_ino)
+
+roots = {}
+for path in [source] + [line.rstrip("\n") for line in sys.stdin if line.strip()]:
+    found = identity(path)
+    if found is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
+        roots[found] = path
+current = base
+while True:
+    info = identity(current)  # None はまだない部分（作る予定の場所）
+    if info is not None and info in roots:
+        print(roots[info])
+        sys.exit(1)
+    parent = os.path.dirname(current)
+    if parent == current:
+        break
+    current = parent
+' "$base" "$source_root") || inside_status=$?
+case $inside_status in
+  0) ;;
+  1)
+    echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${inside}）の中にある。どの作業ツリーの外も指定する" >&2
+    exit 1
+    ;;
+  *)
+    echo "NG: 専用の作業ツリーの置き場所が作業ツリーの中かを判定できない（${base}）" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$base"
 key=$(printf '%s' "$common_dir" | shasum -a 256)
 snapshot="$base/${key%% *}"
@@ -502,7 +532,7 @@ fi
 ```
 
 - プッシュ前のフックは、削除の送信（ローカルの SHA がすべて 0）を照合の対象から外す。削除だけの送信は検査するコミットがないので、`check.sh` を起動せずに終了コード 0 で終える。削除と通常の更新が混ざる場合は、通常の更新だけを HEAD と照合し、従来どおり `check.sh` を実行する。
-- プッシュ前のフックは、送信するコミットをチェックアウトした**専用の作業ツリー**（`git worktree add --detach`）で `check.sh` を実行し、すべての手順が同じスナップショットを読むようにする（元の作業ツリーで検査中にブランチを切り替えて戻しても、検査の対象が変わらない。`--expect-head` の照合だけでは、開始と終了の HEAD が同じなら途中の切り替えを検出できない）。専用の作業ツリーはリポジトリの外（`<ホーム>/Library/Caches/MinutesMobile/pre-push/<git の共通ディレクトリのパスの SHA-256>`。環境変数 `MINUTES_PRE_PUSH_DIR` で変えられる）に置き、次の push で再利用する（`checkout --detach --force` と `clean -fdx -e /.tools -e /.build -e /Packages/MinutesKit/.build` で送信するコミットに合わせる。無視するファイル（`docs/` の下書き・`docs/.build` など）も消して文書の整合の検査に読ませず、`.tools`（push のたびに写し直す）と、`check.sh` が使う直下と Package の `.build` だけを残す。残した直下の `.build` に、中断した前回の検査のカバレッジのロック（`.build/minutes-coverage.lock`。強制終了では `check.sh` の後始末が動かない）が残っていれば、作業ツリーのロックを取った後に持ち主のいない残骸として消す（この作業ツリーで検査するのは作業ツリーのロックを持つ実行だけなので、ほかの実行のロックを消すことはない。ビルドの成果物は消さない）。作業ツリーの一覧（`git worktree list`）を取得できなければ、作業ツリーを消さずに失敗する）。置き場所は作る前に実体のパスへ解決し、元のリポジトリと登録されたすべての作業ツリー（`git worktree list` の各作業ツリーの実体のパス）の中（リンクを経由する場合を含む）なら作らずに失敗する（一覧を取得できなければ比べずに認めることはせず失敗する。どの作業ツリーの外でもない場所は認める）。リポジトリの中（`.git` の下など）に置くと、SwiftFormat が親のディレクトリの `.swiftformat` も読み、元の作業ツリーの設定が混ざるため置かない（複製したリポジトリで確かめた）。開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、導入のロック（`setup-tools.sh` と同じ `.install.lock`）を取ってから専用の作業ツリーの `.tools` に写し（APFS では `cp -c` の clone、対応しなければ通常の複写。ロックと導入の途中の作業場所は写さない）、ロックを外す。bin のリンクは相対パスなので写しの中を指し、手順 0 の照合と後の手順はすべてこの写しを使う（検査の途中に別の `setup.sh` が元の `.tools` の bin のリンクや版のディレクトリを差し替えても、照合した導入と使う導入が食い違わない）。ロックが取れなければ待ち（上限 600 秒）、待ち始めたことを表示する。作れなかった直後にロックが外れていた場合は、待たずに 1 回だけ取り直し、それでも作れずロックもなければ止める（`setup-tools.sh` と同じ扱い）。同時の push はロック（`<作業ツリー>.lock` のディレクトリ）で止める。終了の trap は入口で終了の状態を控え、ロックの解放の後にその状態で明示的に終了する（後始末のコマンドの状態で検査の失敗を上書きしない）。登録が残ったままディレクトリを消された場合は `worktree add --force` で作り直す（`git worktree prune` はほかの作業ツリーの登録も外すので使わない）。フックが設定する `GIT_DIR` などの変数は外してから専用の作業ツリーを操作する。送信するコミットが HEAD と同じで、元の作業ツリーに未コミットの変更がないことは、従来どおり求める。
+- プッシュ前のフックは、送信するコミットをチェックアウトした**専用の作業ツリー**（`git worktree add --detach`）で `check.sh` を実行し、すべての手順が同じスナップショットを読むようにする（元の作業ツリーで検査中にブランチを切り替えて戻しても、検査の対象が変わらない。`--expect-head` の照合だけでは、開始と終了の HEAD が同じなら途中の切り替えを検出できない）。専用の作業ツリーはリポジトリの外（`<ホーム>/Library/Caches/MinutesMobile/pre-push/<git の共通ディレクトリのパスの SHA-256>`。環境変数 `MINUTES_PRE_PUSH_DIR` で変えられる）に置き、次の push で再利用する（`checkout --detach --force` と `clean -fdx -e /.tools -e /.build -e /Packages/MinutesKit/.build` で送信するコミットに合わせる。無視するファイル（`docs/` の下書き・`docs/.build` など）も消して文書の整合の検査に読ませず、`.tools`（push のたびに写し直す）と、`check.sh` が使う直下と Package の `.build` だけを残す。残した直下の `.build` に、中断した前回の検査のカバレッジのロック（`.build/minutes-coverage.lock`。強制終了では `check.sh` の後始末が動かない）が残っていれば、作業ツリーのロックを取った後に持ち主のいない残骸として消す（この作業ツリーで検査するのは作業ツリーのロックを持つ実行だけなので、ほかの実行のロックを消すことはない。ビルドの成果物は消さない）。作業ツリーの一覧（`git worktree list`）を取得できなければ、作業ツリーを消さずに失敗する）。置き場所は作る前に実体のパスへ解決し、元のリポジトリと登録されたすべての作業ツリー（`git worktree list`）の中（リンクを経由する場合を含む）なら作らずに失敗する。中かどうかはパスの文字列ではなく、置き場所の既存の祖先（自身を含む）のどれかが作業ツリーとファイルシステム上で同じディレクトリ（デバイスと inode が一致）かで判定する（大文字小文字を区別しないボリュームの綴りの違いを見逃さず、区別するボリュームの別のディレクトリは別物として認める。判定できなければ失敗する。一覧を取得できなければ比べずに認めることはせず失敗する。どの作業ツリーの中でもない場所は認める）。リポジトリの中（`.git` の下など）に置くと、SwiftFormat が親のディレクトリの `.swiftformat` も読み、元の作業ツリーの設定が混ざるため置かない（複製したリポジトリで確かめた）。開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、導入のロック（`setup-tools.sh` と同じ `.install.lock`）を取ってから専用の作業ツリーの `.tools` に写し（APFS では `cp -c` の clone、対応しなければ通常の複写。ロックと導入の途中の作業場所は写さない）、ロックを外す。bin のリンクは相対パスなので写しの中を指し、手順 0 の照合と後の手順はすべてこの写しを使う（検査の途中に別の `setup.sh` が元の `.tools` の bin のリンクや版のディレクトリを差し替えても、照合した導入と使う導入が食い違わない）。ロックが取れなければ待ち（上限 600 秒）、待ち始めたことを表示する。作れなかった直後にロックが外れていた場合は、待たずに 1 回だけ取り直し、それでも作れずロックもなければ止める（`setup-tools.sh` と同じ扱い）。同時の push はロック（`<作業ツリー>.lock` のディレクトリ）で止める。終了の trap は入口で終了の状態を控え、ロックの解放の後にその状態で明示的に終了する（後始末のコマンドの状態で検査の失敗を上書きしない）。登録が残ったままディレクトリを消された場合は `worktree add --force` で作り直す（`git worktree prune` はほかの作業ツリーの登録も外すので使わない）。フックが設定する `GIT_DIR` などの変数は外してから専用の作業ツリーを操作する。送信するコミットが HEAD と同じで、元の作業ツリーに未コミットの変更がないことは、従来どおり求める。
 - **有効にする時期: 作業単位 2 の最後。** プッシュ前のフックは手順 0〜8 を回すので、プロジェクト設定とテストターゲットが揃う前に有効にすると、push できなくなる。作業単位 1 ではフックのファイルを置くだけにし、複製したリポジトリで動作を確かめた（§17）。
 - フックを飛ばす指定（`--no-verify`）は使わない。クラウドの CI がない間は、PR の説明に貼った検査結果（対象のコミットのハッシュ付き）が統合の条件になる（基本設計 §6.2）。
 - コミット前の検査の所要時間は、Swift ファイル 2 件の現状で約 1 秒である。遅くなると飛ばされるので、コードが増えたら測り直す（§17）。
@@ -766,10 +796,11 @@ custom_rules:
   # random・randomElement・shuffled・shuffle は、注入した生成器を渡す呼び出し（using: の引数）を認め、既定の生成器を使う
   # 呼び出しだけを検出する。引数の中の括弧は 2 段の入れ子まで読む（それより深い引数の using: は見落とさず検出する側に倒れる）
   # 引数の中のブロックコメントと行コメントは 1 つの単位として読み飛ばす（コメントの中の「(」「)」で括弧の対を取り違えて
-  # 後ろの using: を見落とさず、コメントの中の「using:」を引数と見なさない）
+  # 後ろの using: を見落とさず、コメントの中の「using:」を引数と見なさない）。文字列リテラル（1 行の "…"）も 1 つの単位として
+  # 読み飛ばす（文字列の中の「(」「)」で括弧の対を取り違えず、文字列の中の「using:」を引数と見なさない）
   no_direct_random:
     name: "乱数の直接の利用の禁止"
-    regex: '\.(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|[^()/]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|[^()/]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|[^()/]|/(?![/*]))*\))*\))*\busing\s*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
+    regex: '\.(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|"(?:[^"\\\n]|\\.)*"|[^()/"]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|"(?:[^"\\\n]|\\.)*"|[^()/"]|/(?![/*])|\((?:/\*(?:[^*]|\*(?!/))*\*/|//[^\n]*+|"(?:[^"\\\n]|\\.)*"|[^()/"]|/(?![/*]))*\))*\))*\busing\s*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
