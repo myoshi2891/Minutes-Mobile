@@ -1165,10 +1165,11 @@ def require_clean_case() -> None:
         out = Path(directory) / "recorded"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        # 手順 10 の代わり: 実行した場所と marker.txt の内容を記録し、続けて元の作業ツリーの marker.txt を書き換えて戻す
+        # 手順 10 の代わり: 先に元の作業ツリーの marker.txt を書き換え、その後で実行した場所と marker.txt の内容を記録する
+        # （読む前に元の作業ツリーを変えても、専用の作業ツリーの内容が開始時のコミットのままであることを確かめる）
         (repository / "scripts" / "verify-docs.py").write_text(
-            '#!/bin/sh\n{ pwd -P; cat marker.txt; } > "$MINUTES_TEST_OUT"\n'
-            'printf changed > "$MINUTES_TEST_ORIGINAL/marker.txt"\n', encoding="utf-8")
+            '#!/bin/sh\nprintf changed > "$MINUTES_TEST_ORIGINAL/marker.txt"\n'
+            '{ pwd -P; cat marker.txt; } > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
         for name in ("check.sh", "test-checks.py", "verify-docs.py"):
             (repository / "scripts" / name).chmod(0o755)
         (repository / ".gitignore").write_text((ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
@@ -1308,18 +1309,52 @@ def verify_lock_case(setup: str, versions: Path, dest: Path) -> None:
     import time
     lock = dest / ".install.lock"
     lock.mkdir()
+    import queue
+    import threading
     process = subprocess.Popen([setup, "--verify", "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
                                cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def reader() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    collected: List[str] = []
     try:
-        time.sleep(3)
-        waiting = process.poll() is None
+        # 照合がロックの取得を試みて競合を観測したこと（待機の表示）を、時間の上限つきで待つ。まだ終わっていないこと
+        # （poll() が None）だけでは、ロックを試す前の段階にいるのかを区別できないので、競合の根拠にしない
+        waiting = False
+        deadline = time.monotonic() + 15
+        while not waiting and time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            collected.append(line)
+            waiting = "待機:" in line
+        waiting = waiting and process.poll() is None
         lock.rmdir()
-        output, _ = process.communicate(timeout=30)
+        process.wait(timeout=30)
+        thread.join(timeout=30)
+        while True:
+            try:
+                line = lines.get_nowait()
+            except queue.Empty:
+                break
+            if line is not None:
+                collected.append(line)
+        output = "".join(collected)
         # 後始末（finally）の前に、照合の終了時点でロックが残っていないことを控える（後始末で消えた残骸を見逃さない）
         leftover = lock.exists()
     except subprocess.TimeoutExpired:
         process.kill()
-        process.communicate()
+        process.wait()  # 出力は読み取りのスレッドが読むので communicate() は使わない
         failures.append("versions: ロックが外れた後も照合が終わらない")
         return
     finally:
@@ -1643,9 +1678,20 @@ def gitleaks_suppression_cases() -> None:
     def git(repository: Path, *arguments: str) -> None:
         subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
 
-    def fingerprints(command: List[str], cwd: Path, report: Path) -> List[str]:
-        subprocess.run(command + ["--report-format", "json", "--report-path", str(report)], cwd=cwd, env=env, capture_output=True)
-        return [str(item.get("Fingerprint", "")) for item in json.loads(report.read_text(encoding="utf-8"))]
+    def fingerprints(command: List[str], cwd: Path, report: Path, label: str) -> List[str]:
+        """抑止する前の実行で、検出（終了コード 1）と空でない指紋を得る。得られなければ試験にならないので失敗として記録する
+        （空の一覧や成功の実行を、抑止を試す根拠にしない）。"""
+        result = subprocess.run(command + ["--report-format", "json", "--report-path", str(report)], cwd=cwd, env=env,
+                                capture_output=True, text=True)
+        try:
+            found = [str(item.get("Fingerprint", "")) for item in json.loads(report.read_text(encoding="utf-8"))]
+        except (OSError, json.JSONDecodeError, AttributeError) as error:
+            found = []
+            failures.append(f"gitleaks: 抑止の前の実行（{label}）の報告を読めない: {error!r}")
+        if result.returncode != 1 or not found or not all(found):
+            failures.append(f"gitleaks: 抑止の前の実行（{label}）が鍵を検出しない（終了コード {result.returncode}・指紋 {found}）。"
+                            "抑止の試験にならない")
+        return found
 
     for label, content, ignore in (("作業ツリーの .gitleaksignore", f'token = "{key}"\n', True),
                                    ("gitleaks:allow のコメント", f'token = "{key}"  # gitleaks:allow\n', False)):
@@ -1660,7 +1706,7 @@ def gitleaks_suppression_cases() -> None:
             git(repository, "commit", "-q", "-m", "config")
             direct = [gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config", config, str(repository)]
             if ignore:
-                found = fingerprints(direct, repository, Path(directory) / "report.json")
+                found = fingerprints(direct, repository, Path(directory) / "report.json", f"{label}・全履歴")
                 (repository / ".gitleaksignore").write_text("\n".join(found) + "\n", encoding="utf-8")
             control = subprocess.run(direct, cwd=repository, env=env, capture_output=True, text=True)
             if control.returncode != 0:
@@ -1688,7 +1734,7 @@ def gitleaks_suppression_cases() -> None:
             git(repository, "add", "config.txt")
             direct = [gitleaks, "git", "--no-banner", "--no-color", "--redact", "--config", config, "--pre-commit", "--staged", "."]
             if ignore:
-                found = fingerprints(direct, repository, Path(directory) / "report.json")
+                found = fingerprints(direct, repository, Path(directory) / "report.json", f"{label}・ステージ")
                 (repository / ".gitleaksignore").write_text("\n".join(found) + "\n", encoding="utf-8")
             control = subprocess.run(direct, cwd=repository, env=env, capture_output=True, text=True)
             if control.returncode != 0:

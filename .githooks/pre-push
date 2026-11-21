@@ -68,7 +68,8 @@ if ! mkdir "$lock" 2>/dev/null; then
   echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
   exit 1
 fi
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
+trap 'if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null || true; fi; rmdir "$lock" 2>/dev/null || true' EXIT
 trap 'exit 130' INT TERM
 
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
@@ -80,7 +81,7 @@ worktrees=$(git -C "$source_root" worktree list --porcelain) || {
 if printf '%s\n' "$worktrees" | grep -Fqx "worktree $snapshot" && [ -d "$snapshot" ]; then
   git -C "$snapshot" checkout -q --detach --force "$head"
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
-  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールへのリンク（/.tools）と、
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールの写し（/.tools。下で作り直す）と、
   # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
   # ほかの階層の .build（docs/.build など）は消す
   git -C "$snapshot" clean -q -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
@@ -89,20 +90,41 @@ else
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
 fi
-# 開発ツールは Git の管理外なので、元の作業ツリーの .tools を指す（.gitignore の /.tools で無視される）。
-# 既存のリンクの先が現在の元の作業ツリーと違う場合（リンク切れを含む）は張り直す。ロックを持ったまま行う
-tools_link="$snapshot/.tools"
-if [ -L "$tools_link" ]; then
-  if [ "$(readlink "$tools_link")" != "$source_root/.tools" ]; then
-    rm -f -- "$tools_link"
-    ln -s "$source_root/.tools" "$tools_link"
-  fi
-elif [ -e "$tools_link" ]; then
-  echo "NG: 専用の作業ツリーの .tools がシンボリックリンクでない（${tools_link}）。削除してから push し直す" >&2
+# 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
+# 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
+# そこで、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから元の .tools を専用の作業ツリーへ写し、ロックを外す。
+# 写しは APFS では複製の領域を使わない clone（cp -c）、対応しないファイルシステムでは通常の複写で作る。bin のリンクは
+# 相対パスなので写しの中を指す。以後の手順（手順 0 の照合を含む）はすべてこの写しを使い、元の .tools の変更の影響を受けない
+tools_source="$source_root/.tools"
+tools_copy="$snapshot/.tools"
+if [ ! -d "$tools_source" ]; then
+  echo "NG: 開発ツールが導入されていない（${tools_source}）。scripts/setup-tools.sh を実行してから push し直す" >&2
   exit 1
-else
-  ln -s "$source_root/.tools" "$tools_link"
 fi
+waited=0
+until mkdir "$tools_source/.install.lock" 2>/dev/null; do
+  if [ ! -d "$tools_source/.install.lock" ] || [ "$waited" -ge 600 ]; then
+    echo "NG: 開発ツールの導入のロック（${tools_source}/.install.lock）を取れない。導入の実行中でなければ削除してから push し直す" >&2
+    exit 1
+  fi
+  if [ "$waited" -eq 0 ]; then echo "待機: 開発ツールの導入・照合が実行中。終わるのを待つ" >&2; fi
+  sleep 1
+  waited=$((waited + 1))
+done
+tools_lock="$tools_source/.install.lock"
+rm -rf -- "$tools_copy"
+mkdir "$tools_copy"
+for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
+  if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi  # 一致するものがないときの glob の文字列
+  case "${entry##*/}" in .install.lock | .work.*) continue ;; esac  # ロックと導入の途中の作業場所は写さない
+  # -P: シンボリックリンクはたどらずにリンクとして写す
+  if ! cp -c -R -P -- "$entry" "$tools_copy/" 2>/dev/null; then
+    rm -rf -- "${tools_copy:?}/${entry##*/}"
+    cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
+  fi
+done
+rmdir "$tools_lock"
+tools_lock=""
 
-# 専用の作業ツリーは送信するコミットに合わせてあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
+# 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
 MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

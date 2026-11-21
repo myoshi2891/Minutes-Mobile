@@ -85,6 +85,18 @@ def read_fixture(path: Path) -> str:
         sys.exit(2)
 
 
+def read_config(path: Path) -> bytes:
+    """設定（直下と入れ子の .swiftlint.yml）を読む。読めない・UTF-8 として読めない設定は、検出行の不一致（終了コード 1）と
+    区別して、実行できないとして止める（read_fixture と同じ扱い）。"""
+    try:
+        data = path.read_bytes()
+        data.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        print(f"NG: 設定 {path} を読めない: {error}", file=sys.stderr)
+        sys.exit(2)
+    return data
+
+
 def expected_lines(path: Path, rule: str, errors: List[str]) -> Set[int]:
     lines: Set[int] = set()
     text = read_fixture(path)
@@ -174,9 +186,9 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
     if not nested.is_file() or not sample.is_file():
         errors.append(f"{TEST_CODE_FIXTURE}/ に .swiftlint.yml と Sample.swift がない")
         return []
-    template = nested.read_bytes()
+    template = read_config(nested)
     # 入れ子の設定が外してよいのは組み込みの 3 規則だけ（独自の規則などを外す抜け道にさせない）
-    for rule in disabled_rules(template.decode("utf-8", errors="replace"), errors):
+    for rule in disabled_rules(template.decode("utf-8"), errors):
         if rule not in BUILTIN_RULES:
             errors.append(f"{TEST_CODE_FIXTURE}/.swiftlint.yml が組み込みの 3 規則以外の規則 {rule} を外している")
     # 実際のテストのディレクトリには、試験した設定と同じ内容だけを置ける
@@ -184,7 +196,7 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
         real = ROOT / name / ".swiftlint.yml"
         if (ROOT / name).is_dir() and not real.is_file():
             errors.append(f"{name}/.swiftlint.yml がない（{TEST_CODE_FIXTURE}/.swiftlint.yml と同じ内容で置く）")
-        elif real.is_file() and real.read_bytes() != template:
+        elif real.is_file() and read_config(real) != template:
             errors.append(f"{name}/.swiftlint.yml が {TEST_CODE_FIXTURE}/.swiftlint.yml と一致しない")
     # それ以外の場所に入れ子の設定を置かせない（規則を外す抜け道になる）
     allowed = {ROOT / name / ".swiftlint.yml" for name in TEST_CODE_DIRS} | {CONFIG, nested}
@@ -322,7 +334,7 @@ def main() -> int:
         print("NG: .swiftlint.yml がない", file=sys.stderr)
         return 1
     errors: List[str] = []
-    rules = custom_rules(CONFIG.read_text(encoding="utf-8"), errors)
+    rules = custom_rules(read_config(CONFIG).decode("utf-8"), errors)
     if not rules:
         errors.append(".swiftlint.yml に custom_rules が 1 つもない")
     for rule in BUILTIN_RULES:
