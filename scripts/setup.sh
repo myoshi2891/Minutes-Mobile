@@ -24,6 +24,10 @@ fi
 
 "$ROOT/scripts/setup-tools.sh"
 if [ "$HOOKS" = 1 ]; then
+  # 外から引き継いだリポジトリの選択の変数（GIT_DIR・GIT_WORK_TREE など）を外し、git には ROOT からリポジトリを探させる
+  # （変数が別のリポジトリを指していても、その設定を書き換えない）。設定の書き込みは --local に限る
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR \
+    GIT_NAMESPACE GIT_PREFIX GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
   # フックのファイルが揃っていて実行できることを、設定を書く前に確かめる（ないフックを指す設定で有効にしたと表示しない）
   for hook in .githooks/pre-commit .githooks/pre-push; do
     if [ ! -f "$hook" ] || [ ! -x "$hook" ]; then
@@ -36,7 +40,7 @@ if [ "$HOOKS" = 1 ]; then
   # git が選ぶ作業ツリー（GIT_DIR・GIT_WORK_TREE などの変数で別のリポジトリを指しうる）が、このスクリプトのある
   # リポジトリ（ROOT）であること。通常のクローンとリンクした作業ツリーの両方で、リンクを解決した作業ツリーのパスで比べる
   # （.git の配置を仮定しない）。違えば設定を変えない
-  toplevel=$(env -u GIT_CONFIG git rev-parse --show-toplevel) || { echo "NG: git の作業ツリーを特定できない。フックを有効にしない" >&2; exit 1; }
+  toplevel=$(env -u GIT_CONFIG git -C "$ROOT" rev-parse --show-toplevel) || { echo "NG: git の作業ツリーを特定できない。フックを有効にしない" >&2; exit 1; }
   selected=$(cd -P "$toplevel" 2>/dev/null && pwd) || { echo "NG: 作業ツリー ${toplevel} を解決できない。フックを有効にしない" >&2; exit 1; }
   expected=$(cd -P "$ROOT" && pwd)
   if [ "$selected" != "$expected" ]; then
@@ -45,7 +49,7 @@ if [ "$HOOKS" = 1 ]; then
   fi
   # 共有の設定（--local）より優先される設定（作業ツリーの設定・-c・GIT_CONFIG_* の環境変数）が別の値を指していれば、
   # 共有の値を書いても有効にならない。共有の値を変える前に止める
-  current=$(env -u GIT_CONFIG git config --show-scope --get core.hooksPath || true)
+  current=$(env -u GIT_CONFIG git -C "$ROOT" config --show-scope --get core.hooksPath || true)
   case "${current%%$'\t'*}" in
     worktree | command)
       if [ "${current#*$'\t'}" != .githooks ]; then
@@ -58,8 +62,8 @@ if [ "$HOOKS" = 1 ]; then
   # 共有の設定のファイルが取り込む設定（include.path と、今の作業ツリーで条件の当たる includeIf.*.path。onbranch を含む）の
   # core.hooksPath は、取り込みの位置で読まれるので、書き込む値より後に読まれて上書きしうる。取り込みからだけ得られる値
   # （取り込みを読んだ一覧から、共有のファイル自身の値を除いたもの）に .githooks 以外があれば、共有の値を書かずに止める
-  with_includes=$(env -u GIT_CONFIG git config --local --includes --get-all core.hooksPath || true)
-  own=$(env -u GIT_CONFIG git config --local --no-includes --get-all core.hooksPath || true)
+  with_includes=$(env -u GIT_CONFIG git -C "$ROOT" config --local --includes --get-all core.hooksPath || true)
+  own=$(env -u GIT_CONFIG git -C "$ROOT" config --local --no-includes --get-all core.hooksPath || true)
   included=$(comm -23 <(printf '%s\n' "$with_includes" | LC_ALL=C sort) <(printf '%s\n' "$own" | LC_ALL=C sort))
   while IFS= read -r value; do
     if [ -n "$value" ] && [ "$value" != .githooks ]; then
@@ -68,10 +72,10 @@ if [ "$HOOKS" = 1 ]; then
       exit 1
     fi
   done <<< "$included"
-  env -u GIT_CONFIG git config --local core.hooksPath .githooks
+  env -u GIT_CONFIG git -C "$ROOT" config --local core.hooksPath .githooks
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる
-  effective=$(env -u GIT_CONFIG git config --get core.hooksPath || true)
+  effective=$(env -u GIT_CONFIG git -C "$ROOT" config --get core.hooksPath || true)
   if [ "$effective" != .githooks ]; then
     echo "NG: core.hooksPath を .githooks に設定したが、実際に効く値は「${effective}」。" \
       "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2

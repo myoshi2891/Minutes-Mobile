@@ -46,99 +46,17 @@ fi
 source_root=$(cd -P "$(git rev-parse --show-toplevel)" && pwd)  # 実体のパス（シンボリックリンクを解決したもの）
 common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
 base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
-# 置き場所を作る前に実体のパスへ解決する（まだない部分を含んでよい。git worktree list が示す実体のパスとも比べる）。
-# 元のリポジトリと、登録されたすべての作業ツリーの中（リンクを経由して指す場合を含む）は拒否する。中に置くと、
-# SwiftFormat などが親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る
-# （中にディレクトリを残さない）。どの作業ツリーの中でもない場所は認める
-base=$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$base") || {
-  echo "NG: 専用の作業ツリーの置き場所を解決できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
-  exit 1
-}
-# SwiftFormat は検査するディレクトリの親のディレクトリの設定（.swiftformat・.swift-version）も読み、読む範囲を
-# 止める指定を持たない。置き場所（自身を含む）か、その祖先のどれかに設定があれば、専用の作業ツリーの検査に
-# リポジトリの外の設定が混ざるので認めずに止める（専用の作業ツリーの中の設定は、リポジトリの設定としてそのまま読む）
-ancestor=$base
-while :; do
-  for name in .swiftformat .swift-version; do
-    if [ -e "$ancestor/$name" ] || [ -L "$ancestor/$name" ]; then
-      echo "NG: 専用の作業ツリーの置き場所（${base}）の上に SwiftFormat の設定（${ancestor}/${name}）がある。設定のない場所を指定する" >&2
-      exit 1
-    fi
-  done
-  if [ "$ancestor" = / ]; then break; fi
-  ancestor=$(dirname "$ancestor")
-done
-# 作業ツリーの一覧（git worktree list --porcelain -z）を読む Python の関数。2 つの判定で共用する。
-# 一覧は NUL で区切った項目の並びで、記録（作業ツリー 1 つ）は空の項目で終わり、先頭の項目が「worktree <パス>」。
-# 改行を含むパスも 1 つのパスとして読む。git が失敗した・形が違う場合は、比べずに認めることはせず終了コード 2
-worktrees_py='
-import os, subprocess, sys
-
-def registered_worktrees(source):
-    listed = subprocess.run(["git", "-C", source, "worktree", "list", "--porcelain", "-z"], stdout=subprocess.PIPE)
-    if listed.returncode != 0:
-        print(f"git worktree list が失敗した（終了コード {listed.returncode}）", file=sys.stderr)
-        sys.exit(2)
-    paths, first = [], True
-    fields = listed.stdout.split(b"\0")
-    if fields[-1] != b"":
-        print("git worktree list の出力が NUL で終わらない", file=sys.stderr)
-        sys.exit(2)
-    for field in fields[:-1]:
-        if not field:
-            first = True
-            continue
-        if first:
-            if not field.startswith(b"worktree "):
-                print("git worktree list の記録が worktree の項目で始まらない", file=sys.stderr)
-                sys.exit(2)
-            paths.append(field[len(b"worktree "):])
-            first = False
-    return paths
-'
-# 比べるのはパスの文字列ではなく、ファイルシステム上の同一性（デバイスと inode）。置き場所の既存の祖先（自身を含む）の
-# どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら拒否する（大文字小文字を区別しないボリュームで
-# 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）。
-# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。終了コード: 0 = 外 / 1 = 中 / 2 = 判定できない
-inside_status=0
-inside=$(/usr/bin/python3 -c "${worktrees_py}"'
-base, source = sys.argv[1], sys.argv[2]
-
-def identity(path):
-    # デバイスと inode。ないパスは None。それ以外の失敗（権限など）は判定できないとして終了コード 2
-    try:
-        info = os.stat(path)
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        print(f"{path}: {error}", file=sys.stderr)
-        sys.exit(2)
-    return (info.st_dev, info.st_ino)
-
-roots = {}
-for path in [source] + [os.fsdecode(listed) for listed in registered_worktrees(source)]:
-    found = identity(path)
-    if found is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
-        roots[found] = path
-current = base
-while True:
-    info = identity(current)  # None はまだない部分（作る予定の場所）
-    if info is not None and info in roots:
-        print(roots[info])
-        sys.exit(1)
-    parent = os.path.dirname(current)
-    if parent == current:
-        break
-    current = parent
-' "$base" "$source_root") || inside_status=$?
-case $inside_status in
-  0) ;;
-  1)
-    echo "NG: 専用の作業ツリーの置き場所（${base}）が作業ツリー（${inside}）の中にある。どの作業ツリーの外も指定する" >&2
-    exit 1
-    ;;
+# 置き場所の判定（実体のパスへの解決・SwiftFormat の設定のある祖先の拒否・元のリポジトリと登録されたすべての作業ツリーの
+# 中の拒否）は scripts/worktree-location.py が行う（check.sh --require-clean と共用する）。中に置くと、SwiftFormat などが
+# 親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る（中にディレクトリを残さない）。
+# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める
+location_status=0
+resolved_base=$(/usr/bin/python3 "$source_root/scripts/worktree-location.py" check "$base" "$source_root") || location_status=$?
+case $location_status in
+  0) base=$resolved_base ;;
+  1) exit 1 ;;  # 理由は worktree-location.py が標準エラーに書いた
   *)
-    echo "NG: 専用の作業ツリーの置き場所が作業ツリーの中かを判定できない（${base}）" >&2
+    echo "NG: 専用の作業ツリーの置き場所を判定できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
     exit 1
     ;;
 esac
@@ -163,10 +81,7 @@ trap 'exit 130' INT TERM
 # 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）。
 # 照合は記録の worktree の項目（パスの全体）との完全な一致。終了コード: 0 = 登録あり / 1 = 登録なし / 2 = 取得できない
 registration=0
-/usr/bin/python3 -c "${worktrees_py}"'
-source, snapshot = sys.argv[1], os.fsencode(sys.argv[2])
-sys.exit(0 if snapshot in registered_worktrees(source) else 1)
-' "$source_root" "$snapshot" || registration=$?
+/usr/bin/python3 "$source_root/scripts/worktree-location.py" registered "$source_root" "$snapshot" || registration=$?
 case $registration in
   0 | 1) ;;
   *)
@@ -174,15 +89,25 @@ case $registration in
     exit 1
     ;;
 esac
+# このフックが作った印。作業ツリーの専用の管理ディレクトリ（<共通のディレクトリ>/worktrees/<名前>。作業ツリーの中ではないので
+# checkout・clean で消えない）に、このフックの名前と作業ツリーの実体のパスを書く。置き場所と共通のディレクトリが合うだけでは、
+# このフックが作った作業ツリーであることの証拠にならない（利用者が同じ場所に git worktree add した作業ツリーなど）
+owner_mark="minutes-pre-push-owner"
+owner_text="MinutesMobile pre-push ${snapshot}"
 # 再利用するのは、登録があり、ディレクトリの git が専用の作業ツリーそのもの（作業ツリーの起点がこの場所で、
-# 共通のディレクトリが元のリポジトリのもの）を指す場合だけ。.git のファイルを失ったなどで別のリポジトリや
-# 親のディレクトリを指す場合に、そちらを checkout・clean しない（その場合は下で作り直す）
+# 共通のディレクトリが元のリポジトリのもの）を指し、専用の管理ディレクトリにこのフックの印がある場合だけ。
+# .git のファイルを失ったなどで別のリポジトリや親のディレクトリを指す場合・印がない場合に、そちらを checkout・clean しない
+# （その場合は下で止める）
 owned=0
 if [ "$registration" -eq 0 ] && [ -d "$snapshot" ]; then
   top=$(git -C "$snapshot" rev-parse --show-toplevel 2>/dev/null) && top=$(cd -P "$top" && pwd) \
     && common=$(git -C "$snapshot" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
     && common=$(cd -P "$common" && pwd) && source_common=$(cd -P "$common_dir" && pwd) \
-    && [ "$top" = "$snapshot" ] && [ "$common" = "$source_common" ] && owned=1
+    && [ "$top" = "$snapshot" ] && [ "$common" = "$source_common" ] \
+    && private=$(git -C "$snapshot" rev-parse --path-format=absolute --git-dir 2>/dev/null) \
+    && private=$(cd -P "$private" && pwd) && [ "$(dirname "$private")" = "$source_common/worktrees" ] \
+    && [ -f "$private/$owner_mark" ] && [ ! -L "$private/$owner_mark" ] \
+    && [ "$(cat "$private/$owner_mark")" = "$owner_text" ] && owned=1
 fi
 # 元の作業ツリーが sparse checkout なら、専用の作業ツリーもその指定を引き継ぎ（git worktree add が写す）、一部のファイル
 # しかない状態で検査することになる。専用の作業ツリーで sparse checkout を有効にしていれば、そこでだけ解除して全体を
@@ -264,14 +189,19 @@ if [ "$owned" -eq 1 ]; then
   fi
   rm -rf -- "$snapshot/.build/minutes-coverage.lock"
 else
-  # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すものなど）が置き場所に
-  # あれば、消さずに止める（中身が何かを確かめられないものを rm -rf しない）。ないとき（初回・登録だけが残った場合）だけ作る
+  # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すもの・このフックの印のない
+  # 作業ツリーなど）が置き場所にあれば、変更せずに止める（中身が何かを確かめられないものを checkout・clean・rm -rf しない）。
+  # ないとき（初回・登録だけが残った場合）だけ作る
   if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
-    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないものがある。中身を確かめて削除するか、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す" >&2
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないもの（このフックの印のない作業ツリーを含む）がある。中身を確かめて削除する（作業ツリーなら git worktree remove）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す" >&2
     exit 1
   fi
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" -c core.autocrlf=false worktree add -q --force --detach "$snapshot" "$head"
+  # 作った作業ツリーの専用の管理ディレクトリに、このフックの印を書く（次の検査で再利用してよいかの判定に使う）
+  private=$(git -C "$snapshot" rev-parse --path-format=absolute --git-dir) && private=$(cd -P "$private" && pwd) \
+    || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
+  printf '%s\n' "$owner_text" > "$private/$owner_mark"
   full_checkout
 fi
 # 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では

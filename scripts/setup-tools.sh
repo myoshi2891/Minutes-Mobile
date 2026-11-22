@@ -245,7 +245,17 @@ fi
 ARCH=$(uname -m)
 seen=" "      # 写しに現れたツール名
 matched=" "   # この Mac 向けの行が見つかったツール名
+# この Mac 向けの行（台帳の順）。導入・照合は、台帳の全体の検証を終えてから行う
+ROWS_NAME=()
+ROWS_VERSION=()
+ROWS_TAG=()
+ROWS_REPO=()
+ROWS_ASSET=()
+ROWS_BINARY=()
+ROWS_SHA=()
 
+# 台帳の全体を先に検証する（列の形式・アーキテクチャ・重複・gh の行の順序・必須のツール）。途中の行が不正な台帳で、
+# 前の行のツールを導入したり公開するリンクを更新したりしない。
 # 末尾に改行のない最終行も読む（read は非ゼロを返すが、値は入っている）。空の最終行は name が空なので読まない
 while read -r name version arch repo tag asset binary sha extra || [ -n "${name:-}" ]; do
   case "$name" in '' | '#'*) continue ;; esac
@@ -266,16 +276,30 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
     case "$matched" in *" gh "*) ;; *) fail "tools/versions で、$ARCH 向けの gh の行が $name の行より前にない" ;; esac
   fi
   matched="$matched$name "
-  if [ "$MODE" = install ]; then
-    install_tool "$name" "$version" "$repo" "$tag" "$asset" "$binary" "$sha"
-  fi
-  verify_tool "$name" "$version" "$binary" "$sha"
+  ROWS_NAME+=("$name")
+  ROWS_VERSION+=("$version")
+  ROWS_REPO+=("$repo")
+  ROWS_TAG+=("$tag")
+  ROWS_ASSET+=("$asset")
+  ROWS_BINARY+=("$binary")
+  ROWS_SHA+=("$sha")
 done < "$VERSIONS"
 
 [ "$seen" != " " ] || fail "tools/versions にツールが 1 つもない"
 # 台帳に現れたツールと、検査が使う必須のツールの両方について、この Mac 向けの行が 1 つずつあること
-# （重複はループの中で失敗させている）
+# （重複は上の検証で失敗させている）
 for name in $seen $REQUIRED; do
   case "$matched" in *" $name "*) ;; *) fail "$name に $ARCH 向けの行がない" ;; esac
+done
+
+# 検証を終えた行だけを、台帳の順（gh が先）に導入・照合する。標準入力は使わない（取得のコマンドは </dev/null で実行する）
+index=0
+while [ "$index" -lt ${#ROWS_NAME[@]} ]; do
+  if [ "$MODE" = install ]; then
+    install_tool "${ROWS_NAME[$index]}" "${ROWS_VERSION[$index]}" "${ROWS_REPO[$index]}" "${ROWS_TAG[$index]}" \
+      "${ROWS_ASSET[$index]}" "${ROWS_BINARY[$index]}" "${ROWS_SHA[$index]}"
+  fi
+  verify_tool "${ROWS_NAME[$index]}" "${ROWS_VERSION[$index]}" "${ROWS_BINARY[$index]}" "${ROWS_SHA[$index]}"
+  index=$((index + 1))
 done
 echo "OK: 開発ツールの版は tools/versions と一致"

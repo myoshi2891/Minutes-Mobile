@@ -12,8 +12,9 @@ if ! git cat-file blob :tools/versions > "$versions"; then
   echo "NG: ステージした tools/versions を読めない" >&2
   exit 1
 fi
-# 導入し直す手順は、ステージした台帳を一時ファイルに書き出して --versions で渡す（作業ツリーの台帳とステージした内容は変えない）
-reinstall='versions=$(mktemp) && git cat-file blob :tools/versions > "$versions" && scripts/setup-tools.sh --versions "$versions"; rm -f -- "$versions"'
+# 導入し直す手順は、ステージした台帳を一時ファイルに書き出して --versions で渡す（作業ツリーの台帳とステージした内容は変えない）。
+# 一時ファイルを消した後も、導入（または書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）
+reinstall='(versions=$(mktemp) || exit 1; git cat-file blob :tools/versions > "$versions" && scripts/setup-tools.sh --versions "$versions"; status=$?; rm -f -- "$versions"; exit "$status")'
 if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
   echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。ステージした台帳で導入し直してからコミットする: ${reinstall}" >&2
   exit 1

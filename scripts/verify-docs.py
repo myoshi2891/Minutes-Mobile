@@ -338,6 +338,29 @@ def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tupl
     return found
 
 
+# HTML のコードブロック（<pre>…</pre>）の始まりと終わり。中の行は表示どおりのコードで、Markdown の表にならない
+HTML_PRE_OPEN = re.compile(r"^ {0,3}<pre(?:\s|>|$)", re.IGNORECASE)
+HTML_PRE_CLOSE = re.compile(r"</pre\s*>", re.IGNORECASE)
+
+
+def without_html_pre(body: List[str]) -> List[str]:
+    """HTML の <pre> ブロックの行（始まりと終わりの行を含む）を空行に置き換える。空行なので表の境界にもなる
+    （ブロックの前後の行を 1 つの表にしない）。ブロックの外の Markdown の表はそのまま残す。"""
+    result: List[str] = []
+    inside = False
+    for line in body:
+        if not inside and HTML_PRE_OPEN.match(line):
+            inside = HTML_PRE_CLOSE.search(line[line.lower().index("<pre") + 4:]) is None
+            result.append("")
+            continue
+        if inside:
+            inside = HTML_PRE_CLOSE.search(line) is None
+            result.append("")
+            continue
+        result.append(line)
+    return result
+
+
 def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
     """本文（節の行の並び）の中の表ごとに、見出しの列とデータ行を返す（find_tables と同じ判定）。"""
     # コードフェンスの代わりの行（FENCE_LINE）は空行と同じく表を終わらせる（「|」のない行をデータ行にしない）
@@ -429,11 +452,63 @@ class Checker:
         paths += [self.root / name for name in ("README.md", "CLAUDE.md") if (self.root / name).is_file()]
         for path in paths:
             relative = path.relative_to(self.root).as_posix()
+            # 解決の経路（リンクの各段とその置き場所）と最後の実体が、起点の中の追跡されうる場所にない文書は読まない
+            problem = self.document_problem(path)
+            if problem:
+                self.error(relative, f"文書を読まない: {problem}")
+                continue
             # 読めない文書は、その文書のパスで報告して読み飛ばし、ほかの文書の検査を続ける（検査の対象にも書き直しの対象にもしない）
             try:
                 self.texts[relative] = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as error:
                 self.error(relative, f"文書を読めない: {error}")
+
+    # 起点の中で、Git が追跡しない場所（管理領域と、プッシュ前のフックの専用の作業ツリーで消さずに残す開発ツール・
+    # ビルドの成果物）。専用の作業ツリーではこれら以外はすべて送信するコミットの追跡したファイルなので、文書の解決の
+    # 経路がこれらの外にあれば、追跡したものだけをたどったことになる
+    UNTRACKED_AREAS = ((".git",), (".tools",), (".build",), ("Packages", "MinutesKit", ".build"))
+    MAX_LINK_HOPS = 40
+
+    def outside_tracked(self, path: str) -> Optional[str]:
+        """path（絶対パス）が起点の外か、追跡しない場所の中なら理由を返す。"""
+        root = self.root.resolve()
+        candidate = Path(path)
+        if not candidate.is_relative_to(root):
+            return f"{path} が起点の外にある"
+        parts = candidate.relative_to(root).parts
+        for area in self.UNTRACKED_AREAS:
+            if parts[:len(area)] == area:
+                return f"{path} が追跡しない場所（{'/'.join(area)}）にある"
+        return None
+
+    def document_problem(self, path: Path) -> Optional[str]:
+        """文書を読む前に、解決の経路を確かめる。問題がなければ None。
+
+        シンボリックリンクは 1 段ずつたどり、各段のリンク先とその置き場所のディレクトリが、起点の中の追跡されうる場所
+        （outside_tracked）にあることを求める。置き場所のディレクトリの途中にシンボリックリンクがある経路は認めない
+        （どのリンクをたどったかを確かめられないため）。最後の実体は通常のファイルであること。
+        """
+        current = os.path.normpath(str(path))
+        for _ in range(self.MAX_LINK_HOPS):
+            directory = os.path.dirname(current)
+            reason = self.outside_tracked(current)
+            if reason:
+                return reason
+            if not os.path.isdir(directory):
+                return f"{directory} がディレクトリでない"
+            if os.path.realpath(directory) != directory:
+                return f"{directory} の途中にシンボリックリンクがある"
+            try:
+                info = os.lstat(current)
+            except OSError as error:
+                return f"{current} を調べられない: {error.strerror or error}"
+            if stat.S_ISLNK(info.st_mode):
+                current = os.path.normpath(os.path.join(directory, os.readlink(current)))
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                return f"{current} が通常のファイルでない"
+            return None
+        return f"{path} のシンボリックリンクが {self.MAX_LINK_HOPS} 段を超える（循環など）"
 
     def collect_definitions(self) -> None:
         """定義文書の表から ID を集める。要件表の「フェーズ」列が MVP の FR / NFR / SEC も集める。"""
@@ -704,7 +779,7 @@ class Checker:
         for number, heading, body in sections:
             if DETAILED_MAPPING not in heading:
                 continue
-            for header, rows in table_blocks(body):
+            for header, rows in table_blocks(without_html_pre(body)):
                 columns = [at for at, cell in enumerate(header)
                            if at > 0 and any(word in cell for word in TEST_COLUMN_WORDS)]
                 for line in rows:
@@ -925,8 +1000,13 @@ class Checker:
                 with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
                     stream.write("".join(line + ending for line, ending in zip(out, out_endings)))
                 os.chmod(temporary, stat.S_IMODE(target.stat().st_mode))
+                # 一時ファイルを書いて閉じた後、置き換えの直前にもう一度読み直す（書いている間に文書が変わっていれば上書きしない）
+                if self.read_raw(name) != raw_text:
+                    os.unlink(temporary)
+                    self.error(name, "書き直しの途中で変更された。上書きしないので、--update-snippets を実行し直す")
+                    continue
                 os.replace(temporary, target)
-            except OSError as error:
+            except (OSError, UnicodeDecodeError) as error:
                 with contextlib.suppress(OSError):
                     os.unlink(temporary)
                 self.error(name, f"書き直した内容を保存できないので、元の文書を残す: {error}")

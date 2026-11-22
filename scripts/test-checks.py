@@ -16,6 +16,7 @@ import os
 import platform
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -363,6 +364,19 @@ def test_settings() -> None:
     settings_case("参照先の plist の向きが横を含む", 1, "が縦だけでない", project=with_file,
                   plists={"Config/App-Settings.plist": dict(microphone, UISupportedInterfaceOrientations=[
                       "UIInterfaceOrientationPortrait", "UIInterfaceOrientationLandscapeLeft"])})
+    # 参照先の plist の向きの要素の変数も、その構成・SDK のビルド設定で展開してから判定する
+    plist_orientation = lambda value: {"Config/App-Settings.plist": dict(  # noqa: E731
+        microphone, **{"UISupportedInterfaceOrientations~iphone": [value]})}
+    with_orientation_setting = lambda value: lambda t: replaced(with_file(t), '"GENERATE_INFOPLIST_FILE": "NO",',  # noqa: E731
+                                                               f'"GENERATE_INFOPLIST_FILE": "NO",\n        "MINUTES_ORIENTATION": "{value}",')
+    settings_case("plist の向きの変数が縦に展開される", 0, "OK",
+                  project=with_orientation_setting("UIInterfaceOrientationPortrait"),
+                  plists=plist_orientation("$(MINUTES_ORIENTATION)"))
+    settings_case("plist の向きの変数が横に展開される", 1, "が縦だけでない",
+                  project=with_orientation_setting("UIInterfaceOrientationLandscapeLeft"),
+                  plists=plist_orientation("$(MINUTES_ORIENTATION)"))
+    settings_case("plist の向きの変数が展開できない", 1, "展開できない", project=with_file,
+                  plists=plist_orientation("$(MINUTES_UNDEFINED)"))
     # plist の値の変数は、構成・SDK ごとに展開してから判定する
     mic_variable = dict(microphone, NSMicrophoneUsageDescription="$(MIC_TEXT)")
     define = lambda value: lambda t: replaced(with_file(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',  # noqa: E731
@@ -1178,8 +1192,8 @@ def setup_repository(directory: str, env: Dict[str, str]) -> Path:
 
 
 def setup_guard_cases() -> None:
-    """setup.sh --hooks が、git の選ぶ作業ツリーが別のリポジトリのとき・より優先される設定が別の値を指すときに、
-    共有の設定を変えずに失敗すること。リンクした作業ツリーからの実行は通ること。"""
+    """setup.sh --hooks が、引き継いだ GIT_DIR などが別のリポジトリを指していても外して ROOT のリポジトリにだけ書くこと。
+    より優先される設定が別の値を指すときに、共有の設定を変えずに失敗すること。リンクした作業ツリーからの実行は通ること。"""
     global count
     env = isolated_git_env()
 
@@ -1194,9 +1208,10 @@ def setup_guard_cases() -> None:
         subprocess.run(["git", "init", "-q", "--template=", str(other)], env=env, check=True, capture_output=True)
         result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], capture_output=True, text=True,
                                 env=dict(env, GIT_DIR=str(other / ".git"), GIT_WORK_TREE=str(other)))
-        if result.returncode != 1 or configured(repository) or configured(other) or "作業ツリー" not in result.stderr:
-            failures.append(f"setup: 別のリポジトリを指す GIT_DIR で --hooks が止まらない（終了コード {result.returncode}）\n"
-                            f"{result.stderr.strip()}")
+        # 引き継いだ GIT_DIR・GIT_WORK_TREE は外し、ROOT のリポジトリにだけ書く（別のリポジトリの設定を変えない）
+        if result.returncode != 0 or configured(repository) != ".githooks" or configured(other):
+            failures.append(f"setup: 別のリポジトリを指す GIT_DIR を外さずに --hooks を実行した（終了コード {result.returncode}・"
+                            f"設定「{configured(repository)}」/「{configured(other)}」）\n{result.stderr.strip()}")
     count += 1
     with tempfile.TemporaryDirectory() as directory:
         repository = setup_repository(directory, env)
@@ -1264,6 +1279,7 @@ def require_clean_case() -> None:
         out = Path(directory) / "recorded"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        copy_location_script(repository)
         # 手順 10 の代わり: 先に元の作業ツリーの marker.txt を書き換え、その後で実行した場所と marker.txt の内容を記録する
         # （読む前に元の作業ツリーを変えても、専用の作業ツリーの内容が開始時のコミットのままであることを確かめる）
         (repository / "scripts" / "verify-docs.py").write_text(
@@ -1299,6 +1315,45 @@ def require_clean_case() -> None:
             failures.append("check: --require-clean が開発ツールの導入のロックを残した")
 
 
+def require_clean_location_case() -> None:
+    """check.sh --require-clean が、一時の置き場所（TMPDIR）が SwiftFormat の設定を継ぐ場所・作業ツリーの中なら、
+    専用の作業ツリーを作らずに失敗すること（プッシュ前のフックと同じ判定）。"""
+    global count
+    for label in ("SwiftFormat の設定の下", "作業ツリーの中"):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            out = Path(directory) / "recorded"
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "verify-docs.py").write_text('#!/bin/sh\npwd > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+            (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for name in ("check.sh", "verify-docs.py", "test-checks.py"):
+                (repository / "scripts" / name).chmod(0o755)
+            copy_location_script(repository)
+            (repository / ".gitignore").write_text("/.tools\n/tmp/\n", encoding="utf-8")
+            (repository / ".tools").mkdir()
+            identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", f"core.hooksPath={os.devnull}"]
+            for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+            if label == "作業ツリーの中":
+                temporary = repository / "tmp"
+            else:
+                temporary = Path(directory) / "configured" / "tmp"
+                (Path(directory) / "configured" / ".swiftformat").parent.mkdir(parents=True)
+                (Path(directory) / "configured" / ".swiftformat").write_text("--indent 2\n", encoding="utf-8")
+            temporary.mkdir(parents=True)
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "10", "--require-clean"],
+                                    capture_output=True, text=True, env=dict(env, TMPDIR=str(temporary), MINUTES_TEST_OUT=str(out)))
+            leftovers = sorted(path.name for path in temporary.iterdir())
+            if result.returncode != 1 or "一時の置き場所" not in result.stderr or out.exists() or leftovers:
+                failures.append(f"check: --require-clean が{label}の一時の置き場所で止まらない（終了コード {result.returncode}・"
+                                f"残ったもの {leftovers}）\n{(result.stdout + result.stderr).strip()}")
+
+
 def require_clean_smudge_case() -> None:
     """check.sh --require-clean が、smudge のフィルタで内容を変えて展開した専用の作業ツリーを検査せず、失敗すること。"""
     global count
@@ -1310,6 +1365,7 @@ def require_clean_smudge_case() -> None:
         (repository / "scripts").mkdir(parents=True)
         out = Path(directory) / "recorded"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        copy_location_script(repository)
         (repository / "scripts" / "verify-docs.py").write_text('#!/bin/sh\ncat marker.txt > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
         (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         for name in ("check.sh", "verify-docs.py", "test-checks.py"):
@@ -1389,6 +1445,23 @@ def coverage_record_message_case() -> None:
                                 f"{result.stderr.strip()}")
 
 
+def stage_tool_stubs(repository: Path) -> None:
+    """check.sh --staged は開発ツールを写し、ステージした tools/versions で照合してから使う。代わりのツールで試す一時の
+    リポジトリには、照合の代わり（何もせず成功する scripts/setup-tools.sh）と台帳を置く（git add -A でステージする）。"""
+    (repository / "tools").mkdir(parents=True, exist_ok=True)
+    (repository / "tools" / "versions").write_text("# 試験用の台帳（照合は代わりの setup-tools.sh が行う）\n", encoding="utf-8")
+    stub = repository / "scripts" / "setup-tools.sh"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+
+def copy_location_script(repository: Path) -> None:
+    """check.sh --require-clean が専用の作業ツリーの置き場所を判定するスクリプトを、一時のリポジトリに写す。"""
+    target = repository / "scripts" / "worktree-location.py"
+    target.write_text((SCRIPTS / "worktree-location.py").read_text(encoding="utf-8"), encoding="utf-8")
+    target.chmod(0o755)
+
+
 def staged_raw_blob_case() -> None:
     """check.sh --staged の整形・静的解析が、smudge のフィルタを通さずに、ステージした blob そのものを検査すること。
 
@@ -1409,6 +1482,7 @@ def staged_raw_blob_case() -> None:
         lint_out = Path(directory) / "recorded-lint"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "check.sh").chmod(0o755)
+        stage_tool_stubs(repository)
         # 整形の代わり: 渡された最後のファイルの内容を記録し、成功する（手順 2 の静的解析へ進む）
         formatter = repository / ".tools" / "bin" / "swiftformat"
         formatter.write_text('#!/bin/sh\nfor last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\nexit 0\n',
@@ -1473,6 +1547,7 @@ def staged_raw_tree_case() -> None:
             (repository / "scripts" / name).write_text(content, encoding="utf-8")
         for name in ("check.sh", *scripts):
             (repository / "scripts" / name).chmod(0o755)
+        stage_tool_stubs(repository)
         # 秘密情報の検出の代わり（手順 3 を通す）
         gitleaks = repository / ".tools" / "bin" / "gitleaks"
         gitleaks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -1520,6 +1595,7 @@ def staged_index_change_case() -> None:
         (repository / "scripts").mkdir(parents=True)
         (repository / ".tools" / "bin").mkdir(parents=True)
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        stage_tool_stubs(repository)
         # 文書の整合の代わり: 検査の途中で作業ツリーの変更をステージする（手順 10 の後、合格の表示の前にインデックスが変わる）
         (repository / "scripts" / "verify-docs.py").write_text(
             '#!/bin/sh\nprintf changed > doc.md && git add doc.md\n', encoding="utf-8")
@@ -1730,6 +1806,7 @@ def test_versions() -> None:
     setup_relative_case()
     setup_missing_hook_case()
     require_clean_case()
+    require_clean_location_case()
     require_clean_smudge_case()
     setup_include_case()
     staged_symlink_case()
@@ -1808,6 +1885,22 @@ def test_versions() -> None:
             versions = Path(directory) / "versions"
             versions.write_text(change(original), encoding="utf-8")
             expect(f"versions: {label}", [setup, "--verify", "--versions", str(versions), "--dest", tools], 1, want_text)
+    # 台帳の全体を検証してから導入する。最後の行だけが不正な台帳で導入を実行しても、前の行（gh）を取得・展開せず、
+    # 公開するリンクも作らない（取得の前に失敗するので通信もしない）
+    with tempfile.TemporaryDirectory() as directory:
+        versions = Path(directory) / "versions"
+        lines = original.rstrip("\n").splitlines()
+        last = max(at for at, line in enumerate(lines) if line.strip() and not line.startswith("#"))
+        fields = lines[last].split()
+        fields[-1] = "z" * len(fields[-1])
+        lines[last] = " ".join(fields)
+        versions.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        dest = Path(directory) / "dest"
+        expect("versions: 最後の行が不正な台帳で導入を始めない", [setup, "--versions", str(versions), "--dest", str(dest)], 1,
+               "不正")
+        leftovers = sorted(path.name for path in dest.iterdir()) if dest.is_dir() else []
+        if leftovers:
+            failures.append(f"versions: 不正な台帳で導入先に {leftovers} を作った（検証の前に導入した）")
     # タブ区切りの台帳も同じに読む（列を空白文字の種類で決めない）
     tabbed = "\n".join(line if line.startswith("#") else "\t".join(line.split()) for line in original.splitlines()) + "\n"
     for label, text, want_code, want_text in (
@@ -1959,6 +2052,16 @@ def test_gitleaks() -> None:
         # 相対パスの引数も、実行した場所（expect はリポジトリ直下で実行する）からの実体のパスとして検査する
         expect("gitleaks: 相対パスのリポジトリを検査する", [str(SCRIPTS / "gitleaks-history.sh"), os.path.relpath(source, ROOT)], 0,
                "no leaks found", env=env)
+        # 「-」という名前のディレクトリの相対パスも、直前の場所（OLDPWD）ではなくそのディレクトリとして検査する
+        dash = Path(directory) / "-"
+        git("clone", "-q", source.as_uri(), str(dash))
+        global count
+        count += 1
+        result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), "-"], cwd=directory, capture_output=True, text=True,
+                                env=dict(env, OLDPWD=str(Path(directory) / "missing")))
+        if result.returncode != 0 or "no leaks found" not in result.stdout + result.stderr:
+            failures.append(f"gitleaks: 「-」という名前のリポジトリを検査しない（終了コード {result.returncode}）\n"
+                            f"{(result.stdout + result.stderr).strip()}")
         # 追加の引数は報告の指定だけ。検査の方式・終了コード・伏せ字・抑止を変える指定は gitleaks に渡さずに使い方の誤りにする
         report = Path(directory) / "report.json"
         expect("gitleaks: 報告の指定は渡せる",
@@ -2172,6 +2275,10 @@ def gitleaks_suppression_cases() -> None:
             (repository / ".gitleaks.toml").write_text((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"), encoding="utf-8")
             (repository / ".gitignore").write_text("/.tools\n.gitleaksignore\n", encoding="utf-8")
             (repository / ".tools").symlink_to(ROOT / ".tools")
+            # 開発ツールの写しの照合に使う導入スクリプトと台帳（本物の .tools を照合する）
+            for name in ("scripts/setup-tools.sh", "tools/versions"):
+                (repository / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, repository / name)
             git(repository, "add", "-A")
             git(repository, "commit", "-q", "-m", "base")
             (repository / "config.txt").write_text(content, encoding="utf-8")
@@ -2208,6 +2315,10 @@ def gitleaks_suppression_cases() -> None:
             (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
             (repository / ".gitattributes").write_text(attributes, encoding="utf-8")
             (repository / ".tools").symlink_to(ROOT / ".tools")
+            # 開発ツールの写しの照合に使う導入スクリプトと台帳（本物の .tools を照合する）
+            for name in ("scripts/setup-tools.sh", "tools/versions"):
+                (repository / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, repository / name)
             git(repository, "add", "-A")
             git(repository, "commit", "-q", "-m", "base")
             (repository / "config.txt").write_text(f'token = "{key}"\n', encoding="utf-8")
@@ -2488,6 +2599,23 @@ def linked_document_case() -> Path:
     return directory
 
 
+def untracked_document_case() -> None:
+    """解決の経路が起点の外や追跡しない場所（.tools など）を通る文書を、読まずに報告すること。"""
+    global count
+    for label, place in (("起点の外", None), ("追跡しない場所", ".tools")):
+        directory = docs_case(f"{label}を指す文書の準備（整合した文書）", 0, "OK")
+        with tempfile.TemporaryDirectory() as outside:
+            # 読めば定義されていない ID で失敗する内容（読まずに報告したことを区別する）
+            target = Path(outside) / "doc.md" if place is None else directory / place / "doc.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# 外\n\nFR-ZZZ-99\n", encoding="utf-8")
+            (directory / "docs/extra.md").symlink_to(target)
+            count += 1
+            code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory)])
+            if code != 1 or "docs/extra.md: 文書を読まない" not in output or "FR-ZZZ-99" in output:
+                failures.append(f"docs: {label}を指す文書を読まずに報告しない（終了コード {code}）\n{output.strip()}")
+
+
 def cyclic_snippet_case() -> Path:
     """コード片の元のファイルが循環するリンクでも、例外で止まらずに印の行を報告し、ほかの文書の検査を続けること
     （通常と --update-snippets の両方）。"""
@@ -2702,6 +2830,7 @@ def run_docs_cases() -> None:
         # 節が小節から始まる場合は、最初の小節の冒頭だけを見る（後ろの小節の「満たす要件:」で節を合格にしない）
         cyclic_snippet_case(),
         linked_document_case(),
+        untracked_document_case(),
         # 分冊（本冊の基本設計の名前に「-<名前>」を付けた詳細設計）は、必須の節と申し送りを求めず、節の冒頭とコード片を照合する
         docs_case("分冊は必須の節を求めない", 0, "OK", extra={"docs/03-detailed-design/sample-scripts.md": (
             f"# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n\n<!-- file: scripts/sample.sh -->\n\n"
@@ -2817,6 +2946,11 @@ def run_docs_cases() -> None:
         # 「要件 ID ↔ テスト」の節には、要件 ID とテストの両方を持つ対応表の行が要る
         docs_case("要件 ID ↔ テストの対応表がない", 1, "対応表の行がない", detailed,
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", ""),
+        # HTML の <pre> の中の表の形の行は、対応表として数えない（外の表は数える）
+        docs_case("対応表が <pre> の中だけ", 1, "対応表の行がない", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", "<pre>\n| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n</pre>\n"),
+        docs_case("<pre> の後の対応表は数える", 0, "OK", detailed,
+                  "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", "<pre>\n例\n</pre>\n\n| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n"),
         docs_case("対応表の行に要件 ID がない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| 未定 | 試験 |"),
         docs_case("対応表の行にテストがない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| FR-AAA-01 |  |"),
         docs_case("対応表の行のテストがコメントだけ", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |",
@@ -3009,7 +3143,7 @@ def run_docs_cases() -> None:
     count += 1
     if (readonly / detailed).read_text(encoding="utf-8") != stale_text:
         failures.append("docs: 書き直しに失敗したのに、元の文書が変わった")
-    # --update-snippets は、実パスが --root の外にある文書に書き込まない
+    # --update-snippets は、実パスが --root の外にある文書に書き込まない（読む前に起点の外として報告し、読みも書きもしない）
     assert docs_parent is not None
     outside = Path(tempfile.mkdtemp(dir=docs_parent)) / "outside.md"
     stale = replaced(DOCS[detailed], "echo one\necho two\necho three", "echo old")
@@ -3022,7 +3156,7 @@ def run_docs_cases() -> None:
         else:
             (linked / path).write_text(content, encoding="utf-8")
     expect("docs: root の外の文書は書き直さない", [str(SCRIPTS / "verify-docs.py"), "--root", str(linked), "--update-snippets"],
-           1, "--root の外にあるため")
+           1, "文書を読まない")
     count += 1
     if outside.read_text(encoding="utf-8") != stale:
         failures.append("docs: --root の外にある文書が書き直された")

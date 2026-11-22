@@ -395,6 +395,7 @@ def check_plist_orientation(
     生成する構成では、ビルド設定の値か参照先の plist の指定のどちらかで縦だけに決まること（参照先の plist が縦だけを
     持てば、ビルド設定がなくても違反にしない）。生成する・しないの両方がありうる構成では、両方の条件を求める。
     どの構成でも、効きうるビルド設定の値と参照先にある向きの指定は縦だけであること（合わさっても横向きを足さない）。
+    参照先の plist の向きの配列の各要素は、その構成・SDK のビルド設定で変数を展開してから比べる（展開できなければ違反）。
     """
     missing: List[str] = []
     wrong: Dict[str, List[str]] = {}
@@ -408,7 +409,15 @@ def check_plist_orientation(
                 covered = False
             source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
             for key in present:
-                if data[key] != PORTRAIT_ONLY:
+                # 各要素の変数（$(NAME)）はその構成・SDK のビルド設定で展開してから比べる。配列でない値・文字列でない要素・
+                # 展開できない要素は縦だけと見なさない
+                value = data[key]
+                items = value if isinstance(value, list) else None
+                expanded = ([expand_value(item, own, shared, configuration, sdk) if isinstance(item, str) else None
+                             for item in items] if items is not None else None)
+                if expanded is not None and any(item is None for item in expanded):
+                    wrong.setdefault(f"{source} の {key}（展開できない）", []).append(build)
+                elif expanded != PORTRAIT_ONLY:
                     wrong.setdefault(f"{source} の {key}", []).append(build)
         settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
         if True in modes:
