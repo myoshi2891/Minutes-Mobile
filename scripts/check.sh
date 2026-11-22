@@ -63,6 +63,7 @@ STAGED_TREE=""  # --staged のとき、ステージした内容を元の相対�
 STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .gitleaks.toml を書き出す一時ファイル
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 STAGED_SECRETS_TREE=""  # --staged のとき、秘密情報の検査のためにステージした blob をそのまま書き出す一時ディレクトリ
+STAGED_INDEX_TREE=""  # --staged のとき、開始時のインデックスのツリー（終了時に同じであることを確かめる）
 ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
 ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
@@ -124,6 +125,9 @@ fi
 # 一覧は一時ファイルに書き出し、git の失敗を空の一覧として扱わない（プロセス置換では終了コードを確かめられない）
 STAGED_SWIFT=()
 if [ "$STAGED" = 1 ]; then
+  # 各手順はインデックスから別々に書き出すので、その間にインデックスが変わると、手順ごとに違う内容を検査しうる。
+  # 書き出しの前にインデックスのツリーを控え、合格を表示する前に同じであることを確かめる（未解決の衝突があれば失敗する）
+  STAGED_INDEX_TREE=$(git write-tree) || fail "ステージした内容のツリーを作れない（未解決の衝突など）"
   staged_list=$(mktemp)
   # 種類の変更（T。通常のファイルとシンボリックリンクの入れ替えなど）も含める（下でインデックスのモードを確かめる）
   if ! git diff --cached --name-only --diff-filter=ACMRT -z -- '*.swift' > "$staged_list"; then
@@ -205,8 +209,9 @@ write_index_entries() {
     mkdir -p "$dest/$(dirname "$path")" || return 1
     rm -f -- "$dest/$path" || return 1
     if [ "$mode" = 120000 ]; then
-      target=$(git cat-file blob "$object") || return 1
-      ln -s -- "$target" "$dest/$path" || return 1
+      # 末尾の改行もリンク先の一部として保つ（$(…) は末尾の改行を落とすので、印の x を付けてから外す）
+      target=$(git cat-file blob "$object" && printf x) || return 1
+      ln -s -- "${target%x}" "$dest/$path" || return 1
     else
       git cat-file blob "$object" > "$dest/$path" || return 1
       if [ "$mode" = 100755 ]; then chmod +x "$dest/$path" || return 1; fi
@@ -441,6 +446,13 @@ copy_tools() {
     waited=$((waited + 1))
   done
   TOOLS_LOCK="$source/.install.lock"
+  # 写した bin のリンクが写しの中を指すのは、リンクが相対パスの場合だけ（.githooks/pre-push と同じ）。絶対パスのリンクは
+  # 写しても元の導入を指すので、写す前に理由を示して止める（リンクは書き換えない）
+  for entry in "$source"/bin/*; do
+    if [ -L "$entry" ] && case "$(readlink -- "$entry")" in /*) true ;; *) false ;; esac; then
+      fail "開発ツールのリンク（${entry}）が絶対パスを指している。scripts/setup-tools.sh で導入し直してから実行し直す"
+    fi
+  done
   rm -rf -- "$copy"
   mkdir "$copy"
   for entry in "$source"/* "$source"/.[!.]*; do
@@ -479,7 +491,7 @@ full_checkout() {
 # 内容を変えたチェックアウトを、コミットの合格として検査しない。通常のファイルは git hash-object --no-filters で、
 # シンボリックリンクはリンク先の文字列で比べる。サブモジュール（160000）は blob がないので比べない。一致しなければ非 0 を返す
 verify_checkout_blobs() {
-  local tree=$1 entries entry mode object path actual status=0
+  local tree=$1 entries entry mode object path actual expected status=0
   entries=$(mktemp)
   if ! git -C "$tree" ls-files -s -z > "$entries"; then rm -f -- "$entries"; return 1; fi
   while IFS= read -r -d '' entry; do
@@ -490,7 +502,14 @@ verify_checkout_blobs() {
     case "$mode" in
       160000) continue ;;
       120000)
-        if [ ! -L "$tree/$path" ] || [ "$(readlink -- "$tree/$path")" != "$(git -C "$tree" cat-file blob "$object")" ]; then
+        # リンク先は末尾の改行も含めてバイト単位で比べる（$(…) は末尾の改行を落とすので、印の x を付けてから外す）
+        actual=""
+        expected=""
+        if [ -L "$tree/$path" ]; then
+          actual=$(readlink -n -- "$tree/$path" && printf x) && actual=${actual%x} || actual=""
+          expected=$(git -C "$tree" cat-file blob "$object" && printf x) && expected=${expected%x} || expected=""
+        fi
+        if [ ! -L "$tree/$path" ] || [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
           echo "NG: チェックアウトした ${path} がコミットの blob と違う（シンボリックリンク）" >&2
           status=1
         fi
@@ -731,6 +750,10 @@ for step in $STEPS; do
 done
 
 if [ "$STAGED" = 1 ]; then
+  end_index_tree=$(git write-tree) || fail "終了時のステージした内容のツリーを作れない"
+  if [ "$end_index_tree" != "$STAGED_INDEX_TREE" ]; then
+    fail "検査中にステージした内容が変わった（開始時 ${STAGED_INDEX_TREE} / 終了時 ${end_index_tree}）。検査した内容と違うので合格にしない"
+  fi
   echo "OK: コミット前の検査を通過"
 else
   end_head=$(git rev-parse HEAD)

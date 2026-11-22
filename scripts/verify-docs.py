@@ -381,8 +381,9 @@ def reference_label(label: str) -> str:
 
 def section_lead(body: List[str]) -> str:
     """節（「## 」）の冒頭の行（空行を除く最初の行）を返す。節が小節（「### 」）から始まる場合も小節の行で代えず、
-    小節の見出しの行を返す（親の節は自身の「満たす要件:」を持つ。小節の「満たす要件:」は網羅の集計にだけ数える）。"""
-    return next((line for line in body if line.strip()), "")
+    小節の見出しの行を返す（親の節は自身の「満たす要件:」を持つ。小節の「満たす要件:」は網羅の集計にだけ数える）。
+    同じ行で閉じる HTML のコメントだけの行（表示されない）は空行と同じに読み飛ばす（requirement_fields と同じ）。"""
+    return next((line for line in body if visible(line).strip()), "")
 
 
 def fence_indent(line: str) -> int:
@@ -569,7 +570,8 @@ class Checker:
             if heading(line):
                 after_heading = True
                 continue
-            if not line.strip():
+            # 空行と、同じ行で閉じる HTML のコメントだけの行（表示されない。section_lead と同じ）は節の冒頭を終わらせない
+            if not visible(line).strip():
                 continue
             if after_heading and line.startswith("満たす要件:"):
                 fields.append(visible(line))

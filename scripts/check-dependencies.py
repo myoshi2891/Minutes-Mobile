@@ -65,8 +65,9 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[s
     """許可リストを読み、(identity, 版, 正規化した URL) → 項目、URL → 項目、ローカルのバイナリのパス → 項目 を返す。
     形式が違えば読めないものとして扱う。"""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:  # 深い入れ子は RecursionError
+        # 重複した鍵は後の値で前の値を隠すので読めないものとする（resolved_pins と同じ。ValueError で送出される）
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:  # 深い入れ子は RecursionError
         raise Unreadable(f"{path}: {error!r}") from error
     if not isinstance(data, dict) or data.get("formatVersion") != 1:
         raise Unreadable(f"{path}: formatVersion が 1 でない")
@@ -118,7 +119,10 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[s
         previous = by_url.get(url)
         if previous is not None and ("checksum" in package or "checksum" in previous):
             raise Unreadable(f"{path}: リモートのバイナリの承認が同じ URL で重複している（{package['url']}）")
-        by_pin[(package["identity"].lower(), package["version"], url)] = package
+        # checksum を持つ承認はリモートのバイナリ（.binaryTarget(url:checksum:)）の配布物だけを承認し、Package の依存
+        # （.package(url:) と Package.resolved の確定版）は承認しない。版の照合の索引（by_pin）に入れない
+        if "checksum" not in package:
+            by_pin[(package["identity"].lower(), package["version"], url)] = package
         by_url[url] = package
     return by_pin, by_url, by_path
 

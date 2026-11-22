@@ -6,13 +6,22 @@ root=$(git rev-parse --show-toplevel)
 # 導入済みの開発ツールが、ステージした tools/versions（コミットする台帳）と一致することを先に確かめる。作業ツリーの台帳や
 # 古い導入のまま、コミットする台帳と違う版のツールで整形・静的解析・秘密情報を検査しない
 versions=$(mktemp)
-trap 'rm -f -- "$versions"' EXIT
+# 終了の状態を入口で控え、一時ファイルの削除の後に明示的に返す（削除の失敗で検査の結果を上書きしない）
+trap 'status=$?; rm -f -- "$versions" || true; exit "$status"' EXIT
 if ! git cat-file blob :tools/versions > "$versions"; then
   echo "NG: ステージした tools/versions を読めない" >&2
   exit 1
 fi
+# 導入し直す手順は、ステージした台帳を一時ファイルに書き出して --versions で渡す（作業ツリーの台帳とステージした内容は変えない）
+reinstall='versions=$(mktemp) && git cat-file blob :tools/versions > "$versions" && scripts/setup-tools.sh --versions "$versions"; rm -f -- "$versions"'
 if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
-  echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。scripts/setup-tools.sh で導入し直してからコミットする" >&2
+  echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。ステージした台帳で導入し直してからコミットする: ${reinstall}" >&2
   exit 1
 fi
 "$root/scripts/check.sh" --staged
+# 検査の間に導入が差し替えられていないこと（照合の後に別の setup-tools.sh がリンクを置き換えた導入で検査した結果を通さない）。
+# 検査の後にもう一度照合する（差し替えて戻した場合は検出できない。導入のロックは照合の間だけ持つ）
+if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
+  echo "NG: 検査の間に開発ツールの導入が変わった。導入が終わってからコミットし直す" >&2
+  exit 1
+fi

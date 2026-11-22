@@ -206,7 +206,7 @@ full_checkout() {
 # 内容を変えたチェックアウトを、コミットの合格として検査しない。通常のファイルは git hash-object --no-filters で、
 # シンボリックリンクはリンク先の文字列で比べる。サブモジュール（160000）は blob がないので比べない。一致しなければ非 0 を返す
 verify_checkout_blobs() {
-  local tree=$1 entries entry mode object path actual status=0
+  local tree=$1 entries entry mode object path actual expected status=0
   entries=$(mktemp)
   if ! git -C "$tree" ls-files -s -z > "$entries"; then rm -f -- "$entries"; return 1; fi
   while IFS= read -r -d '' entry; do
@@ -217,7 +217,14 @@ verify_checkout_blobs() {
     case "$mode" in
       160000) continue ;;
       120000)
-        if [ ! -L "$tree/$path" ] || [ "$(readlink -- "$tree/$path")" != "$(git -C "$tree" cat-file blob "$object")" ]; then
+        # リンク先は末尾の改行も含めてバイト単位で比べる（$(…) は末尾の改行を落とすので、印の x を付けてから外す）
+        actual=""
+        expected=""
+        if [ -L "$tree/$path" ]; then
+          actual=$(readlink -n -- "$tree/$path" && printf x) && actual=${actual%x} || actual=""
+          expected=$(git -C "$tree" cat-file blob "$object" && printf x) && expected=${expected%x} || expected=""
+        fi
+        if [ ! -L "$tree/$path" ] || [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
           echo "NG: チェックアウトした ${path} がコミットの blob と違う（シンボリックリンク）" >&2
           status=1
         fi
@@ -303,6 +310,14 @@ until mkdir "$tools_source/.install.lock" 2>/dev/null; do
   waited=$((waited + 1))
 done
 tools_lock="$tools_source/.install.lock"
+# 写した bin のリンクが写しの中を指すのは、リンクが相対パスの場合だけ。絶対パスのリンクは写しても元の導入を指し、手順 0 の
+# 照合が写しの導入先と合わずに失敗する（検査は弱まらないが原因が分からない）。写す前に、理由を示して止める（リンクは書き換えない）
+for link in "$tools_source"/bin/*; do
+  if [ -L "$link" ] && case "$(readlink -- "$link")" in /*) true ;; *) false ;; esac; then
+    echo "NG: 開発ツールのリンク（${link}）が絶対パスを指している。scripts/setup-tools.sh で導入し直してから push し直す" >&2
+    exit 1
+  fi
+done
 rm -rf -- "$tools_copy"
 mkdir "$tools_copy"
 for entry in "$tools_source"/* "$tools_source"/.[!.]*; do

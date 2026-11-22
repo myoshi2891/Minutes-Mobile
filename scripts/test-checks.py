@@ -1058,6 +1058,22 @@ def test_dependencies() -> None:
     dependencies_case("重複した鍵の Package.resolved", 2, "重複した鍵",
                       {"Package.resolved": '{"pins": [{"identity": "x", "location": "https://example.com/x", "state": {}}], '
                                            '"pins": [], "version": 3}'})
+    # 許可リストの重複した鍵（後の approvedPackages で前の承認を隠す）も読めないものとする
+    with tempfile.TemporaryDirectory() as directory:
+        allowlist = Path(directory) / "allowlist.json"
+        allowlist.write_text('{"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": [], "approvedPackages": []}',
+                             encoding="utf-8")
+        expect("dependencies: 重複した鍵の許可リスト",
+               [str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 2, "重複した鍵")
+    # checksum を持つ承認はリモートのバイナリの配布物だけを承認する。同じ識別子・版・取得元の Package の確定版と
+    # .package(url:) の宣言は承認しない
+    binary_pin = {"identity": "b-binary", "kind": "remoteSourceControl", "location": remote,
+                  "state": {"revision": "0" * 40, "version": "1.0.0"}}
+    dependencies_case("リモートのバイナリの承認で Package の確定版を承認しない", 1, "b-binary 1.0.0 は許可リストにない",
+                      {"Package.resolved": json.dumps({"pins": [binary_pin], "version": 3})}, [remote_binary])
+    dependencies_case("リモートのバイナリの承認で .package(url:) を承認しない", 1, "確定版 1.0.0 は許可リストにない",
+                      {"Package.resolved": json.dumps({"pins": [binary_pin], "version": 3}),
+                       "Package.swift": declare.format('.package(url: "' + remote + '", exact: "1.0.0")')}, [remote_binary])
     # 版別の manifest（Package@swift-<版>.swift）も同じ検査にかける
     # 除外の階層: 下位の build は検査し、直下の build と全階層の .build は除外する
     dependencies_case("下位の build の中の許可リスト外の依存", 1, "Sub/build/Package.swift",
@@ -1447,10 +1463,12 @@ def staged_raw_tree_case() -> None:
         (repository / "tools" / "lint-fixtures" / "sample").mkdir(parents=True)
         rules_out = Path(directory) / "recorded-rules"
         docs_out = Path(directory) / "recorded-docs"
+        link_out = Path(directory) / "recorded-link"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         # 規則の試験の代わり: 起点（作業ディレクトリ）の試験用のファイルを記録する。文書の整合の代わり: --root の文書を記録する
         scripts = {"test-lint-rules.py": '#!/bin/sh\ncat tools/lint-fixtures/sample/ok.swift > "$MINUTES_TEST_RULES_OUT"\n',
-                   "verify-docs.py": '#!/bin/sh\ncat "$2/doc.md" > "$MINUTES_TEST_DOCS_OUT"\n'}
+                   "verify-docs.py": '#!/bin/sh\ncat "$2/doc.md" > "$MINUTES_TEST_DOCS_OUT"\n'
+                                     'readlink -n "$2/newline-link" > "$MINUTES_TEST_LINK_OUT"\n'}
         for name, content in scripts.items():
             (repository / "scripts" / name).write_text(content, encoding="utf-8")
         for name in ("check.sh", *scripts):
@@ -1464,16 +1482,24 @@ def staged_raw_tree_case() -> None:
         (repository / ".gitattributes").write_text("*.swift filter=rewrite\n*.md filter=rewrite\n", encoding="utf-8")
         (repository / "tools" / "lint-fixtures" / "sample" / "ok.swift").write_text("let raw = 1\n", encoding="utf-8")
         (repository / "doc.md").write_text("raw\n", encoding="utf-8")
+        # 末尾に改行を含むリンク先のシンボリックリンク（書き出しで末尾の改行を落とさないこと）
+        os.symlink("target\n", repository / "newline-link")
         identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
                     "-c", f"core.hooksPath={os.devnull}"]
         subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
         # clean は設定しない（ステージした blob は作業ツリーの内容のまま）。smudge だけが書き出しの内容を書き換える
         subprocess.run(["git", "-C", str(repository), "config", "filter.rewrite.smudge", "sed s/raw/smudged/"], env=env, check=True)
         subprocess.run(["git", "-C", str(repository), *identity, "add", "-A"], env=env, check=True, capture_output=True)
+        # ステージした後に作業ツリーだけを別の内容にする（ステージし直さない）。読んだ内容がステージした blob なら、作業ツリーの
+        # 内容とも smudge の結果とも違う
+        (repository / "tools" / "lint-fixtures" / "sample" / "ok.swift").write_text("let worktree = 1\n", encoding="utf-8")
+        (repository / "doc.md").write_text("worktree\n", encoding="utf-8")
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
-                                env=dict(env, MINUTES_TEST_RULES_OUT=str(rules_out), MINUTES_TEST_DOCS_OUT=str(docs_out)),
+                                env=dict(env, MINUTES_TEST_RULES_OUT=str(rules_out), MINUTES_TEST_DOCS_OUT=str(docs_out),
+                                         MINUTES_TEST_LINK_OUT=str(link_out)),
                                 timeout=60)
-        for label, path, want in (("規則の試験", rules_out, b"let raw = 1\n"), ("文書の整合", docs_out, b"raw\n")):
+        for label, path, want in (("規則の試験", rules_out, b"let raw = 1\n"), ("文書の整合", docs_out, b"raw\n"),
+                                  ("文書の整合のリンク先", link_out, b"target\n")):
             recorded = path.read_bytes() if path.is_file() else None
             if recorded != want:
                 failures.append(f"check: --staged の{label}がステージした blob そのものを書き出さない（読んだ内容 {recorded!r}・"
@@ -1481,6 +1507,39 @@ def staged_raw_tree_case() -> None:
         if result.returncode != 0:
             failures.append(f"check: --staged の規則の試験・文書の整合の書き出しの試験が通らない（終了コード {result.returncode}）\n"
                             f"{(result.stdout + result.stderr).strip()}")
+
+
+def staged_index_change_case() -> None:
+    """check.sh --staged が、検査の間にステージした内容が変わったら（手順ごとに別の内容を検査しうるので）合格にしないこと。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools" / "bin").mkdir(parents=True)
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        # 文書の整合の代わり: 検査の途中で作業ツリーの変更をステージする（手順 10 の後、合格の表示の前にインデックスが変わる）
+        (repository / "scripts" / "verify-docs.py").write_text(
+            '#!/bin/sh\nprintf changed > doc.md && git add doc.md\n', encoding="utf-8")
+        gitleaks = repository / ".tools" / "bin" / "gitleaks"
+        gitleaks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for path in (repository / "scripts" / "check.sh", repository / "scripts" / "verify-docs.py", gitleaks):
+            path.chmod(0o755)
+        (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        (repository / "doc.md").write_text("staged\n", encoding="utf-8")
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), *identity, "add", "-A"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], cwd=repository, capture_output=True,
+                                text=True, env=env, timeout=60)
+        output = result.stdout + result.stderr
+        if result.returncode != 1 or "ステージした内容が変わった" not in output or "コミット前の検査を通過" in output:
+            failures.append(f"check: --staged が検査中にステージした内容が変わっても合格にする（終了コード {result.returncode}）\n"
+                            f"{output.strip()}")
 
 
 def staged_symlink_case() -> None:
@@ -1554,6 +1613,10 @@ def simulator_cases() -> None:
         ("runtimes の platform がない", {"runtimes": [{k: v for k, v in runtime.items() if k != "platform"}], "devices": {}}, 2),
         ("runtimes の platform が数値", {"runtimes": [dict(runtime, platform=1)], "devices": {}}, 2),
         ("runtimes の platform が空", {"runtimes": [dict(runtime, platform="")], "devices": {}}, 2),
+        # 使える iOS のランタイムの identifier は空でない文字列であること（null・空・数値の識別子で候補なしにしない）
+        ("使える iOS のランタイムの identifier が null", {"runtimes": [dict(runtime, identifier=None)], "devices": {}}, 2),
+        ("使える iOS のランタイムの identifier が空", {"runtimes": [dict(runtime, identifier="")], "devices": {}}, 2),
+        ("使える iOS のランタイムの identifier が数値", {"runtimes": [dict(runtime, identifier=1)], "devices": {}}, 2),
         # 正しい形の iOS 以外のランタイム（watchOS）は、これまでどおり読み飛ばす
         ("watchOS だけの一覧は候補なし", {"runtimes": [dict(runtime, platform="watchOS")], "devices": {"r": [
             {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 1),
@@ -1670,6 +1733,7 @@ def test_versions() -> None:
     require_clean_smudge_case()
     setup_include_case()
     staged_symlink_case()
+    staged_index_change_case()
     staged_raw_blob_case()
     staged_raw_tree_case()
     coverage_record_message_case()
@@ -1889,6 +1953,12 @@ def test_gitleaks() -> None:
         expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン", env=env)
         expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found",
                env=env)
+        # リポジトリは実体の絶対パスに解決してから使う。解決できない引数は、判定も検査もせずに失敗する
+        expect("gitleaks: 解決できないリポジトリは検査しない", [str(SCRIPTS / "gitleaks-history.sh"), str(Path(directory) / "missing")],
+               1, "解決できない", env=env)
+        # 相対パスの引数も、実行した場所（expect はリポジトリ直下で実行する）からの実体のパスとして検査する
+        expect("gitleaks: 相対パスのリポジトリを検査する", [str(SCRIPTS / "gitleaks-history.sh"), os.path.relpath(source, ROOT)], 0,
+               "no leaks found", env=env)
         # 追加の引数は報告の指定だけ。検査の方式・終了コード・伏せ字・抑止を変える指定は gitleaks に渡さずに使い方の誤りにする
         report = Path(directory) / "report.json"
         expect("gitleaks: 報告の指定は渡せる",
@@ -2604,6 +2674,15 @@ def run_docs_cases() -> None:
                   "決定: BD-SMP-01 <!-- FR-AAA-09 -->"),
         docs_case("インラインのコードの中の定義されていない ID も検査する", 1, "定義されていない ID: FR-AAA-09", detailed,
                   "決定: BD-SMP-01", "決定: BD-SMP-01 `FR-AAA-09`"),
+        # 同じ行で閉じる HTML のコメントだけの行は表示されないので、節の冒頭を終わらせない（後の「満たす要件:」を冒頭として読み、
+        # 網羅にも数える）。コメントの後の本文の行は、これまでどおり冒頭を終わらせる
+        docs_case("1 行のコメントの後の「満たす要件:」を節の冒頭とする", 0, "OK", basic,
+                  "## 1. 設計決定\n\n満たす要件:", "## 1. 設計決定\n\n<!-- 補足 -->\n満たす要件:"),
+        docs_case("1 行のコメントの後の「満たす要件:」を網羅に数える", 0, "MVP の要件 3 件", "", "", "", None,
+                  {basic: replaced(replaced(DOCS[basic], "FR-AAA-01・02、", "FR-AAA-01、"),
+                                   "## 3. テスト観点\n\n満たす要件: TST-AAA-01", "## 3. テスト観点\n\n<!-- 補足 -->\n\n満たす要件: TST-AAA-01、FR-AAA-02")}),
+        docs_case("1 行のコメントと本文の後の「満たす要件:」は節の冒頭でない", 1, "冒頭に「満たす要件:」の行がない", basic,
+                  "## 1. 設計決定\n\n満たす要件:", "## 1. 設計決定\n\n<!-- 補足 -->\n本文\n\n満たす要件:"),
         docs_case("定義されていない ID の群", 1, "定義されていない ID の群: FR-ZZZ", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-ZZZ 群"),
         docs_case("定義されていない設計決定", 1, "定義されていない ID: BD-SMP-02", detailed, "BD-SMP-01", "BD-SMP-02"),
         docs_case("ID の定義の重複", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-01 | 二 | MVP |"),

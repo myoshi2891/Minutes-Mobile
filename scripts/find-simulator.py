@@ -50,6 +50,11 @@ def main() -> int:
                 raise TypeError(f"runtimes の {item.get('identifier')!r} の isAvailable が真偽値でない")
             if item.get("platform") == "iOS" and item.get("isAvailable") and not isinstance(item.get("version"), str):
                 raise TypeError(f"runtimes の {item.get('identifier')!r} の version が文字列でない")
+            # 候補になりうるランタイムの識別子は空でない文字列であること（null・空・数値の識別子を辞書の鍵にすると、
+            # devices の鍵と一致せず候補なしと取り違えるか、別のランタイムの鍵と取り違える）
+            identifier = item.get("identifier")
+            if item.get("platform") == "iOS" and item.get("isAvailable") and not (isinstance(identifier, str) and identifier):
+                raise TypeError(f"runtimes の使える iOS のランタイムの identifier が空でない文字列でない: {identifier!r}")
         for runtime, devices in devices_by_runtime.items():
             if not isinstance(devices, list) or not all(isinstance(device, dict) for device in devices):
                 raise TypeError(f"devices の {runtime} が辞書の配列でない")

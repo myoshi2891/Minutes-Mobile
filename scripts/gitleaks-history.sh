@@ -28,7 +28,12 @@ usage() {
   exit 2
 }
 [ $# -ge 1 ] && [ -n "$1" ] || usage
-repository=$1
+# リポジトリは一度だけ実体の絶対パスに解決し、以後の判定と gitleaks の検査の両方に同じパスを渡す（相対パス・「-」で始まる
+# 名前・途中で差し替えられたシンボリックリンクで、判定したものと別のリポジトリを検査しない）。「.」は現在の作業ツリーになる
+repository=$(cd -P -- "$1" 2>/dev/null && pwd) || {
+  echo "NG: リポジトリ ${1} を解決できない" >&2
+  exit 1
+}
 shift
 # 追加の引数は報告の指定（--report-format・--report-path。値は次の引数）だけを、それぞれ 1 回まで認める。
 # ほかの指定（--no-git・--log-opts・--exit-code・--no-redact・--baseline-path・--config など）は、検査の方式や対象を変え、
