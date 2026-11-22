@@ -732,6 +732,20 @@ copy_tools() {
   TOOLS_LOCK=""
 }
 
+# 元の作業ツリーが sparse checkout なら、専用の作業ツリー（$1）もその指定を引き継ぎ（git worktree add が写す）、一部のファイル
+# しかない状態で検査することになる。専用の作業ツリーで有効なら、そこでだけ解除して全体を展開する（.githooks/pre-push の
+# full_checkout と同じ。作業ツリーごとの設定に書くので、元の作業ツリーは sparse のまま）。有効でなければ解除しない。
+# 設定を読めない場合は止める。展開は改行の変換（core.autocrlf）を掛けない
+full_checkout() {
+  local tree=$1 sparse status=0
+  sparse=$(git -C "$tree" config --type=bool --get core.sparseCheckout) || status=$?
+  case $status in
+    0) if [ "$sparse" = true ]; then git -C "$tree" -c core.autocrlf=false sparse-checkout disable; fi ;;
+    1) ;;  # 設定がない（sparse でない）
+    *) fail "専用の作業ツリーの sparse checkout の設定を読めない（${tree}）" ;;
+  esac
+}
+
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
 test_destination() {
   local udid
@@ -867,12 +881,17 @@ on_exit() {
   if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
   if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" 2>/dev/null || true; fi
-  if [ -n "$ISOLATED_TREE" ]; then
-    # 登録ごと消す。消せなければディレクトリを消して登録の残骸を片付ける
-    git -C "$ROOT" worktree remove --force "$ISOLATED_TREE" 2>/dev/null \
-      || { remove_or_report "$ISOLATED_TREE"; git -C "$ROOT" worktree prune 2>/dev/null || true; }
+  # この実行で作った専用の作業ツリーだけを登録ごと消す。リポジトリ全体の git worktree prune は実行しない（ほかの作業ツリーの
+  # 登録を消さない）。消せなければ場所を報告して失敗にし、置き場所も残す（中身を確かめて git worktree remove で消せるように）
+  isolated_removed=1
+  # 作成の前に失敗した場合（ディレクトリがない）は消すものがない
+  if [ -n "$ISOLATED_TREE" ] && { [ -e "$ISOLATED_TREE" ] || [ -L "$ISOLATED_TREE" ]; } \
+    && ! git -C "$ROOT" worktree remove --force "$ISOLATED_TREE"; then
+    echo "NG: 専用の作業ツリーを削除できない（${ISOLATED_TREE}）。git worktree remove --force でその作業ツリーを削除する" >&2
+    CLEANUP_FAILED=1
+    isolated_removed=""
   fi
-  if [ -n "$ISOLATED_BASE" ]; then remove_or_report "$ISOLATED_BASE"; fi
+  if [ -n "$ISOLATED_BASE" ] && [ -n "$isolated_removed" ]; then remove_or_report "$ISOLATED_BASE"; fi
   release_coverage_lock
   if [ "$status" -eq 0 ] && [ -n "$CLEANUP_FAILED" ]; then exit 1; fi
   if [ "$status" -eq 0 ]; then return 0; fi
@@ -911,7 +930,9 @@ fi
 if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   ISOLATED_BASE=$(mktemp -d)
   ISOLATED_TREE="$ISOLATED_BASE/tree"
-  git worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
+  # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
+  git -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
+  full_checkout "$ISOLATED_TREE"
   # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。導入のロックを取って写し、手順 0 の照合と
   # 後の手順はすべてこの写しを使う（検査の途中の setup-tools.sh による差し替えの影響を受けない）
   copy_tools "$ROOT/.tools" "$ISOLATED_TREE/.tools"
