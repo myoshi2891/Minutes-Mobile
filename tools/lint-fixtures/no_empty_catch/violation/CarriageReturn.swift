@@ -1,0 +1,1 @@
+// 改行が CR だけのファイル。行コメントは CR で終わる（本体がコメントだけの catch を空として検出し、// コメントの後に実行文がある catch は空と見なさない）func sample() {    do {        try work()    } catch { // expect: no_empty_catch    }    do {        try work()    } catch { // 記録する        recorder.record(.failed)    }}
