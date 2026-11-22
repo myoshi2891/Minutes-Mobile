@@ -17,3 +17,6 @@ let quoted = Int.random(in: 0..<length(of: ")"), using: &generator)
 let nestedComment = Int.random(in: 0..<10, /* 外 /* 内 */ ) を含む */ using: &generator)
 // 引数のラベル using と「:」の間のコメントは空白として扱い、注入した生成器を渡す呼び出しと認める
 let labelComment = Int.random(in: 0..<10, using /* 生成器 */ : &generator)
+// 前の引数に角括弧・波括弧があっても、最上位の using: を認める
+let withLiteral = Int.random(in: 0..<[1, 2].count, using: &generator)
+let withClosure = Int.random(in: 0..<items.map { $0 }.count, using: &generator)

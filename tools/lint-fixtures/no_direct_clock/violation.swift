@@ -8,3 +8,6 @@ let remaining = deadline.timeIntervalSinceNow // expect: no_direct_clock
 let spaced = deadline . timeIntervalSinceNow // expect: no_direct_clock
 let uptime = ProcessInfo.processInfo.systemUptime // expect: no_direct_clock
 let spacedUptime = ProcessInfo . processInfo . systemUptime // expect: no_direct_clock
+let recordedAt: Date = .now // expect: no_direct_clock
+let optionalAt: Date? = . now // expect: no_direct_clock
+let typedInit: Foundation.Date = .init() // expect: no_direct_clock

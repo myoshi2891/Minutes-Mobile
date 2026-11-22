@@ -14,3 +14,7 @@ let withComment = Int.random(in: 0..<10 /* ( */) // expect: no_direct_random
 let inString = Int.random(in: 0..<length(of: "using: (")) // expect: no_direct_random
 // 入れ子のブロックコメントの中の using: は引数ではない
 let inNestedComment = Int.random(in: 0..<10 /* 外 /* 内 */ using: &generator */) // expect: no_direct_random
+// 入れ子（辞書のリテラル・入れ子の呼び出し）の中の using: は、この呼び出しの引数のラベルではない
+let inLiteral = Int.random(in: 0..<[using: 1].count) // expect: no_direct_random
+let inNestedCall = Int.random(in: 0..<pick(using: &generator)) // expect: no_direct_random
+let inClosure = Int.random(in: 0..<items.map { pick(using: $0) }.count) // expect: no_direct_random

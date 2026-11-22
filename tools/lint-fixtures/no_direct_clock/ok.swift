@@ -4,3 +4,6 @@ let candidate: Date? = nil
 let epochInit = Date.init(timeIntervalSince1970: 0)
 let elapsed = deadline.timeIntervalSince(now)
 let systemUptime = clock.uptime
+let typedEpoch: Date = .init(timeIntervalSince1970: 0)
+let tick: ClockInstant = .now
+let instant = clock.now
