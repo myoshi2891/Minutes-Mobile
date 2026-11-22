@@ -7,6 +7,9 @@
 # （<ホーム>/Library/Caches/MinutesMobile/pre-push/<リポジトリごとの値>。MINUTES_PRE_PUSH_DIR で変えられる）に置く
 # （リポジトリの中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読み、元の作業ツリーの設定が混ざる）
 set -euo pipefail
+# 置き換えのオブジェクト（git replace の refs/replace/）を使わず、元のコミットのオブジェクトで照合・展開・検査する
+# （参照の照合・HEAD の確認から専用の作業ツリーの展開、check.sh の各手順まで。子のプロセスにも引き継ぐ）
+export GIT_NO_REPLACE_OBJECTS=1
 # HEAD は削除以外の参照の行を受け取ってから解決する（削除だけの送信では解決しない。HEAD がまだない場合にも失敗させない）。
 # 最初に解決した値を、後続の照合・専用の作業ツリーのチェックアウト・--expect-head に使う
 head=""
@@ -187,7 +190,8 @@ fi
 # sparse でないリポジトリにも作業ツリーごとの設定の拡張を書き足すため）。設定を読めない場合は止める
 full_checkout() {
   local sparse status=0
-  sparse=$(git -C "$snapshot" config --type=bool --get core.sparseCheckout) || status=$?
+  # GIT_CONFIG を外して読む（設定されていると git config はそのファイルだけを読み、専用の作業ツリーの設定を見ない）
+  sparse=$(env -u GIT_CONFIG git -C "$snapshot" config --type=bool --get core.sparseCheckout) || status=$?
   case $status in
     0) if [ "$sparse" = true ]; then git -C "$snapshot" -c core.autocrlf=false sparse-checkout disable; fi ;;
     1) ;;  # 設定がない（sparse でない）
@@ -210,6 +214,11 @@ if [ "$owned" -eq 1 ]; then
   # 残したビルドの成果物の場所には、中断した前回の検査のカバレッジのロック（check.sh の手順 7・8 が直下の .build に作る）が
   # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
   # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
+  # .build がシンボリックリンクなら、リンクの先（作業ツリーの外の場所）の中を消しうるので、消さずに止める
+  if [ -L "$snapshot/.build" ]; then
+    echo "NG: 専用の作業ツリーの ${snapshot}/.build がシンボリックリンク。中身を確かめて削除してから push し直す" >&2
+    exit 1
+  fi
   rm -rf -- "$snapshot/.build/minutes-coverage.lock"
 else
   # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すものなど）が置き場所に

@@ -708,7 +708,8 @@ class Checker:
                     if not any(at < len(cells) and visible(cells[at]).strip() for at in columns):
                         continue
                     # 先頭の列は個々の要件 ID を持つこと（群の表記・「SEC 全般」は対応の行として数えない）
-                    if self.names_individual_requirement(cells[0]):
+                    # 同じ行で閉じるコメントの中の ID は表示されないので数えない
+                    if self.names_individual_requirement(visible(cells[0])):
                         return
             self.error(name, f"「{heading}」の節に、要件 ID とテストの両方を持つ対応表の行がない", number)
 

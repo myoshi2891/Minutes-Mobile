@@ -494,21 +494,24 @@ def check_plist_entry(source: str, key: str, value: object, errors: List[str], e
 
     expand は値の変数を展開する関数（その plist・ビルド設定を使うターゲットのもの）。None なら変数は判定できないものとする。
     """
-    if key in FORBIDDEN_PLIST_KEYS:
-        errors.append(f"[{FORBIDDEN_PLIST_KEYS[key]}] {source}: {key} を設定しない")
+    # iPhone の修飾子（~iphone・-iphoneos・-iphoneos~iphone）を除いた鍵で規則を判定する（修飾子つきの鍵で規則を迂回させない）。
+    # 報告には元の鍵を使う。接頭辞の規則（FORBIDDEN_PLIST_KEY_PREFIXES）は元の鍵のままで当たる
+    base = unmodified_key(key)
+    if base in FORBIDDEN_PLIST_KEYS:
+        errors.append(f"[{FORBIDDEN_PLIST_KEYS[base]}] {source}: {key} を設定しない")
     for prefix, reason in FORBIDDEN_PLIST_KEY_PREFIXES.items():
         if key.startswith(prefix):
             errors.append(f"[{reason}] {source}: {key} を設定しない")
-    if unmodified_key(key) in FORBIDDEN_WHEN_ENABLED:
-        check_enabled(source, key, value, errors, expand, unmodified_key(key))
-    if re.fullmatch(r"NS\w*UsageDescription", key) and key not in ALLOWED_USAGE_DESCRIPTIONS:
+    if base in FORBIDDEN_WHEN_ENABLED:
+        check_enabled(source, key, value, errors, expand, base)
+    if re.fullmatch(r"NS\w*UsageDescription", base) and base not in ALLOWED_USAGE_DESCRIPTIONS:
         errors.append(f"[TST-SEC-03] {source}: 使わない権限の文言 {key} を置かない")
-    if key == "UIBackgroundModes":
+    if base == "UIBackgroundModes":
         modes = value if isinstance(value, list) else str(value).split()
         for mode in modes:
             if str(mode) not in ALLOWED_BACKGROUND_MODES:
                 errors.append(f"[FR-REC-05] {source}: UIBackgroundModes に {mode} を入れない")
-    if key == "NSExtensionPointIdentifier" and str(value) not in ALLOWED_EXTENSION_POINTS:
+    if base == "NSExtensionPointIdentifier" and str(value) not in ALLOWED_EXTENSION_POINTS:
         errors.append(f"[SEC-PLT-04] {source}: 拡張 {value} を置かない")
     if isinstance(value, dict):
         for child_key, child_value in value.items():

@@ -48,10 +48,11 @@ fail() {
 runtime_version() {
   local name=$1 binary=$2 out
   case "$name" in
-    swiftlint) out=$("$binary" version) || return 1 ;;
-    swiftformat) out=$("$binary" --version) || return 1 ;;
-    gitleaks) out=$("$binary" version) || return 1 ;;
-    gh) out=$("$binary" --version) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
+    # 標準入力は /dev/null にする（呼び出し側は版の写しを読んでいる途中で、版のコマンドに後続の行を読ませない）
+    swiftlint) out=$("$binary" version </dev/null) || return 1 ;;
+    swiftformat) out=$("$binary" --version </dev/null) || return 1 ;;
+    gitleaks) out=$("$binary" version </dev/null) || return 1 ;;
+    gh) out=$("$binary" --version </dev/null) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
     *) echo "NG: 版の確認方法が未定義のツール: $name" >&2; return 1 ;;
   esac
   printf '%s\n' "${out#v}"

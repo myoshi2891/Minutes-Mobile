@@ -214,6 +214,17 @@ def test_settings() -> None:
     for modified in ("UIFileSharingEnabled~iphone", "UIFileSharingEnabled-iphoneos~iphone", "UIFileSharingEnabled-iphoneos"):
         settings_case(f"ファイル共有を有効にしている（Info.plist・{modified}）", 1, modified,
                       plists={"App/Info.plist": {modified: True}})
+    # ほかの鍵の規則（あるだけで違反・使わない権限の文言・Background Modes・拡張の種類）も、修飾子を除いた鍵で判定する
+    for modifier in ("~iphone", "-iphoneos", "-iphoneos~iphone"):
+        settings_case(f"修飾子つきの ATS（{modifier}）", 1, f"NSAppTransportSecurity{modifier} を設定しない",
+                      plists={"App/Info.plist": {f"NSAppTransportSecurity{modifier}": {}}})
+        settings_case(f"修飾子つきの使わない権限の文言（{modifier}）", 1, f"使わない権限の文言 NSCameraUsageDescription{modifier}",
+                      plists={"App/Info.plist": {f"NSCameraUsageDescription{modifier}": "x"}})
+        settings_case(f"修飾子つきの Background Modes（{modifier}）", 1, "UIBackgroundModes に fetch を入れない",
+                      plists={"App/Info.plist": {f"UIBackgroundModes{modifier}": ["audio", "fetch"]}})
+        settings_case(f"修飾子つきの拡張の種類（{modifier}）", 1, "拡張 com.apple.share-services を置かない",
+                      plists={"Share/Info.plist": {"NSExtension": {
+                          f"NSExtensionPointIdentifier{modifier}": "com.apple.share-services"}}})
     settings_case("修飾子つきのファイル共有の無効は認める", 0, "OK",
                   plists={"App/Info.plist": {"UIFileSharingEnabled~iphone": False}})
     settings_case("ファイル共有を無効と明記するのは認める", 0, "OK",
@@ -1320,8 +1331,9 @@ def staged_raw_blob_case() -> None:
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
                                 env=dict(env, MINUTES_TEST_OUT=str(out), MINUTES_TEST_LINT_OUT=str(lint_out)), timeout=60)
         for label, path in (("整形", out), ("静的解析", lint_out)):
-            recorded = path.read_text(encoding="utf-8") if path.is_file() else None
-            if recorded != "let raw = 1\n":
+            # バイト列で比べる（テキストとして読むと改行の違いを正規化し、CRLF への変換などを見逃す）
+            recorded = path.read_bytes() if path.is_file() else None
+            if recorded != b"let raw = 1\n":
                 failures.append(f"check: --staged の{label}がステージした blob そのものを検査しない（読んだ内容 {recorded!r}・"
                                 f"終了コード {result.returncode}）\n{(result.stdout + result.stderr).strip()}")
 
@@ -1618,6 +1630,14 @@ def test_versions() -> None:
         stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
         expect("versions: 導入記録のある版を指すリンク", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                  "--require", "gh"], 0, "OK")
+        # 版を表示するコマンドが標準入力を読んでも、台帳の後続の行を消費させない（標準入力は /dev/null）。後続の行が
+        # 読まれていれば、重複した gh の行として失敗する（消費されると、その行を読まずに通る）
+        stub.write_text(f"#!/bin/sh\ncat >/dev/null\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        duplicated = Path(directory) / "versions-duplicated"
+        duplicated.write_text("\n".join([gh_rows[0], gh_rows[0]]) + "\n", encoding="utf-8")
+        expect("versions: 版の表示のコマンドが台帳の後続の行を読まない",
+               [setup, "--verify", "--versions", str(duplicated), "--dest", str(dest), "--require", "gh"], 1, "重複している")
+        stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
         # 照合も導入と同じロックを取る。導入の実行中（ロックがある間）は照合を終えず、ロックが外れてから照合して通る
         verify_lock_case(setup, versions, dest, stub)
         other = dest / "gh" / "other" / executable
@@ -2515,6 +2535,11 @@ def run_docs_cases() -> None:
                   "| FR-AAA-01 | <!-- 試験 --> |"),
         docs_case("対応表の行のテストにコメントと表示される名前がある", 0, "OK", detailed, "| FR-AAA-01 | 試験 |",
                   "| FR-AAA-01 | 試験 <!-- 補足 --> |"),
+        # 先頭の列の要件 ID も表示される部分だけを数える（コメントの中の ID だけの行は対応の行にしない）
+        docs_case("対応表の行の要件 ID がコメントだけ", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |",
+                  "| <!-- FR-AAA-01 --> | 試験 |"),
+        docs_case("対応表の行の要件 ID にコメントと表示される ID がある", 0, "OK", detailed, "| FR-AAA-01 | 試験 |",
+                  "| FR-AAA-01 <!-- 補足 --> | 試験 |"),
         # 検査・試験の列が空なら、「状態」などほかの列に値があっても数えない
         docs_case("対応表の行の検査・試験が空で状態だけがある", 1, "対応表の行がない", detailed,
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |", "| 要件 | 検査・試験 | 状態 |\n| --- | --- | --- |\n| FR-AAA-01 |  | 通過 |"),
