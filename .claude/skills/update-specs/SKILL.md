@@ -111,3 +111,6 @@ git add <変えた文書と実ファイル> && scripts/check.sh --staged   # コ
 ### 8. コミット
 
 利用者に頼まれたときだけコミットする。形式は `docs(<scope>): <subject>`（`<scope>` は `requirements` / `design` / `dev` など、既存の履歴に合わせる）。
+
+- **最後のコミット（`PROGRESS.md` の更新を含む）の後に `scripts/check.sh --require-clean` を実行する。** 開始時のコミットを専用の作業ツリーで検査し、未コミットの変更があれば手順を始めずに失敗する。PR を作る場合は、出力の合格の行（コミットのハッシュを含む）を PR の説明に貼る（`docs/03-detailed-design/dev-environment.md` §4.2）。PR を更新したら、更新後のコミットで実行し直す。
+- 作業単位 2 が済む前は手順 1・4・7〜9 が失敗するので、`--require-clean` に `--steps 0,2,3,5,6,10` を付けて実行し、その結果を貼る（`tdd-implement` の手順 5 と同じ）。

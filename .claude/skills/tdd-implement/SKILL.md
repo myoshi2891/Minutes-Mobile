@@ -93,12 +93,12 @@ swift test --package-path Packages/MinutesKit --filter WAVHeaderTests   # Packag
 ### 5. 検査する
 
 ```bash
-scripts/check.sh            # 手順 0〜10
-scripts/check.sh --staged   # コミット前の範囲
+scripts/check.sh                                   # 手順 0〜10。作業ツリーを検査する
+git add <変えたファイル> && scripts/check.sh --staged   # コミット前の範囲。ステージした内容（インデックス）だけを検査する
 ```
 
 - 作業単位 2 が済んだあとは、全手順が通ることを完了の条件にする。
-- 上の 2 つは作業ツリーを検査するだけで、コミットの合格にはならない。**手順 7 の `PROGRESS.md` の更新まで含めてコミットした後に `scripts/check.sh --require-clean` を実行する**（開始時のコミットを専用の作業ツリーで検査する。未コミットの変更があれば手順を始めずに失敗する。`PROGRESS.md` の更新の前のコミットで得た合格は、統合するコミットの合格にならない）。統合するコミット（`PROGRESS.md` の更新を含む最後のコミット）の合格の行を、そのコミットのハッシュ付きで PR の説明に貼る（`docs/03-detailed-design/dev-environment.md` §4.2）。PR を更新したら、更新後のコミットで実行し直す。
+- `--staged` は作業ツリーではなくインデックスを検査するので、変えたファイルを**ステージしてから**実行する（ステージしていない変更は検査されない）。上の 2 つはどちらもコミットの合格にはならない（1 行目は作業ツリー、2 行目はインデックスを検査する）。**手順 7 の `PROGRESS.md` の更新まで含めてコミットした後に `scripts/check.sh --require-clean` を実行する**（開始時のコミットを専用の作業ツリーで検査する。未コミットの変更があれば手順を始めずに失敗する。`PROGRESS.md` の更新の前のコミットで得た合格は、統合するコミットの合格にならない）。統合するコミット（`PROGRESS.md` の更新を含む最後のコミット）の合格の行を、そのコミットのハッシュ付きで PR の説明に貼る（`docs/03-detailed-design/dev-environment.md` §4.2）。PR を更新したら、更新後のコミットで実行し直す。
 - 作業単位 2 が済む前は、手順 1・4・7〜9 が失敗する（`docs/03-detailed-design/dev-environment.md` §4.1）。`check.sh` は最初の失敗で止まるので、全手順の実行では手順 1 より後の結果が分からない。それ以外の手順は `--steps` で指定して実行し、通ることを確かめる。
 
   ```bash
