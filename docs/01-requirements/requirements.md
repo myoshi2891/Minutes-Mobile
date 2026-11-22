@@ -158,11 +158,12 @@ stateDiagram-v2
     stop_requested --> finalized: 欠落を承知した例外確定（FR-FIN-02。lossRecord を記録）
     finalized --> transcribing: 文字起こしジョブ開始
     transcribing --> transcribed: 全 Chunk 処理 + 統合完了
+    transcribing --> completed: 再文字起こしの完了（P2。completed から再実行した場合。AI 議事録は保持。FR-STT-05）
     transcribing --> transcribing: 一部失敗（再試行待ち）
     transcribed --> transcribing: 再文字起こし（新しい版を作る。以前の版は保持。FR-STT-05）
     completed --> transcribing: 再文字起こし（P2。AI 議事録は保持。FR-STT-05）
     transcribed --> summarizing: AI 要約（P2）
-    completed --> summarizing: AI 議事録の再生成（P2。既存の文字起こしを使う。FR-SUM-05）
+    completed --> summarizing: AI 議事録の再生成（P2。最新の版の文字起こしを使う。FR-SUM-05）
     summarizing --> completed: 要約保存（P2。再生成では新しい版を追加）
     summarizing --> transcribed: 初回の要約の失敗（文字起こしは保持）
     summarizing --> completed: 再生成の失敗（既存の AI 議事録を保持。再試行できる）
@@ -187,7 +188,7 @@ stateDiagram-v2
 | FR-STT-02 | 文字起こしは Chunk 単位のジョブとして実行し、ジョブの状態（`pending` / `processing` / `succeeded` / `failed` / `skipped`）・試行回数・エラー分類を永続化する。途中で中断しても、未完了の Chunk から再開できる | MVP | P2 §9 |
 | FR-STT-03 | Chunk 境界で切れる発話を拾うため、前の Chunk の末尾（既定 3 秒）を重ねて認識し、重なりで生じた重複を統合時に除外する。除外の判定は記録し、UI で確認できる。①Overlap は、直前の連番の Chunk が利用でき（欠番・ファイル欠損・ハッシュ不一致でない）、両 Chunk の間に空白区間が記録されておらず、かつ直前の Chunk の WAV の実際の終わり（開始サンプル + サンプル数）が後続 Chunk の開始サンプルと一致する場合だけ行う（空白区間の前後でサンプル番号は連続するので、サンプル番号の連続だけでは判定しない。空白区間が記録されていれば、理由 `gap` として Overlap を行わない。一部だけ救済した WAV のように直前の WAV の終わりと後続の開始の間に欠落が残れば、理由 `discontinuous` として Overlap を行わない）。②条件を満たさない場合は Overlap を付けず、後続 Chunk は先頭から通常どおり認識する（後続 Chunk 自体の先頭区間は正常な原音なので空白区間・欠落区間として扱わない。欠落区間として扱うのは欠落した Chunk の区間だけ。FR-FIN-02 ③・FR-TRV-03）。③重複除外の判定は境界ごとに記録し、Overlap を行わなかった境界も「Overlap なし」とその理由（`missing` / `file_missing` / `hash_mismatch` / `gap` / `discontinuous` / `first_chunk`）を記録する（除外したセグメントは 0 件） | MVP | P1 §3.10、P2 §10.3、§11.3 |
 | FR-STT-04 | セグメントは `(版番号, chunk, segmentIndex)` で一意にする。同じ版の中では `(chunk, segmentIndex)` の組で一意とし、同じジョブを再実行しても重複しない。版をまたいでセグメントを参照する場合（P2 の根拠セグメント ID など）は版番号と組にする（FR-STT-05 で以前の版を保持するため） | MVP | P2 §10.5 |
-| FR-STT-05 | 統合した確定文字起こしは版番号付きで保存し、再実行で新しい版を作る。以前の版は保持する。再文字起こしは `transcribed` または `completed`（P2）から `transcribing` へ遷移して行い（FR-FIN-03）、新しい版が完成するまでは以前の版を表示し続ける。完了すると `transcribed` へ戻る。`completed` から再実行した場合も既存の AI 議事録は削除せず、各 AI 議事録はもとにした文字起こしの版番号を記録する | MVP | P2 §11 |
+| FR-STT-05 | 統合した確定文字起こしは版番号付きで保存し、再実行で新しい版を作る。以前の版は保持する。再文字起こしは `transcribed` または `completed`（P2）から `transcribing` へ遷移して行い（FR-FIN-03）、新しい版が完成するまでは以前の版を表示し続ける。完了すると、`transcribed` から再実行した場合は `transcribed` へ、`completed` から再実行した場合は `completed` へ戻る。`completed` から再実行した場合も既存の AI 議事録は削除せず、各 AI 議事録はもとにした文字起こしの版番号を記録する。新しい版の文字起こしから AI 議事録を作り直すには、`completed` から FR-SUM-05 の再生成を行う。AI 議事録がもとにした版が表示中の文字起こしの版より古いときは、そのことを表示する | MVP | P2 §11 |
 | FR-STT-06 | 音声認識が使えない状態（言語アセット未取得・非対応端末・OS 側の一時的な失敗）では、会議を `finalized` のまま待たせ、理由を表示する。録音と確定には影響させない | MVP | P2 §5.3、Invariant 3 |
 | FR-STT-07 | 日本語の言語アセットが端末にない場合、OS 標準の取得手順を利用者の明示操作で開始する。開始前に「OS が音声認識モデルをダウンロードします。会議データは送信されません」と説明する（SEC-NET-03） | MVP | P2 §7.4 の読み替え |
 | FR-STT-08 | セグメントごとに信頼度（取得できる場合）を保存し、低信頼度のセグメントを UI で区別して表示する | MVP | P1 §3.8、P2 §18 |
@@ -213,7 +214,7 @@ stateDiagram-v2
 | FR-SUM-02 | LLM が一度に扱える長さ（コンテキスト長）を実行時に取得し、超える場合は分割して要約し、その結果を統合する（Map-Reduce） | P2 | P2 §12.3 |
 | FR-SUM-03 | 出力は構造化スキーマで受け取り、検証する。各項目は根拠となるセグメント ID（`sourceSegmentIds`）を持ち、実在しない ID を含む項目は除外して `rejected` に保持し、件数を警告表示する。除外項目は利用者が確認して手動で採用できる | P2 | P1 §3.8、P2 §12.5 |
 | FR-SUM-04 | 担当者・期限は文字起こしに出現する表現だけから採る。AI に人名を推定させない | P2 | P2 §12.5、Invariant 9 |
-| FR-SUM-05 | AI 議事録は版管理し、再生成は新しい版の追加とする。以前の版と差分を表示できる。再生成は既存の確定文字起こしを使い、`completed` から `summarizing` へ遷移して行う（FR-FIN-03）。再生成に失敗した場合は既存の AI 議事録を保持して `completed` に戻り、利用者は再試行できる | P2 | P2 §12.7 |
+| FR-SUM-05 | AI 議事録は版管理し、再生成は新しい版の追加とする。以前の版と差分を表示できる。再生成は、その時点で最新の版の確定文字起こしを使い（再文字起こし（FR-STT-05）で新しい版ができた後は、その版から作り直す）、`completed` から `summarizing` へ遷移して行う（FR-FIN-03）。各版の AI 議事録は、もとにした文字起こしの版番号を記録する。再生成に失敗した場合は既存の AI 議事録を保持して `completed` に戻り、利用者は再試行できる | P2 | P2 §12.7 |
 | FR-SUM-06 | 使用したモデルと既知の弱点の注記を常時表示する | P2 | P1 §3.8、P2 §12.6 |
 | FR-SUM-07 | Apple Intelligence が非対応・無効の端末では要約機能を無効にし、理由を表示する。文字起こしまでの機能は影響を受けない | P2 | Invariant 2 |
 
