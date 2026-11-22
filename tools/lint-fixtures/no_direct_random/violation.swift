@@ -12,3 +12,5 @@ let inComment = Int.random(in: 0..<10 /* using: &generator */) // expect: no_dir
 let withComment = Int.random(in: 0..<10 /* ( */) // expect: no_direct_random
 // 文字列の中の using: は引数ではない
 let inString = Int.random(in: 0..<length(of: "using: (")) // expect: no_direct_random
+// 入れ子のブロックコメントの中の using: は引数ではない
+let inNestedComment = Int.random(in: 0..<10 /* 外 /* 内 */ using: &generator */) // expect: no_direct_random
