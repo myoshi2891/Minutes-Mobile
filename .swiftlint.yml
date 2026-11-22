@@ -188,7 +188,8 @@ custom_rules:
 
   no_direct_uuid:
     name: "UUID の直接の生成の禁止"
-    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)'
+    # 型の注釈を付けた省略形（let id: UUID = .init()）も生成として検出する。引数のある .init(uuidString:)・.init(uuid:) は認める
+    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)|:\s*(?:Foundation\s*\.\s*)?UUID\s*[?!]?\s*=\s*\.\s*init\s*\(\s*\)'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
       - '.*/TestSupport/TemporaryDirectory\.swift'

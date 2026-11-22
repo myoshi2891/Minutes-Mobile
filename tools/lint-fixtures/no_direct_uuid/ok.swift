@@ -1,3 +1,5 @@
 let parsed = UUID(uuidString: text)
 let initialized = UUID.init(uuidString: text)
 let identifier = identifiers.next()
+let typedParsed: UUID? = .init(uuidString: text)
+let typedBytes: UUID = .init(uuid: bytes)
