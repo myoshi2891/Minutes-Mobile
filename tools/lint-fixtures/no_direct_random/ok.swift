@@ -20,3 +20,5 @@ let labelComment = Int.random(in: 0..<10, using /* 生成器 */ : &generator)
 // 前の引数に角括弧・波括弧があっても、最上位の using: を認める
 let withLiteral = Int.random(in: 0..<[1, 2].count, using: &generator)
 let withClosure = Int.random(in: 0..<items.map { $0 }.count, using: &generator)
+// 前の引数の括弧が 3 段の入れ子でも、最上位の using: を認める
+let deepNested = Int.random(in: 0..<f(g(h(1))), using: &generator)

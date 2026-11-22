@@ -71,7 +71,8 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
             rules[current] = False
         elif re.match(r"^  [^\s#]", line):
             errors.append(f".swiftlint.yml の custom_rules の行を規則名として読めない: {line.strip()}")
-        elif current and re.match(r"^    excluded\s*:", line):  # 「excluded :」のようにコロンの前の空白も許す
+        # 「excluded :」のようにコロンの前の空白も許す。引用符で囲んだ鍵（'excluded'・"excluded"）も同じ鍵として扱う
+        elif current and re.match(r"""^    (?:excluded|'excluded'|"excluded")\s*:""", line):
             rules[current] = True
     return rules
 

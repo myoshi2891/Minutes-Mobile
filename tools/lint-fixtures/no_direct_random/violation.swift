@@ -18,3 +18,6 @@ let inNestedComment = Int.random(in: 0..<10 /* 外 /* 内 */ using: &generator *
 let inLiteral = Int.random(in: 0..<[using: 1].count) // expect: no_direct_random
 let inNestedCall = Int.random(in: 0..<pick(using: &generator)) // expect: no_direct_random
 let inClosure = Int.random(in: 0..<items.map { pick(using: $0) }.count) // expect: no_direct_random
+// 3 段の入れ子でも using: がなければ検出する。4 段以上の入れ子は読めないので、最上位の using: があっても検出する側に倒れる
+let deepWithout = Int.random(in: 0..<f(g(h(1)))) // expect: no_direct_random
+let deeper = Int.random(in: 0..<f(g(h(i(1)))), using: &generator) // expect: no_direct_random
