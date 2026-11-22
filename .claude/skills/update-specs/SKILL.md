@@ -42,7 +42,7 @@ description: Use when adding, changing, or retiring anything in the MinutesMobil
 
 ### 3. 影響を調べる
 
-変える ID で `docs/` と、`CLAUDE.md`・ルートの `README.md` を検索し、参照している文書をすべて挙げる。`CLAUDE.md` は実装の指示を要約して持つので、要件を変えたときに古い指示が残りやすい（`verify-docs.py` もこの 2 つの ID を照合する）。文書は ID を省略して書くことが多いので、完全一致だけで終わらせない。次の 3 つの書き方をすべて拾う（例は `FR-REC-02`）。
+変える ID で `docs/` と、`CLAUDE.md`・ルートの `README.md`・`.claude/skills/`・`PROGRESS.md` を検索し、参照している文書をすべて挙げる。`CLAUDE.md` とスキル（`.claude/skills/`）は実装の指示を要約して持ち、`PROGRESS.md` は次のアクションに ID を挙げるので、要件を変えたときに古い指示・進捗が残りやすい（`verify-docs.py` が ID を照合するのは `docs/`・`CLAUDE.md`・`README.md` だけなので、`.claude/skills/` と `PROGRESS.md` は下の検索の結果を目で読む）。文書は ID を省略して書くことが多いので、完全一致だけで終わらせない。次の 3 つの書き方をすべて拾う（例は `FR-REC-02`）。
 
 | 書き方 | 例 | 拾い方 |
 | --- | --- | --- |
@@ -52,10 +52,10 @@ description: Use when adding, changing, or retiring anything in the MinutesMobil
 | スラッシュ区切りの番号の省略 | `SEC-NET-03 / 04`、`FR-REC-01/02` | 領域の接頭辞の後ろの `/` で検索し、並びが変える番号を含むかを読む |
 
 ```bash
-grep -rn "FR-REC-02" docs/ CLAUDE.md README.md                          # 完全一致
-grep -rnE "FR-([A-Z0-9]+・)*REC(・[A-Z0-9]+)* ?群" docs/ CLAUDE.md README.md   # 群（並びの省略を含む）
-grep -rnE "FR-REC-[0-9]+(〜|・)" docs/ CLAUDE.md README.md               # 範囲・並び。番号が含まれるかは目で確かめる
-grep -rnE "FR-REC-[0-9]+ ?/ ?[0-9]+" docs/ CLAUDE.md README.md          # スラッシュ区切り。番号が含まれるかは目で確かめる
+grep -rn "FR-REC-02" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md                          # 完全一致
+grep -rnE "FR-([A-Z0-9]+・)*REC(・[A-Z0-9]+)* ?群" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md   # 群（並びの省略を含む）
+grep -rnE "FR-REC-[0-9]+(〜|・)" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md               # 範囲・並び。番号が含まれるかは目で確かめる
+grep -rnE "FR-REC-[0-9]+ ?/ ?[0-9]+" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md          # スラッシュ区切り。番号が含まれるかは目で確かめる
 ```
 
 `scripts/verify-docs.py` も範囲（〜）・並び（・）・スラッシュ区切り（`/`）と群を展開して ID を照合している（展開の規則は同じ）。ただし検査が確かめるのは参照先の ID が定義されていることだけで、変えた ID を参照している箇所の内容が正しいかは確かめないので、上の検索の結果を目で読む。検索の結果から、参照している文書と節をすべて挙げてから直す。
