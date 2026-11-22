@@ -220,7 +220,7 @@ gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwi
 - ファイルの一部だけをステージした場合も、コミットされる内容（インデックス）だけを検査する。作業ツリーで直しただけでステージしていない違反は、コミットを止める。
 - 違反の表示は一時ディレクトリのパスになる（末尾の相対パスは元の位置と同じ）。
 - 通常の実行（`--require-clean` なし）は作業ツリーを検査し、未コミットの変更の有無によらず「コミットの合格としては記録しない」と表示する。検査中に作業ツリーを書き換えて戻すと、開始時と終了時の状態が同じでも、コミットにない内容を検査しうるためである。
-- `--require-clean` を付けた場合は、未コミットの変更（追跡していないファイルを含む）があれば、手順を始める前に終了コード 1 で失敗する。なければ、開始時のコミットをリポジトリの外の一時ディレクトリに `git worktree add --detach` で展開し（開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、プッシュ前のフックと同じく導入のロック（`.install.lock`）を取ってから専用の作業ツリーの `.tools` に写す。手順 0 の照合と後の手順はすべてこの写しを使い、検査の途中に別の `setup-tools.sh` が元の `.tools` を差し替えても、照合した導入と使う導入が食い違わない）、その中の `check.sh` に同じ引数を渡して検査する（元の作業ツリーを検査中に書き換えて戻しても、検査する内容は変わらない）。展開はプッシュ前のフックと同じく `-c core.autocrlf=false` で行い（LF のまま実行する）、元の作業ツリーが sparse checkout なら専用の作業ツリーでだけ `sparse-checkout disable` を実行して全体を展開する（`full_checkout`。§5 と同じ扱い。`GIT_CONFIG` を外して設定を読む。通常の実行の作業ツリーは変えない）。`--require-clean` の実行は、開始時の HEAD を読む前に `GIT_NO_REPLACE_OBJECTS=1` を設定し、照合・展開・入れ子の `check.sh` のすべてを置き換えのオブジェクト（`git replace`）なしの元のコミットで行う。プッシュ前のフックも、参照の照合の前に同じ設定をする。専用の作業ツリーで検査中に HEAD が変わった、または変更が生じた場合は、手順の後で失敗する。成功すると、そのコミットのハッシュを付けて表示する。PR の説明にはこの行を貼る（基本設計 §6.2）。専用の作業ツリーは終了時に、この実行で作ったものだけを `git worktree remove --force` で登録ごと消す。リポジトリ全体の `git worktree prune` は実行しない（ほかの作業ツリーの登録を外さない）。消せなければ場所を表示して失敗にし、置き場所も残す。専用の作業ツリーで実行中であることは環境変数 `MINUTES_CHECK_ISOLATED` で示し、プッシュ前のフックは自身の専用の作業ツリー（§5）で実行するのでこれを設定して二重に展開しない（ビルドの成果物を再利用する）。`--staged`（インデックスを検査する）とは組み合わせない。
+- `--require-clean` を付けた場合は、未コミットの変更（追跡していないファイルを含む）があれば、手順を始める前に終了コード 1 で失敗する。なければ、開始時のコミットをリポジトリの外の一時ディレクトリに `git worktree add --detach` で展開し（開発ツールは、元の作業ツリーの `.tools` を共有のリンクで指さず、プッシュ前のフックと同じく導入のロック（`.install.lock`）を取ってから専用の作業ツリーの `.tools` に写す。手順 0 の照合と後の手順はすべてこの写しを使い、検査の途中に別の `setup-tools.sh` が元の `.tools` を差し替えても、照合した導入と使う導入が食い違わない）、その中の `check.sh` に同じ引数を渡して検査する（元の作業ツリーを検査中に書き換えて戻しても、検査する内容は変わらない）。展開はプッシュ前のフックと同じく `-c core.autocrlf=false` で行い（LF のまま実行する）、元の作業ツリーが sparse checkout なら専用の作業ツリーでだけ `sparse-checkout disable` を実行して全体を展開する（`full_checkout`。§5 と同じ扱い。`GIT_CONFIG` を外して設定を読む。通常の実行の作業ツリーは変えない）。`--require-clean` の実行は、開始時の HEAD を読む前に `GIT_NO_REPLACE_OBJECTS=1` を設定し、照合・展開・入れ子の `check.sh` のすべてを置き換えのオブジェクト（`git replace`）なしの元のコミットで行う。プッシュ前のフックも、参照の照合の前に同じ設定をする。展開の後に、専用の作業ツリーの追跡しているファイルがコミットの blob とバイト単位で一致することを確かめ（`verify_checkout_blobs`。通常のファイルは `git hash-object --no-filters`、シンボリックリンクはリンク先の文字列で比べる）、違えば手順を始めずに失敗する。`core.autocrlf=false` では `.gitattributes` の smudge のフィルタは止まらず、clean のフィルタで打ち消されると `git status` では変更が見えないためである。プッシュ前のフックも、専用の作業ツリーの再利用・作り直しのどちらの後でも同じ関数で確かめる。専用の作業ツリーで検査中に HEAD が変わった、または変更が生じた場合は、手順の後で失敗する。成功すると、そのコミットのハッシュを付けて表示する。PR の説明にはこの行を貼る（基本設計 §6.2）。専用の作業ツリーは終了時に、この実行で作ったものだけを `git worktree remove --force` で登録ごと消す。リポジトリ全体の `git worktree prune` は実行しない（ほかの作業ツリーの登録を外さない）。消せなければ場所を表示して失敗にし、置き場所も残す。専用の作業ツリーで実行中であることは環境変数 `MINUTES_CHECK_ISOLATED` で示し、プッシュ前のフックは自身の専用の作業ツリー（§5）で実行するのでこれを設定して二重に展開しない（ビルドの成果物を再利用する）。`--staged`（インデックスを検査する）とは組み合わせない。
 - `--staged` が整形・静的解析に渡すのは、追加・変更・名前の変更・種類の変更（`--diff-filter=ACMRT`）でステージした Swift のパスのうち、インデックスで通常のファイル（モード `100644`・`100755`）のものだけ。シンボリックリンク・サブモジュールの Swift のパスは、黙って除かずに失敗にする。
 - `--expect-head <SHA>` を付けた場合は、開始時の HEAD（`START_HEAD`）を取得した直後に指定したコミットと照合し、違えば手順を始める前に終了コード 1 で失敗する。プッシュ前のフックは、送信する参照と照合した HEAD をこの引数で渡す（照合してから `check.sh` が始まるまでに HEAD が A から B に変わっても、B を A の合格として検査しない。A のままなら通る）。`--require-clean` の開始時・終了時の検査はそのまま行う。`--staged` とは組み合わせない。
 
@@ -258,7 +258,20 @@ gitleaks    8.30.1 x86_64 gitleaks/gitleaks        v8.30.1 gitleaks_8.30.1_darwi
 # コミット前の検査: ステージしたファイルに対する手順 1〜3 と 10（基本設計 dev-environment.md §6.2）。
 # 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
 set -euo pipefail
-exec "$(git rev-parse --show-toplevel)/scripts/check.sh" --staged
+root=$(git rev-parse --show-toplevel)
+# 導入済みの開発ツールが、ステージした tools/versions（コミットする台帳）と一致することを先に確かめる。作業ツリーの台帳や
+# 古い導入のまま、コミットする台帳と違う版のツールで整形・静的解析・秘密情報を検査しない
+versions=$(mktemp)
+trap 'rm -f -- "$versions"' EXIT
+if ! git cat-file blob :tools/versions > "$versions"; then
+  echo "NG: ステージした tools/versions を読めない" >&2
+  exit 1
+fi
+if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
+  echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。scripts/setup-tools.sh で導入し直してからコミットする" >&2
+  exit 1
+fi
+"$root/scripts/check.sh" --staged
 ```
 
 <!-- file: .githooks/pre-push -->
@@ -467,6 +480,42 @@ full_checkout() {
       ;;
   esac
 }
+# 作業ツリー（$1）の追跡しているファイルが、そのインデックス（チェックアウトしたコミット）の blob とバイト単位で一致することを
+# 確かめる。checkout は .gitattributes の smudge のフィルタで内容を変えうる（core.autocrlf=false では filter は止まらない）。
+# 内容を変えたチェックアウトを、コミットの合格として検査しない。通常のファイルは git hash-object --no-filters で、
+# シンボリックリンクはリンク先の文字列で比べる。サブモジュール（160000）は blob がないので比べない。一致しなければ非 0 を返す
+verify_checkout_blobs() {
+  local tree=$1 entries entry mode object path actual status=0
+  entries=$(mktemp)
+  if ! git -C "$tree" ls-files -s -z > "$entries"; then rm -f -- "$entries"; return 1; fi
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    case "$mode" in
+      160000) continue ;;
+      120000)
+        if [ ! -L "$tree/$path" ] || [ "$(readlink -- "$tree/$path")" != "$(git -C "$tree" cat-file blob "$object")" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（シンボリックリンク）" >&2
+          status=1
+        fi
+        ;;
+      *)
+        actual=""
+        if [ -f "$tree/$path" ] && [ ! -L "$tree/$path" ]; then
+          actual=$(git -C "$tree" hash-object --no-filters -- "$tree/$path") || actual=""
+        fi
+        if [ "$actual" != "$object" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（.gitattributes のフィルタなどで内容が変わった）" >&2
+          status=1
+        fi
+        ;;
+    esac
+  done < "$entries"
+  rm -f -- "$entries"
+  return "$status"
+}
 # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
 if [ "$owned" -eq 1 ]; then
   git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"
@@ -496,6 +545,12 @@ else
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" -c core.autocrlf=false worktree add -q --force --detach "$snapshot" "$head"
   full_checkout
+fi
+# 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では
+# smudge のフィルタは止まらない。変わった内容を送信するコミットの合格として検査しない）
+if ! verify_checkout_blobs "$snapshot"; then
+  echo "NG: 専用の作業ツリーの内容が送信するコミット（${head}）の blob と違う（.gitattributes の smudge のフィルタなど）。検査しない" >&2
+  exit 1
 fi
 # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
 # 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
@@ -538,8 +593,11 @@ for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
     cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
   fi
 done
-rmdir "$tools_lock"
+# 持ち主の印（tools_lock）を先に外してからロックを外す。逆の順では、rmdir の後・印を外す前に中断されると、終了の trap が
+# その間に別の導入が取り直したロックを消しうる。この順では中断してもロックが残るだけで、導入の直列化は弱めない
+held_lock=$tools_lock
 tools_lock=""
+rmdir "$held_lock"
 
 # 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
 MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null
@@ -605,6 +663,19 @@ if [ "$HOOKS" = 1 ]; then
       fi
       ;;
   esac
+  # 共有の設定のファイルが取り込む設定（include.path と、今の作業ツリーで条件の当たる includeIf.*.path。onbranch を含む）の
+  # core.hooksPath は、取り込みの位置で読まれるので、書き込む値より後に読まれて上書きしうる。取り込みからだけ得られる値
+  # （取り込みを読んだ一覧から、共有のファイル自身の値を除いたもの）に .githooks 以外があれば、共有の値を書かずに止める
+  with_includes=$(env -u GIT_CONFIG git config --local --includes --get-all core.hooksPath || true)
+  own=$(env -u GIT_CONFIG git config --local --no-includes --get-all core.hooksPath || true)
+  included=$(comm -23 <(printf '%s\n' "$with_includes" | LC_ALL=C sort) <(printf '%s\n' "$own" | LC_ALL=C sort))
+  while IFS= read -r value; do
+    if [ -n "$value" ] && [ "$value" != .githooks ]; then
+      echo "NG: 共有の設定が取り込む設定（include・includeIf）の core.hooksPath が「${value}」を指している。共有の設定を変えずに止める。" \
+        "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
+      exit 1
+    fi
+  done <<< "$included"
   env -u GIT_CONFIG git config --local core.hooksPath .githooks
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる
@@ -663,6 +734,7 @@ fi
 | `no_documents_directory` | `URL.documentsDirectory` | 同じ場所を指す新しい書き方がある |
 | `no_direct_directory_access` | `temporaryDirectory` | 同じ場所を指す新しい書き方がある |
 | `no_direct_clock` | `ContinuousClock`・`SuspendingClock`・`CFAbsoluteTimeGetCurrent`・`DispatchTime.now`・`ProcessInfo.processInfo.systemUptime` など。型の注釈を付けた省略形（`let recordedAt: Date = .now`・`: Date = .init()`） | 単調時計も注入の対象である（TST-GEN-01）。省略形は型の名前を書かずに現在時刻を読めるので、`Date.now` の検出だけでは見逃す（型の注釈のない `.now` は別の型のものとして認める） |
+| `no_direct_uuid` | 型の注釈を付けた省略形（`let id: UUID = .init()`） | `UUID()` の検出だけでは型の名前を書かない生成を見逃す。引数のある `.init(uuidString:)`・`.init(uuid:)` は認める |
 | `no_direct_sleep_timer` | `Thread.sleep`・`sleep(`・`Timer.scheduledTimer`・`asyncAfter` など | タイマーも注入の対象である（TST-GEN-01） |
 | `no_spotlight_user_activity` | `.userActivity(`・`.onContinueUserActivity(` | SwiftUI から `NSUserActivity` を提供する経路になる（SEC-PLT-02） |
 | `no_url_content_loading`（新しい規則。例外の場所なし） | URL を受け取る読み込みの初期化子（`NSData(contentsOf:)`・`Data(contentsOf:)`・`String(contentsOf:)`・`NSDictionary(contentsOf:)`・`XMLParser(contentsOf:)` など。型の注釈つきの `.init(contentsOf:)` を含む） | `https://` の URL を渡すと通信する経路になり、`no_network_api` では検出できない（SEC-NET-01、TST-SEC-01）。ローカルのファイルはパスを受け取る API（`contentsOfFile:`・`FileManager.contents(atPath:)`・`FileHandle`）で読む。`append(contentsOf:)` などのコレクションの操作は対象外 |
@@ -866,7 +938,8 @@ custom_rules:
 
   no_direct_uuid:
     name: "UUID の直接の生成の禁止"
-    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)'
+    # 型の注釈を付けた省略形（let id: UUID = .init()）も生成として検出する。引数のある .init(uuidString:)・.init(uuid:) は認める
+    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)|:\s*(?:Foundation\s*\.\s*)?UUID\s*[?!]?\s*=\s*\.\s*init\s*\(\s*\)'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
       - '.*/TestSupport/TemporaryDirectory\.swift'
@@ -991,7 +1064,7 @@ useDefault = true
 - SwiftFormat は `--lint` で確認だけを行い、検査の中でファイルを書き換えない。直すときは開発者が `.tools/bin/swiftformat .` を実行する。
 - gitleaks は既定の規則をそのまま使い、除外の指定を置かない。`--redact` を付け、検出した値そのものを出力に残さない（出力を PR に貼っても漏れない）。
 - gitleaks の全体の検査はコミット済みの履歴を対象にする。未コミットの変更は、コミット前のフック（ステージした内容）が受け持つ。
-- 履歴の検査には `--log-opts="--all --full-history --diff-merges=separate --root --no-textconv --text --no-color"` を渡す（`scripts/gitleaks-history.sh` の `GITLEAKS_LOG_OPTS`）。`gitleaks-history.sh` が gitleaks に渡す追加の引数は、自己試験が結果を読むための報告の指定（`--report-format`・`--report-path`。それぞれ 1 回まで）だけとし、ほかの指定は渡さずに終了コード 2 で止める（検査の方式・対象・抑止・伏せ字・終了コードを呼び出し側から変えさせない）。既定の `git log` はマージのコミットの差分を出さず、マージの解決で足した行を見落とす（`-m` は形式が設定 `log.diffMerges` に左右されるので使わない）。`--root` は設定 `log.showRoot=false` でも最初のコミットの差分を出す。`--no-textconv` は `.gitattributes` の差分の変換（textconv）を使わず、元の内容の差分を出す（変換で鍵の行を消させない）。`--text` は `.gitattributes` で `binary`（`-diff`）にしたファイルも本文の差分として出す（「Binary files differ」で鍵の行を隠させない）。`--no-color` は設定 `color.diff`・`color.ui` が `always` でも差分に色の制御文字を入れない（行が分断されて鍵を見落とさない。8.30.1 で、付けないと検出しないことを確かめた）。**検出の抑止の仕組みは使わない。** 全履歴の検査とコミット前の検査の両方で、`--gitleaks-ignore-path /dev/null`（実行時の場所の `.gitleaksignore` を読ませない）と `--ignore-gitleaks-allow`（行の `gitleaks:allow` のコメントを無視する）を渡す。gitleaks は検査する場所の直下の `.gitleaksignore` を指定によらず読む（8.30.1 で確かめた）ので、検査する場所に `.gitleaksignore` があれば検査せずに失敗する（承認の記録なしに検出を隠せるため）。`gitleaks-history.sh` は、外から引き継いだリポジトリを指す変数（`GIT_DIR`・`GIT_WORK_TREE` など）を外し、`GIT_NO_REPLACE_OBJECTS=1` を設定して置き換えのオブジェクト（`git replace`）を使わずに元のオブジェクトを読ませてから、浅いクローンの判定と検査を行う。旧来の grafts（`git rev-parse --git-path info/grafts` の位置）は `GIT_NO_REPLACE_OBJECTS` では外れず、コミットの親を付け替えて履歴の一部を隠せる（git 2.55.0 で確かめた）。コメントと空行だけのファイルでも git が非推奨の案内を標準エラーに出し、gitleaks 8.30.1 は「stderr is not empty」で履歴を読まないまま「no leaks found」・終了コード 0 で通す（同じく確かめた）ので、grafts のファイルがあれば内容によらず検査せずに失敗する。`--log-opts` は既定の指定を置き換えるので、既定の `--all --full-history` も書く。手順 3 と自己試験は同じ `scripts/gitleaks-history.sh` を実行する（指定の文字列があることだけを確かめると、手順 3 が `--log-opts` を渡さなくなっても自己試験が通るため）。自己試験は、このコマンドで通常のコミットとマージのコミットだけで足した行の両方が検出され、対照として `gitleaks` を指定なしで直接実行するとマージの行を見落とすことを確かめる。`check.sh` の手順 3 がこのコマンドを呼んでいることも確かめる。
+- 履歴の検査には `--log-opts="--all --full-history --diff-merges=separate --root --no-textconv --text --no-color"` を渡す（`scripts/gitleaks-history.sh` の `GITLEAKS_LOG_OPTS`）。`gitleaks-history.sh` が gitleaks に渡す追加の引数は、自己試験が結果を読むための報告の指定（`--report-format`・`--report-path`。それぞれ 1 回まで）だけとし、ほかの指定は渡さずに終了コード 2 で止める（検査の方式・対象・抑止・伏せ字・終了コードを呼び出し側から変えさせない）。gitleaks（8.30.1）は git log の失敗（欠けたオブジェクトなど）を終了コードに反映しないので、`gitleaks-history.sh` は先に同じ指定の `git log -p -U0` で全履歴を最後まで読めることを確かめ、読めなければ検査せずに終了コード 1 で止める（欠けた blob のある一時リポジトリで、確かめないと「no leaks found」で通ることを自己試験で確かめた）。既定の `git log` はマージのコミットの差分を出さず、マージの解決で足した行を見落とす（`-m` は形式が設定 `log.diffMerges` に左右されるので使わない）。`--root` は設定 `log.showRoot=false` でも最初のコミットの差分を出す。`--no-textconv` は `.gitattributes` の差分の変換（textconv）を使わず、元の内容の差分を出す（変換で鍵の行を消させない）。`--text` は `.gitattributes` で `binary`（`-diff`）にしたファイルも本文の差分として出す（「Binary files differ」で鍵の行を隠させない）。`--no-color` は設定 `color.diff`・`color.ui` が `always` でも差分に色の制御文字を入れない（行が分断されて鍵を見落とさない。8.30.1 で、付けないと検出しないことを確かめた）。**検出の抑止の仕組みは使わない。** 全履歴の検査とコミット前の検査の両方で、`--gitleaks-ignore-path /dev/null`（実行時の場所の `.gitleaksignore` を読ませない）と `--ignore-gitleaks-allow`（行の `gitleaks:allow` のコメントを無視する）を渡す。gitleaks は検査する場所の直下の `.gitleaksignore` を指定によらず読む（8.30.1 で確かめた）ので、検査する場所に `.gitleaksignore` があれば検査せずに失敗する（承認の記録なしに検出を隠せるため）。`gitleaks-history.sh` は、外から引き継いだリポジトリを指す変数（`GIT_DIR`・`GIT_WORK_TREE` など）を外し、`GIT_NO_REPLACE_OBJECTS=1` を設定して置き換えのオブジェクト（`git replace`）を使わずに元のオブジェクトを読ませてから、浅いクローンの判定と検査を行う。旧来の grafts（`git rev-parse --git-path info/grafts` の位置）は `GIT_NO_REPLACE_OBJECTS` では外れず、コミットの親を付け替えて履歴の一部を隠せる（git 2.55.0 で確かめた）。コメントと空行だけのファイルでも git が非推奨の案内を標準エラーに出し、gitleaks 8.30.1 は「stderr is not empty」で履歴を読まないまま「no leaks found」・終了コード 0 で通す（同じく確かめた）ので、grafts のファイルがあれば内容によらず検査せずに失敗する。`--log-opts` は既定の指定を置き換えるので、既定の `--all --full-history` も書く。手順 3 と自己試験は同じ `scripts/gitleaks-history.sh` を実行する（指定の文字列があることだけを確かめると、手順 3 が `--log-opts` を渡さなくなっても自己試験が通るため）。自己試験は、このコマンドで通常のコミットとマージのコミットだけで足した行の両方が検出され、対照として `gitleaks` を指定なしで直接実行するとマージの行を見落とすことを確かめる。`check.sh` の手順 3 がこのコマンドを呼んでいることも確かめる。
 
 ---
 
@@ -1407,11 +1480,11 @@ UI テストは、録音・音声認識・空き容量・保存ルートを差�
 | --- | --- | --- | --- |
 | 独自ルールと入れ子の設定 | `scripts/test-lint-rules.py` | 23 規則・61 件 | 違反例の印の行と検出行が一致する。正常例と例外の場所では検出しない。入れ子の設定は、通常は作業ツリーを走査して Git が無視するものも含めて列挙し（`.git` と、SwiftLint が解析しない excluded の場所は飛ばす。`tools/lint-fixtures` は試験で明示して解析するので走査する）、`--staged`（`check.sh --staged` が渡す）ではインデックスにあるものだけを列挙する。入れ子の設定の試験用のファイル（`_test-code/Sample.swift`）は、通常の設定（`--config` で入れ子の設定を無効にする）では組み込みの 3 規則のすべてに違反することも確かめる（違反のないファイルで「外れる」を確かめても証拠にならない）。入れ子の設定の `disabled_rules` が組み込みの 3 規則だけであること、入れ子の設定の下でも `no_print_logging` が検出されることも確かめる。`custom_rules:` の行と規則名の行は末尾のコメントを許し、規則名として読めない行は失敗にする。SwiftLint が試験用のファイルを読めなかった（標準エラーの「Could not read contents of」。このときも終了コード 0 で検出が 0 件になる）場合と、作業ツリーの走査に失敗した場合と、試験用のファイルの置き場所（`tools/lint-fixtures`）を列挙できない場合は終了コード 2 で止める。作業ツリーの走査では入れ子の設定の名前を大文字小文字を区別せずに探す（既定の APFS では `.SwiftLint.yml` も設定として読まれる）|
 | 設定の検査 | `scripts/test-checks.py settings` | 151 件 | 同じオブジェクトの中の重複した鍵の `project.xcproj` で終了コード 2。向きのビルド設定の変数を構成・SDK ごとに展開して判定する（縦に展開される変数は通り、横に展開される・展開できない変数は違反）。合格する設定で通り、参照先が循環するリンクなら終了コード 2、修飾子つきの向きの鍵（`-iphoneos~iphone`・`-iphoneos`。標準の鍵が縦だけでも）の横向きを違反にすること、相対パス・絶対パスの `--project` で `$(SRCROOT)` から同じ参照先を解決すること、項目ごとの違反で失敗する。必須の設定を SDK ごとに求めること（両方の SDK の条件付きの値で通り、片方だけなら違反）も確かめる。標準の JSON にない定数（NaN・Infinity）は終了コード 2。マイクの利用目的の型・変数の展開、空の条件付きの参照先、生成しない構成の向きの指定も確かめる。`GENERATE_INFOPLIST_FILE` の変数（展開できない場合は生成する・しないの両方を検査する）と、一部の構成だけが参照する plist の変数をその構成・SDK の値だけで展開すること（参照しない構成の値で違反にしない）も確かめる。マイクの利用目的は生成の有無・SDK の条件・参照先の Info.plist の組み合わせと、iPhone の修飾子つきの鍵（`~iphone`・`-iphoneos`・`-iphoneos~iphone`。plist とビルド設定の両方で、最も具体的な鍵の値を判定し、元の鍵だけの plist は認める）で、entitlements は `CODE_SIGN_ENTITLEMENTS` の参照先（拡張子が違うものを含む）で確かめる。読めない設定・参照先がない場合は終了コード 2。画面の向きは Info.plist の生成の有無で判定し、生成する構成で向きを plist だけに置いた場合は通り、どこにもなければ違反、生成しない構成では向きのビルド設定がなくても通ること |
-| 依存の検査 | `scripts/test-checks.py dependencies` | 154 件 | 正規化すると同じパスになるローカルのバイナリの承認が 2 つあれば終了コード 2。壊れたシンボリックリンクの `Package.resolved`・`Package.swift` で終了コード 2 になることも確かめる。正規表現のリテラル（`#/…/#`）の中の `"`・`//` を取り違えないこと、区切りのない `/` と深い入れ子の JSON で終了コード 2 になることも確かめる。読めないディレクトリ（走査の失敗）と循環するリンク（成果物の中・ローカルの Package の参照先）で終了コード 2、URL の正規化でユーザー情報の大文字小文字を区別すること、依存のファイルがなければ通ること、前後に空白のあるローカルのバイナリのパスを拒否することも確かめる。除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない。`.upToNextMinor` の中の `from:` を、名前と「(」の間の空白・コメント・改行によらず `.package` の `from:` と取り違えないこと、未知の呼び出しの中の `from:` と版の指定が 2 つの宣言を判定できないとすること、先行版の `exact`（`1.2.0-rc.1`）が同じ先行版の確定版とだけ一致し、範囲の境界の先行版は判定できないとすることも確かめる。補間の中の正規表現のリテラル（`#/…/#`・`##/…/##`）の「)」で補間が閉じたと見なさないこと、同じ URL のリモートのバイナリの承認の重複と、深い入れ子の補間（RecursionError）で終了コード 2 になること |
-| 版の照合 | `scripts/test-checks.py versions` | 62 件 | `check.sh --staged` の規則の試験と文書の整合が、smudge のフィルタを通さずにステージした blob を書き出し、実行するスクリプトの実行権限を保つこと、静的解析の失敗で手順 2 に止まり手順 3 へ進まないこと。`setup.sh --hooks` が `GIT_CONFIG` によらずリポジトリの設定に書くこと、フックのファイル（`pre-commit`・`pre-push`）がない・実行できない場合は設定を書かずに失敗すること、手順 8 が測定の記録のないときに専用の作業ツリーでは手順 7 と 8 を一緒に実行する案内を出すこと、`find-simulator.py` が真偽値でない `isAvailable` で終了コード 2・成功では選んだ UDID だけを出力すること、`check.sh` の空の `--steps` と範囲外の番号（bash の整数の範囲を超える桁数を含む。正しい番号と並べても）が使い方の誤りになること（写した `check.sh` で試す）、`setup.sh` を相対パスで実行しても CDPATH によらず起点を解決し、`setup-tools.sh` を絶対パスで呼ぶこと、`check.sh --require-clean` が開始時のコミットを専用の作業ツリーで検査して終了後に片付けること、`check.sh --staged` が種類を変えてステージした Swift のシンボリックリンクを手順の前に止めること、`setup-tools.sh --verify` が導入のロックを待つこと、`find-simulator.py` が形の違う一覧（name・udid・deviceTypeIdentifier・ランタイムの version の型と、ない・空・文字列でない platform を含む）で終了コード 2・27.2.0 を 27.2 以上とすること・空の一覧と iPad だけの一覧と正しい形の watchOS だけの一覧で 1 になること、公開するリンクの位置がディレクトリなら止まることも確かめる。書き込めない導入先・ロックの位置のファイルではロックを待たずに止まることも確かめる。実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンク・版のディレクトリの中の実行ファイルがシンボリックリンク（通常のファイルでない）で失敗する。`setup.sh --hooks` が、git の選ぶ作業ツリーが別のリポジトリのとき・より優先される `core.hooksPath`（`-c`・`GIT_CONFIG_*`・作業ツリーの設定）が別の値を指すときに共有の設定を変えずに失敗し、リンクした作業ツリーからは通ること。入れ子の `check.sh` の試験は外側の `MINUTES_CHECK_ISOLATED` を引き継がないこと |
-| 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 33 件 | `gitleaks-history.sh` の追加の引数は報告の指定（`--report-format`・`--report-path`）だけを通し、ほかの指定（`--exit-code`・`--no-redact`・`--log-opts`・`--baseline-path`）・値のない指定・重複した指定は終了コード 2。実行時に組み立てた偽の鍵を検出する。浅いクローンは検査せずに失敗する（一時のリポジトリは外側の `GIT_DIR` などを外した環境で検査する）。`.gitattributes` の textconv で差分から鍵を消しても検出する。`.gitattributes` で `binary` にしたテキストのファイルの鍵も検出する。作業ツリーにだけある `.gitleaksignore`（検出の指紋）と行の `gitleaks:allow` のコメントで、全履歴の検査とコミット前の検査（`check.sh --staged`）の検出が隠れないこと（対照として、指定のない gitleaks では抑止されること）、引き継いだ `GIT_DIR` が別のリポジトリを指していても引数のリポジトリを検査することも確かめる。`log.showRoot=false` でも最初のコミットの鍵を検出する。通常の色の設定と `color.diff=always`・`color.ui=always` のどれでも全履歴の鍵を検出する。手順 3 と同じ `gitleaks-history.sh` で、通常のコミットとマージのコミットだけで足した行の両方を検出する。置き換えのオブジェクト（`git replace`）で隠した鍵も全履歴の検査で検出すること。grafts（`info/grafts`）があれば、有効な行があってもコメントと空行だけでも検査せずに失敗すること。コミット前の検査が `.gitattributes` の `binary`・textconv によらずステージした内容の鍵を検出すること（対照として `gitleaks git --staged` は見落とすこと）、`.gitleaksignore` とコメントの場合ごとの診断を確かめる |
+| 依存の検査 | `scripts/test-checks.py dependencies` | 156 件 | 重複した鍵の `Package.resolved` で終了コード 2。宣言の最上位の引数の `branch:`・`revision:` だけを版で固定していないものとし、`traits` の中の入れ子の `revision:` では拒否しない。正規化すると同じパスになるローカルのバイナリの承認が 2 つあれば終了コード 2。壊れたシンボリックリンクの `Package.resolved`・`Package.swift` で終了コード 2 になることも確かめる。正規表現のリテラル（`#/…/#`）の中の `"`・`//` を取り違えないこと、区切りのない `/` と深い入れ子の JSON で終了コード 2 になることも確かめる。読めないディレクトリ（走査の失敗）と循環するリンク（成果物の中・ローカルの Package の参照先）で終了コード 2、URL の正規化でユーザー情報の大文字小文字を区別すること、依存のファイルがなければ通ること、前後に空白のあるローカルのバイナリのパスを拒否することも確かめる。除外の階層（下位の `build` は検査し、直下の `build` と全階層の `.build` は除外する）も確かめる。ローカルのバイナリの内容の変更（配下のファイルの増減を含む）・リモートのバイナリの checksum の不一致・CR で終わる行コメント（`strip_comments` に直接渡す）も確かめる。許可リストにない依存・版の不一致・取得元の不一致・版で固定していない依存・取得元を判定できない宣言・対象外のライセンスで失敗する。コメントだけの宣言（行・ブロック・入れ子）は通り、閉じていないブロックコメントは終了コード 2。補間の中の文字列で宣言を隠せない。`.upToNextMinor` の中の `from:` を、名前と「(」の間の空白・コメント・改行によらず `.package` の `from:` と取り違えないこと、未知の呼び出しの中の `from:` と版の指定が 2 つの宣言を判定できないとすること、先行版の `exact`（`1.2.0-rc.1`）が同じ先行版の確定版とだけ一致し、範囲の境界の先行版は判定できないとすることも確かめる。補間の中の正規表現のリテラル（`#/…/#`・`##/…/##`）の「)」で補間が閉じたと見なさないこと、同じ URL のリモートのバイナリの承認の重複と、深い入れ子の補間（RecursionError）で終了コード 2 になること |
+| 版の照合 | `scripts/test-checks.py versions` | 67 件 | `check.sh --require-clean` が、smudge で変わり clean で打ち消された展開を検査せずに失敗すること。`setup.sh --hooks` が、共有の設定が取り込む `includeIf.onbranch` の `core.hooksPath` が別の値なら書かずに止まること。`find-simulator.py` が、候補になりうる使える機種の `deviceTypeIdentifier` がない・空の一覧で終了コード 2。`check.sh --staged` の規則の試験と文書の整合が、smudge のフィルタを通さずにステージした blob を書き出し、実行するスクリプトの実行権限を保つこと、静的解析の失敗で手順 2 に止まり手順 3 へ進まないこと。`setup.sh --hooks` が `GIT_CONFIG` によらずリポジトリの設定に書くこと、フックのファイル（`pre-commit`・`pre-push`）がない・実行できない場合は設定を書かずに失敗すること、手順 8 が測定の記録のないときに専用の作業ツリーでは手順 7 と 8 を一緒に実行する案内を出すこと、`find-simulator.py` が真偽値でない `isAvailable` で終了コード 2・成功では選んだ UDID だけを出力すること、`check.sh` の空の `--steps` と範囲外の番号（bash の整数の範囲を超える桁数を含む。正しい番号と並べても）が使い方の誤りになること（写した `check.sh` で試す）、`setup.sh` を相対パスで実行しても CDPATH によらず起点を解決し、`setup-tools.sh` を絶対パスで呼ぶこと、`check.sh --require-clean` が開始時のコミットを専用の作業ツリーで検査して終了後に片付けること、`check.sh --staged` が種類を変えてステージした Swift のシンボリックリンクを手順の前に止めること、`setup-tools.sh --verify` が導入のロックを待つこと、`find-simulator.py` が形の違う一覧（name・udid・deviceTypeIdentifier・ランタイムの version の型と、ない・空・文字列でない platform を含む）で終了コード 2・27.2.0 を 27.2 以上とすること・空の一覧と iPad だけの一覧と正しい形の watchOS だけの一覧で 1 になること、公開するリンクの位置がディレクトリなら止まることも確かめる。書き込めない導入先・ロックの位置のファイルではロックを待たずに止まることも確かめる。実行ファイル名が名前と違う台帳でも `bin/<名前>` のリンクで照合することも確かめる。版・SHA-256・形式・行の不足（必須のツールの行の欠落を含む）・`gh` の行の順序（タブ区切りの台帳を含む）・版の表示の失敗・導入記録のない場所を指すリンク・版のディレクトリの中の実行ファイルがシンボリックリンク（通常のファイルでない）で失敗する。`setup.sh --hooks` が、git の選ぶ作業ツリーが別のリポジトリのとき・より優先される `core.hooksPath`（`-c`・`GIT_CONFIG_*`・作業ツリーの設定）が別の値を指すときに共有の設定を変えずに失敗し、リンクした作業ツリーからは通ること。入れ子の `check.sh` の試験は外側の `MINUTES_CHECK_ISOLATED` を引き継がないこと |
+| 秘密情報の検出 | `scripts/test-checks.py gitleaks` | 35 件 | 欠けたオブジェクトで全履歴を読めないリポジトリは終了コード 1。`gitleaks-history.sh` の追加の引数は報告の指定（`--report-format`・`--report-path`）だけを通し、ほかの指定（`--exit-code`・`--no-redact`・`--log-opts`・`--baseline-path`）・値のない指定・重複した指定は終了コード 2。実行時に組み立てた偽の鍵を検出する。浅いクローンは検査せずに失敗する（一時のリポジトリは外側の `GIT_DIR` などを外した環境で検査する）。`.gitattributes` の textconv で差分から鍵を消しても検出する。`.gitattributes` で `binary` にしたテキストのファイルの鍵も検出する。作業ツリーにだけある `.gitleaksignore`（検出の指紋）と行の `gitleaks:allow` のコメントで、全履歴の検査とコミット前の検査（`check.sh --staged`）の検出が隠れないこと（対照として、指定のない gitleaks では抑止されること）、引き継いだ `GIT_DIR` が別のリポジトリを指していても引数のリポジトリを検査することも確かめる。`log.showRoot=false` でも最初のコミットの鍵を検出する。通常の色の設定と `color.diff=always`・`color.ui=always` のどれでも全履歴の鍵を検出する。手順 3 と同じ `gitleaks-history.sh` で、通常のコミットとマージのコミットだけで足した行の両方を検出する。置き換えのオブジェクト（`git replace`）で隠した鍵も全履歴の検査で検出すること。grafts（`info/grafts`）があれば、有効な行があってもコメントと空行だけでも検査せずに失敗すること。コミット前の検査が `.gitattributes` の `binary`・textconv によらずステージした内容の鍵を検出すること（対照として `gitleaks git --staged` は見落とすこと）、`.gitleaksignore` とコメントの場合ごとの診断を確かめる |
 | カバレッジの集計 | `scripts/test-checks.py coverage` | 17 件 | 目標以上・未満（警告）の集計と、不正な行数の記録（整数でない・真偽値・範囲外）で終了コード 2。目標（`--target`）は 0〜100 の有限の数だけを認め、NaN・無限大・範囲外・数でない値で終了コード 2。目標にわずかに届かない値（89.96%）を丸めて目標以上に見せず、小数の目標を丸めずに表示し、深い入れ子の記録で終了コード 2 |
-| 文書の検査 | `scripts/test-checks.py docs` | 171 件 | 同じ行の HTML のコメントの中の ID を参照として検査せず、インラインのコードの中の ID は検査する。「満たす要件」の同じ行の HTML のコメントの中の ID を網羅と節の冒頭の要件に数えず、コメントの後の見える ID と「—」は認めること、設計決定（BD）を各文書の §1（`architecture.md` は §3）の表からだけ定義として集めることも確かめる。分冊（必須の節を求めず、節の冒頭とコード片を照合する。本冊のない分冊は失敗する。配下のディレクトリの分冊も同じ）も確かめる。表の後の引用の行を表の行にしないこと、2 列目の見出しが「解決」でない申し送りの表を解決と見なさないこと、コード片の元のファイルを読めない（UTF-8 でない）場合に印の行で報告して検査を続け、`--update-snippets` でそのコード片を書き直さないことも確かめる。循環するリンクの後に検査する別の文書の不一致も報告されること（検査が続くこと）を確かめる。行頭の `\|` を省いた表の行、字下げしたコードブロックの表の形の行を表にしないこと、インラインのコードの中のリンクを確かめないこと、小節だけが「満たす要件:」を持つ親の節を不合格にすること、コード片の元のファイルが循環するリンクでも止まらずに報告することも確かめる。列の区切りの前後に空白のない表の定義（要件・設計決定・重複）と、番号付き（`1. `）の申し送りの項目の照合（解決の行の欠落・解決の表がない場合）も確かめる。節の後半の「満たす要件:」を網羅に数えないこと（小節の冒頭は数える）・フェンスをまたいだ行を 1 つの表にしないこと・`--update-snippets` が末尾の改行だけでは書き直さず、`--root` の外の文書に書き込まず、書き直しを保存できない（一時ファイルを作れない）ときに元の文書を残すことも確かめる。対応表の行は、検査・試験の列が空なら「状態」などほかの列に値があっても数えないことも確かめる。山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。U+2028 を行の区切りにしないこと（照合と書き直し）、コメントの中のフェンスの印をフェンスとしないこと、コメントの中の見出しと「満たす要件:」を MVP の網羅に数えないこと、`--update-snippets` で文書を読み直せない（OSError）ときにその文書のパスで報告して書き直さないこと、読めない文書をパスで報告して検査を続けること、括弧を含むリンク先、「\|」を含まない表のデータ行、複数行の HTML のコメントの中の対応表・定義を数えないことも確かめる。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2。字下げ（空白 0〜3 個）した見出しを節として扱い 4 個以上は扱わないこと、同じ行で閉じるコメントの中のリンクを確かめないこと、「(」の直後の空白を読み飛ばしてリンク先を確かめること、読めないディレクトリを報告して失敗すること、先の文書の読み直しの失敗の後も後の文書を書き直すこと |
+| 文書の検査 | `scripts/test-checks.py docs` | 174 件 | `--update-snippets` が、詳細設計のディレクトリの外を実体とするリンクの文書を書き直さない。同じ行の HTML のコメントの中の ID を参照として検査せず、インラインのコードの中の ID は検査する。「満たす要件」の同じ行の HTML のコメントの中の ID を網羅と節の冒頭の要件に数えず、コメントの後の見える ID と「—」は認めること、設計決定（BD）を各文書の §1（`architecture.md` は §3）の表からだけ定義として集めることも確かめる。分冊（必須の節を求めず、節の冒頭とコード片を照合する。本冊のない分冊は失敗する。配下のディレクトリの分冊も同じ）も確かめる。表の後の引用の行を表の行にしないこと、2 列目の見出しが「解決」でない申し送りの表を解決と見なさないこと、コード片の元のファイルを読めない（UTF-8 でない）場合に印の行で報告して検査を続け、`--update-snippets` でそのコード片を書き直さないことも確かめる。循環するリンクの後に検査する別の文書の不一致も報告されること（検査が続くこと）を確かめる。行頭の `\|` を省いた表の行、字下げしたコードブロックの表の形の行を表にしないこと、インラインのコードの中のリンクを確かめないこと、小節だけが「満たす要件:」を持つ親の節を不合格にすること、コード片の元のファイルが循環するリンクでも止まらずに報告することも確かめる。列の区切りの前後に空白のない表の定義（要件・設計決定・重複）と、番号付き（`1. `）の申し送りの項目の照合（解決の行の欠落・解決の表がない場合）も確かめる。節の後半の「満たす要件:」を網羅に数えないこと（小節の冒頭は数える）・フェンスをまたいだ行を 1 つの表にしないこと・`--update-snippets` が末尾の改行だけでは書き直さず、`--root` の外の文書に書き込まず、書き直しを保存できない（一時ファイルを作れない）ときに元の文書を残すことも確かめる。対応表の行は、検査・試験の列が空なら「状態」などほかの列に値があっても数えないことも確かめる。山括弧のリンク先・区切りの行のない表・群の表記だけの対応表の行・字下げしたフェンスのコード片・`--root` の外のコード片の元のファイルも確かめる。未定義の ID・切れたリンク・言語のないコードフェンス・閉じていないフェンス・食い違うコード片・ID のない「満たす要件:」・申し送りの欠落と重複と余分な行・入れ子の設計書の不備などで失敗する。長いフェンス・チルダのフェンスで誤って切り替わらない。フェンスの中の印は照合にも書き直しにも使わない。U+2028 を行の区切りにしないこと（照合と書き直し）、コメントの中のフェンスの印をフェンスとしないこと、コメントの中の見出しと「満たす要件:」を MVP の網羅に数えないこと、`--update-snippets` で文書を読み直せない（OSError）ときにその文書のパスで報告して書き直さないこと、読めない文書をパスで報告して検査を続けること、括弧を含むリンク先、「\|」を含まない表のデータ行、複数行の HTML のコメントの中の対応表・定義を数えないことも確かめる。「／」の後の関連の参照だけでは網羅にならない。存在しない root・定義文書の欠落は終了コード 2。字下げ（空白 0〜3 個）した見出しを節として扱い 4 個以上は扱わないこと、同じ行で閉じるコメントの中のリンクを確かめないこと、「(」の直後の空白を読み飛ばしてリンク先を確かめること、読めないディレクトリを報告して失敗すること、先の文書の読み直しの失敗の後も後の文書を書き直すこと |
 
 自己試験の入力は、試験スクリプトの中で組み立てて一時ディレクトリに置く。リポジトリに違反例の設定ファイルを置くと、本物の検査がそれを避けるための除外が要り、抜け道になるためである。
 
