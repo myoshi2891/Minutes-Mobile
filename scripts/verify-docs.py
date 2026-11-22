@@ -492,6 +492,9 @@ class Checker:
         prefixes = {identifier.rsplit("-", 1)[0] for identifier in self.defined}
         for name, text in self.texts.items():
             for number, line in prose_lines(text):
+                # 同じ行で閉じる HTML のコメントは表示されないので、中の ID を参照として数えない（複数行のコメントは
+                # prose_lines が除く）。visible と同じ置き換えで、インラインのコード（`…`）の中の ID は検査に残す
+                line = INLINE_COMMENT.sub("", line)
                 for match in ID_PATTERN.finditer(line):
                     if reversed_range(match):
                         self.error(name, f"逆順の範囲: {match.group(0)}（終点が直前の番号より小さい）", number)

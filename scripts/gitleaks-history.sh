@@ -2,7 +2,9 @@
 # Git の全履歴の秘密情報の検査（TST-CI-04、SEC-SUP-03）。check.sh の手順 3 と、その自己試験（test-checks.py gitleaks）が
 # 同じこのコマンドを実行する（試験した指定と手順 3 の指定が食い違わないようにする）。
 #
-# 使い方: scripts/gitleaks-history.sh <リポジトリ> [gitleaks に渡す追加の引数…]
+# 使い方: scripts/gitleaks-history.sh <リポジトリ> [--report-format <形式>] [--report-path <パス>]
+#   追加の引数は、自己試験が検出の結果を読むための報告の指定だけを認める（検査の方式・対象・抑止・伏せ字・終了コードを
+#   変える指定を渡させない）
 # 終了コード: gitleaks のもの（0 = 検出なし / 1 = 検出あり・失敗）。2 = 使い方の誤り
 set -euo pipefail
 
@@ -21,9 +23,37 @@ GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textc
 # gitleaks は検査するリポジトリの直下の .gitleaksignore を指定によらず読む（8.30.1 で確かめた）ので、それがあれば検査せずに失敗する
 GITLEAKS_SUPPRESSION=(--gitleaks-ignore-path /dev/null --ignore-gitleaks-allow)
 
-[ $# -ge 1 ] && [ -n "$1" ] || { echo "使い方: $0 <リポジトリ> [gitleaks の追加の引数…]" >&2; exit 2; }
+usage() {
+  echo "使い方: $0 <リポジトリ> [--report-format json|csv|junit|sarif] [--report-path <パス>]" >&2
+  exit 2
+}
+[ $# -ge 1 ] && [ -n "$1" ] || usage
 repository=$1
 shift
+# 追加の引数は報告の指定（--report-format・--report-path。値は次の引数）だけを、それぞれ 1 回まで認める。
+# ほかの指定（--no-git・--log-opts・--exit-code・--no-redact・--baseline-path・--config など）は、検査の方式や対象を変え、
+# 検出を隠し、伏せ字を外し、終了コードを変えうるので、gitleaks に渡さずに使い方の誤りにする
+REPORT=()
+format_given=""
+path_given=""
+while [ $# -gt 0 ]; do
+  # 値がない・空・「-」で始まる（次の指定を値として取り込む）ものは認めない
+  [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ] || usage
+  case "$1" in
+    --report-format)
+      [ -z "$format_given" ] || usage
+      case "$2" in json | csv | junit | sarif) ;; *) usage ;; esac
+      format_given=1
+      ;;
+    --report-path)
+      [ -z "$path_given" ] || usage
+      path_given=1
+      ;;
+    *) usage ;;
+  esac
+  REPORT+=("$1" "$2")
+  shift 2
+done
 # 外から引き継いだリポジトリを指す変数（フックが設定する GIT_DIR など）を外す。残すと、浅いクローンの判定と gitleaks の
 # git log が引数のリポジトリではなく、その変数が指すリポジトリを読む
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR \
@@ -53,4 +83,4 @@ if [ -e "$repository/.gitleaksignore" ] || [ -L "$repository/.gitleaksignore" ];
 fi
 # --redact: 検出した値そのものを出力に残さない
 exec "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
-  "${GITLEAKS_SUPPRESSION[@]}" --log-opts="$GITLEAKS_LOG_OPTS" "$@" "$repository"
+  "${GITLEAKS_SUPPRESSION[@]}" --log-opts="$GITLEAKS_LOG_OPTS" ${REPORT[@]+"${REPORT[@]}"} "$repository"

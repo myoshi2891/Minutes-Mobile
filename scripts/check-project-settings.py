@@ -414,7 +414,13 @@ def check_plist_orientation(
         if True in modes:
             effective, undecided = resolve(own, shared, ORIENTATION_SETTING, [configuration], sdk)
             for (key, value), _ in effective.items():
-                if value not in ORIENTATION_SETTING_VALUES:
+                # 変数（$(NAME)）はその構成・SDK で展開してから判定する（GENERATE_INFOPLIST_FILE と同じ）。
+                # 展開できない値は縦だけと見なさない
+                expanded = expand_value(value, own, shared, configuration, sdk, setting=ORIENTATION_SETTING,
+                                        from_target=key in own and as_text(own[key]) == value)
+                if expanded is None:
+                    wrong.setdefault(f"{key} = {value}（展開できない）", []).append(build)
+                elif expanded not in ORIENTATION_SETTING_VALUES:
                     wrong.setdefault(f"{key} = {value}", []).append(build)
             settings_cover = bool(effective) and not undecided
         if (False in modes and not covered) or (True in modes and not (settings_cover or covered)):

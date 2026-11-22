@@ -106,6 +106,9 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[s
             location = normalize_path(package["path"])
             if posixpath.isabs(location) or location == ".." or location.startswith("../"):
                 raise Unreadable(f"{path}: {package['identity']} の path は起点からの相対パスで、起点の中を指す（{package['path']}）")
+            # 正規化して同じ場所を指す承認が 2 つあると、後の項目が先の sha256 を黙って上書きする。読めないものとする
+            if location in by_path:
+                raise Unreadable(f"{path}: ローカルのバイナリの承認が同じパスで重複している（{package['path']}）")
             by_path[location] = package
             continue
         # 同じ identity と版でも取得元が違えば別の承認とする（取得元ごとに承認する）

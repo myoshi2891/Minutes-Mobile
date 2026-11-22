@@ -185,14 +185,49 @@ prepare_staged_tree() {
   rm -f -- "$entries"
 }
 
+# インデックスの項目（git ls-files -s -z の出力。標準入力から読む）を、blob のまま $1 の下へ元の相対位置で書き出す。
+# git cat-file blob で書くので、checkout-index と違い .gitattributes の smudge のフィルタ・改行の変換を通さない（検査する
+# 内容をステージした・記録したツリーの内容と同じにする）。モードを保つ: 100755 は実行権限を付け、120000 は blob の内容を
+# リンク先とするシンボリックリンクにし、160000（サブモジュール）は blob がないので書き出さない。それ以外のモードは
+# 書き出せないものとして失敗する。失敗したら非 0 を返す（呼び出し側は失敗を確かめる。set -e に頼らない）
+write_index_entries() {
+  local dest=$1 entry mode object path target
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    case "$mode" in
+      160000) continue ;;
+      100644 | 100755 | 120000) ;;
+      *) echo "NG: インデックスの ${path} のモード ${mode} を書き出せない" >&2; return 1 ;;
+    esac
+    mkdir -p "$dest/$(dirname "$path")" || return 1
+    rm -f -- "$dest/$path" || return 1
+    if [ "$mode" = 120000 ]; then
+      target=$(git cat-file blob "$object") || return 1
+      ln -s -- "$target" "$dest/$path" || return 1
+    else
+      git cat-file blob "$object" > "$dest/$path" || return 1
+      if [ "$mode" = 100755 ]; then chmod +x "$dest/$path" || return 1; fi
+    fi
+  done
+}
+
 # 規則の試験に使うもの（規則・試験用のファイル・試験のスクリプト）をインデックスから同じ一時ディレクトリへ書き出す。
 # 試験のスクリプトは自身の位置をリポジトリ直下とみなすので、一時ディレクトリの中のスクリプトを実行する。
 # 開発ツールは作業ツリーの .tools を指す（ツールは Git の管理外）
 prepare_rules_tree() {
-  local directory
+  local directory entries
   [ -n "$STAGED_TREE" ] || STAGED_TREE=$(mktemp -d)
-  git ls-files -z -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
-    | git checkout-index -z -f --stdin --prefix="$STAGED_TREE/"
+  # blob のまま書き出す（write_index_entries）。試験のスクリプト（100755）は実行権限を保ち、下で直接実行する
+  entries=$(mktemp)
+  if ! git ls-files -s -z -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py > "$entries" \
+    || ! write_index_entries "$STAGED_TREE" < "$entries"; then
+    rm -f -- "$entries"
+    fail "規則の試験に使うステージした内容を書き出せない"
+  fi
+  rm -f -- "$entries"
   # 入れ子の設定の置き忘れの検査（テストのディレクトリがあるのに設定がない）を、インデックスのディレクトリで行う。
   # 一覧は scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
   for directory in MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; do
@@ -364,18 +399,22 @@ release_coverage_lock() {
 }
 
 # 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
-# 試験用のファイルなどを省きうるので使わず、一時のインデックスに読み込んで checkout-index で書き出す（追跡している
-# ファイルをすべて書き出す）。失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
+# 試験用のファイルなどを省きうるので使わず、一時のインデックスに読み込んで、追跡しているファイルをすべて blob のまま
+# 書き出す（write_index_entries。checkout-index の smudge のフィルタ・改行の変換を通さないので、測る内容は識別子の
+# ツリーの内容と一致する）。失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
 materialize_coverage_input() {
-  local index status=0
+  local index entries status=0
   index=$(mktemp)
+  entries=$(mktemp)
   rm -f -- "$index"
   GIT_INDEX_FILE="$index" git read-tree "$1" || status=1
   if [ "$status" = 0 ]; then
-    GIT_INDEX_FILE="$index" git ls-files -z -- Packages \
-      | GIT_INDEX_FILE="$index" git checkout-index -z --stdin --prefix="$COVERAGE_INPUT/" || status=1
+    GIT_INDEX_FILE="$index" git ls-files -s -z -- Packages > "$entries" || status=1
   fi
-  rm -f -- "$index"
+  if [ "$status" = 0 ]; then
+    write_index_entries "$COVERAGE_INPUT" < "$entries" || status=1
+  fi
+  rm -f -- "$index" "$entries"
   return "$status"
 }
 
@@ -541,8 +580,15 @@ step_10() {
     # 文書・コード片の元の実装・検査スクリプトのすべてを、作業ツリーではなくインデックスの内容で照合する。
     # 文書と実装の両方をステージした一致する変更は通り、片方だけをステージした変更はコード片の不一致で止まる
     STAGED_DOCS_TREE=$(mktemp -d)
-    # sparse checkout で作業ツリーにない（skip-worktree の）項目も書き出し、インデックスの全体を照合する
-    git checkout-index -a --ignore-skip-worktree-bits --prefix="$STAGED_DOCS_TREE/"
+    # インデックスの全体（sparse checkout で作業ツリーにない skip-worktree の項目を含む）を blob のまま書き出して照合する
+    # （write_index_entries。smudge のフィルタ・改行の変換を通さない。verify-docs.py は 100755 のまま実行できる）
+    local entries
+    entries=$(mktemp)
+    if ! git ls-files -s -z > "$entries" || ! write_index_entries "$STAGED_DOCS_TREE" < "$entries"; then
+      rm -f -- "$entries"
+      fail "文書の整合の検査に使うステージした内容を書き出せない"
+    fi
+    rm -f -- "$entries"
     "$STAGED_DOCS_TREE/scripts/verify-docs.py" --root "$STAGED_DOCS_TREE"
   else
     scripts/test-checks.py docs
@@ -581,7 +627,8 @@ on_exit() {
   if [ -n "$ISOLATED_BASE" ] && [ -n "$isolated_removed" ]; then remove_or_report "$ISOLATED_BASE"; fi
   release_coverage_lock
   if [ "$status" -eq 0 ] && [ -n "$CLEANUP_FAILED" ]; then exit 1; fi
-  if [ "$status" -eq 0 ]; then return 0; fi
+  # 成功も明示的に exit する（bash 3.2 は、trap の最後のコマンドの状態で終了コードを上書きすることがある）
+  if [ "$status" -eq 0 ]; then exit 0; fi
   if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
   # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
   if [ "$status" -eq 2 ] && [ -z "$current" ]; then exit 2; fi

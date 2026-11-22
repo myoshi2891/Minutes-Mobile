@@ -335,8 +335,9 @@ def main() -> int:
         print("NG: .tools/bin/swiftlint がない。scripts/setup-tools.sh を実行する", file=sys.stderr)
         return 2
     if not CONFIG.is_file():
+        # 設定がなければ試験を実行できない（read_config の読めない設定と同じく 2。検出行の不一致の 1 と区別する）
         print("NG: .swiftlint.yml がない", file=sys.stderr)
-        return 1
+        return 2
     errors: List[str] = []
     rules = custom_rules(read_config(CONFIG).decode("utf-8"), errors)
     if not rules:

@@ -1,7 +1,7 @@
 """project.xcproj（JSON 形式・末尾カンマあり）を読む。検査スクリプトが共有する。"""
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 
 class Unreadable(Exception):
@@ -53,9 +53,20 @@ def reject_constant(name: str) -> None:
     raise ValueError(f"標準の JSON にない定数 {name}")
 
 
+def reject_duplicate_keys(pairs: List[Tuple[str, object]]) -> dict:
+    """同じオブジェクトの中で重複した鍵を拒否する（json.loads は既定で後の値を黙って採用し、前の値を検査から隠すため）。"""
+    data: dict = {}
+    for key, value in pairs:
+        if key in data:
+            raise ValueError(f"重複した鍵 {key!r}")
+        data[key] = value
+    return data
+
+
 def load_project(path: Path) -> dict:
     try:
-        data = json.loads(strip_trailing_commas(path.read_text(encoding="utf-8")), parse_constant=reject_constant)
+        data = json.loads(strip_trailing_commas(path.read_text(encoding="utf-8")), parse_constant=reject_constant,
+                          object_pairs_hook=reject_duplicate_keys)
     # json.JSONDecodeError は ValueError の派生。入れ子が深すぎる入力は RecursionError（ValueError の派生ではない）になる
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:
         raise Unreadable(f"{path}: {error}") from error

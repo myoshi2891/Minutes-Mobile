@@ -142,6 +142,10 @@ def test_settings() -> None:
         settings_case(f"標準の JSON にない定数 {constant}", 2, "読めない",
                       project=lambda t, c=constant: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
                                                              f'"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n    "X": {c},'))
+    # 同じオブジェクトの中の重複した鍵は、後の値で前の値を隠すので読めないものとして扱う
+    settings_case("重複した鍵", 2, "重複した鍵",
+                  project=lambda t: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
+                                             '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",\n    "IPHONEOS_DEPLOYMENT_TARGET": "27.2",'))
     # 入れ子が深すぎる入力（Xcode 同梱の python3 では RecursionError になる）も読めないものとして扱う
     settings_case("入れ子が深すぎる設定", 2, "読めない",
                   project=lambda t: replaced(t, '"IPHONEOS_DEPLOYMENT_TARGET": "27.2",',
@@ -341,6 +345,16 @@ def test_settings() -> None:
                   plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, **{
                       "UISupportedInterfaceOrientations~iphone": ["UIInterfaceOrientationPortrait"]})})
     settings_case("生成する構成で向きがどこにもない", 1, "縦だけの向きの指定がない", project=without_orientation)
+    # 向きのビルド設定の変数は、その構成・SDK で展開してから判定する
+    orientation_variable = lambda value: lambda t: replaced(  # noqa: E731
+        t, '"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone": "UIInterfaceOrientationPortrait",',
+        '"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone": "$(MINUTES_ORIENTATION)",\n'
+        f'        "MINUTES_ORIENTATION": "{value}",')
+    settings_case("縦に展開される向きの変数", 0, "OK", project=orientation_variable("UIInterfaceOrientationPortrait"))
+    settings_case("横に展開される向きの変数", 1, "縦だけでない", project=orientation_variable("UIInterfaceOrientationLandscapeLeft"))
+    settings_case("展開できない向きの変数", 1, "展開できない",
+                  project=lambda t: replaced(t, '"UIInterfaceOrientationPortrait",\n        "PRODUCT_BUNDLE_IDENTIFIER"',
+                                             '"$(MINUTES_UNDEFINED)",\n        "PRODUCT_BUNDLE_IDENTIFIER"'))
     settings_case("生成しない構成では向きのビルド設定がなくてよい", 0, "OK", project=lambda t: without_orientation(with_file(t)),
                   plists={"Config/App-Settings.plist": microphone})
     # 生成しない構成では、使われる plist に縦だけの向きの指定が要る
@@ -904,6 +918,9 @@ def test_dependencies() -> None:
                       [remote_binary, dict(remote_binary, version="1.0.1", checksum="b" * 64)])
     dependencies_case("別のディレクトリのローカルのバイナリは承認と一致しない", 1, "ローカルのバイナリ Frameworks/B.xcframework",
                       {"Package.swift": declare.format(binary)}, [approved_binary])
+    # 正規化すると同じパスになる承認が 2 つあると、後の項目が先の sha256 を黙って上書きする
+    dependencies_case("同じパスのローカルのバイナリの承認の重複", 2, "同じパスで重複",
+                      {}, [approved_binary, dict(approved_binary, path="./" + approved_binary["path"], sha256="b" * 64)])
     dependencies_case("ローカルのバイナリの項目に版がない", 2, "version",
                       {}, [{k: v for k, v in approved_binary.items() if k != "version"}])
     dependencies_case("url と path の両方を持つ項目は読まない", 2, "どちらか一方",
@@ -1336,6 +1353,65 @@ def staged_raw_blob_case() -> None:
             if recorded != b"let raw = 1\n":
                 failures.append(f"check: --staged の{label}がステージした blob そのものを検査しない（読んだ内容 {recorded!r}・"
                                 f"終了コード {result.returncode}）\n{(result.stdout + result.stderr).strip()}")
+        # 静的解析の代わりの失敗で手順 2 に止まり、手順 3 へ進まないこと（記録だけを見ると、失敗を無視して進む実装を見逃す）
+        if result.returncode == 0 or "NG: 手順 2" not in result.stderr or "== 手順 3" in result.stdout:
+            failures.append(f"check: --staged が静的解析の失敗で手順 2 に止まらない（終了コード {result.returncode}）\n"
+                            f"{(result.stdout + result.stderr).strip()}")
+
+
+def staged_raw_tree_case() -> None:
+    """check.sh --staged の規則の試験（手順 2）と文書の整合（手順 10）が、smudge のフィルタを通さずにステージした blob を
+    書き出し、実行するスクリプトのモード（100755）を保つこと。
+
+    一時のリポジトリで、smudge のフィルタが内容を書き換える試験用のファイルと文書をステージする。規則の試験の代わり
+    （scripts/test-lint-rules.py）と文書の整合の代わり（scripts/verify-docs.py）は、書き出した場所の内容を記録して成功する。
+    どちらも書き出した場所から直接実行するので、実行権限を失うと実行できずに失敗する。
+    """
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools" / "bin").mkdir(parents=True)
+        (repository / "tools" / "lint-fixtures" / "sample").mkdir(parents=True)
+        rules_out = Path(directory) / "recorded-rules"
+        docs_out = Path(directory) / "recorded-docs"
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        # 規則の試験の代わり: 起点（作業ディレクトリ）の試験用のファイルを記録する。文書の整合の代わり: --root の文書を記録する
+        scripts = {"test-lint-rules.py": '#!/bin/sh\ncat tools/lint-fixtures/sample/ok.swift > "$MINUTES_TEST_RULES_OUT"\n',
+                   "verify-docs.py": '#!/bin/sh\ncat "$2/doc.md" > "$MINUTES_TEST_DOCS_OUT"\n'}
+        for name, content in scripts.items():
+            (repository / "scripts" / name).write_text(content, encoding="utf-8")
+        for name in ("check.sh", *scripts):
+            (repository / "scripts" / name).chmod(0o755)
+        # 秘密情報の検出の代わり（手順 3 を通す）
+        gitleaks = repository / ".tools" / "bin" / "gitleaks"
+        gitleaks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gitleaks.chmod(0o755)
+        (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        (repository / ".gitattributes").write_text("*.swift filter=rewrite\n*.md filter=rewrite\n", encoding="utf-8")
+        (repository / "tools" / "lint-fixtures" / "sample" / "ok.swift").write_text("let raw = 1\n", encoding="utf-8")
+        (repository / "doc.md").write_text("raw\n", encoding="utf-8")
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        # clean は設定しない（ステージした blob は作業ツリーの内容のまま）。smudge だけが書き出しの内容を書き換える
+        subprocess.run(["git", "-C", str(repository), "config", "filter.rewrite.smudge", "sed s/raw/smudged/"], env=env, check=True)
+        subprocess.run(["git", "-C", str(repository), *identity, "add", "-A"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
+                                env=dict(env, MINUTES_TEST_RULES_OUT=str(rules_out), MINUTES_TEST_DOCS_OUT=str(docs_out)),
+                                timeout=60)
+        for label, path, want in (("規則の試験", rules_out, b"let raw = 1\n"), ("文書の整合", docs_out, b"raw\n")):
+            recorded = path.read_bytes() if path.is_file() else None
+            if recorded != want:
+                failures.append(f"check: --staged の{label}がステージした blob そのものを書き出さない（読んだ内容 {recorded!r}・"
+                                f"終了コード {result.returncode}）\n{(result.stdout + result.stderr).strip()}")
+        if result.returncode != 0:
+            failures.append(f"check: --staged の規則の試験・文書の整合の書き出しの試験が通らない（終了コード {result.returncode}）\n"
+                            f"{(result.stdout + result.stderr).strip()}")
 
 
 def staged_symlink_case() -> None:
@@ -1517,6 +1593,7 @@ def test_versions() -> None:
     require_clean_case()
     staged_symlink_case()
     staged_raw_blob_case()
+    staged_raw_tree_case()
     coverage_record_message_case()
     # 明示した --steps が空なら、全手順を実行せずに使い方の誤りにする。
     # リポジトリの外の一時ディレクトリに写した check.sh で試す（誤って全手順を実行しても、手順 0 がこの自己試験を
@@ -1733,6 +1810,16 @@ def test_gitleaks() -> None:
         expect("gitleaks: 浅いクローンは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(clone)], 1, "浅いクローン", env=env)
         expect("gitleaks: 全履歴のあるリポジトリは検査する", [str(SCRIPTS / "gitleaks-history.sh"), str(source)], 0, "no leaks found",
                env=env)
+        # 追加の引数は報告の指定だけ。検査の方式・終了コード・伏せ字・抑止を変える指定は gitleaks に渡さずに使い方の誤りにする
+        report = Path(directory) / "report.json"
+        expect("gitleaks: 報告の指定は渡せる",
+               [str(SCRIPTS / "gitleaks-history.sh"), str(source), "--report-format", "json", "--report-path", str(report)],
+               0, "no leaks found", env=env)
+        for extra in (["--exit-code", "0"], ["--no-redact"], ["--log-opts", "HEAD"], ["--baseline-path", str(report)],
+                      ["--report-path", "--exit-code"], ["--report-format", "toml"], ["--report-path"],
+                      ["--report-path", str(report), "--report-path", str(report)]):
+            expect(f"gitleaks: 追加の引数 {' '.join(extra)} は認めない", [str(SCRIPTS / "gitleaks-history.sh"), str(source), *extra],
+                   2, "使い方", env=env)
     # 最初のコミットで足した行も、設定 log.showRoot=false によらず検査する
     count += 1
     with tempfile.TemporaryDirectory() as directory:
@@ -2396,6 +2483,10 @@ def run_docs_cases() -> None:
         docs_case("定義されていない ID", 1, "定義されていない ID: FR-AAA-09", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-AAA-09"),
         docs_case("範囲の省略の中に定義されていない ID", 1, "定義されていない ID: FR-AAA-04", detailed, "FR-AAA-01〜02", "FR-AAA-01〜04"),
         docs_case("逆順の範囲", 1, "逆順の範囲: FR-AAA-01〜00", detailed, "FR-AAA-01〜02", "FR-AAA-01〜00"),
+        docs_case("コメントの中の定義されていない ID は参照にしない", 0, "OK", detailed, "決定: BD-SMP-01",
+                  "決定: BD-SMP-01 <!-- FR-AAA-09 -->"),
+        docs_case("インラインのコードの中の定義されていない ID も検査する", 1, "定義されていない ID: FR-AAA-09", detailed,
+                  "決定: BD-SMP-01", "決定: BD-SMP-01 `FR-AAA-09`"),
         docs_case("定義されていない ID の群", 1, "定義されていない ID の群: FR-ZZZ", detailed, "決定: BD-SMP-01", "決定: BD-SMP-01、FR-ZZZ 群"),
         docs_case("定義されていない設計決定", 1, "定義されていない ID: BD-SMP-02", detailed, "BD-SMP-01", "BD-SMP-02"),
         docs_case("ID の定義の重複", 1, "定義が重複", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-01 | 二 | MVP |"),
