@@ -267,7 +267,17 @@ fi
 ARCH=$(uname -m)
 seen=" "      # 写しに現れたツール名
 matched=" "   # この Mac 向けの行が見つかったツール名
+# この Mac 向けの行（台帳の順）。導入・照合は、台帳の全体の検証を終えてから行う
+ROWS_NAME=()
+ROWS_VERSION=()
+ROWS_TAG=()
+ROWS_REPO=()
+ROWS_ASSET=()
+ROWS_BINARY=()
+ROWS_SHA=()
 
+# 台帳の全体を先に検証する（列の形式・アーキテクチャ・重複・gh の行の順序・必須のツール）。途中の行が不正な台帳で、
+# 前の行のツールを導入したり公開するリンクを更新したりしない。
 # 末尾に改行のない最終行も読む（read は非ゼロを返すが、値は入っている）。空の最終行は name が空なので読まない
 while read -r name version arch repo tag asset binary sha extra || [ -n "${name:-}" ]; do
   case "$name" in '' | '#'*) continue ;; esac
@@ -288,17 +298,31 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
     case "$matched" in *" gh "*) ;; *) fail "tools/versions で、$ARCH 向けの gh の行が $name の行より前にない" ;; esac
   fi
   matched="$matched$name "
-  if [ "$MODE" = install ]; then
-    install_tool "$name" "$version" "$repo" "$tag" "$asset" "$binary" "$sha"
-  fi
-  verify_tool "$name" "$version" "$binary" "$sha"
+  ROWS_NAME+=("$name")
+  ROWS_VERSION+=("$version")
+  ROWS_REPO+=("$repo")
+  ROWS_TAG+=("$tag")
+  ROWS_ASSET+=("$asset")
+  ROWS_BINARY+=("$binary")
+  ROWS_SHA+=("$sha")
 done < "$VERSIONS"
 
 [ "$seen" != " " ] || fail "tools/versions にツールが 1 つもない"
 # 台帳に現れたツールと、検査が使う必須のツールの両方について、この Mac 向けの行が 1 つずつあること
-# （重複はループの中で失敗させている）
+# （重複は上の検証で失敗させている）
 for name in $seen $REQUIRED; do
   case "$matched" in *" $name "*) ;; *) fail "$name に $ARCH 向けの行がない" ;; esac
+done
+
+# 検証を終えた行だけを、台帳の順（gh が先）に導入・照合する。標準入力は使わない（取得のコマンドは </dev/null で実行する）
+index=0
+while [ "$index" -lt ${#ROWS_NAME[@]} ]; do
+  if [ "$MODE" = install ]; then
+    install_tool "${ROWS_NAME[$index]}" "${ROWS_VERSION[$index]}" "${ROWS_REPO[$index]}" "${ROWS_TAG[$index]}" \
+      "${ROWS_ASSET[$index]}" "${ROWS_BINARY[$index]}" "${ROWS_SHA[$index]}"
+  fi
+  verify_tool "${ROWS_NAME[$index]}" "${ROWS_VERSION[$index]}" "${ROWS_BINARY[$index]}" "${ROWS_SHA[$index]}"
+  index=$((index + 1))
 done
 echo "OK: 開発ツールの版は tools/versions と一致"
 ```
@@ -380,6 +404,7 @@ STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .g
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 STAGED_SECRETS_TREE=""  # --staged のとき、秘密情報の検査のためにステージした blob をそのまま書き出す一時ディレクトリ
 STAGED_INDEX_TREE=""  # --staged のとき、開始時のインデックスのツリー（終了時に同じであることを確かめる）
+STAGED_TOOLS=""  # --staged のとき、開発ツールの写しと、照合に使うステージした台帳を置く一時ディレクトリ
 ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
 ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
@@ -554,7 +579,8 @@ prepare_rules_tree() {
   for directory in MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; do
     if [ -n "$(git ls-files -- "$directory" | head -n 1)" ]; then mkdir -p "$STAGED_TREE/$directory"; fi
   done
-  [ -e "$STAGED_TREE/.tools" ] || ln -s "$ROOT/.tools" "$STAGED_TREE/.tools"
+  # 開発ツールは、照合した写し（snapshot_staged_tools）を指す（元の .tools は検査の途中で差し替えられうる）
+  [ -e "$STAGED_TREE/.tools" ] || ln -s "$STAGED_TOOLS/.tools" "$STAGED_TREE/.tools"
 }
 
 # ステージした（追加・変更・名前の変更・種類の変更をした）ファイルの blob を、加工せずに元の相対位置で書き出す。
@@ -694,7 +720,10 @@ coverage_input() {
     printf 'commit %s\n' "$(git rev-parse HEAD)"
     return 0
   fi
-  # 一時のインデックスに作業ツリーを写してツリーを作る（本来のインデックスとステージの内容は変えない）
+  # 一時のインデックスに作業ツリーを写してツリーを作る（本来のインデックスとステージの内容は変えない）。
+  # 識別子は測る入力（Packages/）だけでなく作業ツリーの全体を表す（測定の前後で作業ツリーのどこかが変われば記録しない）。
+  # git add -A は追跡していないファイル（無視するものは除く）の blob とツリーをオブジェクトの格納庫に書き、どの参照からも
+  # 届かないまま残る。これらは手元のリポジトリの中だけにあり、git gc が gc.pruneExpire（既定 2 週間）を過ぎたものを消す
   index=$(mktemp)
   rm -f -- "$index"
   if ! GIT_INDEX_FILE="$index" git read-tree HEAD || ! GIT_INDEX_FILE="$index" git add -A \
@@ -714,9 +743,12 @@ take_coverage_lock() {
   COVERAGE_LOCK_HELD=1
 }
 
+# 持ち主の印を先に外してからロックを外す（copy_tools と同じ。rmdir の途中で中断されても、後始末が別の実行の取り直した
+# ロックを消さない。中断でロックが残った場合は、残骸として案内のとおり削除する）
 release_coverage_lock() {
-  if [ -n "$COVERAGE_LOCK_HELD" ]; then rmdir "$COVERAGE_LOCK" 2>/dev/null || true; fi
+  local held=$COVERAGE_LOCK_HELD
   COVERAGE_LOCK_HELD=""
+  if [ -n "$held" ]; then rmdir "$COVERAGE_LOCK" 2>/dev/null || true; fi
 }
 
 # 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
@@ -844,6 +876,18 @@ verify_checkout_blobs() {
   done < "$entries"
   rm -f -- "$entries"
   return "$status"
+}
+
+# --staged の検査が使う開発ツールを固定する。元の .tools を導入のロックを取って一時ディレクトリへ写し（copy_tools）、
+# 写しをステージした tools/versions と照合してから、以後の手順はすべて写しを使う（TOOLS）。コミット前のフックの照合の後に
+# 別の setup-tools.sh が bin のリンクや版のディレクトリを差し替えても、照合していない導入で整形・静的解析・秘密情報を検査しない
+snapshot_staged_tools() {
+  STAGED_TOOLS=$(mktemp -d)
+  copy_tools "$ROOT/.tools" "$STAGED_TOOLS/.tools"
+  git cat-file blob :tools/versions > "$STAGED_TOOLS/versions" || fail "ステージした tools/versions を読めない"
+  scripts/setup-tools.sh --verify --versions "$STAGED_TOOLS/versions" --dest "$STAGED_TOOLS/.tools" > /dev/null \
+    || fail "写した開発ツールがステージした tools/versions と一致しない。ステージした台帳で導入し直してからコミットする"
+  TOOLS="$STAGED_TOOLS/.tools/bin"
 }
 
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
@@ -986,6 +1030,7 @@ on_exit() {
   if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then remove_or_report "$STAGED_GITLEAKS_CONFIG"; fi
   if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
   if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
+  if [ -n "$STAGED_TOOLS" ]; then remove_or_report "$STAGED_TOOLS"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
   if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" 2>/dev/null || true; fi
@@ -1011,6 +1056,7 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+if [ "$STAGED" = 1 ]; then snapshot_staged_tools; fi
 if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
 # 通常の実行は作業ツリーを検査する。開始時と終了時の HEAD と未コミットの変更を控え、
 # （未追跡のファイルは status.showUntrackedFiles の設定によらず数える）
@@ -1040,7 +1086,19 @@ fi
 # 示す（プッシュ前のフックは自身の専用の作業ツリーで実行するので、これを設定して二重に展開しない）。置き場所は
 # リポジトリの外（中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読む）
 if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
-  ISOLATED_BASE=$(mktemp -d)
+  # 一時の置き場所は TMPDIR（なければ /tmp）の下に明示的に作る（mktemp -d の既定は TMPDIR を使わない環境がある）
+  temporary_root=${TMPDIR:-/tmp}
+  ISOLATED_BASE=$(mktemp -d "${temporary_root%/}/minutes-check.XXXXXX")
+  # 一時の置き場所も、プッシュ前のフックと同じ判定（scripts/worktree-location.py）で確かめてから作業ツリーを作る。
+  # TMPDIR が作業ツリーの中や、SwiftFormat の設定（.swiftformat・.swift-version）のある場所の下を指すと、専用の作業ツリーの
+  # 検査に別の設定が混ざる。作業ツリーの外で、設定を継がない一時ディレクトリは認める
+  location_status=0
+  checked_base=$("$ROOT/scripts/worktree-location.py" check "$ISOLATED_BASE" "$ROOT") || location_status=$?
+  case $location_status in
+    0) ISOLATED_BASE=$checked_base ;;
+    1) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
+    *) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）が作業ツリーの中かを判定できない" ;;
+  esac
   ISOLATED_TREE="$ISOLATED_BASE/tree"
   # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
   git -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
