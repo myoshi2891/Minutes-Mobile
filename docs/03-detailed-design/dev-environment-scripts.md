@@ -70,10 +70,11 @@ fail() {
 runtime_version() {
   local name=$1 binary=$2 out
   case "$name" in
-    swiftlint) out=$("$binary" version) || return 1 ;;
-    swiftformat) out=$("$binary" --version) || return 1 ;;
-    gitleaks) out=$("$binary" version) || return 1 ;;
-    gh) out=$("$binary" --version) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
+    # 標準入力は /dev/null にする（呼び出し側は版の写しを読んでいる途中で、版のコマンドに後続の行を読ませない）
+    swiftlint) out=$("$binary" version </dev/null) || return 1 ;;
+    swiftformat) out=$("$binary" --version </dev/null) || return 1 ;;
+    gitleaks) out=$("$binary" version </dev/null) || return 1 ;;
+    gh) out=$("$binary" --version </dev/null) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
     *) echo "NG: 版の確認方法が未定義のツール: $name" >&2; return 1 ;;
   esac
   printf '%s\n' "${out#v}"
@@ -480,7 +481,7 @@ prepare_staged_tree() {
   STAGED_TREE=$(mktemp -d)
   entries=$(mktemp)
   # 一覧の取得の失敗を空の一覧として扱わない
-  if ! git ls-files -s -z -- ':(glob)**/.swiftformat' ':(glob)**/.swiftlint.yml' ':(glob)**/.swift-version' > "$entries" \
+  if ! git ls-files -s -z -- ':(glob)**/.swiftformat' ':(glob,icase)**/.swiftlint.yml' ':(glob)**/.swift-version' > "$entries" \
     || ! git --literal-pathspecs ls-files -s -z -- "${STAGED_SWIFT[@]}" >> "$entries"; then
     rm -f -- "$entries"
     fail "ステージしたファイルの一覧を取得できない"
@@ -506,7 +507,7 @@ prepare_staged_tree() {
 prepare_rules_tree() {
   local directory
   [ -n "$STAGED_TREE" ] || STAGED_TREE=$(mktemp -d)
-  git ls-files -z -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+  git ls-files -z -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
     | git checkout-index -z -f --stdin --prefix="$STAGED_TREE/"
   # 入れ子の設定の置き忘れの検査（テストのディレクトリがあるのに設定がない）を、インデックスのディレクトリで行う。
   # 一覧は scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
@@ -595,7 +596,7 @@ step_2() {
     fi
     # 規則・試験用のファイル・入れ子の設定・テストのディレクトリ（入れ子の設定の置き忘れを検査する）を変えたときだけ、
     # 規則の試験を回す。テストのディレクトリの一覧は prepare_rules_tree と scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
-    if git diff --cached --quiet -- ':(glob)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+    if git diff --cached --quiet -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
       MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; then return 0; fi
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
@@ -738,7 +739,8 @@ copy_tools() {
 # 設定を読めない場合は止める。展開は改行の変換（core.autocrlf）を掛けない
 full_checkout() {
   local tree=$1 sparse status=0
-  sparse=$(git -C "$tree" config --type=bool --get core.sparseCheckout) || status=$?
+  # GIT_CONFIG を外して読む（設定されていると git config はそのファイルだけを読み、専用の作業ツリーの設定を見ない）
+  sparse=$(env -u GIT_CONFIG git -C "$tree" config --type=bool --get core.sparseCheckout) || status=$?
   case $status in
     0) if [ "$sparse" = true ]; then git -C "$tree" -c core.autocrlf=false sparse-checkout disable; fi ;;
     1) ;;  # 設定がない（sparse でない）
@@ -855,7 +857,8 @@ step_10() {
     # 文書・コード片の元の実装・検査スクリプトのすべてを、作業ツリーではなくインデックスの内容で照合する。
     # 文書と実装の両方をステージした一致する変更は通り、片方だけをステージした変更はコード片の不一致で止まる
     STAGED_DOCS_TREE=$(mktemp -d)
-    git checkout-index -a --prefix="$STAGED_DOCS_TREE/"
+    # sparse checkout で作業ツリーにない（skip-worktree の）項目も書き出し、インデックスの全体を照合する
+    git checkout-index -a --ignore-skip-worktree-bits --prefix="$STAGED_DOCS_TREE/"
     "$STAGED_DOCS_TREE/scripts/verify-docs.py" --root "$STAGED_DOCS_TREE"
   else
     scripts/test-checks.py docs
@@ -909,6 +912,9 @@ if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree;
 START_HEAD=""
 START_CHANGES=""
 if [ "$STAGED" = 0 ]; then
+  # コミットの合格を求める実行は、置き換えのオブジェクト（git replace）を使わず、元のコミットのオブジェクトで開始時の
+  # 照合・専用の作業ツリーの展開・sparse checkout の解除・入れ子の check.sh の検査を行う（子のプロセスにも引き継ぐ）
+  if [ "$REQUIRE_CLEAN" = 1 ]; then export GIT_NO_REPLACE_OBJECTS=1; fi
   START_HEAD=$(git rev-parse HEAD)
   # 呼び出し元が照合した HEAD と、これから検査する HEAD が同じであること（A → A は通し、A → B は止める）
   if [ -n "$EXPECT_HEAD" ]; then
