@@ -15,3 +15,5 @@ let lineCommented = Int.random(
 let quoted = Int.random(in: 0..<length(of: ")"), using: &generator)
 // 引数の中の入れ子のブロックコメント（内側を閉じた後に ) を含む）があっても、後ろの using: を認める
 let nestedComment = Int.random(in: 0..<10, /* 外 /* 内 */ ) を含む */ using: &generator)
+// 引数のラベル using と「:」の間のコメントは空白として扱い、注入した生成器を渡す呼び出しと認める
+let labelComment = Int.random(in: 0..<10, using /* 生成器 */ : &generator)

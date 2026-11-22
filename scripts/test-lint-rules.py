@@ -170,7 +170,8 @@ def nested_configs_in_index() -> List[str]:
     """インデックスにある .swiftlint.yml を列挙する。列挙できなければ実行できないとして止める。"""
     try:
         return subprocess.run(
-            ["git", "ls-files", "--cached", "--", ":(glob)**/.swiftlint.yml"],
+            # 大文字小文字を区別しない（nested_configs_in_worktree と同じ。.SwiftLint.yml も SwiftLint が読む）。結果は実際のパス
+            ["git", "ls-files", "--cached", "--", ":(glob,icase)**/.swiftlint.yml"],
             cwd=ROOT, capture_output=True, text=True, check=True,
         ).stdout.splitlines()
     except (OSError, subprocess.CalledProcessError) as error:
@@ -208,10 +209,11 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
         if ROOT / relative not in allowed:
             errors.append(f"許可していない場所に入れ子の設定がある: {relative}")
     # 入れ子の設定の下でも独自の規則は効いていること（試験用のファイルの print( の行で no_print_logging が検出される）
-    print_lines = {number for number, line in enumerate(read_fixture(sample).splitlines(), start=1)
-                   if re.search(r"\bprint\s*\(", line)}
+    # 期待する行は、print の呼び出しの行に付けた印（// expect: no_print_logging）で決める（本文の文字の一致では決めない）
+    print_lines = expected_lines(sample, "no_print_logging", errors)
     if not print_lines:
-        errors.append(f"{sample.relative_to(ROOT)}: print( の行がない（入れ子の設定で独自の規則が効くことを試験できない）")
+        errors.append(f"{sample.relative_to(ROOT)}: 印（// expect: no_print_logging）の付いた print の行がない"
+                      "（入れ子の設定で独自の規則が効くことを試験できない）")
     return [(sample, rule, set()) for rule in BUILTIN_RULES] + [(sample, "no_print_logging", print_lines)]
 
 
