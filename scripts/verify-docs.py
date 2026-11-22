@@ -899,6 +899,10 @@ class Checker:
             if target is None:
                 self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
                 continue
+            # 書き直すのは詳細設計のディレクトリの中の文書だけ（リンクした文書の実体がほかの場所にあれば上書きしない）
+            if not target.is_relative_to(self.root.resolve() / DETAILED):
+                self.error(name, "文書の実パスが詳細設計のディレクトリの外にあるため、コード片を書き直さない")
+                continue
             # 書き込む直前にも、読み直した内容から変わっていないことを確かめる（変わっていれば上書きしない）
             try:
                 current = self.read_raw(name)

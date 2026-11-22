@@ -64,6 +64,14 @@ def main() -> int:
             for item in data["runtimes"]
             if item.get("platform") == "iOS" and item.get("isAvailable")
         }
+        # 候補になりうる機種（最低 OS 以上の使えるランタイムの、使える機種）は、機種の識別子が空でない文字列であること
+        # （ない・空の識別子を iPhone でないとして読み飛ばし、候補なしと取り違えない）
+        for runtime, devices in devices_by_runtime.items():
+            if runtime in runtimes and runtimes[runtime] >= minimum:
+                for device in devices:
+                    identifier = device.get("deviceTypeIdentifier")
+                    if device.get("isAvailable") and not (isinstance(identifier, str) and identifier):
+                        raise TypeError(f"devices の {runtime} の使える機種の deviceTypeIdentifier がない・空")
         candidates: List[Tuple[Tuple[int, ...], str, str]] = [
             (runtimes[runtime], device["name"], device["udid"])
             for runtime, devices in devices_by_runtime.items()

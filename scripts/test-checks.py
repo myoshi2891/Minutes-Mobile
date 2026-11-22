@@ -672,6 +672,10 @@ def test_dependencies() -> None:
     }.items():
         dependencies_case(f"版で固定していない宣言（{label}）", 1, "版で固定されていない",
                           {"Package.resolved": resolved, "Package.swift": declare.format(declaration)}, [approved])
+    # 入れ子の引数（traits の中の呼び出し）の revision: は版の指定ではない
+    dependencies_case("traits の中の revision は版の指定にしない", 0, "OK",
+                      {"Package.resolved": resolved, "Package.swift": declare.format(
+                          f'.package(url: "{url}", exact: "1.2.3", traits: [selectedTraits(revision: 2)])')}, [approved])
     dependencies_case("宣言の版と承認済みの確定版が違う", 1, "合わない",
                       {"Package.resolved": resolved, "Package.swift": declare.format(f'.package(url: "{url}", exact: "2.0.0")')},
                       [approved])
@@ -1050,6 +1054,10 @@ def test_dependencies() -> None:
     dependencies_case("区切りのない「/」", 2, "「/」を判定できない", {"Package.swift": declare.format("let x = 4 / 2")})
     # JSON の深い入れ子（Python 3.9 の json は RecursionError）は読めないものとして終了コード 2
     dependencies_case("深い入れ子の Package.resolved", 2, "読めない", {"Package.resolved": "[" * 100000 + "]" * 100000})
+    # 重複した鍵（後の pins で前の pins を隠す）は読めないものとする
+    dependencies_case("重複した鍵の Package.resolved", 2, "重複した鍵",
+                      {"Package.resolved": '{"pins": [{"identity": "x", "location": "https://example.com/x", "state": {}}], '
+                                           '"pins": [], "version": 3}'})
     # 版別の manifest（Package@swift-<版>.swift）も同じ検査にかける
     # 除外の階層: 下位の build は検査し、直下の build と全階層の .build は除外する
     dependencies_case("下位の build の中の許可リスト外の依存", 1, "Sub/build/Package.swift",
@@ -1275,6 +1283,67 @@ def require_clean_case() -> None:
             failures.append("check: --require-clean が開発ツールの導入のロックを残した")
 
 
+def require_clean_smudge_case() -> None:
+    """check.sh --require-clean が、smudge のフィルタで内容を変えて展開した専用の作業ツリーを検査せず、失敗すること。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        out = Path(directory) / "recorded"
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "verify-docs.py").write_text('#!/bin/sh\ncat marker.txt > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+        (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for name in ("check.sh", "verify-docs.py", "test-checks.py"):
+            (repository / "scripts" / name).chmod(0o755)
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        (repository / ".gitattributes").write_text("marker.txt filter=rewrite\n", encoding="utf-8")
+        (repository / "marker.txt").write_text("committed\n", encoding="utf-8")
+        (repository / ".tools").mkdir()
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"],
+                          ["config", "filter.rewrite.smudge", "sed s/committed/smudged/"],
+                          # clean で smudge を打ち消す（git status では変更がないように見える。status の照合だけでは見逃す）
+                          ["config", "filter.rewrite.clean", "sed s/smudged/committed/"]):
+            subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "10", "--require-clean"], capture_output=True,
+                                text=True, env=dict(env, MINUTES_TEST_OUT=str(out)), timeout=60)
+        if result.returncode == 0 or "blob と違う" not in result.stderr or out.exists():
+            failures.append(f"check: --require-clean が smudge で変わった展開を検査した（終了コード {result.returncode}・"
+                            f"記録 {out.read_text(encoding='utf-8') if out.exists() else None!r}）\n{(result.stdout + result.stderr).strip()}")
+
+
+def setup_include_case() -> None:
+    """setup.sh --hooks が、共有の設定が取り込む設定（includeIf.onbranch）の core.hooksPath が別の値なら、書かずに止めること。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        env = isolated_git_env()
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        (repository / "scripts" / "setup.sh").write_text((SCRIPTS / "setup.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "setup-tools.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+        for name in ("setup.sh", "setup-tools.sh"):
+            (repository / "scripts" / name).chmod(0o755)
+        (repository / ".githooks").mkdir()
+        for name in ("pre-commit", "pre-push"):
+            (repository / ".githooks" / name).write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+            (repository / ".githooks" / name).chmod(0o755)
+        (repository / ".git" / "extra.config").write_text("[core]\n\thooksPath = elsewhere\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repository), "config", "--local", "includeIf.onbranch:main.path", "extra.config"],
+                       env=env, check=True)
+        result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], env=env, capture_output=True, text=True)
+        local = subprocess.run(["git", "-C", str(repository), "config", "--local", "--no-includes", "--get", "core.hooksPath"],
+                               env=env, capture_output=True, text=True).stdout.strip()
+        if result.returncode != 1 or local or "取り込む設定" not in result.stderr:
+            failures.append(f"setup: includeIf の core.hooksPath があるのに共有の設定を書いた・止まらない（終了コード "
+                            f"{result.returncode}・共有の値「{local}」）\n{result.stderr.strip()}")
+
+
 def coverage_record_message_case() -> None:
     """check.sh の手順 8 が、測定の記録がないとき、専用の作業ツリーでは手順 7 と 8 を一緒に実行する案内を、通常の実行では
     手順 7 を先に実行する案内を出すこと（専用の作業ツリーは実行のたびに作り直すので、前の測定が残らない）。"""
@@ -1472,6 +1541,13 @@ def simulator_cases() -> None:
         # 機種の識別子が文字列でない一覧は取得の失敗（「iPhone」を含む配列を iPhone と取り違えない）
         ("deviceTypeIdentifier が配列", {"runtimes": [runtime], "devices": {"r": [
             {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": ["iPhone"]}]}}, 2),
+        ("使える機種の deviceTypeIdentifier がない", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "x", "isAvailable": True}]}}, 2),
+        ("使える機種の deviceTypeIdentifier が空", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": ""}]}}, 2),
+        ("使えない機種の deviceTypeIdentifier はなくてよい", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "y", "isAvailable": False},
+            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
         ("iPad だけの一覧は候補なし", {"runtimes": [runtime], "devices": {"r": [
             {"name": "iPad A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPad"}]}}, 1),
         # ランタイムの platform は空でない文字列であること（形の違う項目を、iOS でないとして読み飛ばして候補なしにしない）
@@ -1591,6 +1667,8 @@ def test_versions() -> None:
     setup_relative_case()
     setup_missing_hook_case()
     require_clean_case()
+    require_clean_smudge_case()
+    setup_include_case()
     staged_symlink_case()
     staged_raw_blob_case()
     staged_raw_tree_case()
@@ -1789,6 +1867,7 @@ def test_gitleaks() -> None:
         (Path(directory) / "config.txt").write_text('name = "sample"\n', encoding="utf-8")
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
     gitleaks_merge_case()
+    gitleaks_broken_history_case()
     gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
     with tempfile.TemporaryDirectory() as directory:
@@ -2126,6 +2205,28 @@ def step3_history_case() -> None:
                             f"（終了コード {result.returncode}・記録 {recorded}）\n{(result.stdout + result.stderr).strip()}")
 
 
+def gitleaks_broken_history_case() -> None:
+    """gitleaks-history.sh が、欠けたオブジェクトで全履歴を読めないリポジトリを「検出なし」で通さないこと。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        repository = Path(directory) / "repository"
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        for index in range(2):
+            (repository / "a.txt").write_text(f"content {index}\n", encoding="utf-8")
+            for arguments in (["add", "a.txt"], ["commit", "-q", "-m", str(index)]):
+                subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+        # 最初のコミットの blob を消す（ゆるいオブジェクトのファイルを削除する）
+        blob = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD~1:a.txt"], env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        (repository / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        expect("gitleaks: 全履歴を読めないリポジトリは通さない", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], 1,
+               "全履歴を git log で読めない", env=env)
+
+
 def gitleaks_merge_case() -> None:
     """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
 
@@ -2298,6 +2399,22 @@ def docs_case(label: str, want_code: int, want_text: str, name: str = "", old: s
         (directory / path).parent.mkdir(parents=True, exist_ok=True)
         (directory / path).write_text(content, encoding="utf-8")
     expect(f"docs: {label}", [str(SCRIPTS / "verify-docs.py"), "--root", str(directory)] + (options or []), want_code, want_text)
+    return directory
+
+
+def linked_document_case() -> Path:
+    """--update-snippets が、詳細設計のディレクトリの外を実体とするリンクの文書を書き直さないこと（起点の中でも）。"""
+    global count
+    directory = docs_case("リンクの文書の準備（整合した文書）", 0, "OK")
+    outside = directory / "outside.md"
+    content = f"# 外の文書\n\n<!-- file: scripts/sample.sh -->\n\n{FENCE}bash\necho old\n{FENCE}\n"
+    outside.write_text(content, encoding="utf-8")
+    (directory / "docs/03-detailed-design/linked.md").symlink_to("../../outside.md")
+    count += 1
+    expect("docs: 詳細設計の外を指すリンクの文書は書き直さない",
+           [str(SCRIPTS / "verify-docs.py"), "--root", str(directory), "--update-snippets"], 1, "詳細設計のディレクトリの外")
+    if outside.read_text(encoding="utf-8") != content:
+        failures.append("docs: --update-snippets が詳細設計の外のリンクの実体を書き換えた")
     return directory
 
 
@@ -2505,6 +2622,7 @@ def run_docs_cases() -> None:
                   "`コード` [例](missing.md)"),
         # 節が小節から始まる場合は、最初の小節の冒頭だけを見る（後ろの小節の「満たす要件:」で節を合格にしない）
         cyclic_snippet_case(),
+        linked_document_case(),
         # 分冊（本冊の基本設計の名前に「-<名前>」を付けた詳細設計）は、必須の節と申し送りを求めず、節の冒頭とコード片を照合する
         docs_case("分冊は必須の節を求めない", 0, "OK", extra={"docs/03-detailed-design/sample-scripts.md": (
             f"# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n\n<!-- file: scripts/sample.sh -->\n\n"

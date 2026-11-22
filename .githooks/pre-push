@@ -201,6 +201,42 @@ full_checkout() {
       ;;
   esac
 }
+# 作業ツリー（$1）の追跡しているファイルが、そのインデックス（チェックアウトしたコミット）の blob とバイト単位で一致することを
+# 確かめる。checkout は .gitattributes の smudge のフィルタで内容を変えうる（core.autocrlf=false では filter は止まらない）。
+# 内容を変えたチェックアウトを、コミットの合格として検査しない。通常のファイルは git hash-object --no-filters で、
+# シンボリックリンクはリンク先の文字列で比べる。サブモジュール（160000）は blob がないので比べない。一致しなければ非 0 を返す
+verify_checkout_blobs() {
+  local tree=$1 entries entry mode object path actual status=0
+  entries=$(mktemp)
+  if ! git -C "$tree" ls-files -s -z > "$entries"; then rm -f -- "$entries"; return 1; fi
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    case "$mode" in
+      160000) continue ;;
+      120000)
+        if [ ! -L "$tree/$path" ] || [ "$(readlink -- "$tree/$path")" != "$(git -C "$tree" cat-file blob "$object")" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（シンボリックリンク）" >&2
+          status=1
+        fi
+        ;;
+      *)
+        actual=""
+        if [ -f "$tree/$path" ] && [ ! -L "$tree/$path" ]; then
+          actual=$(git -C "$tree" hash-object --no-filters -- "$tree/$path") || actual=""
+        fi
+        if [ "$actual" != "$object" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（.gitattributes のフィルタなどで内容が変わった）" >&2
+          status=1
+        fi
+        ;;
+    esac
+  done < "$entries"
+  rm -f -- "$entries"
+  return "$status"
+}
 # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
 if [ "$owned" -eq 1 ]; then
   git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"
@@ -230,6 +266,12 @@ else
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
   git -C "$source_root" -c core.autocrlf=false worktree add -q --force --detach "$snapshot" "$head"
   full_checkout
+fi
+# 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では
+# smudge のフィルタは止まらない。変わった内容を送信するコミットの合格として検査しない）
+if ! verify_checkout_blobs "$snapshot"; then
+  echo "NG: 専用の作業ツリーの内容が送信するコミット（${head}）の blob と違う（.gitattributes の smudge のフィルタなど）。検査しない" >&2
+  exit 1
 fi
 # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
 # 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
@@ -272,8 +314,11 @@ for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
     cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
   fi
 done
-rmdir "$tools_lock"
+# 持ち主の印（tools_lock）を先に外してからロックを外す。逆の順では、rmdir の後・印を外す前に中断されると、終了の trap が
+# その間に別の導入が取り直したロックを消しうる。この順では中断してもロックが残るだけで、導入の直列化は弱めない
+held_lock=$tools_lock
 tools_lock=""
+rmdir "$held_lock"
 
 # 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
 MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

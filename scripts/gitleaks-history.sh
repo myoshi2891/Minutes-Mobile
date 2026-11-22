@@ -81,6 +81,13 @@ if [ -e "$repository/.gitleaksignore" ] || [ -L "$repository/.gitleaksignore" ];
   echo "NG: ${repository}/.gitleaksignore がある。検出の抑止の記録は使わない（gitleaks が指定によらず読むため）。削除してから検査し直す" >&2
   exit 1
 fi
+# gitleaks（8.30.1）は git log の失敗（壊れた・欠けたオブジェクトなど）を終了コードに反映せず、読めた分だけで「no leaks found」
+# として通しうる。そこで、同じ指定の git log で全履歴の差分を最後まで読めることを先に確かめ、読めなければ検査せずに失敗する
+# （出力は捨てる。値を表示しない）。gitleaks と同じく -p -U0 で差分を出す
+if ! git -C "$repository" log -p -U0 $GITLEAKS_LOG_OPTS > /dev/null; then
+  echo "NG: ${repository} の全履歴を git log で読めない（壊れた・欠けたオブジェクトなど）。git fsck で確かめてから検査し直す" >&2
+  exit 1
+fi
 # --redact: 検出した値そのものを出力に残さない
 exec "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
   "${GITLEAKS_SUPPRESSION[@]}" --log-opts="$GITLEAKS_LOG_OPTS" ${REPORT[@]+"${REPORT[@]}"} "$repository"

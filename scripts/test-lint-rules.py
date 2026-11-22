@@ -169,14 +169,18 @@ def nested_configs_in_worktree() -> List[str]:
 def nested_configs_in_index() -> List[str]:
     """インデックスにある .swiftlint.yml を列挙する。列挙できなければ実行できないとして止める。"""
     try:
-        return subprocess.run(
-            # 大文字小文字を区別しない（nested_configs_in_worktree と同じ。.SwiftLint.yml も SwiftLint が読む）。結果は実際のパス
-            ["git", "ls-files", "--cached", "--", ":(glob,icase)**/.swiftlint.yml"],
-            cwd=ROOT, capture_output=True, text=True, check=True,
-        ).stdout.splitlines()
+        listed = subprocess.run(
+            # 大文字小文字を区別しない（nested_configs_in_worktree と同じ。.SwiftLint.yml も SwiftLint が読む）。結果は実際のパス。
+            # -z で NUL 区切りの生のパスを読み、os.fsdecode で戻す（-z なしでは ASCII 以外の文字を含むパスが引用符と
+            # 8 進数のエスケープで出力され、報告と照合に実際のパスを使えない）
+            ["git", "ls-files", "--cached", "-z", "--", ":(glob,icase)**/.swiftlint.yml"],
+            cwd=ROOT, capture_output=True, check=True,
+        ).stdout
+        return [os.fsdecode(path) for path in listed.split(b"\0") if path]
     except (OSError, subprocess.CalledProcessError) as error:
         # 入れ子の設定を列挙できなければ抜け道を検査できないので、実行できないとして止める
-        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+        detail = (os.fsdecode(error.stderr).strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr
+                  else str(error))
         print(detail, file=sys.stderr)
         print("NG: git ls-files を実行できない（入れ子の設定を列挙できない）", file=sys.stderr)
         sys.exit(2)

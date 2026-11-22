@@ -55,6 +55,19 @@ if [ "$HOOKS" = 1 ]; then
       fi
       ;;
   esac
+  # 共有の設定のファイルが取り込む設定（include.path と、今の作業ツリーで条件の当たる includeIf.*.path。onbranch を含む）の
+  # core.hooksPath は、取り込みの位置で読まれるので、書き込む値より後に読まれて上書きしうる。取り込みからだけ得られる値
+  # （取り込みを読んだ一覧から、共有のファイル自身の値を除いたもの）に .githooks 以外があれば、共有の値を書かずに止める
+  with_includes=$(env -u GIT_CONFIG git config --local --includes --get-all core.hooksPath || true)
+  own=$(env -u GIT_CONFIG git config --local --no-includes --get-all core.hooksPath || true)
+  included=$(comm -23 <(printf '%s\n' "$with_includes" | LC_ALL=C sort) <(printf '%s\n' "$own" | LC_ALL=C sort))
+  while IFS= read -r value; do
+    if [ -n "$value" ] && [ "$value" != .githooks ]; then
+      echo "NG: 共有の設定が取り込む設定（include・includeIf）の core.hooksPath が「${value}」を指している。共有の設定を変えずに止める。" \
+        "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
+      exit 1
+    fi
+  done <<< "$included"
   env -u GIT_CONFIG git config --local core.hooksPath .githooks
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる

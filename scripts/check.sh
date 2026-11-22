@@ -452,8 +452,11 @@ copy_tools() {
       cp -R -P -- "$entry" "$copy/" || fail "開発ツールを写せない（${entry}）"
     fi
   done
-  rmdir "$TOOLS_LOCK"
+  # 持ち主の印を先に外してからロックを外す（間で中断されても、後始末が別の実行の取り直したロックを消さない。
+  # 印を外した後・ロックを外す前に中断された場合はロックが残るが、導入の直列化は弱めない。残骸は案内のとおり削除する）
+  local held=$TOOLS_LOCK
   TOOLS_LOCK=""
+  rmdir "$held"
 }
 
 # 元の作業ツリーが sparse checkout なら、専用の作業ツリー（$1）もその指定を引き継ぎ（git worktree add が写す）、一部のファイル
@@ -469,6 +472,43 @@ full_checkout() {
     1) ;;  # 設定がない（sparse でない）
     *) fail "専用の作業ツリーの sparse checkout の設定を読めない（${tree}）" ;;
   esac
+}
+
+# 作業ツリー（$1）の追跡しているファイルが、そのインデックス（チェックアウトしたコミット）の blob とバイト単位で一致することを
+# 確かめる。checkout は .gitattributes の smudge のフィルタで内容を変えうる（core.autocrlf=false では filter は止まらない）。
+# 内容を変えたチェックアウトを、コミットの合格として検査しない。通常のファイルは git hash-object --no-filters で、
+# シンボリックリンクはリンク先の文字列で比べる。サブモジュール（160000）は blob がないので比べない。一致しなければ非 0 を返す
+verify_checkout_blobs() {
+  local tree=$1 entries entry mode object path actual status=0
+  entries=$(mktemp)
+  if ! git -C "$tree" ls-files -s -z > "$entries"; then rm -f -- "$entries"; return 1; fi
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    case "$mode" in
+      160000) continue ;;
+      120000)
+        if [ ! -L "$tree/$path" ] || [ "$(readlink -- "$tree/$path")" != "$(git -C "$tree" cat-file blob "$object")" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（シンボリックリンク）" >&2
+          status=1
+        fi
+        ;;
+      *)
+        actual=""
+        if [ -f "$tree/$path" ] && [ ! -L "$tree/$path" ]; then
+          actual=$(git -C "$tree" hash-object --no-filters -- "$tree/$path") || actual=""
+        fi
+        if [ "$actual" != "$object" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（.gitattributes のフィルタなどで内容が変わった）" >&2
+          status=1
+        fi
+        ;;
+    esac
+  done < "$entries"
+  rm -f -- "$entries"
+  return "$status"
 }
 
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
@@ -670,6 +710,9 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
   git -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
   full_checkout "$ISOLATED_TREE"
+  # 展開した内容がコミットの blob と同じであること（smudge のフィルタで変わった内容をコミットの合格として検査しない）
+  verify_checkout_blobs "$ISOLATED_TREE" \
+    || fail "専用の作業ツリーの内容がコミット ${START_HEAD} の blob と違う（.gitattributes の smudge のフィルタなど）。コミットの合格にしない"
   # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。導入のロックを取って写し、手順 0 の照合と
   # 後の手順はすべてこの写しを使う（検査の途中の setup-tools.sh による差し替えの影響を受けない）
   copy_tools "$ROOT/.tools" "$ISOLATED_TREE/.tools"

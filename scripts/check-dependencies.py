@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from xcproj import Unreadable, load_project
+from xcproj import Unreadable, load_project, reject_duplicate_keys
 
 ROOT = Path(__file__).resolve().parent.parent
 # ビルドの成果物と個人の設定は全階層で除外する。.git・.tools・build はリポジトリ直下だけを除外する
@@ -145,8 +145,9 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
 
 def resolved_pins(path: Path) -> List[dict]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:  # 深い入れ子は RecursionError
+        # 重複した鍵は後の値で前の値を隠すので読めないものとする（xcproj.py と同じ。ValueError で送出される）
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:  # 深い入れ子は RecursionError
         raise Unreadable(f"{path}: {error!r}") from error
     pins = data.get("pins") if isinstance(data, dict) else None
     if pins is None and isinstance(data, dict) and isinstance(data.get("object"), dict):
@@ -591,7 +592,8 @@ def literal_argument(arguments: str, masked: str, label: str, pattern: "re.Patte
 
 def version_errors(arguments: str, masked: str, summary: str, approved: Set[str], pinned: Optional[List[object]]) -> List[str]:
     """.package(url:) の版の指定を、承認した版と、同じディレクトリの Package.resolved の確定版で照合する。"""
-    if UNPINNED.search(masked):
+    # 宣言の最上位の引数だけを見る（traits の中の selectedTraits(revision: 2) のような入れ子の引数を版の指定と見なさない）
+    if UNPINNED.search(top_level_only(masked)):
         return [f"版で固定されていない（ブランチやコミットの指定は認めない）: .package({summary})"]
     rule = requirement(arguments, masked)
     if rule is None:
