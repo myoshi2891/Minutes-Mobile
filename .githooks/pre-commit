@@ -2,6 +2,9 @@
 # コミット前の検査: ステージしたファイルに対する手順 1〜3 と 10（基本設計 dev-environment.md §6.2）。
 # 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
 set -euo pipefail
+# 置き換えのオブジェクト（git replace の refs/replace/）を使わず、ステージした blob そのものを読む（台帳の書き出しと、
+# check.sh --staged の各手順の書き出し。子のプロセスにも引き継ぐ）
+export GIT_NO_REPLACE_OBJECTS=1
 root=$(git rev-parse --show-toplevel)
 # 導入済みの開発ツールが、ステージした tools/versions（コミットする台帳）と一致することを先に確かめる。作業ツリーの台帳や
 # 古い導入のまま、コミットする台帳と違う版のツールで整形・静的解析・秘密情報を検査しない
@@ -19,10 +22,6 @@ if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
   echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。ステージした台帳で導入し直してからコミットする: ${reinstall}" >&2
   exit 1
 fi
+# check.sh --staged は、導入のロックを取って開発ツールを写し、写しをステージした台帳と照合してから、検査のすべてを写しで
+# 行う（照合の後に元の導入が差し替えられても、検査に使う導入は変わらない）。上の照合は、導入し直す手順を示すために先に行う
 "$root/scripts/check.sh" --staged
-# 検査の間に導入が差し替えられていないこと（照合の後に別の setup-tools.sh がリンクを置き換えた導入で検査した結果を通さない）。
-# 検査の後にもう一度照合する（差し替えて戻した場合は検出できない。導入のロックは照合の間だけ持つ）
-if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
-  echo "NG: 検査の間に開発ツールの導入が変わった。導入が終わってからコミットし直す" >&2
-  exit 1
-fi

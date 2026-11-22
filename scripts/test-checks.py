@@ -377,6 +377,14 @@ def test_settings() -> None:
                   plists=plist_orientation("$(MINUTES_ORIENTATION)"))
     settings_case("plist の向きの変数が展開できない", 1, "展開できない", project=with_file,
                   plists=plist_orientation("$(MINUTES_UNDEFINED)"))
+    # ビルドが参照先の plist の変数を展開しない構成（INFOPLIST_EXPAND_BUILD_SETTINGS = NO）では、縦に展開される変数でも認めない
+    without_expansion = lambda value: lambda t: replaced(  # noqa: E731
+        with_orientation_setting("UIInterfaceOrientationPortrait")(t), '"GENERATE_INFOPLIST_FILE": "NO",',
+        f'"GENERATE_INFOPLIST_FILE": "NO",\n        "INFOPLIST_EXPAND_BUILD_SETTINGS": "{value}",')
+    settings_case("plist の変数を展開しない構成の向きの変数", 1, "変数が展開されない", project=without_expansion("NO"),
+                  plists=plist_orientation("$(MINUTES_ORIENTATION)"))
+    settings_case("plist の変数を展開する構成の向きの変数", 0, "OK", project=without_expansion("YES"),
+                  plists=plist_orientation("$(MINUTES_ORIENTATION)"))
     # plist の値の変数は、構成・SDK ごとに展開してから判定する
     mic_variable = dict(microphone, NSMicrophoneUsageDescription="$(MIC_TEXT)")
     define = lambda value: lambda t: replaced(with_file(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',  # noqa: E731
@@ -1260,8 +1268,11 @@ def setup_relative_case() -> None:
                             f"{result.returncode}・呼ばれたパス「{recorded}」）\n{(result.stdout + result.stderr).strip()}")
 
 
-def require_clean_case() -> None:
+def require_clean_case(inherited: bool = False) -> None:
     """check.sh --require-clean が、開始時のコミットを専用の作業ツリーに展開してそこで検査し、終了後に片付けること。
+
+    inherited では、元の作業ツリーで MINUTES_CHECK_ISOLATED=1 を引き継いでも展開を省かないこと（変数は、この検査の
+    専用の作業ツリーの印がある場合だけ認める）を確かめる。
 
     一時のリポジトリに check.sh と、手順 10 が呼ぶスクリプトの代わり（実行した場所と読んだ内容を記録する）を置いて試す。
     記録した場所が元の作業ツリーでなく、読んだ内容が開始時のコミットのものであること（検査中に元の作業ツリーを
@@ -1274,6 +1285,8 @@ def require_clean_case() -> None:
         # 外側が専用の作業ツリーで実行中（プッシュ前のフック・--require-clean）でも、入れ子の check.sh には専用の作業ツリーへ
         # 展開する経路を通らせる（引き継ぐと展開を省き、元の作業ツリーで検査してしまう）。ほかの変数は残す
         env.pop("MINUTES_CHECK_ISOLATED", None)
+        if inherited:
+            env["MINUTES_CHECK_ISOLATED"] = "1"
         repository = Path(directory) / "repository"
         (repository / "scripts").mkdir(parents=True)
         out = Path(directory) / "recorded"
@@ -1306,7 +1319,8 @@ def require_clean_case() -> None:
         isolated = (len(recorded) == 3 and recorded[1] == "committed" and recorded[2] == "copy"
                     and not recorded[0].startswith(os.path.realpath(repository)))
         if result.returncode != 0 or not isolated or "専用の作業ツリーで検査" not in result.stdout:
-            failures.append(f"check: --require-clean が専用の作業ツリーで検査しない（終了コード {result.returncode}・記録 {recorded}）\n"
+            failures.append(f"check: --require-clean が専用の作業ツリーで検査しない（引き継いだ変数 {inherited}・"
+                            f"終了コード {result.returncode}・記録 {recorded}）\n"
                             f"{(result.stdout + result.stderr).strip()}")
         # 作業ツリーの数は「worktree 」で始まる行だけを数える（パスの途中の「worktree 」を数えない）
         elif sum(line.startswith("worktree ") for line in worktrees.splitlines()) != 1 or (recorded and Path(recorded[0]).exists()):
@@ -1585,7 +1599,16 @@ def staged_raw_tree_case() -> None:
 
 
 def staged_index_change_case() -> None:
-    """check.sh --staged が、検査の間にステージした内容が変わったら（手順ごとに別の内容を検査しうるので）合格にしないこと。"""
+    """check.sh --staged が、検査の間にステージした内容が変わったら（手順ごとに別の内容を検査しうるので）合格にしないこと。
+
+    検査が読む専用のインデックス（引き継いだ GIT_INDEX_FILE）を変えた場合と、外から本来のインデックスを変えた場合の両方。
+    """
+    global count
+    for target in ("専用のインデックス", "本来のインデックス"):
+        staged_index_change_run(target)
+
+
+def staged_index_change_run(target: str) -> None:
     global count
     count += 1
     with tempfile.TemporaryDirectory() as directory:
@@ -1597,8 +1620,10 @@ def staged_index_change_case() -> None:
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         stage_tool_stubs(repository)
         # 文書の整合の代わり: 検査の途中で作業ツリーの変更をステージする（手順 10 の後、合格の表示の前にインデックスが変わる）
+        # 本来のインデックスは、検査が設定した GIT_INDEX_FILE を外して（git が選ぶ既定のインデックスで）変える
+        stage = "git add doc.md" if target == "専用のインデックス" else "env -u GIT_INDEX_FILE git add doc.md"
         (repository / "scripts" / "verify-docs.py").write_text(
-            '#!/bin/sh\nprintf changed > doc.md && git add doc.md\n', encoding="utf-8")
+            f'#!/bin/sh\nprintf changed > doc.md && {stage}\n', encoding="utf-8")
         gitleaks = repository / ".tools" / "bin" / "gitleaks"
         gitleaks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         for path in (repository / "scripts" / "check.sh", repository / "scripts" / "verify-docs.py", gitleaks):
@@ -1614,7 +1639,7 @@ def staged_index_change_case() -> None:
                                 text=True, env=env, timeout=60)
         output = result.stdout + result.stderr
         if result.returncode != 1 or "ステージした内容が変わった" not in output or "コミット前の検査を通過" in output:
-            failures.append(f"check: --staged が検査中にステージした内容が変わっても合格にする（終了コード {result.returncode}）\n"
+            failures.append(f"check: --staged が検査中に{target}が変わっても合格にする（終了コード {result.returncode}）\n"
                             f"{output.strip()}")
 
 
@@ -1649,42 +1674,53 @@ def staged_symlink_case() -> None:
             failures.append(f"check: 種類を変えてステージした Swift のリンクを止めない（終了コード {result.returncode}）\n{output.strip()}")
 
 
+# シミュレータの一覧の試験に使う UDID（UUID の形）
+SIM_X = "11111111-2222-4333-8444-555555555555"
+SIM_Y = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+
+
 def simulator_cases() -> None:
     """find-simulator.py が、形の違う一覧を取得の失敗（終了コード 2）とし、正しい空の一覧を候補なし（1）とすること。"""
     global count
     runtime = {"identifier": "r", "version": "27.2", "platform": "iOS", "isAvailable": True}
+    sim_cases_extra = [
+        # UDID は UUID の形であること（空でない文字列でも、UUID でなければ取得の失敗）
+        ("udid が UUID でない", {"runtimes": [runtime], "devices": {"r": [
+            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+    ]
     for label, listing, want_code in (
         ("runtimes の項目が辞書でない", {"runtimes": ["x"], "devices": {}}, 2),
         ("devices の項目が辞書でない", {"runtimes": [runtime], "devices": {"r": ["x"]}}, 2),
         ("devices の値が配列でない", {"runtimes": [runtime], "devices": {"r": "x"}}, 2),
         ("空の一覧は候補なし", {"runtimes": [], "devices": {}}, 1),
+        *sim_cases_extra,
         # 使えるかの値は真偽値であること（文字列の "false" を真と取り違えない）
         ("runtimes の isAvailable が文字列", {"runtimes": [dict(runtime, isAvailable="false")], "devices": {}}, 2),
         ("devices の isAvailable が数値", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPhone A", "udid": "x", "isAvailable": 1, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+            {"name": "iPhone A", "udid": SIM_X, "isAvailable": 1, "deviceTypeIdentifier": "iPhone"}]}}, 2),
         ("使えない機種は候補にしない", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPhone A", "udid": "y", "isAvailable": False, "deviceTypeIdentifier": "iPhone"},
-            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
+            {"name": "iPhone A", "udid": SIM_Y, "isAvailable": False, "deviceTypeIdentifier": "iPhone"},
+            {"name": "iPhone B", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
         # 版が文字列でないランタイムは取得の失敗（split の例外で止まらない）
         ("runtimes の version が数値", {"runtimes": [dict(runtime, version=27.2)], "devices": {}}, 2),
         # 27.2 と 27.2.0 は同じ版として最低 OS を満たす
         ("27.2.0 は 27.2 以上", {"runtimes": [dict(runtime, version="27.2.0")], "devices": {"r": [
-            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
+            {"name": "iPhone A", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
         ("udid が文字列でない", {"runtimes": [runtime], "devices": {"r": [
             {"name": "iPhone A", "udid": 1, "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
-            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+            {"name": "iPhone B", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
         # 機種の識別子が文字列でない一覧は取得の失敗（「iPhone」を含む配列を iPhone と取り違えない）
         ("deviceTypeIdentifier が配列", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": ["iPhone"]}]}}, 2),
+            {"name": "iPhone A", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": ["iPhone"]}]}}, 2),
         ("使える機種の deviceTypeIdentifier がない", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPhone A", "udid": "x", "isAvailable": True}]}}, 2),
+            {"name": "iPhone A", "udid": SIM_X, "isAvailable": True}]}}, 2),
         ("使える機種の deviceTypeIdentifier が空", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": ""}]}}, 2),
+            {"name": "iPhone A", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": ""}]}}, 2),
         ("使えない機種の deviceTypeIdentifier はなくてよい", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPhone A", "udid": "y", "isAvailable": False},
-            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
+            {"name": "iPhone A", "udid": SIM_Y, "isAvailable": False},
+            {"name": "iPhone B", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
         ("iPad だけの一覧は候補なし", {"runtimes": [runtime], "devices": {"r": [
-            {"name": "iPad A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPad"}]}}, 1),
+            {"name": "iPad A", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPad"}]}}, 1),
         # ランタイムの platform は空でない文字列であること（形の違う項目を、iOS でないとして読み飛ばして候補なしにしない）
         ("runtimes の platform がない", {"runtimes": [{k: v for k, v in runtime.items() if k != "platform"}], "devices": {}}, 2),
         ("runtimes の platform が数値", {"runtimes": [dict(runtime, platform=1)], "devices": {}}, 2),
@@ -1695,10 +1731,10 @@ def simulator_cases() -> None:
         ("使える iOS のランタイムの identifier が数値", {"runtimes": [dict(runtime, identifier=1)], "devices": {}}, 2),
         # 正しい形の iOS 以外のランタイム（watchOS）は、これまでどおり読み飛ばす
         ("watchOS だけの一覧は候補なし", {"runtimes": [dict(runtime, platform="watchOS")], "devices": {"r": [
-            {"name": "iPhone A", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 1),
+            {"name": "iPhone A", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 1),
         ("name が文字列でない", {"runtimes": [runtime], "devices": {"r": [
-            {"name": None, "udid": "y", "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
-            {"name": "iPhone B", "udid": "x", "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
+            {"name": None, "udid": SIM_Y, "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
+            {"name": "iPhone B", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
     ):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
@@ -1711,9 +1747,9 @@ def simulator_cases() -> None:
                                     env=dict(os.environ, PATH=f"{directory}:{os.environ.get('PATH', '')}"))
             if result.returncode != want_code:
                 failures.append(f"simulator: {label}: 終了コードが {result.returncode}（期待 {want_code}）\n{result.stderr.strip()}")
-            elif want_code == 0 and result.stdout != "x\n":
-                # 成功の場合は、選んだ機種の UDID（試験用の一覧の x）だけを出力すること
-                failures.append(f"simulator: {label}: 出力が {result.stdout!r}（期待 'x\\n'）")
+            elif want_code == 0 and result.stdout != f"{SIM_X}\n":
+                # 成功の場合は、選んだ機種の UDID（試験用の一覧の SIM_X）だけを出力すること
+                failures.append(f"simulator: {label}: 出力が {result.stdout!r}（期待 {SIM_X!r}）")
 
 
 def verify_lock_case(setup: str, versions: Path, dest: Path, stub: Path) -> None:
@@ -1806,6 +1842,7 @@ def test_versions() -> None:
     setup_relative_case()
     setup_missing_hook_case()
     require_clean_case()
+    require_clean_case(inherited=True)
     require_clean_location_case()
     require_clean_smudge_case()
     setup_include_case()
@@ -1942,14 +1979,21 @@ def test_versions() -> None:
         stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
         expect("versions: 導入記録のある版を指すリンク", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                  "--require", "gh"], 0, "OK")
-        # 版を表示するコマンドが標準入力を読んでも、台帳の後続の行を消費させない（標準入力は /dev/null）。後続の行が
-        # 読まれていれば、重複した gh の行として失敗する（消費されると、その行を読まずに通る）
-        stub.write_text(f"#!/bin/sh\ncat >/dev/null\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        # 版を表示するコマンドに標準入力を渡さない（/dev/null）。正しい台帳で、setup-tools.sh の標準入力に既知の行を渡し、
+        # 代わりの gh が何かを読めたら失敗させる（読めなければ版を表示して照合が通る）
+        stub.write_text(f'#!/bin/sh\nif IFS= read -r line; then echo "標準入力を読んだ: $line" >&2; exit 9; fi\n'
+                        f"echo 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        result = subprocess.run([setup, "--verify", "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
+                                input="minutes-known-input-line\n", capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 or "標準入力を読んだ" in result.stderr:
+            failures.append(f"versions: 版の表示のコマンドが標準入力を読めた（終了コード {result.returncode}）\n"
+                            f"{(result.stdout + result.stderr).strip()}")
+        stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        # 重複した gh の行は、台帳の検証で失敗する（上の標準入力の試験とは別に確かめる）
         duplicated = Path(directory) / "versions-duplicated"
         duplicated.write_text("\n".join([gh_rows[0], gh_rows[0]]) + "\n", encoding="utf-8")
-        expect("versions: 版の表示のコマンドが台帳の後続の行を読まない",
-               [setup, "--verify", "--versions", str(duplicated), "--dest", str(dest), "--require", "gh"], 1, "重複している")
-        stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+        expect("versions: 重複した gh の行", [setup, "--verify", "--versions", str(duplicated), "--dest", str(dest),
+                                       "--require", "gh"], 1, "重複している")
         # 照合も導入と同じロックを取る。導入の実行中（ロックがある間）は照合を終えず、ロックが外れてから照合して通る
         verify_lock_case(setup, versions, dest, stub)
         other = dest / "gh" / "other" / executable
@@ -2480,7 +2524,9 @@ def coverage_case(label: str, want_code: int, want_text: str, count_value: objec
         sources = Path(directory) / "Sources"
         sources.mkdir()
         report = Path(directory) / "report.json"
-        report.write_text(json.dumps({"data": [{"files": [{"filename": str(sources / "A.swift"), "summary": {
+        # swift test の記録と同じく、起点（Package）は実体のパスに解決して書く（一時ディレクトリの /var は /private/var へのリンク）
+        recorded = Path(os.path.realpath(sources)) / "A.swift"
+        report.write_text(json.dumps({"data": [{"files": [{"filename": str(recorded), "summary": {
             "lines": {"count": count_value, "covered": covered_value}}}]}]}), encoding="utf-8")
         if nested:
             report.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")  # json の読み込みが RecursionError になる深さ
@@ -2506,6 +2552,36 @@ def test_coverage() -> None:
     coverage_case("目標にわずかに届かない", 0, "行 89.96%", 10000, 8996, target="90")
     coverage_case("小数の目標", 0, "目標の 90.5% に届いていない", 20, 18, target="90.5")
     coverage_case("深い入れ子の記録", 2, "RecursionError", 20, 19, nested=True)
+    coverage_symlink_case()
+
+
+def coverage_symlink_case() -> None:
+    """数える対象かを、記録したパスで決めること（現在のファイルシステムのシンボリックリンクをたどらない）。
+
+    Sources の中のリンク（外のファイルを指す）は記録のパスが Sources の中なので数え、Sources の外のリンク（Sources の中の
+    ファイルを指す）は数えない。記録したパスが相対パスなら読めないものとする。
+    """
+    global count
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(os.path.realpath(directory))
+        sources, other = root / "Sources", root / "Tests"
+        sources.mkdir()
+        other.mkdir()
+        (other / "Outside.swift").write_text("", encoding="utf-8")
+        (sources / "Linked.swift").symlink_to(other / "Outside.swift")
+        (sources / "Real.swift").write_text("", encoding="utf-8")
+        (other / "Alias.swift").symlink_to(sources / "Real.swift")
+        files = [(sources / "Linked.swift", 10, 5), (other / "Alias.swift", 100, 0)]
+        for label, entries, want_code, want_text in (
+            ("記録したパスで数える", files, 0, "行 50.0%（1 ファイル"),
+            ("相対パスの記録", [(Path("Sources/Linked.swift"), 10, 5)], 2, "絶対パスでない"),
+        ):
+            report = root / "report.json"
+            report.write_text(json.dumps({"data": [{"files": [
+                {"filename": str(path), "summary": {"lines": {"count": lines, "covered": covered}}}
+                for path, lines, covered in entries]}]}), encoding="utf-8")
+            expect(f"coverage: {label}", [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources),
+                                          "--target", "90"], want_code, want_text)
 
 
 # 設計決定を §3 に置く基本設計（architecture.md）
@@ -2614,6 +2690,41 @@ def untracked_document_case() -> None:
             code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory)])
             if code != 1 or "docs/extra.md: 文書を読まない" not in output or "FR-ZZZ-99" in output:
                 failures.append(f"docs: {label}を指す文書を読まずに報告しない（終了コード {code}）\n{output.strip()}")
+
+
+def resolution_order_case() -> None:
+    """リンクのディレクトリの後の「..」を字面で取り除かず、ファイルシステムがたどる順に確かめること（起点の外へ出る経路の
+    文書を読まない）。字面で取り除くと起点の中の別の文書（docs/sub/x.md）に見え、実際には起点の外の文書を読む。"""
+    global count
+    directory = docs_case("経路の順の準備（整合した文書）", 0, "OK")
+    with tempfile.TemporaryDirectory() as outside:
+        (Path(outside) / "inner").mkdir()
+        (Path(outside) / "x.md").write_text("# 外\n\nFR-ZZZ-99\n", encoding="utf-8")
+        sub = directory / "docs" / "sub"
+        sub.mkdir()
+        (sub / "x.md").write_text("# 中\n", encoding="utf-8")
+        (sub / "link").symlink_to(Path(outside) / "inner")
+        (directory / "docs" / "extra.md").symlink_to("sub/link/../x.md")
+        count += 1
+        code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory)])
+        if code != 1 or "docs/extra.md: 文書を読まない" not in output or "FR-ZZZ-99" in output:
+            failures.append(f"docs: リンクのディレクトリの後の「..」を字面で取り除いて読んだ（終了コード {code}）\n{output.strip()}")
+
+
+def alias_rewrite_case() -> None:
+    """--update-snippets が、同じ実体を指す 2 つの名前（本冊と、それを指すリンクの分冊）を 1 回だけ書き直し、
+    両方の読んだ内容を更新すること（2 回目の読み直しの照合で「変更された」と止まらない）。"""
+    global count
+    detailed = "docs/03-detailed-design/sample.md"
+    directory = docs_case("同じ実体の文書の準備（古いコード片）", 1, "一致しない", detailed,
+                          "echo one\necho two\necho three\n" + FENCE + "\n\n<!-- excerpt", "echo old\n" + FENCE + "\n\n<!-- excerpt")
+    (directory / "docs/03-detailed-design/sample-alias.md").symlink_to("sample.md")
+    count += 1
+    code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory), "--update-snippets"])
+    rewritten = output.count("コード片を書き直した")
+    content = (directory / detailed).read_text(encoding="utf-8")
+    if code != 0 or rewritten != 1 or "echo old" in content:
+        failures.append(f"docs: 同じ実体の文書を 1 回だけ書き直さない（終了コード {code}・書き直し {rewritten} 回）\n{output.strip()}")
 
 
 def cyclic_snippet_case() -> Path:
@@ -2831,6 +2942,8 @@ def run_docs_cases() -> None:
         cyclic_snippet_case(),
         linked_document_case(),
         untracked_document_case(),
+        resolution_order_case(),
+        alias_rewrite_case(),
         # 分冊（本冊の基本設計の名前に「-<名前>」を付けた詳細設計）は、必須の節と申し送りを求めず、節の冒頭とコード片を照合する
         docs_case("分冊は必須の節を求めない", 0, "OK", extra={"docs/03-detailed-design/sample-scripts.md": (
             f"# 分冊\n\n## 1. 全文\n\n満たす要件: FR-AAA-01\n\n<!-- file: scripts/sample.sh -->\n\n"
@@ -2949,6 +3062,10 @@ def run_docs_cases() -> None:
         # HTML の <pre> の中の表の形の行は、対応表として数えない（外の表は数える）
         docs_case("対応表が <pre> の中だけ", 1, "対応表の行がない", detailed,
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", "<pre>\n| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n</pre>\n"),
+        # 申し送りの解決の表も、HTML の <pre> の中の表の形の行を数えない
+        docs_case("申し送りの解決の表が <pre> の中だけ", 1, "解決が表にない", detailed,
+                  "| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n",
+                  "<pre>\n| 申し送り | 解決 |\n| --- | --- |\n| 一つ目 | 済 |\n| 二つ目 | 済 |\n</pre>\n"),
         docs_case("<pre> の後の対応表は数える", 0, "OK", detailed,
                   "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n", "<pre>\n例\n</pre>\n\n| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n"),
         docs_case("対応表の行に要件 ID がない", 1, "対応表の行がない", detailed, "| FR-AAA-01 | 試験 |", "| 未定 | 試験 |"),

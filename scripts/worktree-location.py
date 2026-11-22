@@ -3,7 +3,7 @@
 
 使い方:
   scripts/worktree-location.py check <置き場所> <元のリポジトリ>
-      置き場所を実体のパスに解決して標準出力に書く。置き場所（自身を含む）か祖先に SwiftFormat の設定（.swiftformat・
+      置き場所を実体のパスに解決して標準出力に書く（NUL で終える）。置き場所（自身を含む）か祖先に SwiftFormat の設定（.swiftformat・
       .swift-version）があるもの、元のリポジトリか登録された作業ツリーの中にあるものは認めない。
       SwiftFormat は検査するディレクトリの親のディレクトリの設定も読み、読む範囲を止める指定を持たないので、そうした
       置き場所の作業ツリーの検査に、リポジトリの外の設定や別の作業ツリーの設定が混ざる。
@@ -98,7 +98,9 @@ def check(requested: str, source: str) -> int:
         if parent == current:
             break
         current = parent
-    print(base)
+    # パスは NUL で終える（末尾の改行を含むパスも、呼び出し側が read -d '' でそのまま受け取れる）
+    sys.stdout.buffer.write(os.fsencode(base) + b"\0")
+    sys.stdout.flush()
     return 0
 
 

@@ -430,6 +430,8 @@ class Checker:
         self.errors: List[str] = []
         self.warnings: List[str] = []
         self.texts: Dict[str, str] = {}
+        # 文書の名前 → 解決の経路を確かめた実体のパス（読み込み・読み直し・書き直しはこのパスだけを使う）
+        self.paths: Dict[str, Path] = {}
         self.defined: Dict[str, str] = {}
         self.mvp: Set[str] = set()
 
@@ -453,13 +455,15 @@ class Checker:
         for path in paths:
             relative = path.relative_to(self.root).as_posix()
             # 解決の経路（リンクの各段とその置き場所）と最後の実体が、起点の中の追跡されうる場所にない文書は読まない
-            problem = self.document_problem(path)
-            if problem:
+            problem, real = self.resolve_document(path)
+            if problem or real is None:
                 self.error(relative, f"文書を読まない: {problem}")
                 continue
-            # 読めない文書は、その文書のパスで報告して読み飛ばし、ほかの文書の検査を続ける（検査の対象にも書き直しの対象にもしない）
+            # 読めない文書は、その文書のパスで報告して読み飛ばし、ほかの文書の検査を続ける（検査の対象にも書き直しの対象にもしない）。
+            # 読むのは確かめた実体のパス（元の綴りを開き直すと、確かめた後にリンクを差し替えられうる）
             try:
-                self.texts[relative] = path.read_text(encoding="utf-8")
+                self.texts[relative] = real.read_text(encoding="utf-8")
+                self.paths[relative] = real
             except (OSError, UnicodeDecodeError) as error:
                 self.error(relative, f"文書を読めない: {error}")
 
@@ -481,34 +485,67 @@ class Checker:
                 return f"{path} が追跡しない場所（{'/'.join(area)}）にある"
         return None
 
-    def document_problem(self, path: Path) -> Optional[str]:
-        """文書を読む前に、解決の経路を確かめる。問題がなければ None。
+    def resolve_document(self, path: Path) -> Tuple[Optional[str], Optional[Path]]:
+        """文書を読む前に、解決の経路を確かめる。（問題, 実体のパス）を返す。問題がなければ問題は None。
 
-        シンボリックリンクは 1 段ずつたどり、各段のリンク先とその置き場所のディレクトリが、起点の中の追跡されうる場所
-        （outside_tracked）にあることを求める。置き場所のディレクトリの途中にシンボリックリンクがある経路は認めない
-        （どのリンクをたどったかを確かめられないため）。最後の実体は通常のファイルであること。
+        経路の要素は、ファイルシステムがたどる順に 1 つずつ確かめる（「..」を字面で先に取り除くと、シンボリックリンクの
+        ディレクトリの後の「..」が実際とは別の場所を指しうる）。各要素とリンクの各段の行き先が、起点の中の追跡されうる場所
+        （outside_tracked）にあることを求める。絶対パスのリンク先は、起点の実体のパスの中を指すものだけを認める。
+        最後の実体は通常のファイルであること。
         """
-        current = os.path.normpath(str(path))
-        for _ in range(self.MAX_LINK_HOPS):
-            directory = os.path.dirname(current)
-            reason = self.outside_tracked(current)
+        root = str(self.root.resolve())
+        hops = 0
+
+        class Rejected(Exception):
+            pass
+
+        def walk(current: str, parts: List[str]) -> str:
+            nonlocal hops
+            for part in parts:
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    current = os.path.dirname(current)
+                    if current != root and not current.startswith(root + os.sep):
+                        raise Rejected(f"{current} が起点の外にある")
+                    continue
+                candidate = os.path.join(current, part)
+                reason = self.outside_tracked(candidate)
+                if reason:
+                    raise Rejected(reason)
+                try:
+                    info = os.lstat(candidate)
+                except OSError as error:
+                    raise Rejected(f"{candidate} を調べられない: {error.strerror or error}") from error
+                if stat.S_ISLNK(info.st_mode):
+                    hops += 1
+                    if hops > self.MAX_LINK_HOPS:
+                        raise Rejected(f"{path} のシンボリックリンクが {self.MAX_LINK_HOPS} 段を超える（循環など）")
+                    target = os.readlink(candidate)
+                    if os.path.isabs(target):
+                        if target != root and not target.startswith(root + os.sep):
+                            raise Rejected(f"{candidate} のリンク先 {target} が起点の外にある")
+                        current = walk(root, target[len(root):].split("/"))
+                    else:
+                        current = walk(current, target.split("/"))
+                    continue
+                current = candidate
+            return current
+
+        try:
+            final = walk(root, list(path.relative_to(self.root).parts))
+            reason = self.outside_tracked(final)
             if reason:
-                return reason
-            if not os.path.isdir(directory):
-                return f"{directory} がディレクトリでない"
-            if os.path.realpath(directory) != directory:
-                return f"{directory} の途中にシンボリックリンクがある"
+                raise Rejected(reason)
             try:
-                info = os.lstat(current)
+                info = os.lstat(final)
             except OSError as error:
-                return f"{current} を調べられない: {error.strerror or error}"
-            if stat.S_ISLNK(info.st_mode):
-                current = os.path.normpath(os.path.join(directory, os.readlink(current)))
-                continue
+                raise Rejected(f"{final} を調べられない: {error.strerror or error}") from error
             if not stat.S_ISREG(info.st_mode):
-                return f"{current} が通常のファイルでない"
-            return None
-        return f"{path} のシンボリックリンクが {self.MAX_LINK_HOPS} 段を超える（循環など）"
+                raise Rejected(f"{final} が通常のファイルでない")
+        except Rejected as rejected:
+            return str(rejected), None
+        return None, Path(final)
 
     def collect_definitions(self) -> None:
         """定義文書の表から ID を集める。要件表の「フェーズ」列が MVP の FR / NFR / SEC も集める。"""
@@ -837,7 +874,7 @@ class Checker:
         rows: List[str] = []
         for _, heading, body in sections:
             if "申し送り" in heading:
-                rows.extend(row for header, block in table_blocks(body) if len(header) >= 2 and "解決" in header[1]
+                rows.extend(row for header, block in table_blocks(without_html_pre(body)) if len(header) >= 2 and "解決" in header[1]
                             for row in block)
         # 解決の列（2 列目）が空・空白だけ・コメントだけ（表示されない）の行は、解決したことにしない
         resolved = []
@@ -911,8 +948,13 @@ class Checker:
 
     def update_snippets(self) -> None:
         """全文のコード片を、実ファイルの内容で書き直す。"""
+        # 書き直した実体のパス → 書き直した内容。同じ実体を指す別の名前（リンクの文書）は書き直さず、読んだ内容を更新する
+        written: Dict[Path, str] = {}
         for name, text in sorted(self.texts.items()):
             if not name.startswith(DETAILED + "/"):
+                continue
+            if self.paths.get(name) in written:
+                self.texts[name] = written[self.paths[name]]
                 continue
             # 読み込み（load）は改行を LF にそろえるので、元の改行を知るためにファイルを改行の変換なしで読み直す。
             # 読み直した内容が load の時点の内容と違えば（その間に変更された）、書き直さずに再実行を案内する。
@@ -968,14 +1010,8 @@ class Checker:
             # 末尾の改行の有無などコード片以外の違いでは書き直さない（本文の行が変わったときだけ）
             if out == lines:
                 continue
-            try:
-                target = self.snippet_source(name)
-            except Unresolvable as error:
-                self.error(name, f"文書の実パスを解決できないため、コード片を書き直さない: {error}")
-                continue
-            if target is None:
-                self.error(name, "文書の実パスが --root の外にあるため、コード片を書き直さない")
-                continue
+            # 書き直すのは、読み込みで解決の経路を確かめた実体のパス（元の綴りを開き直さない）
+            target = self.paths[name]
             # 書き直すのは詳細設計のディレクトリの中の文書だけ（リンクした文書の実体がほかの場所にあれば上書きしない）
             if not target.is_relative_to(self.root.resolve() / DETAILED):
                 self.error(name, "文書の実パスが詳細設計のディレクトリの外にあるため、コード片を書き直さない")
@@ -1012,12 +1048,16 @@ class Checker:
                 self.error(name, f"書き直した内容を保存できないので、元の文書を残す: {error}")
                 continue
             updated = "\n".join(out) + ("\n" if text.endswith("\n") else "")
-            self.texts[name] = updated
+            written[target] = updated
+            # 同じ実体を指すすべての名前の読んだ内容を更新する（先に処理した名前も含む）
+            for other, other_path in self.paths.items():
+                if other_path == target:
+                    self.texts[other] = updated
             print(f"コード片を書き直した: {name}")
 
     def read_raw(self, name: str) -> str:
         """文書を改行の変換なしで読む。"""
-        with (self.root / name).open(encoding="utf-8", newline="") as handle:
+        with self.paths.get(name, self.root / name).open(encoding="utf-8", newline="") as handle:
             return handle.read()
 
     def check_freshness(self) -> None:

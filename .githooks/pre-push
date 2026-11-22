@@ -50,8 +50,13 @@ base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
 # 中の拒否）は scripts/worktree-location.py が行う（check.sh --require-clean と共用する）。中に置くと、SwiftFormat などが
 # 親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る（中にディレクトリを残さない）。
 # 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める
+# 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
 location_status=0
-resolved_base=$(/usr/bin/python3 "$source_root/scripts/worktree-location.py" check "$base" "$source_root") || location_status=$?
+location_out=$(mktemp)
+/usr/bin/python3 "$source_root/scripts/worktree-location.py" check "$base" "$source_root" > "$location_out" || location_status=$?
+resolved_base=""
+if [ "$location_status" = 0 ] && ! IFS= read -r -d '' resolved_base < "$location_out"; then location_status=2; fi
+rm -f -- "$location_out"
 case $location_status in
   0) base=$resolved_base ;;
   1) exit 1 ;;  # 理由は worktree-location.py が標準エラーに書いた

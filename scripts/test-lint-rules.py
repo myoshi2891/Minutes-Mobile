@@ -77,6 +77,32 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
     return rules
 
 
+def excluded_patterns(config_text: str) -> List[str]:
+    """.swiftlint.yml の custom_rules の各規則の excluded に並ぶパターン（正規表現）を取り出す。
+
+    対照の写し（check_allowed_controls）の置き場所が、どの規則の例外の場所にも当たらないことを確かめるために使う。
+    """
+    patterns: List[str] = []
+    in_block = in_excluded = False
+    for line in config_text.splitlines():
+        if re.match(r"^custom_rules:\s*(?:#.*)?$", line):
+            in_block = True
+            continue
+        if not in_block or not line.strip() or re.match(r"^\s*#", line):
+            continue
+        if re.match(r"^\S", line):
+            break
+        if re.match(r"""^    (?:excluded|'excluded'|"excluded")\s*:""", line):
+            in_excluded = True
+            continue
+        item = re.match(r"""^      -\s+(?:'(.*)'|"(.*)"|(\S.*?))\s*$""", line) if in_excluded else None
+        if item:
+            patterns.append(next(group for group in item.groups() if group is not None))
+        else:
+            in_excluded = False
+    return patterns
+
+
 def read_fixture(path: Path) -> str:
     """試験用のファイルを読む。読めない試験用のファイルは、検出行の不一致（終了コード 1）と区別して、実行できないとして止める。"""
     try:
@@ -314,6 +340,7 @@ def check_allowed_controls(cases: List[Tuple[Path, str, Set[int]]], rules: Dict[
     allowed = [(path, rule) for path, rule, _ in cases if rules.get(rule) and "allowed" in path.relative_to(FIXTURES).parts]
     if not allowed:
         return
+    patterns = excluded_patterns(read_config(CONFIG).decode("utf-8"))
     with tempfile.TemporaryDirectory() as directory:
         copies: Dict[Path, Tuple[Path, str]] = {}
         for index, (path, rule) in enumerate(allowed):
@@ -321,6 +348,16 @@ def check_allowed_controls(cases: List[Tuple[Path, str, Set[int]]], rules: Dict[
             copy.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, copy)
             copies[copy] = (path, rule)
+        # 写しの置き場所（TMPDIR の下）が、どれかの規則の例外の場所に当たると、検出されないのが例外のためか規則のためかを
+        # 区別できない（TMPDIR が …/SystemDependencies/ の下なら no_direct_clock などが写しを除外する）。当たれば実行できない
+        # ものとして止める。パスは実体のパスと与えたパスの両方で確かめる（SwiftLint がどちらで照合しても当たらないように）
+        for copy in copies:
+            for spelled in {str(copy), os.path.realpath(str(copy))}:
+                hits = [pattern for pattern in patterns if re.search(pattern, spelled)]
+                if hits:
+                    print(f"NG: 対照の写しの置き場所（{spelled}）が例外の場所のパターン {sorted(set(hits))} に当たる。"
+                          "TMPDIR を例外の場所に当たらない場所にしてから実行し直す", file=sys.stderr)
+                    sys.exit(2)
         found: Set[Tuple[str, str]] = set()
         for item in run_swiftlint(sorted(copies), CONFIG):
             found.add((os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", ""))))

@@ -49,10 +49,17 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         files = json.loads(arguments.report.read_text(encoding="utf-8"))["data"][0]["files"]
+        # 数える対象かは、記録したパスで決める（現在のファイルシステムのシンボリックリンクをたどらない）。swift test の記録は
+        # Package の起点を実体のパスに解決し、起点の中のパスはそのまま書く（2026-11-22 に一時的に置いた Package で、/tmp を
+        # 経由して指定しても /private/tmp の起点になり、Sources の中のシンボリックリンクのファイルはリンクのパスのまま記録される
+        # ことを確かめた）。そこで起点の側だけを実体のパスにし、記録したパスは字面のまま正規化して比べる
         prefix = os.path.realpath(arguments.sources) + os.sep
         lines = []
         for item in files:
-            if not os.path.realpath(item["filename"]).startswith(prefix):
+            filename = item["filename"]
+            if not isinstance(filename, str) or not os.path.isabs(filename):
+                raise ValueError(f"記録したパスが絶対パスでない: {filename!r}")
+            if not os.path.normpath(filename).startswith(prefix):
                 continue
             count, covered = item["summary"]["lines"]["count"], item["summary"]["lines"]["covered"]
             # 整数（bool を除く）で 0 <= covered <= count のものだけを数える。不正な記録を丸めて集計しない

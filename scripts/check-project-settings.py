@@ -260,6 +260,31 @@ def expand_value(
     return result
 
 
+# Info.plist のファイルの値の変数を、ビルドが展開するかの設定（Xcode の既定は YES）
+EXPAND_PLIST_SETTING = "INFOPLIST_EXPAND_BUILD_SETTINGS"
+
+
+def plist_expansion(own: dict, shared: dict, configuration: str, sdk: str) -> Optional[bool]:
+    """その構成・SDK で、INFOPLIST_FILE の参照先の値の変数をビルドが展開するか。決められなければ None。
+
+    設定がなければ Xcode の既定（YES）とする。条件（arch など）付きの書き方だけで決まらない場合、展開できない値の場合、
+    値が書き方によって分かれる場合は None（展開される・されないの両方がありうる）。
+    """
+    effective, undecided = resolve(own, shared, EXPAND_PLIST_SETTING, [configuration], sdk)
+    if not effective:
+        return True
+    results = set()
+    for key, value in effective:
+        expanded = expand_value(value, own, shared, configuration, sdk, setting=EXPAND_PLIST_SETTING,
+                                from_target=key in own and as_text(own[key]) == value)
+        if expanded is None:
+            return None
+        results.add(enabled(expanded))
+    if undecided:
+        results.add(True)  # 条件に当たらないビルドでは既定（YES）が効く
+    return results.pop() if len(results) == 1 else None
+
+
 def infoplist_sources(
     project_path: Path, target_name: str, own: dict, shared: dict, configuration: str, sdk: str
 ) -> Tuple[set, List[Tuple[Path, dict]], bool]:
@@ -410,9 +435,16 @@ def check_plist_orientation(
             source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
             for key in present:
                 # 各要素の変数（$(NAME)）はその構成・SDK のビルド設定で展開してから比べる。配列でない値・文字列でない要素・
-                # 展開できない要素は縦だけと見なさない
+                # 展開できない要素は縦だけと見なさない。ビルドが参照先の plist の変数を展開しない（INFOPLIST_EXPAND_BUILD_SETTINGS
+                # が NO）、または展開するかを決められない構成・SDK では、変数を含む要素は展開後の値で認めない（ビルドの結果には
+                # 変数の文字列がそのまま残りうる）
                 value = data[key]
                 items = value if isinstance(value, list) else None
+                expands = plist_expansion(own, shared, configuration, sdk)
+                if items is not None and expands is not True and any(isinstance(item, str) and VARIABLE.search(item)
+                                                                       for item in items):
+                    wrong.setdefault(f"{source} の {key}（{EXPAND_PLIST_SETTING} で変数が展開されない構成）", []).append(build)
+                    continue
                 expanded = ([expand_value(item, own, shared, configuration, sdk) if isinstance(item, str) else None
                              for item in items] if items is not None else None)
                 if expanded is not None and any(item is None for item in expanded):

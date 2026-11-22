@@ -558,7 +558,13 @@ def content_digest(path: Path) -> str:
                 entry = f"D\0{relative}\0"
             else:
                 raise Unreadable(f"{item}: ローカルのバイナリの中に通常のファイル・ディレクトリ以外の項目がある")
-            digest.update(entry.encode("utf-8") + b"\n")
+            # UTF-8 にできないパス（os.walk が surrogateescape で返す、UTF-8 でない名前）は、記録の形を決められないので
+            # 読めないものとする（有効な UTF-8 のパスの記録の形は変えない）
+            try:
+                encoded = entry.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise Unreadable(f"{item}: ローカルのバイナリの中のパスを UTF-8 にできない: {error}") from error
+            digest.update(encoded + b"\n")
         return digest.hexdigest()
     except OSError as error:
         raise Unreadable(f"{path}: {error}") from error

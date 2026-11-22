@@ -65,6 +65,8 @@ STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のために
 STAGED_SECRETS_TREE=""  # --staged のとき、秘密情報の検査のためにステージした blob をそのまま書き出す一時ディレクトリ
 STAGED_INDEX_TREE=""  # --staged のとき、開始時のインデックスのツリー（終了時に同じであることを確かめる）
 STAGED_TOOLS=""  # --staged のとき、開発ツールの写しと、照合に使うステージした台帳を置く一時ディレクトリ
+STAGED_INDEX_COPY=""  # --staged のとき、開始時のインデックスのツリーから作った専用のインデックス（検査はこれだけを読む）
+ORIGINAL_INDEX=""  # --staged のとき、本来のインデックスのファイル（終了時に開始時のツリーのままであることを確かめる）
 ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
 ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
@@ -126,9 +128,20 @@ fi
 # 一覧は一時ファイルに書き出し、git の失敗を空の一覧として扱わない（プロセス置換では終了コードを確かめられない）
 STAGED_SWIFT=()
 if [ "$STAGED" = 1 ]; then
-  # 各手順はインデックスから別々に書き出すので、その間にインデックスが変わると、手順ごとに違う内容を検査しうる。
-  # 書き出しの前にインデックスのツリーを控え、合格を表示する前に同じであることを確かめる（未解決の衝突があれば失敗する）
+  # 置き換えのオブジェクト（git replace の refs/replace/）を使わず、ステージした blob そのものを書き出して検査する
+  # （子のプロセスにも引き継ぐ。置き換えがなければ結果は変わらない）
+  export GIT_NO_REPLACE_OBJECTS=1
+  # 書き出しの前にインデックスのツリーを控え、以後の検査はそのツリーだけから作った専用のインデックスを読む
+  # （GIT_INDEX_FILE で指して子のプロセスにも引き継ぐ。検査の途中に本来のインデックスが変わっても、検査する内容は
+  # 控えたツリーのまま）。合格を表示する前に、本来のインデックスと専用のインデックスの両方が控えたツリーのままで
+  # あることを確かめる（変わっていれば、コミットされる内容が検査した内容と違いうるので合格にしない）。
+  # 未解決の衝突があればツリーを作れずに失敗する
   STAGED_INDEX_TREE=$(git write-tree) || fail "ステージした内容のツリーを作れない（未解決の衝突など）"
+  ORIGINAL_INDEX=$(git rev-parse --path-format=absolute --git-path index) || fail "インデックスの場所を特定できない"
+  STAGED_INDEX_COPY=$(mktemp)
+  rm -f -- "$STAGED_INDEX_COPY"
+  GIT_INDEX_FILE="$STAGED_INDEX_COPY" git read-tree "$STAGED_INDEX_TREE" || fail "控えたツリーから専用のインデックスを作れない"
+  export GIT_INDEX_FILE="$STAGED_INDEX_COPY"
   staged_list=$(mktemp)
   # 種類の変更（T。通常のファイルとシンボリックリンクの入れ替えなど）も含める（下でインデックスのモードを確かめる）
   if ! git diff --cached --name-only --diff-filter=ACMRT -z -- '*.swift' > "$staged_list"; then
@@ -550,6 +563,23 @@ snapshot_staged_tools() {
   TOOLS="$STAGED_TOOLS/.tools/bin"
 }
 
+# 引き継いだ MINUTES_CHECK_ISOLATED を信じてよいか。この作業ツリーが、プッシュ前のフックか check.sh --require-clean が
+# この検査のために作った専用の作業ツリー（作成時に専用の管理ディレクトリへ書いた印があり、印の作業ツリーのパスが ROOT の
+# 実体のパスと一致する）なら 0 を返す。そうでなければ 1（元の作業ツリーで変数だけを引き継いでも、展開を省かせない）
+isolated_checkout() {
+  local private common root_real mark file text
+  private=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) && private=$(cd -P "$private" && pwd) || return 1
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && common=$(cd -P "$common" && pwd) || return 1
+  root_real=$(cd -P "$ROOT" && pwd) || return 1
+  [ "$(dirname "$private")" = "$common/worktrees" ] || return 1
+  for mark in "minutes-pre-push-owner:MinutesMobile pre-push" "minutes-check-owner:MinutesMobile check"; do
+    file="$private/${mark%%:*}"
+    text="${mark#*:} ${root_real}"
+    if [ -f "$file" ] && [ ! -L "$file" ] && [ "$(cat "$file")" = "$text" ]; then return 0; fi
+  done
+  return 1
+}
+
 # テストに使うシミュレータ。機種名は決め打ちにせず、最低 OS 以上の iPhone を選ぶ（MINUTES_SIMULATOR で指定もできる）
 test_destination() {
   local udid
@@ -691,6 +721,7 @@ on_exit() {
   if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
   if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
   if [ -n "$STAGED_TOOLS" ]; then remove_or_report "$STAGED_TOOLS"; fi
+  if [ -n "$STAGED_INDEX_COPY" ]; then remove_or_report "$STAGED_INDEX_COPY"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
   if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" 2>/dev/null || true; fi
@@ -745,6 +776,12 @@ fi
 # 検査中に書き換えて戻しても、検査する内容は変わらない）。専用の作業ツリーで実行中であることは MINUTES_CHECK_ISOLATED で
 # 示す（プッシュ前のフックは自身の専用の作業ツリーで実行するので、これを設定して二重に展開しない）。置き場所は
 # リポジトリの外（中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読む）
+# 引き継いだ MINUTES_CHECK_ISOLATED は、この作業ツリーがこの検査の専用の作業ツリーである場合だけ認める（元の作業ツリーで
+# 変数を引き継いだ直接の --require-clean が、展開を省いて専用の作業ツリーで検査したと表示しない）
+if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "${MINUTES_CHECK_ISOLATED:-}" ] && ! isolated_checkout; then
+  echo "注意: 引き継いだ MINUTES_CHECK_ISOLATED を無視する（この作業ツリーはこの検査の専用の作業ツリーではない）。開始時のコミットを専用の作業ツリーに展開する" >&2
+  unset MINUTES_CHECK_ISOLATED
+fi
 if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   # 一時の置き場所は TMPDIR（なければ /tmp）の下に明示的に作る（mktemp -d の既定は TMPDIR を使わない環境がある）
   temporary_root=${TMPDIR:-/tmp}
@@ -752,8 +789,13 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   # 一時の置き場所も、プッシュ前のフックと同じ判定（scripts/worktree-location.py）で確かめてから作業ツリーを作る。
   # TMPDIR が作業ツリーの中や、SwiftFormat の設定（.swiftformat・.swift-version）のある場所の下を指すと、専用の作業ツリーの
   # 検査に別の設定が混ざる。作業ツリーの外で、設定を継がない一時ディレクトリは認める
+  # 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
   location_status=0
-  checked_base=$("$ROOT/scripts/worktree-location.py" check "$ISOLATED_BASE" "$ROOT") || location_status=$?
+  location_out=$(mktemp)
+  "$ROOT/scripts/worktree-location.py" check "$ISOLATED_BASE" "$ROOT" > "$location_out" || location_status=$?
+  checked_base=""
+  if [ "$location_status" = 0 ] && ! IFS= read -r -d '' checked_base < "$location_out"; then location_status=2; fi
+  rm -f -- "$location_out"
   case $location_status in
     0) ISOLATED_BASE=$checked_base ;;
     1) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
@@ -762,6 +804,12 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   ISOLATED_TREE="$ISOLATED_BASE/tree"
   # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
   git -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
+  # 作った作業ツリーの専用の管理ディレクトリに印を書く（入れ子の check.sh が、引き継いだ MINUTES_CHECK_ISOLATED を
+  # この作業ツリーのものと確かめる。isolated_checkout）
+  isolated_private=$(git -C "$ISOLATED_TREE" rev-parse --path-format=absolute --git-dir) \
+    && isolated_private=$(cd -P "$isolated_private" && pwd) && isolated_root=$(cd -P "$ISOLATED_TREE" && pwd) \
+    || fail "専用の作業ツリー（${ISOLATED_TREE}）の管理ディレクトリを特定できない"
+  printf '%s\n' "MinutesMobile check ${isolated_root}" > "$isolated_private/minutes-check-owner"
   full_checkout "$ISOLATED_TREE"
   # 展開した内容がコミットの blob と同じであること（smudge のフィルタで変わった内容をコミットの合格として検査しない）
   verify_checkout_blobs "$ISOLATED_TREE" \
@@ -784,9 +832,11 @@ for step in $STEPS; do
 done
 
 if [ "$STAGED" = 1 ]; then
-  end_index_tree=$(git write-tree) || fail "終了時のステージした内容のツリーを作れない"
-  if [ "$end_index_tree" != "$STAGED_INDEX_TREE" ]; then
-    fail "検査中にステージした内容が変わった（開始時 ${STAGED_INDEX_TREE} / 終了時 ${end_index_tree}）。検査した内容と違うので合格にしない"
+  # 検査が読んだ専用のインデックスと、コミットされる本来のインデックスの両方が、控えたツリーのままであること
+  end_copy_tree=$(git write-tree) || fail "終了時の専用のインデックスのツリーを作れない"
+  end_index_tree=$(GIT_INDEX_FILE="$ORIGINAL_INDEX" git write-tree) || fail "終了時のステージした内容のツリーを作れない"
+  if [ "$end_copy_tree" != "$STAGED_INDEX_TREE" ] || [ "$end_index_tree" != "$STAGED_INDEX_TREE" ]; then
+    fail "検査中にステージした内容が変わった（開始時 ${STAGED_INDEX_TREE} / 終了時 ${end_index_tree}・検査したもの ${end_copy_tree}）。検査した内容と違うので合格にしない"
   fi
   echo "OK: コミット前の検査を通過"
 else

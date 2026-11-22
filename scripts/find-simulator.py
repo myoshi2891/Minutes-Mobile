@@ -11,9 +11,14 @@
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 from typing import List, Tuple
+
+
+# シミュレータの UDID は UUID（8-4-4-4-12 桁の 16 進数）。simctl は大文字で出すが、大文字小文字は区別しない
+UDID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 
 
 def version_key(text: str) -> Tuple[int, ...]:
@@ -84,9 +89,10 @@ def main() -> int:
             for device in devices
             if device.get("isAvailable") and "iPhone" in device.get("deviceTypeIdentifier", "")
         ]
-        # 候補の名前と UDID は文字列で、UDID は空でないこと（並べ替えや出力の前に確かめ、形の違う一覧を取得の失敗にする）
+        # 候補の名前と UDID は文字列で、UDID は UUID の形であること（並べ替えや出力の前に確かめ、形の違う一覧を取得の失敗にする。
+        # destination の id= に UUID でない値を渡さない）
         for _, name, udid in candidates:
-            if not isinstance(name, str) or not isinstance(udid, str) or not udid:
+            if not isinstance(name, str) or not isinstance(udid, str) or not UDID.fullmatch(udid):
                 raise TypeError(f"シミュレータの name・udid の形が違う: {name!r}, {udid!r}")
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         print(f"NG: シミュレータの一覧を取得できない: {error!r}", file=sys.stderr)
