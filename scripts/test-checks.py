@@ -421,6 +421,32 @@ def test_settings() -> None:
     settings_case("生成しない Info.plist のマイクの利用目的が空", 1, "Config/App-Settings.plist の NSMicrophoneUsageDescription が空",
                   project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
                   plists={"Config/App-Settings.plist": {"NSMicrophoneUsageDescription": " "}})
+    # iPhone の修飾子つきの鍵（~iphone・-iphoneos・-iphoneos~iphone）は元の鍵より優先されるので、最も具体的なものを検査する
+    for modifier in ("~iphone", "-iphoneos", "-iphoneos~iphone"):
+        settings_case(f"生成しない Info.plist の {modifier} のマイクの利用目的が空", 1,
+                      f"Config/App-Settings.plist の NSMicrophoneUsageDescription{modifier} が空",
+                      project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
+                      plists={"Config/App-Settings.plist": dict(microphone, **{f"NSMicrophoneUsageDescription{modifier}": " "})})
+    settings_case("生成しない Info.plist の -iphoneos~iphone のマイクの利用目的が文字列でない", 1,
+                  "NSMicrophoneUsageDescription-iphoneos~iphone が空",
+                  project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
+                  plists={"Config/App-Settings.plist": dict(microphone, **{"NSMicrophoneUsageDescription-iphoneos~iphone": []})})
+    settings_case("生成しない Info.plist の -iphoneos~iphone の変数を展開できない", 1, "の値を展開できない",
+                  project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
+                  plists={"Config/App-Settings.plist": dict(microphone, **{"NSMicrophoneUsageDescription-iphoneos~iphone": "$(MIC_TEXT)"})})
+    # 使われない元の鍵が空でも、より具体的な鍵に空でない値があれば iPhone のビルドでは足りる
+    settings_case("生成しない Info.plist の元の鍵が空でも ~iphone に利用目的がある", 0, "OK",
+                  project=lambda t: generate_no(info_plist_file("Config/App-Settings.plist")(t)),
+                  plists={"Config/App-Settings.plist": dict(microphone, NSMicrophoneUsageDescription="",
+                                                            **{"NSMicrophoneUsageDescription~iphone": "会議を録音するためにマイクを使用します。"})})
+    settings_case("ビルド設定の ~iphone のマイクの利用目的が空", 1, "INFOPLIST_KEY_NSMicrophoneUsageDescription~iphone が空",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n'
+                                             '        "INFOPLIST_KEY_NSMicrophoneUsageDescription~iphone": " ",'))
+    settings_case("ビルド設定の -iphoneos のマイクの利用目的が配列", 1, "INFOPLIST_KEY_NSMicrophoneUsageDescription-iphoneos が文字列でない",
+                  project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
+                                             '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",\n'
+                                             '        "INFOPLIST_KEY_NSMicrophoneUsageDescription-iphoneos": ["a"],'))
     settings_case("生成しない構成で、条件付きの参照先の 1 つにマイクの利用目的がない", 1, "NSMicrophoneUsageDescription がない",
                   project=lambda t: generate_no(replaced(
                       info_plist_file("Config/App-Settings.plist")(t), '"INFOPLIST_FILE": "Config/App-Settings.plist",',
@@ -1253,7 +1279,8 @@ def coverage_record_message_case() -> None:
 def staged_raw_blob_case() -> None:
     """check.sh --staged の整形・静的解析が、smudge のフィルタを通さずに、ステージした blob そのものを検査すること。
 
-    一時のリポジトリで、.gitattributes の smudge のフィルタが内容を書き換える Swift ファイルをステージし、整形の代わり
+    一時のリポジトリで、.gitattributes の smudge のフィルタが内容を書き換える Swift ファイルをステージし、ステージした後に
+    作業ツリーの内容だけを変える（ステージし直さない。作業ツリーを読む実装と区別する）。整形の代わり
     （.tools/bin/swiftformat。渡されたファイルの内容を記録して成功する）と静的解析の代わり（.tools/bin/swiftlint。
     渡されたファイルの内容を記録して失敗し、手順 2 で止める）の両方が読んだ内容を確かめる。
     """
@@ -1288,6 +1315,8 @@ def staged_raw_blob_case() -> None:
         # clean は設定しない（ステージした blob は作業ツリーの内容のまま）。smudge だけが書き出しの内容を書き換える
         subprocess.run(["git", "-C", str(repository), "config", "filter.rewrite.smudge", "sed s/raw/smudged/"], env=env, check=True)
         subprocess.run(["git", "-C", str(repository), *identity, "add", "-A"], env=env, check=True, capture_output=True)
+        # ステージした後に作業ツリーだけを変える（ステージし直さない）。作業ツリーを読む実装は、この内容を記録して失敗する
+        (repository / "Sample.swift").write_text("let worktree = 2\n", encoding="utf-8")
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
                                 env=dict(env, MINUTES_TEST_OUT=str(out), MINUTES_TEST_LINT_OUT=str(lint_out)), timeout=60)
         for label, path in (("整形", out), ("静的解析", lint_out)):
@@ -1738,6 +1767,33 @@ def test_gitleaks() -> None:
         result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository)], capture_output=True, text=True, env=env)
         if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
             failures.append(f"gitleaks: binary の属性のファイルの差分を検査せず、鍵を見落とした（終了コード {result.returncode}）")
+    # 差分の色づけ（color.diff=always・color.ui=always）で行に制御文字が入っても、鍵を検出する（--log-opts の --no-color）。
+    # 対照として、色の設定のない通常の場合も同じ履歴で検出する
+    for label, settings in (
+        ("通常の色の設定", ()),
+        ("color.diff=always", (("color.diff", "always"),)),
+        ("color.ui=always", (("color.ui", "always"),)),
+    ):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository = Path(directory) / "repository"
+            colored_key = "ghp_" + "k8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"  # 実行時に組み立てる
+            identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", f"core.hooksPath={os.devnull}"]
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True,
+                           capture_output=True)
+            (repository / "config.txt").write_text(f'token = "{colored_key}"\n', encoding="utf-8")
+            for arguments in (["add", "config.txt"], ["commit", "-q", "-m", "config"]):
+                subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+            colored = dict(env, GIT_CONFIG_COUNT=str(len(settings)))
+            for index, (key, value) in enumerate(settings):
+                colored[f"GIT_CONFIG_KEY_{index}"] = key
+                colored[f"GIT_CONFIG_VALUE_{index}"] = value
+            result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository)], capture_output=True, text=True,
+                                    env=colored)
+            if result.returncode != 1 or "leaks found: 1" not in result.stdout + result.stderr:
+                failures.append(f"gitleaks: {label}で履歴の鍵を検出しない（終了コード {result.returncode}）")
     # 置き換えのオブジェクト（git replace）で鍵を含む blob を別の内容に見せても、元のオブジェクトを検査する
     count += 1
     with tempfile.TemporaryDirectory() as directory:

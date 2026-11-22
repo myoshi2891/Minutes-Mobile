@@ -189,7 +189,7 @@ full_checkout() {
   local sparse status=0
   sparse=$(git -C "$snapshot" config --type=bool --get core.sparseCheckout) || status=$?
   case $status in
-    0) if [ "$sparse" = true ]; then git -C "$snapshot" sparse-checkout disable; fi ;;
+    0) if [ "$sparse" = true ]; then git -C "$snapshot" -c core.autocrlf=false sparse-checkout disable; fi ;;
     1) ;;  # 設定がない（sparse でない）
     *)
       echo "NG: 専用の作業ツリーの sparse checkout の設定を読めない（${snapshot}）" >&2
@@ -197,8 +197,9 @@ full_checkout() {
       ;;
   esac
 }
+# 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
 if [ "$owned" -eq 1 ]; then
-  git -C "$snapshot" checkout -q --detach --force "$head"
+  git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
   # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。-f を 2 回付け、中に .git を持つ
@@ -211,10 +212,14 @@ if [ "$owned" -eq 1 ]; then
   # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
   rm -rf -- "$snapshot/.build/minutes-coverage.lock"
 else
-  # 登録のない残骸（前回の作成の途中で止まったものなど）と、専用の作業ツリーとして確かめられなかったもの
-  rm -rf -- "$snapshot"
+  # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すものなど）が置き場所に
+  # あれば、消さずに止める（中身が何かを確かめられないものを rm -rf しない）。ないとき（初回・登録だけが残った場合）だけ作る
+  if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないものがある。中身を確かめて削除するか、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す" >&2
+    exit 1
+  fi
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
-  git -C "$source_root" worktree add -q --force --detach "$snapshot" "$head"
+  git -C "$source_root" -c core.autocrlf=false worktree add -q --force --detach "$snapshot" "$head"
   full_checkout
 fi
 # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に

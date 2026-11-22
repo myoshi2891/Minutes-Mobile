@@ -280,6 +280,21 @@ def infoplist_sources(
     return modes, [(path, load_plist(path)) for path in plists], plists_undecided
 
 
+# iPhone のビルドで使われうる修飾子つきの鍵の、優先の高い順の組。Info.plist は修飾子つきの鍵を元の鍵より優先して読む。
+# -iphoneos と ~iphone の間の優先は文書に定めがないので、両方があれば両方を検査する（どちらが使われてもよいように）
+def iphone_key_groups(name: str) -> List[List[str]]:
+    return [[f"{name}-iphoneos~iphone"], [f"{name}-iphoneos", f"{name}~iphone"], [name]]
+
+
+def applicable_keys(name: str, present: Callable[[str], bool]) -> List[str]:
+    """iPhone のビルドで使われる鍵（最も具体的な組のうち、あるもの）。どれもなければ元の鍵だけを返す。"""
+    for group in iphone_key_groups(name):
+        found = [key for key in group if present(key)]
+        if found:
+            return found
+    return [name]
+
+
 def check_plist_values(
     project_path: Path, target: str, target_name: str, own: dict, shared: dict, configurations: List[str],
     root: Path, errors: List[str]
@@ -290,14 +305,18 @@ def check_plist_values(
     無効（設定がない場合も無効）な構成では、INFOPLIST_FILE の参照先だけが使われる。
     どちらが優先されるかに頼らないよう、効きうる値はすべて空でないことを求め、どこにもなければ欠落とする。
     ビルド設定の値が SDK の条件付きだけの場合、条件に合わない SDK では参照先の plist で補われていなければ欠落とする。
+    iPhone の修飾子つきの鍵（<鍵>-iphoneos~iphone・<鍵>-iphoneos・<鍵>~iphone）があれば、元の鍵より優先されるので、
+    plist・ビルド設定（INFOPLIST_KEY_…）のそれぞれで最も具体的な鍵の値を判定する（元の鍵だけの plist はそのまま認める）。
     値は構成・SDK ごとに変数（$(NAME)）を展開してから判定する。展開後が空なら空、展開できなければ欠落（未確定）とする。
     ビルド設定の値は文字列化する前の元の値で型を確かめ、文字列でない値（配列など）は認めない。
     """
     for name, reason in REQUIRED_PLIST_VALUES_APPLICATION.items():
-        # 文字列化（variants）の前に、元の値の型を確かめる（配列を空白で連結した文字列を利用目的と見なさない）
+        # 文字列化（variants）の前に、元の値の型を確かめる（配列を空白で連結した文字列を利用目的と見なさない）。
+        # iPhone の修飾子つきの鍵のビルド設定も同じく確かめる
+        candidate_settings = {f"INFOPLIST_KEY_{key}" for group in iphone_key_groups(name) for key in group}
         for label, level in (("ターゲット", own), ("プロジェクト", shared)):
             for key, value in level.items():
-                if key.split("[", 1)[0] == f"INFOPLIST_KEY_{name}" and not isinstance(value, str):
+                if key.split("[", 1)[0] in candidate_settings and not isinstance(value, str):
                     errors.append(f"[{reason}] {target}: {label}の {key} が文字列でない（{type(value).__name__}）")
         missing: List[str] = []
         empty: Dict[str, List[str]] = {}
@@ -309,30 +328,39 @@ def check_plist_values(
             from_files: List[Tuple[str, str]] = []
             lacking = False  # 参照先の plist のうち、鍵を持たない・値を決められないものがある
             for path, data in plists:
-                if name not in data:
-                    lacking = True
-                    continue
-                value = data[name]
                 source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
-                expanded = expand_value(value, own, shared, configuration, sdk) if isinstance(value, str) else ""
-                if expanded is None:
-                    lacking = True
-                    unresolved.setdefault(f"{source} の {name}", []).append(build)
-                    continue
-                from_files.append((f"{source} の {name}", expanded.strip()))
+                # iPhone のビルドで使われる鍵（修飾子つきの鍵があればそれ。なければ元の鍵）だけを検査する
+                for key in applicable_keys(name, lambda candidate, data=data: candidate in data):
+                    if key not in data:
+                        lacking = True
+                        continue
+                    value = data[key]
+                    expanded = expand_value(value, own, shared, configuration, sdk) if isinstance(value, str) else ""
+                    if expanded is None:
+                        lacking = True
+                        unresolved.setdefault(f"{source} の {key}", []).append(build)
+                        continue
+                    from_files.append((f"{source} の {key}", expanded.strip()))
             from_settings: List[Tuple[str, str]] = []
             settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
             if True in modes:
-                effective, undecided = resolve(own, shared, f"INFOPLIST_KEY_{name}", [configuration], sdk)
+                # ビルド設定も、iPhone のビルドで使われる鍵（最も具体的な組のうち、その構成・SDK で効く書き方があるもの）を検査する
+                chosen = applicable_keys(name, lambda candidate, c=configuration, s=sdk: bool(
+                    resolve(own, shared, f"INFOPLIST_KEY_{candidate}", [c], s)[0]))
                 settings_unresolved = False
-                for key, value in effective:
-                    expanded = expand_value(value, own, shared, configuration, sdk, setting=f"INFOPLIST_KEY_{name}",
-                                            from_target=key in own and as_text(own[key]) == value)
-                    if expanded is None:
-                        settings_unresolved = True
-                        unresolved.setdefault(key, []).append(build)
-                        continue
-                    from_settings.append((key, expanded.strip()))
+                undecided: List[str] = []
+                for candidate in chosen:
+                    setting = f"INFOPLIST_KEY_{candidate}"
+                    effective, missing_here = resolve(own, shared, setting, [configuration], sdk)
+                    undecided.extend(missing_here)
+                    for key, value in effective:
+                        expanded = expand_value(value, own, shared, configuration, sdk, setting=setting,
+                                                from_target=key in own and as_text(own[key]) == value)
+                        if expanded is None:
+                            settings_unresolved = True
+                            unresolved.setdefault(key, []).append(build)
+                            continue
+                        from_settings.append((key, expanded.strip()))
                 settings_cover = bool(from_settings) and not undecided and not settings_unresolved
             # 生成しない書き方がありうる構成では、ビルド設定だけにある値を数えない。
             # 参照先が条件（arch など）で複数ある場合はどれが使われてもよいように、1 つでも鍵がなければ補えないとする。
