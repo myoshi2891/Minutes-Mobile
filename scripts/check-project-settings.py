@@ -4,7 +4,9 @@
 基本設計 dev-environment.md §3 の「変更後の値」になっていること、
 「設定しないもの」が入っていないことを確かめる。
 
-使い方: scripts/check-project-settings.py [--project <project.xcproj>] [--root <探す起点>]
+使い方: scripts/check-project-settings.py [--project <project.xcproj>] [--root <探す起点>] [--tracked-only]
+  --tracked-only  ビルド設定が指すファイル（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）の実体が、起点の中の、HEAD のコミットで
+                  追跡したファイルであることを求める（check.sh が専用の作業ツリーの検査で渡す）。満たさなければ終了コード 2
 終了コード: 0 = 問題なし / 1 = 違反あり / 2 = 読めない（読めないものを合格にしない）
 """
 import argparse
@@ -15,7 +17,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 from xml.parsers.expat import ExpatError
 
 from xcproj import Unreadable, load_project
@@ -629,15 +631,30 @@ def load_plist(path: Path) -> dict:
     return data
 
 
+def tracked_files(root: Path) -> Set[Path]:
+    """root の下の、HEAD のコミットで追跡した通常のファイルのパス。取得できなければ、読めないものとして扱う。"""
+    # 外から引き継いだリポジトリを指す変数（GIT_DIR など）を外し、置き換えのオブジェクトを使わない
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    try:
+        listed = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "-z", "HEAD"], env=env, capture_output=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise Unreadable(f"{root}: 追跡したファイルの一覧を取得できない: {error}") from error
+    entries = [entry.split(b"\t", 1) for entry in listed.stdout.split(b"\0") if entry]
+    return {root / os.fsdecode(path) for attributes, path in entries if attributes.startswith(b"100")}
+
+
 def referenced_files(
     project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str,
-    sdk: Optional[str] = None
+    sdk: Optional[str] = None, root: Optional[Path] = None, tracked: Optional[Set[Path]] = None
 ) -> Tuple[List[Path], bool]:
     """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルと、
     参照先が条件（arch など）なしには決まらないか（resolve の未確定、または空の書き方が効きうる）を返す。
 
     ファイル名や拡張子にかかわらず検査するために使う。
     相対パスは SRCROOT（.xcodeproj のあるディレクトリ）から解決する。展開できない変数を含む値は合格にしない。
+    tracked を渡した場合（--tracked-only）は、リンクを解決した参照先が root の中の追跡したファイルでなければ Unreadable とする
+    （check が最初に全部の構成・SDK の参照先を確かめるので、ほかの呼び出しは渡さなくてよい）。
     """
     # 絶対パスにしてから SRCROOT を決める（相対の --project では、展開した $(SRCROOT)/… が相対パスのまま残り、
     # さらに source_root から解決されて二重になる）
@@ -663,11 +680,17 @@ def referenced_files(
 
         expanded = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", expand, text)
         path = Path(expanded)
-        paths.append(resolved(path if path.is_absolute() else source_root / path))
+        target_path = resolved(path if path.is_absolute() else source_root / path)
+        if tracked is not None and root is not None:
+            if not target_path.is_relative_to(root):
+                raise Unreadable(f"{project_path}: {key} = {value} の参照先（{target_path}）が起点の外にある")
+            if target_path not in tracked:
+                raise Unreadable(f"{project_path}: {key} = {value} の参照先（{target_path}）を検査するコミットで追跡していない")
+        paths.append(target_path)
     return paths, bool(undecided) or explicit_empty
 
 
-def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
+def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
     project = load_project(project_path)
@@ -688,20 +711,23 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
     # 値の変数を展開する。参照しない構成の値で判定しない）
     referenced: Dict[Path, List[Expander]] = {}
     entitlements: List[Path] = []
+    tracked = tracked_files(root) if tracked_only else None
     for target in targets:
         name = f"ターゲット {target.get('name', '?')}"
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
         for configuration in configurations:
             for sdk in SDKS:
-                for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)[0]:
+                for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk,
+                                             root, tracked)[0]:
                     referenced.setdefault(path, []).append(
                         # ビルドが plist の変数を展開しない・展開するかを決められない構成では、展開後の値で判定しない
                         # （None = 判定できない。check_plist_values・check_plist_orientation と同じ）
                         lambda text, own=own, c=configuration, s=sdk: [
                             expand_value(text, own, shared, c, s) if plist_expansion(own, shared, c, s) is True else None])
             entitlements.extend(
-                referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS")[0])
+                referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS",
+                                 None, root, tracked)[0])
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
         if target.get("product-type") == "application":
             check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
@@ -736,9 +762,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="プロジェクト設定・Info.plist・entitlements の検査")
     parser.add_argument("--project", type=Path, default=ROOT / "MinutesMobile.xcodeproj" / "project.xcproj")
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--tracked-only", action="store_true")
     arguments = parser.parse_args()
     try:
-        errors, warnings = check(arguments.project, arguments.root.resolve())
+        errors, warnings = check(arguments.project, arguments.root.resolve(), arguments.tracked_only)
     except Unreadable as error:
         print(f"NG: 設定を読めない: {error}", file=sys.stderr)
         return 2

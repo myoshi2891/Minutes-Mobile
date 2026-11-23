@@ -207,6 +207,92 @@ def prose_lines(text: str) -> Iterator[Tuple[int, str]]:
             yield number, line
 
 
+# 引用の印（字下げは空白 0〜3 個。直後の空白 1 つは印の一部）
+QUOTE_MARK = re.compile(r"^ {0,3}> ?")
+
+
+def strip_quote(line: str, limit: Optional[int] = None) -> Tuple[int, str]:
+    """行頭の引用の印を（limit があればその数まで）除き、除いた数と残りを返す。"""
+    depth = 0
+    while limit is None or depth < limit:
+        found = QUOTE_MARK.match(line)
+        if not found:
+            break
+        line = line[found.end():]
+        depth += 1
+    return depth, line
+
+
+def quoted_fences(text: str) -> Iterator[Tuple[int, str]]:
+    """引用の中で開いたコードフェンスを（行番号, 情報文字列）で返す（ふつうのフェンス・コメント・<pre> の中の行は見ない）。
+
+    開いたときと同じ深さの引用が続く間だけ、閉じるフェンスまでを中の行とする（引用が終わればフェンスも終わる。CommonMark）。
+    """
+    current: Optional[Tuple[int, Fence]] = None
+    for number, line, inside, _, _, _ in scanned_lines(text):
+        if inside:
+            current = None
+            continue
+        if current is not None:
+            depth, content = strip_quote(line, current[0])
+            if depth == current[0]:
+                if fence_closes(content, current[1]):
+                    current = None
+                continue
+            current = None
+        depth, content = strip_quote(line)
+        opened = fence_open(content) if depth else None
+        if opened:
+            current = (depth, opened[0])
+            yield number, opened[1]
+
+
+# 箇条書きの項目の始まり（字下げ・印・印の後の空白）と、段落を終わらせる行（ATX の見出し・下線の見出し・区切りの線）
+LIST_ITEM = re.compile(r"^([ \t]*)([-+*]|\d{1,9}[.)])([ \t]+|$)")
+PARAGRAPH_END = re.compile(r"^ {0,3}(?:#{1,6}(?:\s|$)|=+[ \t]*$|-+[ \t]*$|([-*_])(?:[ \t]*\1){2,}[ \t]*$)")
+
+
+class IndentedCode:
+    """字下げしたコードブロックの行かを、本文の行を順に受け取って判定する。
+
+    空行などで段落が切れた後の、空白 4 個以上（タブは 4 桁）の行をコードとする。段落の続きの行は、字下げがあってもコードにしない。
+    箇条書きの中では、項目の本文の位置からの字下げで判定する（項目の中の段落・入れ子の項目をコードと取り違えない）。
+    """
+
+    def __init__(self) -> None:
+        self.paragraph = False  # 直前の行が段落で、次の行が続きになりうる
+        self.items: List[int] = []  # 開いている箇条書きの項目の、本文の位置（外側から）
+
+    def interrupt(self) -> None:
+        self.paragraph = False
+
+    def leave(self, indent: int) -> int:
+        """字下げ indent より深い位置の項目を閉じ、残った項目の本文の位置を返す。"""
+        while self.items and indent < self.items[-1]:
+            self.items.pop()
+        return self.items[-1] if self.items else 0
+
+    def is_code(self, line: str) -> bool:
+        expanded = line.expandtabs(4)
+        if not expanded.strip():
+            self.paragraph = False
+            return False
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if not self.paragraph and indent - self.leave(indent) >= 4:
+            return True
+        ends = PARAGRAPH_END.match(expanded)
+        item = None if ends else LIST_ITEM.match(expanded)
+        # 段落の続きの行は、項目の本文の位置から 4 個以上の字下げなら、項目の始まりではなく続き
+        if item and not (self.paragraph and indent - max([at for at in self.items if at <= indent], default=0) >= 4):
+            self.leave(indent)
+            spaces = len(item.group(3))
+            self.items.append(indent + len(item.group(2)) + (spaces if 1 <= spaces <= 4 else 1))
+            self.paragraph = bool(expanded[item.end():].strip())
+            return False
+        self.paragraph = not ends
+        return False
+
+
 def reversed_range(match: "re.Match[str]") -> bool:
     """「FR-AAA-03〜01」のように、範囲の終点が直前の番号より小さい書き方か。"""
     previous = int(match.group(1).rsplit("-", 1)[1])
@@ -764,6 +850,10 @@ class Checker:
                     self.error(name, "コードフェンスに言語の指定がない", number)
                 if fence_end(lines, number - 1) >= len(lines):
                     self.error(name, "コードフェンスが閉じていない", number)
+            # 引用の中のフェンスは、言語の指定だけを確かめる（閉じていなくても、引用の終わりで終わる）
+            for number, info in quoted_fences(text):
+                if not info:
+                    self.error(name, "コードフェンスに言語の指定がない（引用の中）", number)
             # 参照形式のリンクは、定義（[ラベル]: リンク先）を通してリンク先を求め、インラインのリンクと同じく確かめる
             definitions: Dict[str, str] = {}
             for _, line in prose_lines(text):
@@ -772,16 +862,24 @@ class Checker:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
             openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」
             previous = 0  # 前の行の番号
+            code = IndentedCode()
             for number, line in prose_lines(text):
                 is_definition = REFERENCE_DEFINITION.match(line) is not None
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
                 if number != previous + 1 or not line.strip() or BLOCK_START.match(line):
                     openers = []
+                if number != previous + 1:
+                    code.interrupt()
                 previous = number
+                # 字下げしたコードブロックの中はリンクとして確かめない（段落の続きの行・箇条書きの中の段落は確かめる）
+                if code.is_code(line):
+                    openers = []
+                    continue
                 # コメントで始まる行は、行の全体が HTML のブロックで、閉じた後ろの文字もリンクにならない（CommonMark）。
                 # 段落も切れる。コード片の印の照合は check_snippets が別に行う
                 if COMMENT_OPEN.match(line):
                     openers = []
+                    code.interrupt()
                     continue
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
                 line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない

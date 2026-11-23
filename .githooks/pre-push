@@ -43,11 +43,24 @@ if [ -n "$status_output" ]; then
   exit 1
 fi
 
-# 実体のパス（シンボリックリンクを解決したもの）。$(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、
-# x と、git rev-parse・pwd が出力の区切りとして付けた改行 1 つだけを外す（パスの一部である末尾の改行は残す）
-toplevel=$(git rev-parse --show-toplevel && printf x) && toplevel=${toplevel%x} && toplevel=${toplevel%$'\n'}
-source_root=$(cd -P "$toplevel" && pwd && printf x) && source_root=${source_root%x} && source_root=${source_root%$'\n'}
-common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+# ディレクトリ $2 の実体のパスを変数 $1 に入れる。$(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が
+# 付けた区切りの改行 1 つだけを外す（名前が改行で終わるディレクトリを取り違えない）
+real_directory() {
+  local resolved_path
+  resolved_path=$(cd -P -- "$2" 2>/dev/null && pwd && printf x) || return 1
+  resolved_path=${resolved_path%x}
+  printf -v "$1" '%s' "${resolved_path%$'\n'}"
+}
+# 作業ツリー $2 の git rev-parse --path-format=absolute $3 のパスを変数 $1 に入れる（末尾の改行の扱いは real_directory と同じ）
+git_path() {
+  local printed_path
+  printed_path=$(git -C "$2" rev-parse --path-format=absolute "$3" 2>/dev/null && printf x) || return 1
+  printed_path=${printed_path%x}
+  printf -v "$1" '%s' "${printed_path%$'\n'}"
+}
+# 実体のパス（シンボリックリンクを解決したもの）と共通のディレクトリ。&& の並びの途中の失敗では set -e が働かないので、明示的に止める
+git_path toplevel . --show-toplevel && real_directory source_root "$toplevel" && git_path common_dir . --git-common-dir \
+  || { echo "NG: 作業ツリーの起点・共通のディレクトリを特定できない" >&2; exit 1; }
 base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
 # 置き場所の判定（実体のパスへの解決・SwiftFormat の設定のある祖先の拒否・元のリポジトリと登録されたすべての作業ツリーの
 # 中の拒否）は scripts/worktree-location.py が行う（check.sh --require-clean と共用する）。中に置くと、SwiftFormat などが
@@ -132,12 +145,11 @@ owner_text="MinutesMobile pre-push ${snapshot}"
 # （その場合は下で止める）
 owned=0
 if [ "$registration" -eq 0 ] && [ -d "$snapshot" ]; then
-  top=$(git -C "$snapshot" rev-parse --show-toplevel 2>/dev/null) && top=$(cd -P "$top" && pwd) \
-    && common=$(git -C "$snapshot" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-    && common=$(cd -P "$common" && pwd) && source_common=$(cd -P "$common_dir" && pwd) \
+  git_path top "$snapshot" --show-toplevel && real_directory top "$top" \
+    && git_path common "$snapshot" --git-common-dir && real_directory common "$common" \
+    && real_directory source_common "$common_dir" \
     && [ "$top" = "$snapshot" ] && [ "$common" = "$source_common" ] \
-    && private=$(git -C "$snapshot" rev-parse --path-format=absolute --git-dir 2>/dev/null) \
-    && private=$(cd -P "$private" && pwd) && [ "$(dirname "$private")" = "$source_common/worktrees" ] \
+    && git_path private "$snapshot" --git-dir && real_directory private "$private" && [ "$(dirname "$private")" = "$source_common/worktrees" ] \
     && [ -f "$private/$owner_mark" ] && [ ! -L "$private/$owner_mark" ] \
     && [ "$(cat "$private/$owner_mark")" = "$owner_text" ] && owned=1
 fi
@@ -233,7 +245,7 @@ else
   # このフックの作業ツリーとして展開し直せる）
   git -C "$source_root" worktree add -q --force --no-checkout --detach "$snapshot" "$head"
   # 作った作業ツリーの専用の管理ディレクトリに、このフックの印を書く（次の検査で再利用してよいかの判定に使う）
-  private=$(git -C "$snapshot" rev-parse --path-format=absolute --git-dir) && private=$(cd -P "$private" && pwd) \
+  git_path private "$snapshot" --git-dir && real_directory private "$private" \
     || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
   printf '%s\n' "$owner_text" > "$private/$owner_mark"
   git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"

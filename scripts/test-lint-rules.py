@@ -45,6 +45,9 @@ UNREADABLE_DIAGNOSTIC = re.compile(r"^Could not read contents of `(.+)`$", re.MU
 # 規則名は custom_rules の規則名と同じ形（先頭は英小文字、以降は英小文字・数字・下線）
 MARKER = re.compile(r"//\s*expect:\s*([a-z][a-z0-9_]*)\s*$")
 
+# excluded の項目（1 行の「- 値」）。流れの形（[ {）・ブロックの文字列（| >）・アンカーなど（& * !）・値のない項目は認めない
+EXCLUDED_ITEM = re.compile(r"""-\s+(?:'[^']*'|"[^"]*"|[^\s'"\[{|>&*!#][^#]*)\s*(?:\s#.*)?$""")
+
 
 def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
     """.swiftlint.yml の custom_rules から、規則名 → 例外（excluded）の有無 を取り出す。
@@ -86,7 +89,11 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
                 attribute_indent = indent
                 if indent != 4:
                     errors.append(f".swiftlint.yml の規則 {current} の属性は字下げ 4 で書く（字下げ {indent} は読めない）: {body}")
-            if in_excluded and body.startswith("-") and indent != 6:
+            if in_excluded and indent > attribute_indent and (indent != 6 or not EXCLUDED_ITEM.match(body)):
+                # without_excluded が除けるのは字下げ 6 の 1 行の項目だけ。流れの形・複数行の値・次の行の文字列などは続きを残す
+                errors.append(f".swiftlint.yml の規則 {current} の excluded の項目は字下げ 6 で書く"
+                              f"（1 行の「- 値」の並びで書く。読めない形: {body}）")
+            elif in_excluded and body.startswith("-") and indent != 6:
                 # YAML は属性と同じ字下げの項目の並びも認めるが、without_excluded は字下げ 6 の項目だけを読む
                 errors.append(f".swiftlint.yml の規則 {current} の excluded の項目は字下げ 6 で書く（字下げ {indent} は読めない）: {body}")
             elif indent == attribute_indent:
@@ -364,6 +371,25 @@ def run_swiftlint(paths: List[Path], config: Optional[Path] = None) -> List[dict
     return report
 
 
+def reported_lines(items: List[dict], cases: List[Tuple[Path, str, Set[int]]], errors: List[str]) -> Dict[Tuple[str, str], Set[int]]:
+    """試験で見ているファイルと規則の組の検出を、組 → 行番号の集合にする（ほかの組の検出は読まない）。
+
+    行番号のない（null など）検出は、印の行と比べられない。0 行目や「検出なし」と数えずに errors に入れる。
+    """
+    watched = {(os.path.realpath(path), rule) for path, rule, _ in cases}
+    reported: Dict[Tuple[str, str], Set[int]] = {}
+    for item in items:
+        key = (os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", "")))
+        if key not in watched:
+            continue
+        line = item.get("line")
+        if type(line) is not int:  # 真偽値は int の派生なので isinstance では除けない
+            errors.append(f"{key[0]}: 規則 {key[1]} の検出に行番号がなく、印の行と比べられない（{line!r}）")
+            continue
+        reported.setdefault(key, set()).add(line)
+    return reported
+
+
 def check_allowed_controls(cases: List[Tuple[Path, str, Set[int]]], rules: Dict[str, bool], errors: List[str]) -> None:
     """allowed/ の各ファイルが、その規則の excluded だけを除いた設定では、同じパスのまま検出されること
     （例外が検出を止めていることの対照）。
@@ -410,6 +436,11 @@ def main() -> int:
               "参照を使わず 1 つの設定に書く", file=sys.stderr)
         return 2
     rules = custom_rules(config_text, errors)
+    if errors:
+        # 読めない書き方の規則から対照の設定を作らない（SwiftLint を実行する前に止める）
+        for message in errors:
+            print(f"NG: {message}")
+        return 1
     if not rules:
         errors.append(".swiftlint.yml に custom_rules が 1 つもない")
     for rule in BUILTIN_RULES:
@@ -430,10 +461,7 @@ def main() -> int:
         for message in errors:
             print(f"NG: {message}")
         return 1
-    reported: Dict[Tuple[str, str], Set[int]] = {}
-    for item in run_swiftlint(sorted({path for path, _, _ in cases})):
-        key = (os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", "")))
-        reported.setdefault(key, set()).add(int(item.get("line", 0)))
+    reported = reported_lines(run_swiftlint(sorted({path for path, _, _ in cases})), cases, errors)
     check_allowed_controls(cases, rules, errors)
     for path, rule, expected in cases:
         actual = reported.get((os.path.realpath(str(path)), rule), set())

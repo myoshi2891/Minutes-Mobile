@@ -465,6 +465,39 @@ def test_settings() -> None:
                           info_plist_file("Config/App-Settings.plist")(t), '"GENERATE_INFOPLIST_FILE": "YES",',
                           f'"GENERATE_INFOPLIST_FILE": "YES",\n        "INFOPLIST_EXPAND_BUILD_SETTINGS": "{e}",\n        "SHARING": "{s}",'),
                       plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, UIFileSharingEnabled=flag)})
+    # --tracked-only（専用の作業ツリーの検査）では、参照先の実体が起点の中の、HEAD のコミットで追跡したファイルであること
+    for label, target, options, want_code, want_text in (
+        ("追跡したファイル", "file", ["--tracked-only"], 0, "OK"),
+        ("追跡したファイルを指すリンク", "link", ["--tracked-only"], 0, "OK"),
+        ("起点の外を指すリンク", "outside", ["--tracked-only"], 2, "起点の外"),
+        ("無視するファイル", "ignored", ["--tracked-only"], 2, "追跡していない"),
+        ("無視するファイルを指すリンク", "link-ignored", ["--tracked-only"], 2, "追跡していない"),
+        ("ステージしただけのファイル", "staged", ["--tracked-only"], 2, "追跡していない"),
+        ("起点の外を指すリンク（通常の実行）", "outside", [], 0, "OK"),
+        ("無視するファイル（通常の実行）", "ignored", [], 0, "OK"),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root, env = Path(directory) / "root", isolated_git_env()
+            reference = root / "Config" / "App-Settings.plist"
+            reference.parent.mkdir(parents=True)
+            contents = plistlib.dumps(OK_INFO_PLIST)
+            (root / "project.xcproj").write_text(info_plist_file("Config/App-Settings.plist")(OK_PROJECT), encoding="utf-8")
+            (root / ".gitignore").write_text("Ignored.plist\n" + ("App-Settings.plist\n" if target == "ignored" else ""), encoding="utf-8")
+            real = {"link": root / "Config" / "Real.plist", "link-ignored": root / "Config" / "Ignored.plist",
+                    "outside": Path(directory) / "Outside.plist"}.get(target, reference)
+            if real != reference:
+                reference.symlink_to(real)
+            if target != "staged":
+                real.write_bytes(contents)
+            for command in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", str(root), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *command], env=env, check=True,
+                               capture_output=True)
+            if target == "staged":
+                real.write_bytes(contents)
+                subprocess.run(["git", "-C", str(root), "add", "-A"], env=env, check=True, capture_output=True)
+            expect(f"settings: 参照先: {label}", [str(SCRIPTS / "check-project-settings.py"), "--project", str(root / "project.xcproj"),
+                                                  "--root", str(root), *options], want_code, want_text, env=env)
     settings_case("どのターゲットも参照しない plist の変数は判定できない", 1, "UIFileSharingEnabled の値を展開できない",
                   plists={"Other/Info.plist": {"UIFileSharingEnabled": "$(SHARING)"}})
 
@@ -2097,6 +2130,15 @@ def lint_rules_config_cases() -> None:
         ("字下げ 4 の excluded の項目", "custom_rules:\n  rule_a:\n    excluded:\n    - a\n", None, "字下げ 6 で書く"),
         ("同じ行の excluded（文字列）", "custom_rules:\n  rule_a:\n    regex: x\n    excluded: '.*/A/.*'\n", None, "同じ行に書かない"),
         ("同じ行の excluded（流れの形）", "custom_rules:\n  rule_a:\n    regex: x\n    excluded: [a, b]\n", None, "同じ行に書かない"),
+        ("複数行の流れの形", "custom_rules:\n  rule_a:\n    excluded:\n      [a,\n      b]\n", None, "「- 値」の並びで書く"),
+        ("項目の流れの形", "custom_rules:\n  rule_a:\n    excluded:\n      - [a, b]\n", None, "「- 値」の並びで書く"),
+        ("項目の値の続き", "custom_rules:\n  rule_a:\n    excluded:\n      - a\n        b\n", None, "「- 値」の並びで書く"),
+        ("次の行の文字列", "custom_rules:\n  rule_a:\n    excluded:\n      a\n", None, "「- 値」の並びで書く"),
+        ("空白のない項目", "custom_rules:\n  rule_a:\n    excluded:\n      -a\n", None, "「- 値」の並びで書く"),
+        ("空の項目", "custom_rules:\n  rule_a:\n    excluded:\n      -\n        a\n", None, "「- 値」の並びで書く"),
+        ("ブロックの文字列の項目", "custom_rules:\n  rule_a:\n    excluded:\n      - |\n        a\n", None, "「- 値」の並びで書く"),
+        ("項目の間のコメントと次の属性", "custom_rules:\n  rule_a:\n    excluded:\n      - 'a'\n        # 注\n      - b\n    match_kinds:\n      - x\n",
+         {"rule_a": True}, ""),
         ("excluded の行のコメント", "custom_rules:\n  rule_a:\n    excluded:  # 注\n      - a\n", {"rule_a": True}, ""),
         ("字下げ 3 の excluded", "custom_rules:\n  rule_a:\n    regex: x\n   excluded:\n      - a\n", None, "属性の階層と違う"),
     ):
@@ -2135,13 +2177,35 @@ def lint_rules_config_cases() -> None:
                                   {"no_direct_logger": True}, errors)
     if errors or checked != [[allowed]]:
         failures.append(f"lint-rules: 例外の例の対照が元のパスで検出されない（{errors}・{checked}）")
+    # 検出の行番号は、試験で見ているファイルと規則の組だけを読む。行番号のない検出は、0 行目とも「ない」とも数えずに報告する
+    watched = module.FIXTURES / "no_direct_logger" / "violation.swift"
+    for label, items, want_lines, want_errors in (
+        ("見ている組", [{"file": str(watched), "rule_id": "no_direct_logger", "line": 3}], {3}, 0),
+        ("見ている組の null", [{"file": str(watched), "rule_id": "no_direct_logger", "line": None}], set(), 1),
+        ("見ている組の欠落", [{"file": str(watched), "rule_id": "no_direct_logger"}], set(), 1),
+        ("見ている組の真偽値", [{"file": str(watched), "rule_id": "no_direct_logger", "line": True}], set(), 1),
+        ("見ていない規則の null", [{"file": str(watched), "rule_id": "other", "line": None}], set(), 0),
+        ("見ていないファイルの null", [{"file": "/x.swift", "rule_id": "no_direct_logger", "line": None}], set(), 0),
+    ):
+        count += 1
+        line_errors: List[str] = []
+        lines = module.reported_lines(items, [(watched, "no_direct_logger", {3})], line_errors)
+        if lines.get((os.path.realpath(watched), "no_direct_logger"), set()) != want_lines or len(line_errors) != want_errors:
+            failures.append(f"lint-rules: 検出の行番号（{label}）の扱いが違う（{lines}・{line_errors}）")
     # 参照のある設定では、SwiftLint を実行する前に終了コード 2 で止まる
     count += 1
     executed: List[bool] = []
     module.run_swiftlint = lambda paths, config=None: executed.append(True) or []
     original_read = module.read_config
-    module.read_config = lambda path: original_read(path) + b"\nparent_config: base.yml\n"
     original_argv, sys.argv = sys.argv, ["test-lint-rules.py"]
+    # custom_rules の読めない書き方でも、対照の設定で SwiftLint を実行する前に止まる
+    count += 1
+    module.read_config = lambda path: original_read(path) + b"\n  rule_z:\n    excluded:\n      [a,\n      b]\n"
+    with contextlib.redirect_stdout(io.StringIO()) as printed:
+        code = module.main()
+    if code != 1 or executed or "「- 値」の並びで書く" not in printed.getvalue():
+        failures.append(f"lint-rules: 読めない excluded で止まらない（終了コード {code}・実行 {executed}）")
+    module.read_config = lambda path: original_read(path) + b"\nparent_config: base.yml\n"
     with contextlib.redirect_stderr(io.StringIO()) as captured:
         code = module.main()
     sys.argv = original_argv
@@ -2439,13 +2503,14 @@ def staged_newline_directory_case() -> None:
         (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
         (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
         # 3 か所の書き出し（整形・静的解析、秘密情報、文書）のそれぞれで、同じ相対位置のファイルを読む
-        reader = "#!/bin/sh\nfor d in sub*; do cat \"$d/Sample.swift\" >> \"$MINUTES_TEST_OUT\" || exit 1; done\n"
+        # 名前は改行まで正確に指定する（glob では、改行を落として書き出した「sub」にも当たる）
+        reader = "#!/bin/sh\ncat 'sub\n/Sample.swift' >> \"$MINUTES_TEST_OUT\" || exit 1\n"
         for name in ("swiftformat", "gitleaks"):
             (repository / ".tools" / "bin" / name).write_text(reader, encoding="utf-8")
             (repository / ".tools" / "bin" / name).chmod(0o755)
         (repository / ".tools" / "bin" / "swiftlint").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (repository / ".tools" / "bin" / "swiftlint").chmod(0o755)
-        (repository / "scripts" / "verify-docs.py").write_text(reader.replace("\nfor", '\ncd "$2" || exit 1\nfor'), encoding="utf-8")
+        (repository / "scripts" / "verify-docs.py").write_text(reader.replace("\ncat", '\ncd "$2" || exit 1\ncat'), encoding="utf-8")
         for path in (check, repository / "scripts" / "verify-docs.py"):
             path.chmod(0o755)
         subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
@@ -2456,6 +2521,192 @@ def staged_newline_directory_case() -> None:
         if result.returncode != 0 or recorded != "let sample = 1\n" * 3:
             failures.append(f"check: 名前が改行で終わるディレクトリを書き出せない（終了コード {result.returncode}・記録 {recorded!r}）\n"
                             f"{result.stderr.strip()}")
+
+
+def staged_dash_case() -> None:
+    """check.sh --staged が、「-」で始まる名前の Swift のファイルを、整形・静的解析に指定ではなくパスとして渡すこと。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository, out = Path(directory) / "repository", Path(directory) / "recorded"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools" / "bin").mkdir(parents=True)
+        check = repository / "scripts" / "check.sh"
+        check.write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        stage_tool_stubs(repository)
+        for name in ("-dash.swift", "Plain.swift"):
+            (repository / name).write_text("let sample = 1\n", encoding="utf-8")
+        (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        for name in ("swiftformat", "swiftlint", "gitleaks"):
+            # 受け取った Swift のパスを記録し、開けることを確かめる
+            (repository / ".tools" / "bin" / name).write_text(
+                f'#!/bin/bash\nfor a in "$@"; do case "$a" in *.swift) [ -f "$a" ] || exit 1; echo "{name} $a" >> "$MINUTES_TEST_OUT" ;; esac; done\n',
+                encoding="utf-8")
+            (repository / ".tools" / "bin" / name).chmod(0o755)
+        (repository / "scripts" / "verify-docs.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for path in (check, repository / "scripts" / "verify-docs.py"):
+            path.chmod(0o755)
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), "add", "-A"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(check), "--staged"], capture_output=True, text=True, timeout=60,
+                                env=dict(env, MINUTES_TEST_OUT=str(out)))
+        recorded = out.read_text(encoding="utf-8").split("\n")[:-1] if out.is_file() else []
+        want = [f"{tool} ./{name}" for tool in ("swiftformat", "swiftlint") for name in ("-dash.swift", "Plain.swift")]
+        if result.returncode != 0 or recorded != want:
+            failures.append(f"check: 「-」で始まるファイルを正しく渡さない（終了コード {result.returncode}・記録 {recorded}）\n"
+                            f"{result.stderr.strip()}")
+
+
+def step4_tracked_case() -> None:
+    """check.sh の手順 4 が、確かめた専用の作業ツリーの検査でだけ --tracked-only を渡すこと（変数の引き継ぎだけでは渡さない）。"""
+    global count
+    for label, arguments, inherited, want in (("専用の作業ツリー", ["--require-clean"], "", "--tracked-only\n"), ("通常の実行", [], "", "\n"),
+                                              ("変数だけの引き継ぎ", [], "1", "\n")):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository, out = Path(directory) / "repository", Path(directory) / "recorded"
+            (repository / "scripts").mkdir(parents=True)
+            (repository / ".tools" / "bin").mkdir(parents=True)
+            check = repository / "scripts" / "check.sh"
+            check.write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            copy_location_script(repository)
+            (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (repository / "scripts" / "check-project-settings.py").write_text(
+                '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+            for path in (repository / "scripts").iterdir():
+                path.chmod(0o755)
+            (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+            for command in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *command], env=env, check=True,
+                               capture_output=True)
+            run_env = dict(env, MINUTES_TEST_OUT=str(out))
+            if inherited:
+                run_env["MINUTES_CHECK_ISOLATED"] = inherited
+            result = subprocess.run([str(check), "--steps", "4", *arguments], cwd=repository, capture_output=True, text=True,
+                                    timeout=60, env=run_env)
+            recorded = out.read_text(encoding="utf-8") if out.is_file() else ""
+            if result.returncode != 0 or recorded != want:
+                failures.append(f"check: 手順 4 の引数が違う（{label}。終了コード {result.returncode}・記録 {recorded!r}）\n{result.stderr.strip()}")
+
+
+def pre_push_newline_case() -> None:
+    """プッシュ前のフックと check.sh の isolated_checkout が、共通のディレクトリの名前が改行で終わっても、作業ツリーを見分けること。
+
+    名前が改行で終わる bare のリポジトリに登録した作業ツリーから 2 回 push し、2 回目が 1 回目の専用の作業ツリーを再利用する。
+    改行のない名前の別のリポジトリも置く（取り違えないこと）。
+    """
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        bare, work, base = Path(directory) / "bare\n", Path(directory) / "work", Path(directory) / "base"
+        hook = Path(directory) / "pre-push"
+        hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
+        hook.chmod(0o755)
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+
+        def git(cwd: Path, *arguments: str) -> str:
+            return subprocess.run(["git", *identity, *arguments], cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+        for path in (bare, Path(directory) / "bare"):
+            path.mkdir()
+            git(path, "init", "-q", "--bare", "--template=", "-b", "main")
+        git(bare, "worktree", "add", "-q", "--orphan", "-b", "main", str(work))
+        (work / "scripts").mkdir()
+        (work / ".tools" / "bin").mkdir(parents=True)
+        copy_location_script(work)
+        (work / "scripts" / "check.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (work / "scripts" / "check.sh").chmod(0o755)
+        (work / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        git(work, "add", "-A")
+        git(work, "commit", "-q", "-m", "base")
+        head = git(work, "rev-parse", "HEAD")
+        results = [subprocess.run([str(hook)], cwd=work, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
+                                  capture_output=True, text=True, timeout=60, env=dict(env, MINUTES_PRE_PUSH_DIR=str(base)))
+                   for _ in range(2)]
+        if [result.returncode for result in results] != [0, 0]:
+            failures.append(f"pre-push: 改行で終わる共通のディレクトリで再利用できない（{[result.returncode for result in results]}）\n"
+                            f"{results[-1].stderr.strip()}")
+            return
+        count += 1
+        text = (SCRIPTS / "check.sh").read_text(encoding="utf-8")
+        found = [re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.MULTILINE | re.DOTALL)
+                 for name in ("real_directory", "git_path", "isolated_checkout")]
+        snapshot = next(path for path in base.iterdir() if path.is_dir())
+        script = "set -euo pipefail\nROOT=$PWD\n" + "".join(match.group(0) for match in found if match) + "isolated_checkout\n"
+        result = subprocess.run(["/bin/bash", "-c", script], cwd=os.path.realpath(snapshot), env=env, capture_output=True, text=True)
+        other = subprocess.run(["/bin/bash", "-c", script], cwd=work, env=env, capture_output=True, text=True)
+        if result.returncode != 0 or other.returncode != 1:
+            failures.append(f"check: 改行で終わる共通のディレクトリの専用の作業ツリーを見分けない（{result.returncode}・{other.returncode}）\n"
+                            f"{result.stderr.strip()}")
+
+
+def install_lock_case() -> None:
+    """setup-tools.sh が、導入のロックの取得の途中の中断で自分のロックを残さず、ほかの実行のロックを消さないこと。"""
+    global count
+    for label, held in (("取得できた", False), ("取得できなかった", True)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            dest, shims, sent, versions = base / "tools", base / "shims", base / "sent", base / "versions"
+            dest.mkdir()
+            shims.mkdir()
+            versions.write_text(f"gh 9.9.9 any cli/cli v9.9.9 gh.zip gh {'0' * 64}\n", encoding="utf-8")
+            write_lock_shim(shims, ".install.lock", sent, held)
+            result = subprocess.run([str(SCRIPTS / "setup-tools.sh"), "--verify", "--versions", str(versions), "--dest", str(dest),
+                                     "--require", "gh"], capture_output=True, text=True, timeout=60,
+                                    env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}"))
+            left = (dest / ".install.lock").exists()
+            if result.returncode != 130 or not sent.exists() or left != held:
+                failures.append(f"versions: setup-tools.sh がロックを{label}ときの中断の扱いが違う（終了コード {result.returncode}・"
+                                f"残ったロック {left}）\n{result.stderr.strip()}")
+
+
+def linked_bin_case() -> None:
+    """setup-tools.sh が、導入先の bin がシンボリックリンクなら、導入もリンクの先も変えずに止まること。導入先自体のリンクは認める。"""
+    global count
+    import hashlib
+    import tarfile
+    for label, linked, want in (("bin", "bin", 1), ("導入先", "dest", 0)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            binary, archive, versions = base / "gh", base / "gh.tar.gz", base / "versions"
+            binary.write_text("#!/bin/sh\necho 'gh version 9.9.9 (2000-01-01)'\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(binary, arcname="gh")
+            versions.write_text(f"gh 9.9.9 any cli/cli v9.9.9 gh.tar.gz gh {hashlib.sha256(archive.read_bytes()).hexdigest()}\n",
+                                encoding="utf-8")
+            real, dest, shared, shims = base / "real", base / "tools", base / "shared", base / "shims"
+            for path in (real, shared, shims):
+                path.mkdir()
+            if linked == "dest":
+                dest.symlink_to(real)
+            else:
+                dest.mkdir()
+                (dest / "bin").symlink_to(shared)
+                (dest / "gh" / "9.9.9").mkdir(parents=True)
+                (dest / "gh" / "9.9.9" / "gh").write_text("old", encoding="utf-8")
+            (shims / "curl").write_text('#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\ncp "$MINUTES_TEST_ARCHIVE" "$2"\n',
+                                        encoding="utf-8")
+            (shims / "curl").chmod(0o755)
+            result = subprocess.run([str(SCRIPTS / "setup-tools.sh"), "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
+                                    capture_output=True, text=True, timeout=60,
+                                    env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_ARCHIVE=str(archive)))
+            unchanged = linked == "dest" or (not list(shared.iterdir()) and sorted(path.name for path in (dest / "gh").iterdir()) == ["9.9.9"]
+                                             and (dest / "gh" / "9.9.9" / "gh").read_text(encoding="utf-8") == "old")
+            if result.returncode != want or not unchanged or (dest / ".install.lock").exists():
+                failures.append(f"versions: {label}がリンクの導入の扱いが違う（終了コード {result.returncode}・変わらない {unchanged}）\n"
+                                f"{result.stderr.strip()}")
 
 
 def copy_tools_lock_case() -> None:
@@ -2878,6 +3129,11 @@ def test_versions() -> None:
     snapshot_tools_case()
     retired_backup_case()
     publish_interrupted_case()
+    install_lock_case()
+    linked_bin_case()
+    staged_dash_case()
+    step4_tracked_case()
+    pre_push_newline_case()
     staged_scripts_case()
     reinstall_command_case()
     pre_push_interrupted_case()
@@ -3175,6 +3431,7 @@ def test_gitleaks() -> None:
     gitleaks_broken_history_case()
     gitleaks_traversal_case()
     gitleaks_signature_case()
+    gitleaks_rename_case()
     gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
     with tempfile.TemporaryDirectory() as directory:
@@ -3693,6 +3950,35 @@ def gitleaks_signature_case() -> None:
             failures.append("gitleaks: 署名の試験の対照が標準エラーに書かない（試験にならない）")
         expect("gitleaks: log.showSignature の署名の表示", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], 0,
                "no leaks found", env=env)
+
+
+def gitleaks_rename_case() -> None:
+    """名前の変更の検出の上限（diff.renameLimit）を超えた警告（標準エラー）を、走査の失敗と取り違えないこと。"""
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        repository = Path(directory) / "repository"
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+
+        def git(*arguments: str) -> "subprocess.CompletedProcess[str]":
+            return subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True, text=True)
+
+        repository.mkdir()
+        git("init", "-q", "--template=", "-b", "main")
+        for number in range(4):
+            (repository / f"old{number}").write_text("".join(f"{line}\n" for line in range(number, 40)), encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        for number in range(4):
+            path = repository / f"new{number}"
+            (repository / f"old{number}").rename(path)
+            path.write_text(path.read_text(encoding="utf-8") + f"added {number}\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-q", "-m", "renamed")
+        git("config", "diff.renameLimit", "1")
+        if not git("log", "-p", "-U0", "--all").stderr.strip():
+            failures.append("gitleaks: 名前の変更の試験の対照が標準エラーに書かない（試験にならない）")
+        expect("gitleaks: 名前の変更の検出の上限", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], 0, "no leaks found", env=env)
 
 
 def gitleaks_merge_case() -> None:
@@ -4639,6 +4925,38 @@ def run_docs_cases() -> None:
         docs_case(f"コメントで始まる行の後ろは確かめない: {label}", 0, "OK", basic, "[要件](../01-requirements/requirements.md)", text)
     docs_case("コメントの次の行のリンクは確かめる", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
               "<!-- 注 -->\n[要件](missing.md)")
+    # 空行の後の空白 4 個（かタブ）の行は字下げしたコードブロック。段落の続き・箇条書きの中の段落と項目は確かめる
+    for label, text, want in (
+        ("コードブロック", "本文\n\n    [例](missing.md)\n    [例](missing2.md)\n\n    [例](missing.md)", 0),
+        ("タブのコードブロック", "本文\n\n\t[例](missing.md)", 0),
+        ("見出しの直後のコードブロック", "#### 例\n    [例](missing.md)", 0),
+        ("段落の続き", "本文\n    [例](missing.md)", 1),
+        ("段落の続きをまたぐ文", "本文 [例\n    続き](missing.md)", 1),
+        ("コードブロックの後の本文", "本文\n\n    例\n\n[例](missing.md)", 1),
+        ("箇条書きの中の段落", "- 項目\n\n    [例](missing.md)", 1),
+        ("番号付きの箇条書きの中の段落", "1. 項目\n\n    [例](missing.md)", 1),
+        ("入れ子の項目", "- 項目\n  - 内側\n\n    - [例](missing.md)", 1),
+        ("箇条書きの中のコードブロック", "- 項目\n\n      [例](missing.md)", 0),
+        ("箇条書きが終わった後のコードブロック", "- 項目\n\n本文\n\n    [例](missing.md)", 0),
+    ):
+        docs_case(f"字下げした行のリンク: {label}", want, "リンクの先がない: missing.md" if want else "OK", basic,
+                  "[要件](../01-requirements/requirements.md)", f"[要件](../01-requirements/requirements.md)\n\n{text}")
+    # 引用の中のフェンスも言語の指定を求める。閉じるフェンス・中の行は開始と数えず、引用が終わればフェンスも終わる
+    for label, text, want in (
+        ("指定なし", f"> {FENCE}\n> 例\n> {FENCE}", 1),
+        ("指定あり", f"> {FENCE}text\n> 例\n> {FENCE}", 0),
+        ("空白のない引用", f">{FENCE}\n>例\n>{FENCE}", 1),
+        ("入れ子の引用", f"> > {FENCE}\n> > 例\n> > {FENCE}", 1),
+        ("引用の終わりで終わるフェンス", f"> {FENCE}text\n> 例\n\n> {FENCE}\n> 例\n> {FENCE}", 1),
+        ("閉じたフェンスの後のフェンス", f"> {FENCE}text\n> {FENCE}\n> {FENCE}\n> 例", 1),
+        ("引用が終わった後の閉じないフェンス", f"> {FENCE}text\n> 例\n\n> {FENCE}\n> 例", 1),
+        ("フェンスの中の引用の印", f"> {FENCE}text\n> > ~~~\n> {FENCE}", 0),
+        ("長いフェンスの中の短いフェンス", f"> {FENCE}`text\n> {FENCE}\n> {FENCE}`", 0),
+        ("引用の中の字下げしたコード", f">     {FENCE}", 0),
+        ("ふつうのフェンスの中の引用", f"{FENCE}text\n> {FENCE}\n{FENCE}", 0),
+    ):
+        docs_case(f"引用の中のフェンス: {label}", want, "コードフェンスに言語の指定がない" if want else "OK", basic,
+                  "[要件](../01-requirements/requirements.md)", f"[要件](../01-requirements/requirements.md)\n\n{text}")
     # <pre> の中は生の文字列。フェンスの印・コメントの始まりとして扱わず、</pre> の後は通常の検査に戻る
     link_text = "[要件](../01-requirements/requirements.md)"
     docs_case("<pre> の中のバッククォートはフェンスではない", 1, "リンクの先がない: missing.md", basic, link_text,

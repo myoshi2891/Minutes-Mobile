@@ -271,11 +271,22 @@ if [ -d "$DEST" ]; then
   }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  # ロックを取る。取れたら LOCK_HELD に記録して 0 を返す。結果を記録するまで、中断は控えるだけにする（check.sh の take_lock と
+  # 同じ。取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を
+  # 無視して実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
+  take_install_lock() {
+    interrupted=""
+    trap 'interrupted=1' INT TERM
+    if lock_error=$(trap '' INT TERM; exec mkdir "$LOCK" 2>&1); then LOCK_HELD=1; fi
+    trap 'exit 130' INT TERM
+    if [ -n "$interrupted" ]; then exit 130; fi
+    [ -n "$LOCK_HELD" ]
+  }
   # 作れない理由を区別する。ロックのディレクトリがあるときだけ別の導入の実行中として待ち、
   # ないのに作れない場合（書き込めない導入先など）や、ディレクトリ以外のものがある場合は待たずに止める
   waited=0
   retried=""
-  until lock_error=$(mkdir "$LOCK" 2>&1); do
+  until take_install_lock; do
     if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then
       if [ "$waited" -ge 600 ]; then
         fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
@@ -291,8 +302,10 @@ if [ -d "$DEST" ]; then
       fail "ロック（${LOCK}）を作れない: ${lock_error}"
     fi
   done
-  LOCK_HELD=1
   if [ "$MODE" = install ]; then
+    # 公開するリンクの置き場所（bin）がリンクなら、リンクの先の共有の場所を書き換えずに、導入を変える前に止める
+    # （導入先自体のリンクは認める）
+    [ ! -L "$DEST/bin" ] || fail "${DEST}/bin がシンボリックリンク。削除してから実行し直す"
     WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
   fi
 fi
