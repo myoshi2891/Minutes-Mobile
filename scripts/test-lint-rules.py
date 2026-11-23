@@ -51,10 +51,16 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
 
     規則名の行は末尾のコメント（「# …」）を許す。字下げ 2 の行で規則名として読めないものは、
     規則を黙って読み飛ばさないよう errors に入れる。
+    規則の属性（excluded など）は、規則名の直下の階層（最初の属性の行の字下げ）で判定する。この検査と excluded_patterns が
+    読めるのは字下げ 4 の属性と字下げ 6 の excluded の項目だけなので、ほかの字下げで書いた属性・項目は、YAML として正しくても
+    読み落とさないよう errors に入れる（excluded を見落として例外のない規則と取り違えない）。
     """
     rules: Dict[str, bool] = {}
     in_block = False
     current = ""
+    attribute_indent: Optional[int] = None  # 規則の属性の階層の字下げ（規則ごとに最初の属性の行で決める）
+    in_excluded = False  # excluded の値（項目の並び）の中
+    excluded_key = re.compile(r"""(?:excluded|'excluded'|"excluded")\s*:""")
     for line in config_text.splitlines():
         if re.match(r"^custom_rules:\s*(?:#.*)?$", line):
             in_block = True
@@ -69,11 +75,27 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
         if name:
             current = name.group(1)
             rules[current] = False
+            attribute_indent = None
+            in_excluded = False
         elif re.match(r"^  [^\s#]", line):
             errors.append(f".swiftlint.yml の custom_rules の行を規則名として読めない: {line.strip()}")
-        # 「excluded :」のようにコロンの前の空白も許す。引用符で囲んだ鍵（'excluded'・"excluded"）も同じ鍵として扱う
-        elif current and re.match(r"""^    (?:excluded|'excluded'|"excluded")\s*:""", line):
-            rules[current] = True
+        elif current and not line.lstrip(" ").startswith("#"):
+            indent = len(line) - len(line.lstrip(" "))
+            body = line.strip()
+            if attribute_indent is None:
+                attribute_indent = indent
+                if indent != 4:
+                    errors.append(f".swiftlint.yml の規則 {current} の属性は字下げ 4 で書く（字下げ {indent} は読めない）: {body}")
+            if in_excluded and body.startswith("-") and indent != 6:
+                # YAML は属性と同じ字下げの項目の並びも認めるが、excluded_patterns は字下げ 6 の項目だけを読む
+                errors.append(f".swiftlint.yml の規則 {current} の excluded の項目は字下げ 6 で書く（字下げ {indent} は読めない）: {body}")
+            elif indent == attribute_indent:
+                # 「excluded :」のようにコロンの前の空白も許す。引用符で囲んだ鍵（'excluded'・"excluded"）も同じ鍵として扱う
+                in_excluded = excluded_key.match(body) is not None
+                if in_excluded:
+                    rules[current] = True
+            elif excluded_key.match(body) and indent < attribute_indent:
+                errors.append(f".swiftlint.yml の規則 {current} の excluded の字下げ {indent} が属性の階層と違う: {body}")
     return rules
 
 
