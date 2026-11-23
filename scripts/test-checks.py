@@ -395,6 +395,16 @@ def test_settings() -> None:
                   plists={"Config/App-Settings.plist": mic_variable})
     settings_case("plist の値の変数を展開できない", 1, "NSMicrophoneUsageDescription がない", project=with_file,
                   plists={"Config/App-Settings.plist": mic_variable})
+    # ビルドが参照先の plist の変数を展開しない構成では、空でない値に展開される変数でも認めない（向きの検査と同じ）。
+    # 変数を含まない値は、展開しない構成でも認める
+    mic_expansion = lambda value: lambda t: replaced(define("会議を録音します。")(t), '"GENERATE_INFOPLIST_FILE": "NO",',  # noqa: E731
+                                                     f'"GENERATE_INFOPLIST_FILE": "NO",\n        "INFOPLIST_EXPAND_BUILD_SETTINGS": "{value}",')
+    settings_case("plist の変数を展開しない構成のマイクの利用目的の変数", 1, "変数が展開されない", project=mic_expansion("NO"),
+                  plists={"Config/App-Settings.plist": mic_variable})
+    settings_case("plist の変数を展開する構成のマイクの利用目的の変数", 0, "OK", project=mic_expansion("YES"),
+                  plists={"Config/App-Settings.plist": mic_variable})
+    settings_case("plist の変数を展開しない構成の変数のないマイクの利用目的", 0, "OK", project=mic_expansion("NO"),
+                  plists={"Config/App-Settings.plist": microphone})
     settings_case("ビルド設定の値の変数を展開できない", 1, "NSMicrophoneUsageDescription がない",
                   project=lambda t: replaced(t, '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",',
                                              '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "$(MIC_TEXT)",'))
@@ -1012,6 +1022,15 @@ def test_dependencies() -> None:
             module.content_digest(framework)
         except module.Unreadable as error:
             failures.append(f"dependencies: 成果物の中を指すリンクを拒否した: {error}")
+        # リンクの内容はリンク先の生の文字列で記録する（末尾の「/」の有無で違う内容とする。Path にして違いを消さない）
+        count += 1
+        plain = module.content_digest(framework)
+        (framework / "Current").unlink()
+        (framework / "Current").symlink_to("ios/")
+        if module.content_digest(framework) == plain:
+            failures.append("dependencies: 末尾の「/」だけが違うリンクを同じ内容のハッシュにした")
+        (framework / "Current").unlink()
+        (framework / "Current").symlink_to("ios")
         for label, target in {"外の相対パス": "../../outside", "絶対パス": "/etc/hosts", "外を指すリンクの連鎖": "Chain"}.items():
             (framework / "Bad").unlink() if (framework / "Bad").is_symlink() else None
             if label == "外を指すリンクの連鎖":
@@ -1467,6 +1486,8 @@ def stage_tool_stubs(repository: Path) -> None:
     stub = repository / "scripts" / "setup-tools.sh"
     stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     stub.chmod(0o755)
+    # ステージした内容を書き出す一時ディレクトリの置き場所も、本物の判定で確かめる（check.sh の make_staged_tree）
+    copy_location_script(repository)
 
 
 def copy_location_script(repository: Path) -> None:
@@ -1604,7 +1625,8 @@ def staged_index_change_case() -> None:
     検査が読む専用のインデックス（引き継いだ GIT_INDEX_FILE）を変えた場合と、外から本来のインデックスを変えた場合の両方。
     """
     global count
-    for target in ("専用のインデックス", "本来のインデックス"):
+    # HEAD: ステージした内容は変えずに HEAD だけを進める（ステージしたファイルを選んだ基点が変わる。HEAD がまだない状態から）
+    for target in ("専用のインデックス", "本来のインデックス", "HEAD"):
         staged_index_change_run(target)
 
 
@@ -1621,9 +1643,11 @@ def staged_index_change_run(target: str) -> None:
         stage_tool_stubs(repository)
         # 文書の整合の代わり: 検査の途中で作業ツリーの変更をステージする（手順 10 の後、合格の表示の前にインデックスが変わる）
         # 本来のインデックスは、検査が設定した GIT_INDEX_FILE を外して（git が選ぶ既定のインデックスで）変える
-        stage = "git add doc.md" if target == "専用のインデックス" else "env -u GIT_INDEX_FILE git add doc.md"
-        (repository / "scripts" / "verify-docs.py").write_text(
-            f'#!/bin/sh\nprintf changed > doc.md && {stage}\n', encoding="utf-8")
+        stage = {"専用のインデックス": "printf changed > doc.md && git add doc.md",
+                 "本来のインデックス": "printf changed > doc.md && env -u GIT_INDEX_FILE git add doc.md",
+                 "HEAD": "env -u GIT_INDEX_FILE git -c user.name=test -c user.email=test@example.invalid "
+                         "-c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m moved"}[target]
+        (repository / "scripts" / "verify-docs.py").write_text(f'#!/bin/sh\n{stage}\n', encoding="utf-8")
         gitleaks = repository / ".tools" / "bin" / "gitleaks"
         gitleaks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         for path in (repository / "scripts" / "check.sh", repository / "scripts" / "verify-docs.py", gitleaks):
@@ -1638,8 +1662,72 @@ def staged_index_change_run(target: str) -> None:
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], cwd=repository, capture_output=True,
                                 text=True, env=env, timeout=60)
         output = result.stdout + result.stderr
-        if result.returncode != 1 or "ステージした内容が変わった" not in output or "コミット前の検査を通過" in output:
+        want = "検査中に HEAD が変わった" if target == "HEAD" else "ステージした内容が変わった"
+        if result.returncode != 1 or want not in output or "コミット前の検査を通過" in output:
             failures.append(f"check: --staged が検査中に{target}が変わっても合格にする（終了コード {result.returncode}）\n"
+                            f"{output.strip()}")
+
+
+def staged_setup_tools_case() -> None:
+    """check.sh --staged とコミット前のフックが、照合にステージした scripts/setup-tools.sh を使うこと（作業ツリーのものを使わない）。
+
+    ステージした setup-tools.sh は照合に失敗し（exit 1）、作業ツリーのものは成功する（exit 0）一時のリポジトリで、
+    どちらも照合の失敗で止まることを確かめる（作業ツリーのものを使う実装は通ってしまう）。
+    """
+    global count
+    for runner in ("check.sh --staged", "pre-commit"):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            (repository / ".tools" / "bin").mkdir(parents=True)
+            (repository / ".githooks").mkdir()
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            hook = repository / ".githooks" / "pre-commit"
+            hook.write_text((ROOT / ".githooks" / "pre-commit").read_text(encoding="utf-8"), encoding="utf-8")
+            for path in (repository / "scripts" / "check.sh", hook):
+                path.chmod(0o755)
+            stage_tool_stubs(repository)
+            setup = repository / "scripts" / "setup-tools.sh"
+            setup.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "add", "-A"], env=env, check=True, capture_output=True)
+            setup.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")  # 作業ツリーだけを照合の成功に戻す（ステージし直さない）
+            command = [str(repository / "scripts" / "check.sh"), "--staged"] if runner != "pre-commit" else [str(hook)]
+            result = subprocess.run(command, cwd=repository, capture_output=True, text=True, env=env, timeout=60)
+            output = result.stdout + result.stderr
+            if result.returncode != 1 or "tools/versions" not in output or "コミット前の検査を通過" in output:
+                failures.append(f"check: {runner} がステージした setup-tools.sh で照合しない（終了コード {result.returncode}）\n"
+                                f"{output.strip()}")
+
+
+def staged_tree_location_case() -> None:
+    """check.sh --staged が、ステージした内容を書き出す一時ディレクトリを作業ツリーの中に作ったら（TMPDIR が作業ツリーの中）、
+    書き出す前に止めること（--require-clean の専用の作業ツリーと同じ置き場所の判定）。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools" / "bin").mkdir(parents=True)
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "check.sh").chmod(0o755)
+        stage_tool_stubs(repository)
+        (repository / ".gitignore").write_text("/.tools\n/tmp\n", encoding="utf-8")
+        (repository / "Sample.swift").write_text("let value = 1\n", encoding="utf-8")
+        (repository / "tmp").mkdir()
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), "add", "-A"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], cwd=repository, capture_output=True,
+                                text=True, env=dict(env, TMPDIR=str(repository / "tmp")), timeout=60)
+        output = result.stdout + result.stderr
+        if result.returncode != 1 or "ステージした内容の一時の置き場所" not in output:
+            failures.append(f"check: --staged が作業ツリーの中の一時ディレクトリに書き出す（終了コード {result.returncode}）\n"
                             f"{output.strip()}")
 
 
@@ -1679,6 +1767,28 @@ SIM_X = "11111111-2222-4333-8444-555555555555"
 SIM_Y = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
 
 
+def lint_rules_config_cases() -> None:
+    """test-lint-rules.py が規則の excluded を属性の階層で読み、読めない字下げの属性・項目を黙って読み落とさないこと。"""
+    global count
+    spec = importlib.util.spec_from_file_location("test_lint_rules", SCRIPTS / "test-lint-rules.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for label, text, want_rules, want_error in (
+        ("字下げ 4 の excluded", "custom_rules:\n  rule_a:\n    regex: x\n    excluded:\n      - a\n", {"rule_a": True}, ""),
+        ("字下げ 6 の属性", "custom_rules:\n  rule_a:\n      regex: x\n      excluded:\n        - a\n", None, "字下げ 4 で書く"),
+        ("字下げ 4 の excluded の項目", "custom_rules:\n  rule_a:\n    excluded:\n    - a\n", None, "字下げ 6 で書く"),
+        ("字下げ 3 の excluded", "custom_rules:\n  rule_a:\n    regex: x\n   excluded:\n      - a\n", None, "属性の階層と違う"),
+    ):
+        count += 1
+        errors: List[str] = []
+        rules = module.custom_rules(text, errors)
+        if want_error and not any(want_error in message for message in errors):
+            failures.append(f"lint-rules: {label}: 読めない字下げを報告しない（{errors}・{rules}）")
+        if not want_error and (errors or rules != want_rules):
+            failures.append(f"lint-rules: {label}: 期待と違う（{errors}・{rules}）")
+
+
 def simulator_cases() -> None:
     """find-simulator.py が、形の違う一覧を取得の失敗（終了コード 2）とし、正しい空の一覧を候補なし（1）とすること。"""
     global count
@@ -1693,6 +1803,8 @@ def simulator_cases() -> None:
         ("devices の項目が辞書でない", {"runtimes": [runtime], "devices": {"r": ["x"]}}, 2),
         ("devices の値が配列でない", {"runtimes": [runtime], "devices": {"r": "x"}}, 2),
         ("空の一覧は候補なし", {"runtimes": [], "devices": {}}, 1),
+        # 深い入れ子の一覧は json の読み込みが RecursionError になる。取得の失敗（2）として報告する（文字列はそのまま一覧として書く）
+        ("深い入れ子の一覧", "[" * 100000 + "]" * 100000, 2),
         *sim_cases_extra,
         # 使えるかの値は真偽値であること（文字列の "false" を真と取り違えない）
         ("runtimes の isAvailable が文字列", {"runtimes": [dict(runtime, isAvailable="false")], "devices": {}}, 2),
@@ -1738,7 +1850,8 @@ def simulator_cases() -> None:
     ):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / "listing.json").write_text(json.dumps(listing), encoding="utf-8")
+            (Path(directory) / "listing.json").write_text(listing if isinstance(listing, str) else json.dumps(listing),
+                                                           encoding="utf-8")
             stub = Path(directory) / "xcrun"
             # 一覧は実行時に自身の位置から読む（一時ディレクトリのパスをシェルの本文に埋め込まない）
             stub.write_text('#!/bin/sh\ncat "$(dirname "$0")/listing.json"\n', encoding="utf-8")
@@ -1848,6 +1961,8 @@ def test_versions() -> None:
     setup_include_case()
     staged_symlink_case()
     staged_index_change_case()
+    staged_tree_location_case()
+    staged_setup_tools_case()
     staged_raw_blob_case()
     staged_raw_tree_case()
     coverage_record_message_case()
@@ -1865,6 +1980,7 @@ def test_versions() -> None:
         for value in ("11", "0,99999999999999999999", "0-99999999999999999999", "99999999999999999999-0", "0,010"):
             expect(f"check: 範囲外の --steps（{value!r}）", [str(copy), "--steps", value], 2, "使い方", timeout=30)
     simulator_cases()
+    lint_rules_config_cases()
     setup = str(SCRIPTS / "setup-tools.sh")
     tools = str(ROOT / ".tools")
     original = (ROOT / "tools" / "versions").read_text(encoding="utf-8")
@@ -1938,6 +2054,24 @@ def test_versions() -> None:
         leftovers = sorted(path.name for path in dest.iterdir()) if dest.is_dir() else []
         if leftovers:
             failures.append(f"versions: 不正な台帳で導入先に {leftovers} を作った（検証の前に導入した）")
+    # 公開するリンクを更新できないときは失敗し、既存のリンクと導入を残す（一時の名前のリンクを rename で置き換える）。
+    # 導入済みの写しで行う（取得しないので通信しない）
+    with tempfile.TemporaryDirectory() as directory:
+        dest = Path(directory) / "dest"
+        dest.mkdir()
+        for entry in Path(tools).iterdir():
+            if entry.name in (".install.lock",) or entry.name.startswith(".work."):
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.copytree(entry, dest / entry.name, symlinks=True)
+            else:
+                shutil.copy2(entry, dest / entry.name, follow_symlinks=False)
+        (dest / "bin").chmod(0o555)
+        try:
+            expect("versions: 公開するリンクを更新できない", [setup, "--dest", str(dest)], 1, "公開するリンク")
+        finally:
+            (dest / "bin").chmod(0o755)
+        expect("versions: 更新できなかった後もリンクと導入が残る", [setup, "--verify", "--dest", str(dest)], 0, "OK")
     # タブ区切りの台帳も同じに読む（列を空白文字の種類で決めない）
     tabbed = "\n".join(line if line.startswith("#") else "\t".join(line.split()) for line in original.splitlines()) + "\n"
     for label, text, want_code, want_text in (
@@ -2393,6 +2527,35 @@ def gitleaks_suppression_cases() -> None:
             failures.append(f"gitleaks: 引き継いだ GIT_DIR のリポジトリを検査した（終了コード {result.returncode}）")
 
 
+def step3_tool_verify_case() -> None:
+    """check.sh が手順 0 なしで手順 3 を実行するとき、先に開発ツールを照合し、照合に失敗したら手順 3 を実行しないこと。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        out = Path(directory) / "recorded"
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repository / "scripts" / "setup-tools.sh").write_text("#!/bin/sh\necho 'NG: 照合の代わりが失敗' >&2\nexit 1\n",
+                                                               encoding="utf-8")
+        (repository / "scripts" / "gitleaks-history.sh").write_text('#!/bin/sh\necho called > "$MINUTES_TEST_OUT"\n',
+                                                                    encoding="utf-8")
+        for name in ("check.sh", "test-checks.py", "setup-tools.sh", "gitleaks-history.sh"):
+            (repository / "scripts" / name).chmod(0o755)
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "--allow-empty",
+                        "-m", "base"], env=env, check=True, capture_output=True)
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "3"], capture_output=True, text=True,
+                                env=dict(env, MINUTES_TEST_OUT=str(out)), timeout=60)
+        if result.returncode != 1 or out.exists() or "照合の代わりが失敗" not in result.stderr:
+            failures.append(f"gitleaks: 手順 0 なしの手順 3 が開発ツールを照合せずに実行した（終了コード {result.returncode}・"
+                            f"記録 {out.exists()}）\n{(result.stdout + result.stderr).strip()}")
+
+
 def step3_history_case() -> None:
     """check.sh の手順 3 が、履歴の検査に scripts/gitleaks-history.sh を作業ツリーの起点で呼ぶこと。
 
@@ -2410,6 +2573,9 @@ def step3_history_case() -> None:
         out = Path(directory) / "recorded"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        # 手順 0 なしで手順 3 を実行するので、check.sh は先に開発ツールを照合する。照合の代わり（成功する）を置く
+        (repository / "scripts" / "setup-tools.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (repository / "scripts" / "setup-tools.sh").chmod(0o755)
         # 履歴の検査の代わり: 実行した場所と引数（1 行に 1 つ）を記録する
         (repository / "scripts" / "gitleaks-history.sh").write_text(
             '#!/bin/sh\n{ pwd -P; for argument in "$@"; do printf \'%s\\n\' "$argument"; done; } > "$MINUTES_TEST_OUT"\n',
@@ -2463,6 +2629,7 @@ def gitleaks_merge_case() -> None:
     gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
     history = str(SCRIPTS / "gitleaks-history.sh")
     step3_history_case()
+    step3_tool_verify_case()
     count += 1
     # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
     normal_key = "ghp_" + "a8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
@@ -2552,6 +2719,8 @@ def test_coverage() -> None:
     coverage_case("目標にわずかに届かない", 0, "行 89.96%", 10000, 8996, target="90")
     coverage_case("小数の目標", 0, "目標の 90.5% に届いていない", 20, 18, target="90.5")
     coverage_case("深い入れ子の記録", 2, "RecursionError", 20, 19, nested=True)
+    # 大きな行数でも、割ってから 100 を掛けるので float への変換の途中で桁あふれしない
+    coverage_case("大きな行数", 0, "行 50.0%", 2 * 10**400, 10**400)
     coverage_symlink_case()
 
 
@@ -2850,6 +3019,36 @@ def reread_partial_failure_case() -> None:
         failures.append("docs: 先の文書の読み直しの失敗の後に、後の文書が書き直されない")
     if not any(detailed in message and "読み直せない" in message for message in checker.errors):
         failures.append(f"docs: 先の文書の読み直しの失敗をそのパスで報告しない（{checker.errors}）")
+
+
+def readlink_failure_case() -> None:
+    """文書の解決の経路のリンク先を読めない（os.readlink の OSError）とき、その文書のパスで報告して読まず、ほかの文書を続けること。"""
+    global count
+    count += 1
+    directory = docs_case("リンク先を読めない文書の準備（整合した文書）", 0, "OK")
+    (directory / "docs/extra.md").symlink_to("02-basic-design/sample.md")
+    spec = importlib.util.spec_from_file_location("verify_docs", SCRIPTS / "verify-docs.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    checker = module.Checker(directory.resolve())
+    original = module.os.readlink
+
+    def failing(path: object) -> str:
+        raise PermissionError(13, "読めない", str(path))
+
+    module.os.readlink = failing
+    try:
+        checker.load()
+    except OSError as error:
+        failures.append(f"docs: リンク先を読めない文書で例外が送出された: {error!r}")
+        return
+    finally:
+        module.os.readlink = original
+    if not any(message.startswith("docs/extra.md: 文書を読まない") for message in checker.errors):
+        failures.append(f"docs: リンク先を読めない文書をそのパスで報告しない（{checker.errors}）")
+    if "docs/02-basic-design/sample.md" not in checker.texts:
+        failures.append("docs: リンク先を読めない文書の後に、ほかの文書を読まない")
 
 
 def unreadable_directory_case() -> None:
@@ -3310,6 +3509,16 @@ def run_docs_cases() -> None:
               extra={"docs/02-basic-design/design(v2).txt": "v2\n"})
     docs_case("括弧を含むリンク先がない", 1, "リンクの先がない: missing(v2).txt", basic, "[要件](../01-requirements/requirements.md)",
               "[要件](../01-requirements/requirements.md) [版 2](missing(v2).txt)")
+    # エスケープした括弧（\\(・\\)）は括弧の対として数えず、エスケープを戻してから解決する（しない括弧と同じファイルを指す）
+    docs_case("エスケープした括弧を含むリンク先", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+              "[要件](../01-requirements/requirements.md) [版 2](design\\(v2\\).txt) [片](design\\(v2.txt)",
+              extra={"docs/02-basic-design/design(v2).txt": "v2\n", "docs/02-basic-design/design(v2.txt": "v2\n"})
+    docs_case("エスケープした括弧を含むリンク先がない", 1, "リンクの先がない: missing(v2.txt", basic,
+              "[要件](../01-requirements/requirements.md)", "[要件](../01-requirements/requirements.md) [片](missing\\(v2.txt)")
+    # 印と見出しの文の間がタブの見出しも節として数え、冒頭の「満たす要件:」を確かめる
+    docs_case("タブで区切った節の見出し", 1, "節「3a. 補足」の冒頭に「満たす要件:」の行がない", basic,
+              "## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n", "## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n##\t3a. 補足\n\n本文\n\n")
+    readlink_failure_case()
     # 表は空行か別のブロックの始まりまで続き、「|」を含まない行もデータ行になる（GFM と同じ）
     docs_case("「|」を含まない表の行の定義", 1, "定義が重複", requirements, "| CON-01 | 制約 |\n", "| CON-01 | 制約 |\nCON-01\n")
     # 複数行の HTML のコメントの中の表は、対応表・定義として数えない

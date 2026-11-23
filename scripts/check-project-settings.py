@@ -360,6 +360,15 @@ def check_plist_values(
                         lacking = True
                         continue
                     value = data[key]
+                    # ビルドが参照先の plist の変数を展開しない（INFOPLIST_EXPAND_BUILD_SETTINGS が NO）、または展開するかを
+                    # 決められない構成・SDK では、変数を含む値を展開後の値で認めない（向きの検査と同じ。ビルドの結果に変数の
+                    # 文字列がそのまま残りうる）。変数を含まない値は、これまでどおり空でなければ認める
+                    if (isinstance(value, str) and VARIABLE.search(value)
+                            and plist_expansion(own, shared, configuration, sdk) is not True):
+                        lacking = True
+                        unresolved.setdefault(f"{source} の {key}（{EXPAND_PLIST_SETTING} で変数が展開されない構成）",
+                                              []).append(build)
+                        continue
                     expanded = expand_value(value, own, shared, configuration, sdk) if isinstance(value, str) else ""
                     if expanded is None:
                         lacking = True

@@ -75,7 +75,8 @@ def main() -> int:
     if total == 0:
         print(f"NG: {arguments.sources} 配下に数える行がない", file=sys.stderr)
         return 2
-    percent = 100.0 * sum(covered for _, covered in lines) / total
+    # 先に割ってから 100 を掛ける（大きな整数の行数を float に直す途中で OverflowError にしない。整数どうしの割り算は正確に丸める）
+    percent = sum(covered for _, covered in lines) / total * 100.0
     target = target_text(arguments.target)
     print(f"カバレッジ（{arguments.sources}）: 行 {shown(percent, arguments.target)}%（{len(lines)} ファイル・目標 {target}%）")
     if percent < arguments.target:

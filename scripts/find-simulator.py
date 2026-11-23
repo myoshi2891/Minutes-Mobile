@@ -94,7 +94,8 @@ def main() -> int:
         for _, name, udid in candidates:
             if not isinstance(name, str) or not isinstance(udid, str) or not UDID.fullmatch(udid):
                 raise TypeError(f"シミュレータの name・udid の形が違う: {name!r}, {udid!r}")
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+    # 深い入れ子の一覧は json の読み込みが RecursionError になる（形の違う一覧と同じく取得の失敗として扱う）
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, RecursionError, KeyError, TypeError, ValueError) as error:
         print(f"NG: シミュレータの一覧を取得できない: {error!r}", file=sys.stderr)
         return 2
     if not candidates:

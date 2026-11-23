@@ -167,17 +167,44 @@ install_tool() {
       if [ -n "$backup" ]; then mv "$backup" "$target" || echo "NG: 退避した $name の導入を戻せない（${backup}）" >&2; fi
       fail "$name の導入を置き換えられない。既存の導入は残す"
     fi
-    if [ -n "$backup" ]; then rm -rf -- "${backup:?}"; fi
-    PENDING_TARGET=""
-    PENDING_BACKUP=""
+    # 退避した旧い導入は、公開するリンクの更新が成功するまで消さない（下の publish_link。失敗したら戻す）
   fi
-  mkdir -p "$DEST/bin"
-  # 公開するリンクの位置に実体のディレクトリがあると、ln -sfn はその中にリンクを作り、位置のリンクを更新しない。
+  publish_link "$name" "$version" "$binary"
+  # リンクを更新できたので、退避した旧い導入を消す
+  if [ -n "$PENDING_BACKUP" ]; then rm -rf -- "${PENDING_BACKUP:?}"; fi
+  PENDING_TARGET=""
+  PENDING_BACKUP=""
+}
+
+# 置き換えの途中で失敗したとき、置いた新しい導入をどけて、退避した旧い導入を元の場所に戻す（既存のリンクは同じ版の
+# ディレクトリを指すので、戻せばリンクの先も元の導入になる）。退避していなければ何もしない
+restore_backup() {
+  [ -n "$PENDING_BACKUP" ] && [ -e "$PENDING_BACKUP" ] || return 0
+  rm -rf -- "${PENDING_TARGET:?}" || { echo "NG: 置いた導入をどけられない（${PENDING_TARGET}）" >&2; return 1; }
+  mv "$PENDING_BACKUP" "$PENDING_TARGET" || { echo "NG: 退避した導入を戻せない（${PENDING_BACKUP}）" >&2; return 1; }
+  PENDING_TARGET=""
+  PENDING_BACKUP=""
+}
+
+# 公開するリンク（$DEST/bin/<名前>）を、導入先の実行ファイルに向ける。新しいリンクを同じディレクトリの一時の名前で作り、
+# rename（mv）で置き換える（途中で失敗しても既存のリンクを壊さない）。失敗したら退避した旧い導入を戻して止める
+publish_link() {
+  local name=$1 version=$2 binary=$3 link="$DEST/bin/$1" temporary="$DEST/bin/.$1.link.$$"
+  if ! mkdir -p "$DEST/bin"; then restore_backup || true; fail "$DEST/bin を作れない。既存の導入は残す"; fi
+  # 公開するリンクの位置に実体のディレクトリがあると、mv はその中にリンクを移し、位置のリンクを更新しない。
   # 既存のシンボリックリンクは更新してよい
-  if [ -d "$DEST/bin/$name" ] && [ ! -L "$DEST/bin/$name" ]; then
-    fail "$DEST/bin/$name がディレクトリ（シンボリックリンクでない）。削除してから実行し直す"
+  if [ -d "$link" ] && [ ! -L "$link" ]; then
+    restore_backup || true
+    fail "$link がディレクトリ（シンボリックリンクでない）。削除してから実行し直す"
   fi
-  ln -sfn "../$name/$version/$binary" "$DEST/bin/$name"
+  # ディレクトリを指すリンクは、mv がリンクの先のディレクトリの中へ移してしまうので、先に外す（壊れた導入の場合だけ）
+  if [ -L "$link" ] && [ -d "$link" ]; then rm -f -- "$link"; fi
+  rm -f -- "$temporary"
+  if ! ln -s "../$name/$version/$binary" "$temporary" || ! mv -f -- "$temporary" "$link"; then
+    rm -f -- "$temporary"
+    restore_backup || true
+    fail "$name の公開するリンク（${link}）を更新できない。既存の導入とリンクは残す"
+  fi
 }
 
 # 置き換えの途中の導入先と退避先（install_tool が設定し、置き換えが終わったら空に戻す）
@@ -198,16 +225,9 @@ if [ -d "$DEST" ]; then
   # 解放するのは LOCK_HELD が立った後、つまり自分が取得したロックだけ
   cleanup() {
     local status=$?
-    # 置き換えの途中で終わった場合: 新しい導入がまだ置かれていなければ退避した旧い導入を戻し、
-    # 置かれていれば新しい導入を残して退避を消す
-    if [ -n "$PENDING_BACKUP" ] && [ -e "$PENDING_BACKUP" ]; then
-      if [ ! -e "$PENDING_TARGET" ]; then
-        mv "$PENDING_BACKUP" "$PENDING_TARGET" || echo "NG: 退避した導入を戻せない（${PENDING_BACKUP}）" >&2
-      else
-        # 削除の失敗で終了処理を止めない（set -e でロックの解放を飛ばさない）。失敗はパスとともに記録する
-        rm -rf -- "${PENDING_BACKUP:?}" || echo "NG: 退避した導入を削除できない（${PENDING_BACKUP}）" >&2
-      fi
-    fi
+    # 置き換えの途中（公開するリンクの更新が成功する前）で終わった場合: 新しい導入を置いていればどけて、退避した旧い導入を
+    # 戻す（退避はリンクの更新が成功した後にだけ消す）。失敗は restore_backup がパスとともに記録し、終了処理は止めない
+    restore_backup || true
     if [ -n "$WORK" ]; then rm -rf -- "${WORK:?}" || echo "NG: 作業場所を削除できない（${WORK}）" >&2; fi
     # 自分が取得したロックだけを解放する（ロックを待っている間に終わった場合は、他の実行のロックを消さない）
     if [ -n "$LOCK_HELD" ]; then rmdir "$LOCK" 2>/dev/null || true; fi

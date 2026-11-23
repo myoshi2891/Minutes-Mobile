@@ -64,6 +64,8 @@ STAGED_GITLEAKS_CONFIG=""  # --staged のとき、インデックスにある .g
 STAGED_DOCS_TREE=""  # --staged のとき、文書の整合の検査のためにインデックス全体を書き出す一時ディレクトリ
 STAGED_SECRETS_TREE=""  # --staged のとき、秘密情報の検査のためにステージした blob をそのまま書き出す一時ディレクトリ
 STAGED_INDEX_TREE=""  # --staged のとき、開始時のインデックスのツリー（終了時に同じであることを確かめる）
+STAGED_HEAD=""  # --staged のとき、開始時の HEAD のコミット（HEAD がまだないなら空。終了時に同じであることを確かめる）
+STAGED_BASE=""  # --staged のとき、ステージしたファイルを選ぶ基点（開始時の HEAD。HEAD がまだないなら空のツリー）
 STAGED_TOOLS=""  # --staged のとき、開発ツールの写しと、照合に使うステージした台帳を置く一時ディレクトリ
 STAGED_INDEX_COPY=""  # --staged のとき、開始時のインデックスのツリーから作った専用のインデックス（検査はこれだけを読む）
 ORIGINAL_INDEX=""  # --staged のとき、本来のインデックスのファイル（終了時に開始時のツリーのままであることを確かめる）
@@ -137,6 +139,17 @@ if [ "$STAGED" = 1 ]; then
   # あることを確かめる（変わっていれば、コミットされる内容が検査した内容と違いうるので合格にしない）。
   # 未解決の衝突があればツリーを作れずに失敗する
   STAGED_INDEX_TREE=$(git write-tree) || fail "ステージした内容のツリーを作れない（未解決の衝突など）"
+  # ステージしたファイルを選ぶ基点を開始時に 1 回だけ決め、3 か所の git diff --cached で同じ基点を使う（検査の途中に HEAD が
+  # 変わっても、選ぶファイルの集合を変えない）。HEAD がまだない（最初のコミットの前）場合は空のツリーを基点にし、
+  # ステージしたファイルをすべて選ぶ。HEAD が読めない理由がまだないこと以外（壊れた参照など）なら止める
+  if STAGED_HEAD=$(git rev-parse --verify -q HEAD); then
+    STAGED_BASE=$STAGED_HEAD
+  elif git symbolic-ref -q HEAD > /dev/null && ! git rev-parse --verify -q "$(git symbolic-ref -q HEAD)" > /dev/null; then
+    STAGED_HEAD=""
+    STAGED_BASE=$(git hash-object -t tree /dev/null) || fail "空のツリーを作れない"
+  else
+    fail "開始時の HEAD を読めない（まだないのでもない）"
+  fi
   ORIGINAL_INDEX=$(git rev-parse --path-format=absolute --git-path index) || fail "インデックスの場所を特定できない"
   STAGED_INDEX_COPY=$(mktemp)
   rm -f -- "$STAGED_INDEX_COPY"
@@ -144,7 +157,7 @@ if [ "$STAGED" = 1 ]; then
   export GIT_INDEX_FILE="$STAGED_INDEX_COPY"
   staged_list=$(mktemp)
   # 種類の変更（T。通常のファイルとシンボリックリンクの入れ替えなど）も含める（下でインデックスのモードを確かめる）
-  if ! git diff --cached --name-only --diff-filter=ACMRT -z -- '*.swift' > "$staged_list"; then
+  if ! git diff --cached --name-only --diff-filter=ACMRT -z "$STAGED_BASE" -- '*.swift' > "$staged_list"; then
     rm -f -- "$staged_list"
     fail "ステージしたファイルの一覧を取得できない"
   fi
@@ -174,13 +187,34 @@ if [ "$STAGED" = 1 ]; then
   fi
 fi
 
+# ステージした内容を書き出す一時ディレクトリ（STAGED_TREE）を作る。作った直後、ファイルを書く前に、--require-clean の専用の
+# 作業ツリーと同じ判定（scripts/worktree-location.py check）で置き場所を確かめる。TMPDIR が作業ツリーの中や、SwiftFormat の
+# 設定（.swiftformat・.swift-version）のある場所の下を指すと、書き出した内容の整形・静的解析に別の設定が混ざるため。
+# 認めない・判定できない場合は止める。認めた場所では、書き出した内容の設定（インデックスの .swiftformat など）をそのまま使う。
+# 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
+make_staged_tree() {
+  local location_out location_status=0 checked="" temporary_root=${TMPDIR:-/tmp}
+  # 一時の置き場所は TMPDIR（なければ /tmp）の下に明示的に作る（--require-clean と同じ。mktemp -d の既定は TMPDIR を使わない
+  # 環境がある）。判定で止めた場合も、終了処理が消せるように先に控える
+  STAGED_TREE=$(mktemp -d "${temporary_root%/}/minutes-staged.XXXXXX")
+  location_out=$(mktemp)
+  "$ROOT/scripts/worktree-location.py" check "$STAGED_TREE" "$ROOT" > "$location_out" || location_status=$?
+  if [ "$location_status" = 0 ] && ! IFS= read -r -d '' checked < "$location_out"; then location_status=2; fi
+  rm -f -- "$location_out"
+  case $location_status in
+    0) STAGED_TREE=$checked ;;
+    1) fail "ステージした内容の一時の置き場所（${STAGED_TREE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
+    *) fail "ステージした内容の一時の置き場所（${STAGED_TREE}）が作業ツリーの中かを判定できない" ;;
+  esac
+}
+
 # ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
 # 設定（.swiftformat・各階層の .swiftlint.yml）もインデックスから同じ位置へ書き出し、入れ子の設定を作業ツリーと同じに解決させる。
 # 書き出すのはインデックスの blob そのもの（git cat-file blob。prepare_staged_secrets_tree と同じ）。checkout-index を通すと
 # .gitattributes の smudge のフィルタ・改行の変換が掛かり、整形・静的解析がステージした内容と違うものを検査しうる
 prepare_staged_tree() {
   local entries entry mode object path
-  STAGED_TREE=$(mktemp -d)
+  make_staged_tree
   entries=$(mktemp)
   # 一覧の取得の失敗を空の一覧として扱わない
   if ! git ls-files -s -z -- ':(glob)**/.swiftformat' ':(glob,icase)**/.swiftlint.yml' ':(glob)**/.swift-version' > "$entries" \
@@ -238,7 +272,7 @@ write_index_entries() {
 # 開発ツールは作業ツリーの .tools を指す（ツールは Git の管理外）
 prepare_rules_tree() {
   local directory entries
-  [ -n "$STAGED_TREE" ] || STAGED_TREE=$(mktemp -d)
+  [ -n "$STAGED_TREE" ] || make_staged_tree
   # blob のまま書き出す（write_index_entries）。試験のスクリプト（100755）は実行権限を保ち、下で直接実行する
   entries=$(mktemp)
   if ! git ls-files -s -z -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py > "$entries" \
@@ -266,7 +300,7 @@ prepare_staged_secrets_tree() {
   list=$(mktemp)
   entries=$(mktemp)
   # 一覧の取得の失敗を空の一覧として扱わない
-  if ! git diff --cached --name-only --diff-filter=ACMRT -z > "$list"; then
+  if ! git diff --cached --name-only --diff-filter=ACMRT -z "$STAGED_BASE" > "$list"; then
     rm -f -- "$list" "$entries"
     fail "ステージしたファイルの一覧を取得できない"
   fi
@@ -335,7 +369,7 @@ step_2() {
     fi
     # 規則・試験用のファイル・入れ子の設定・テストのディレクトリ（入れ子の設定の置き忘れを検査する）を変えたときだけ、
     # 規則の試験を回す。テストのディレクトリの一覧は prepare_rules_tree と scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
-    if git diff --cached --quiet -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+    if git diff --cached --quiet "$STAGED_BASE" -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
       MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; then return 0; fi
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
@@ -558,7 +592,9 @@ snapshot_staged_tools() {
   STAGED_TOOLS=$(mktemp -d)
   copy_tools "$ROOT/.tools" "$STAGED_TOOLS/.tools"
   git cat-file blob :tools/versions > "$STAGED_TOOLS/versions" || fail "ステージした tools/versions を読めない"
-  scripts/setup-tools.sh --verify --versions "$STAGED_TOOLS/versions" --dest "$STAGED_TOOLS/.tools" > /dev/null \
+  # 照合に使う setup-tools.sh もステージしたものを書き出して実行する（ステージしていない作業ツリーの変更で照合を変えない）
+  git cat-file blob :scripts/setup-tools.sh > "$STAGED_TOOLS/setup-tools.sh" || fail "ステージした scripts/setup-tools.sh を読めない"
+  /bin/bash "$STAGED_TOOLS/setup-tools.sh" --verify --versions "$STAGED_TOOLS/versions" --dest "$STAGED_TOOLS/.tools" > /dev/null \
     || fail "写した開発ツールがステージした tools/versions と一致しない。ステージした台帳で導入し直してからコミットする"
   TOOLS="$STAGED_TOOLS/.tools/bin"
 }
@@ -822,6 +858,22 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   exit 0
 fi
 
+# 固定した開発ツールを使う手順（1・2・3）を、照合する手順 0 なしで実行する場合も、使う導入がコミットした台帳（この作業ツリーの
+# tools/versions。専用の作業ツリーでは展開したコミットのもの、そこへ写した .tools）と一致することを先に確かめる（照合して
+# いない導入の結果で合格にしない）。手順 0 の自己試験（test-checks.py versions）は求めない。--staged は snapshot_staged_tools が
+# ステージした台帳と照合済み
+if [ "$STAGED" = 0 ]; then
+  uses_tools=""
+  runs_step_0=""
+  for step in $STEPS; do
+    case "$step" in 0) runs_step_0=1 ;; 1 | 2 | 3) uses_tools=1 ;; esac
+  done
+  if [ -n "$uses_tools" ] && [ -z "$runs_step_0" ]; then
+    echo "== 開発ツールの照合（手順 1〜3 が使う導入を tools/versions と照合する）"
+    scripts/setup-tools.sh --verify
+  fi
+fi
+
 for step in $STEPS; do
   echo "== 手順 $step: $(title "$step")"
   started=$SECONDS
@@ -837,6 +889,12 @@ if [ "$STAGED" = 1 ]; then
   end_index_tree=$(GIT_INDEX_FILE="$ORIGINAL_INDEX" git write-tree) || fail "終了時のステージした内容のツリーを作れない"
   if [ "$end_copy_tree" != "$STAGED_INDEX_TREE" ] || [ "$end_index_tree" != "$STAGED_INDEX_TREE" ]; then
     fail "検査中にステージした内容が変わった（開始時 ${STAGED_INDEX_TREE} / 終了時 ${end_index_tree}・検査したもの ${end_copy_tree}）。検査した内容と違うので合格にしない"
+  fi
+  # ステージしたファイルを選んだ基点（開始時の HEAD）が終了時も同じであること（変わっていれば、コミットされる差分と
+  # 検査したファイルの集合が違いうるので合格にしない）。HEAD がまだなかった場合は、終了時もまだないこと
+  end_staged_head=$(git rev-parse --verify -q HEAD) || end_staged_head=""
+  if [ "$end_staged_head" != "$STAGED_HEAD" ]; then
+    fail "検査中に HEAD が変わった（開始時 ${STAGED_HEAD:-まだない} / 終了時 ${end_staged_head:-まだない}）。検査したファイルの集合と違いうるので合格にしない"
   fi
   echo "OK: コミット前の検査を通過"
 else

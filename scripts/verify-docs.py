@@ -136,8 +136,9 @@ def visible(line: str) -> str:
     """同じ行で閉じる HTML のコメントを除いた、表示される部分（「満たす要件」の ID・「—」の判定に使う）。"""
     return INLINE_COMMENT.sub("", line)
 # 節（「## 」）と小節（「### 」）の見出し。字下げは空白 0〜3 個まで（CommonMark。4 個以上は字下げしたコードブロック）。
+# 印と見出しの文の間は空白かタブ（CommonMark。「##\t節」も節として数え、「満たす要件:」の検査から漏らさない）。
 # sections() と requirement_fields() が同じ判定を使う
-HEADING = re.compile(r"^ {0,3}(#{2,3}) (.*)$")
+HEADING = re.compile(r"^ {0,3}(#{2,3})[ \t](.*)$")
 
 
 def heading(line: str) -> Optional[Tuple[int, str]]:
@@ -222,6 +223,11 @@ def expand(match: "re.Match[str]") -> List[str]:
     return identifiers
 
 
+# バックスラッシュでエスケープできる文字（CommonMark の ASCII の句読点）と、リンク先のエスケープ
+ASCII_PUNCTUATION = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+LINK_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+
 def link_destinations(line: str) -> List[str]:
     """行の中のインラインのリンクのリンク先を返す。リンク先は山括弧で囲んだもの（<…>）か、空白を含まず括弧の対が
     とれたもの（design(v2).md の「)」をリンクの終わりと取り違えない。CommonMark と同じ）。その後にタイトルを書ける。"""
@@ -240,6 +246,10 @@ def link_destinations(line: str) -> List[str]:
         else:
             begin, depth = at, 0
             while at < len(line) and not line[at].isspace():
+                # エスケープした文字（「\(」「\)」など）は括弧の対として数えない（CommonMark）。エスケープは check_link が戻す
+                if line[at] == "\\" and at + 1 < len(line) and line[at + 1] in ASCII_PUNCTUATION:
+                    at += 2
+                    continue
                 if line[at] == "(":
                     depth += 1
                 elif line[at] == ")":
@@ -521,7 +531,11 @@ class Checker:
                     hops += 1
                     if hops > self.MAX_LINK_HOPS:
                         raise Rejected(f"{path} のシンボリックリンクが {self.MAX_LINK_HOPS} 段を超える（循環など）")
-                    target = os.readlink(candidate)
+                    try:
+                        target = os.readlink(candidate)
+                    except OSError as error:
+                        # lstat の失敗と同じく、その文書を読まない理由として報告し、ほかの文書の検査は続ける
+                        raise Rejected(f"{candidate} のリンク先を読めない: {error.strerror or error}") from error
                     if os.path.isabs(target):
                         if target != root and not target.startswith(root + os.sep):
                             raise Rejected(f"{candidate} のリンク先 {target} が起点の外にある")
@@ -725,6 +739,9 @@ class Checker:
         # 山括弧で囲んだリンク先（空白を含められる）は、山括弧を除いてから解決する
         if target.startswith("<") and target.endswith(">"):
             target = target[1:-1]
+        # Markdown のエスケープ（「\(」など）を戻してから解決する（エスケープした括弧と、しない括弧を同じファイル名として扱う）。
+        # パーセント符号化は、その後でこれまでどおり戻す
+        target = LINK_ESCAPE.sub(r"\1", target)
         if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
             return
         # パーセント符号化（%20 など）は、節へのリンクを分けた後に戻してから解決する（GitHub の表示と同じく、符号化した

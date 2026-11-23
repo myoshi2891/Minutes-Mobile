@@ -18,7 +18,15 @@ fi
 # 導入し直す手順は、ステージした台帳を一時ファイルに書き出して --versions で渡す（作業ツリーの台帳とステージした内容は変えない）。
 # 一時ファイルを消した後も、導入（または書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）
 reinstall='(versions=$(mktemp) || exit 1; git cat-file blob :tools/versions > "$versions" && scripts/setup-tools.sh --versions "$versions"; status=$?; rm -f -- "$versions"; exit "$status")'
-if ! "$root/scripts/setup-tools.sh" --verify --versions "$versions"; then
+# 照合に使う setup-tools.sh も、作業ツリーではなくステージしたもの（コミットする内容）を一時ファイルに書き出して実行する
+# （ステージしていない作業ツリーの変更で照合の結果を変えない）。--versions・--dest を渡すので、置き場所に依存しない
+setup=$(mktemp)
+trap 'status=$?; rm -f -- "$versions" "$setup" || true; exit "$status"' EXIT
+if ! git cat-file blob :scripts/setup-tools.sh > "$setup"; then
+  echo "NG: ステージした scripts/setup-tools.sh を読めない" >&2
+  exit 1
+fi
+if ! /bin/bash "$setup" --verify --versions "$versions" --dest "$root/.tools"; then
   echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。ステージした台帳で導入し直してからコミットする: ${reinstall}" >&2
   exit 1
 fi

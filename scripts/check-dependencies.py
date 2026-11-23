@@ -548,8 +548,10 @@ def content_digest(path: Path) -> str:
             if item.is_symlink():
                 # リンクは成果物の中を指すものだけを認める（ビルドはリンクをたどるので、外を指すリンクは
                 # 内容のハッシュに入らない外のファイルを成果物に取り込む）。連鎖したリンクもたどった先で判定する
-                link = item.readlink()
-                if link.is_absolute() or not resolved(item).is_relative_to(resolved(path)):
+                # 記録するのは os.readlink の生の文字列（Path にすると末尾の「/」などの違いが消え、別のリンクを同じ内容とみなす）。
+                # 外を指すかの判定は、これまでどおり解決した実体のパスで行う
+                link = os.readlink(item)
+                if os.path.isabs(link) or not resolved(item).is_relative_to(resolved(path)):
                     raise Unreadable(f"{item}: ローカルのバイナリの中のリンクが成果物の外を指す（{link}）")
                 entry = f"L\0{relative}\0{link}"
             elif item.is_file():

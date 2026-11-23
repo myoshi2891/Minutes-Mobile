@@ -43,7 +43,10 @@ if [ -n "$status_output" ]; then
   exit 1
 fi
 
-source_root=$(cd -P "$(git rev-parse --show-toplevel)" && pwd)  # 実体のパス（シンボリックリンクを解決したもの）
+# 実体のパス（シンボリックリンクを解決したもの）。$(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、
+# x と、git rev-parse・pwd が出力の区切りとして付けた改行 1 つだけを外す（パスの一部である末尾の改行は残す）
+toplevel=$(git rev-parse --show-toplevel && printf x) && toplevel=${toplevel%x} && toplevel=${toplevel%$'\n'}
+source_root=$(cd -P "$toplevel" && pwd && printf x) && source_root=${source_root%x} && source_root=${source_root%$'\n'}
 common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
 base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
 # 置き場所の判定（実体のパスへの解決・SwiftFormat の設定のある祖先の拒否・元のリポジトリと登録されたすべての作業ツリーの
