@@ -28,6 +28,8 @@ from xcproj import strip_trailing_commas  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
+# 開発ツールの場所。check.sh は照合した写しを MINUTES_TOOLS_DIR で渡す（なければリポジトリの .tools）
+TOOLS = Path(os.environ.get("MINUTES_TOOLS_DIR") or ROOT / ".tools")
 failures: List[str] = []
 count = 0
 
@@ -621,6 +623,10 @@ def test_dependencies() -> None:
     project = '{"targets": [], "packages": [{"location": "https://example.com/owner/sample-lib"},],}'
 
     dependencies_case("依存がない", 0, "OK", {})
+    # 名前が合うディレクトリは読めないものとする（manifest として検査できないものを、ないものとして通さない）
+    for name in ("Package.resolved", "Sub/Package.swift", "Package@swift-6.0.swift", "App.xcodeproj/project.xcproj"):
+        dependencies_case(f"{name} がディレクトリ", 2, "ディレクトリ", {f"{name}/keep.txt": ""})
+    dependencies_case("除外する場所の中の同じ名前のディレクトリ", 0, "OK", {".build/Package.swift/keep.txt": ""})
     dependencies_case("許可リストにない依存（Package.resolved）", 1, "sample-lib 1.2.3", {"Package.resolved": resolved})
     dependencies_case("承認済みの依存", 0, "OK", {"Package.resolved": resolved, "Package.swift": manifest}, [approved])
     dependencies_case("承認した版と違う", 1, "sample-lib 1.2.3", {"Package.resolved": resolved}, [dict(approved, version="1.2.2")])
@@ -1260,6 +1266,193 @@ def setup_guard_cases() -> None:
                             f"{result.stderr.strip()}")
 
 
+def setup_config_failure_case() -> None:
+    """setup.sh --hooks が、設定の事前の読み取りの失敗（鍵がない終了コード 1 以外）を「鍵がない」と扱わず、書く前に止まること。"""
+    global count
+    real = shutil.which("git")
+    assert real is not None
+    for pattern in ("--show-scope", "--local --includes", "--local --no-includes"):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository = setup_repository(directory, env)
+            shims = Path(directory) / "shims"
+            shims.mkdir()
+            (shims / "git").write_text(f'#!/bin/sh\ncase " $* " in *" {pattern} "*) exit 3 ;; esac\nexec "{real}" "$@"\n',
+                                       encoding="utf-8")
+            (shims / "git").chmod(0o755)
+            result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], capture_output=True, text=True,
+                                    env=dict(env, PATH=f"{shims}:{env['PATH']}"))
+            configured = subprocess.run(["git", "-C", str(repository), "config", "--local", "--get", "core.hooksPath"], env=env,
+                                        capture_output=True, text=True).stdout.strip()
+            if result.returncode != 1 or configured or "読み取れない" not in result.stderr:
+                failures.append(f"setup: 設定の読み取り（{pattern}）の失敗で止まらない（終了コード {result.returncode}・"
+                                f"設定「{configured}」）\n{result.stderr.strip()}")
+
+
+def require_clean_child_case() -> None:
+    """check.sh --require-clean が、入れ子の check.sh に開始時のコミットの --expect-head を最後に渡し、引き継いだ
+    GIT_INDEX_FILE（最初の照合だけに使う）を外して専用の作業ツリーを作ること（呼び出し側のインデックスを変えない）。
+
+    コミットした check.sh は引数と環境を記録する代わり。本物は作業ツリーにだけ置く（assume-unchanged で変更なしに見せる）。
+    """
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools").mkdir()
+        out = Path(directory) / "recorded"
+        check = repository / "scripts" / "check.sh"
+        check.write_text('#!/bin/sh\ncd "$(dirname "$0")/.." || exit 1\n'
+                         '{ echo "$*"; echo "${GIT_INDEX_FILE:-none}"; git status --porcelain; } > "$MINUTES_TEST_OUT"\n',
+                         encoding="utf-8")
+        check.chmod(0o755)
+        copy_location_script(repository)
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                   "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        git("init", "-q", "--template=", "-b", "main")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        head = git("rev-parse", "HEAD")
+        git("update-index", "--assume-unchanged", "scripts/check.sh")
+        check.write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        index = repository / ".git" / "caller-index"
+        shutil.copy2(repository / ".git" / "index", index)
+        result = subprocess.run([str(check), "--steps", "10", "--require-clean", "--expect-head", "main"], cwd=repository,
+                                capture_output=True, text=True, timeout=60,
+                                env=dict(env, GIT_INDEX_FILE=".git/caller-index", MINUTES_TEST_OUT=str(out)))
+        recorded = out.read_text(encoding="utf-8") if out.is_file() else ""
+        want = f"--steps 10 --require-clean --expect-head main --expect-head {head}\nnone\n"
+        listed = subprocess.run(["git", "-C", str(repository), "ls-files", "-v"], env=dict(env, GIT_INDEX_FILE=str(index)),
+                                capture_output=True, text=True).stdout
+        if result.returncode != 0 or recorded != want or "h scripts/check.sh" not in listed:
+            failures.append(f"check: --require-clean の入れ子の実行の引数・インデックスが違う（終了コード {result.returncode}・"
+                            f"記録 {recorded!r}・呼び出し側のインデックス {listed!r}）\n{result.stderr.strip()}")
+
+
+def ordinary_tools_snapshot_case() -> None:
+    """通常の check.sh の手順 1〜3 が、照合した開発ツールの写しだけを使うこと。
+
+    照合の代わりが照合の直後に元の .tools の中身を差し替える。手順 1〜3 と、手順 2・3 が呼ぶスクリプト（MINUTES_TOOLS_DIR）の
+    どれも差し替え前の写しを使い、写しが終了後に残らないこと、引き継いだ MINUTES_TOOLS_DIR を使わないことを確かめる。
+    """
+    global count
+    for steps in ("1-3", "0-3"):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            (repository / ".tools" / "bin").mkdir(parents=True)
+            out = Path(directory) / "recorded"
+            for name in ("swiftformat", "swiftlint", "gitleaks"):
+                tool = repository / ".tools" / "bin" / name
+                tool.write_text(f'#!/bin/sh\necho "{name} verified" >> "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+                tool.chmod(0o755)
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "setup-tools.sh").write_text(
+                '#!/bin/bash\necho "verify $*" >> "$MINUTES_TEST_OUT"\nfor name in swiftformat swiftlint gitleaks; do\n'
+                '  echo "echo swapped >> \\"$MINUTES_TEST_OUT\\"" > "$(dirname "$0")/../.tools/bin/$name"\ndone\n', encoding="utf-8")
+            (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (repository / "scripts" / "test-lint-rules.py").write_text('#!/bin/sh\n"$MINUTES_TOOLS_DIR/bin/swiftlint"\n',
+                                                                       encoding="utf-8")
+            (repository / "scripts" / "gitleaks-history.sh").write_text('#!/bin/sh\n"$MINUTES_TOOLS_DIR/bin/gitleaks"\n',
+                                                                        encoding="utf-8")
+            for path in (repository / "scripts").iterdir():
+                path.chmod(0o755)
+            for arguments in (["init", "-q", "--template=", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env,
+                               check=True, capture_output=True)
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", steps], capture_output=True, text=True,
+                                    timeout=60, env=dict(env, MINUTES_TEST_OUT=str(out), MINUTES_TOOLS_DIR="/nonexistent"))
+            recorded = out.read_text(encoding="utf-8").splitlines() if out.is_file() else []
+            verify = re.fullmatch(r"verify --verify --dest (/.*/\.tools)", recorded[0]) if recorded else None
+            want = ["swiftformat verified", "swiftlint verified", "swiftlint verified", "gitleaks verified"]
+            if result.returncode != 0 or recorded[1:] != want or verify is None or os.path.exists(verify.group(1)) \
+                    or Path(verify.group(1)) == repository.resolve() / ".tools" or (repository / ".tools" / ".install.lock").exists():
+                failures.append(f"check: 通常の実行（--steps {steps}）が照合した写しの開発ツールだけを使わない（終了コード "
+                                f"{result.returncode}・記録 {recorded}）\n{(result.stdout + result.stderr).strip()}")
+
+
+def tools_override_case() -> None:
+    """gitleaks-history.sh・test-lint-rules.py が、MINUTES_TOOLS_DIR の開発ツールを使うこと（check.sh が照合した写しを渡す手段）。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        tools = Path(directory) / "tools"
+        (tools / "bin").mkdir(parents=True)
+        env = isolated_git_env()
+        for name in ("gitleaks", "swiftlint"):
+            (tools / "bin" / name).write_text(f'#!/bin/sh\necho "override {name}" >&2\nexit 9\n', encoding="utf-8")
+            (tools / "bin" / name).chmod(0o755)
+        repository = Path(directory) / "repository"
+        subprocess.run(["git", "init", "-q", "--template=", str(repository)], env=env, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "base"], env=env, check=True,
+                       capture_output=True)
+        for name, command in (("gitleaks", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)]),
+                              ("swiftlint", [str(SCRIPTS / "test-lint-rules.py")])):
+            result = subprocess.run(command, capture_output=True, text=True, env=dict(env, MINUTES_TOOLS_DIR=str(tools)))
+            if result.returncode == 0 or f"override {name}" not in result.stderr:
+                failures.append(f"versions: {command[0]} が MINUTES_TOOLS_DIR の {name} を使わない（終了コード {result.returncode}）")
+
+
+def worktree_location_case() -> None:
+    """worktree-location.py が、git を起動できないとき理由を示して終了コード 2 になること（登録なしの 1 と取り違えない）。"""
+    for arguments in (["registered", str(ROOT), str(ROOT)], ["check", "/tmp/minutes-none", str(ROOT)]):
+        expect(f"worktree-location: git を起動できない（{arguments[0]}）",
+               ["/usr/bin/python3", str(SCRIPTS / "worktree-location.py"), *arguments], 2, "git を起動できない",
+               env=dict(os.environ, PATH="/nonexistent"))
+
+
+def pre_push_lock_case() -> None:
+    """プッシュ前のフックが、ロックの取得の途中の中断で自分のロックを残さず、取れなかったほかの実行のロックを消さないこと。
+
+    mkdir の代わりは、実際の mkdir の後（成功・失敗とも）にフックへ TERM を送る。
+    """
+    global count
+    for label, held in (("取得できた", False), ("取得できなかった", True)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository, base, shims = Path(directory) / "repository", Path(directory) / "base", Path(directory) / "shims"
+            (repository / "scripts").mkdir(parents=True)
+            shims.mkdir()
+            copy_location_script(repository)
+            hook = Path(directory) / "pre-push"
+            hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
+            hook.chmod(0o755)
+            for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env, check=True,
+                               capture_output=True)
+            head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+            sent = Path(directory) / "sent"
+            occupy = '/bin/mkdir -p "$1"; ' if held else ""
+            (shims / "mkdir").write_text(f'#!/bin/bash\ncase "$1" in\n  *.lock) {occupy}/bin/mkdir "$@"; result=$?; touch "{sent}"; '
+                                         'kill -TERM "$PPID"; sleep 1; exit "$result" ;;\nesac\nexec /bin/mkdir "$@"\n',
+                                         encoding="utf-8")
+            (shims / "mkdir").chmod(0o755)
+            result = subprocess.run([str(hook)], cwd=repository, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
+                                    capture_output=True, text=True, timeout=60,
+                                    env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_PRE_PUSH_DIR=str(base)))
+            locks = list(base.glob("*.lock"))
+            if result.returncode != 130 or not sent.exists() or len(locks) != (1 if held else 0):
+                failures.append(f"pre-push: ロックを{label}ときの中断の扱いが違う（終了コード {result.returncode}・"
+                                f"ロック {locks}）\n{result.stderr.strip()}")
+
+
 def setup_relative_case() -> None:
     """setup.sh を相対パスで実行しても、CDPATH によらずリポジトリの起点を解決し、setup-tools.sh を絶対パスで呼ぶこと。
 
@@ -1778,6 +1971,9 @@ def lint_rules_config_cases() -> None:
         ("字下げ 4 の excluded", "custom_rules:\n  rule_a:\n    regex: x\n    excluded:\n      - a\n", {"rule_a": True}, ""),
         ("字下げ 6 の属性", "custom_rules:\n  rule_a:\n      regex: x\n      excluded:\n        - a\n", None, "字下げ 4 で書く"),
         ("字下げ 4 の excluded の項目", "custom_rules:\n  rule_a:\n    excluded:\n    - a\n", None, "字下げ 6 で書く"),
+        ("同じ行の excluded（文字列）", "custom_rules:\n  rule_a:\n    regex: x\n    excluded: '.*/A/.*'\n", None, "同じ行に書かない"),
+        ("同じ行の excluded（流れの形）", "custom_rules:\n  rule_a:\n    regex: x\n    excluded: [a, b]\n", None, "同じ行に書かない"),
+        ("excluded の行のコメント", "custom_rules:\n  rule_a:\n    excluded:  # 注\n      - a\n", {"rule_a": True}, ""),
         ("字下げ 3 の excluded", "custom_rules:\n  rule_a:\n    regex: x\n   excluded:\n      - a\n", None, "属性の階層と違う"),
     ):
         count += 1
@@ -1834,6 +2030,9 @@ def simulator_cases() -> None:
         # 27.2 と 27.2.0 は同じ版として最低 OS を満たす
         ("27.2.0 は 27.2 以上", {"runtimes": [dict(runtime, version="27.2.0")], "devices": {"r": [
             {"name": "iPhone A", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 0),
+        # 版の各要素は ASCII の数字だけ（int が読める符号・空白・下線・全角数字の版を、正しい版として扱わない）
+        *[(f"runtimes の version が {value!r}", {"runtimes": [dict(runtime, version=value)], "devices": {}}, 2)
+          for value in ("+27.2", "27.-2", "27. 2", "2_7.2", "２７.2", "27.")],
         ("udid が文字列でない", {"runtimes": [runtime], "devices": {"r": [
             {"name": "iPhone A", "udid": 1, "isAvailable": True, "deviceTypeIdentifier": "iPhone"},
             {"name": "iPhone B", "udid": SIM_X, "isAvailable": True, "deviceTypeIdentifier": "iPhone"}]}}, 2),
@@ -2050,12 +2249,15 @@ def staged_scripts_case() -> None:
     逆に、ステージした補助だけを拒否する内容にすると止まることも確かめる。
     """
     global count
-    for label, staged_location in (("作業ツリーの版を使わない", ""), ("ステージした補助を使う", "import sys\nsys.exit(1)\n")):
+    # 起点のパスの末尾の改行も保つ（名前を改行で終えたリポジトリでも検査できる）
+    for label, staged_location, name in (("作業ツリーの版を使わない", "", "repository"),
+                                         ("ステージした補助を使う", "import sys\nsys.exit(1)\n", "repository"),
+                                         ("改行で終わる起点", "", "repository\n")):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
             env = isolated_git_env()
             env.pop("MINUTES_CHECK_ISOLATED", None)
-            repository = Path(directory) / "repository"
+            repository = Path(directory) / name
             (repository / "scripts").mkdir(parents=True)
             (repository / ".tools" / "bin").mkdir(parents=True)
             out = Path(directory) / "recorded"
@@ -2071,10 +2273,10 @@ def staged_scripts_case() -> None:
             (repository / "scripts" / "verify-docs.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
             (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
-            for name, body in (("swiftformat", 'for last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\n'),
+            for tool, body in (("swiftformat", 'for last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\n'),
                                ("swiftlint", "exit 0\n"), ("gitleaks", "exit 0\n")):
-                (repository / ".tools" / "bin" / name).write_text("#!/bin/sh\n" + body, encoding="utf-8")
-                (repository / ".tools" / "bin" / name).chmod(0o755)
+                (repository / ".tools" / "bin" / tool).write_text("#!/bin/sh\n" + body, encoding="utf-8")
+                (repository / ".tools" / "bin" / tool).chmod(0o755)
             # 書き出した補助のスクリプトと同じ場所に置かれたモジュールを読み込まないこと（mktemp の代わりで場所を決める）
             shims, temporary, planted = Path(directory) / "shims", Path(directory) / "tmp", Path(directory) / "planted"
             shims.mkdir()
@@ -2114,11 +2316,11 @@ def reinstall_command_case() -> None:
     """コミット前のフックが案内する導入し直す手順が、bash と zsh の両方で、ステージした setup-tools.sh と台帳を使い、
     終了コードを返し、一時ファイルを残さず、インデックスと作業ツリーを変えないこと。"""
     global count
-    for shell in ("/bin/bash", "/bin/zsh"):
+    for shell, name in (("/bin/bash", "repository"), ("/bin/zsh", "repository"), ("/bin/bash", "repository\n"), ("/bin/zsh", "repository\n")):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
             env = isolated_git_env()
-            repository = Path(directory) / "repository"
+            repository = Path(directory) / name
             temporary = Path(directory) / "tmp"
             temporary.mkdir()
             (repository / "scripts").mkdir(parents=True)
@@ -2158,7 +2360,7 @@ def reinstall_command_case() -> None:
             want = f"staged\n--versions --dest {os.path.realpath(repository)}/.tools"
             leftovers = [path.name for path in temporary.iterdir()]
             if ran.returncode != 7 or recorded != want or leftovers or state() != before:
-                failures.append(f"check: 導入し直す手順（{shell}）が期待と違う（終了コード {ran.returncode}・記録 {recorded!r}・"
+                failures.append(f"check: 導入し直す手順（{shell}・{name!r}）が期待と違う（終了コード {ran.returncode}・記録 {recorded!r}・"
                                 f"残ったもの {leftovers}）\n{command}\n{ran.stderr.strip()}")
 
 
@@ -2176,6 +2378,7 @@ def pre_push_interrupted_case() -> None:
         (repository / "other").mkdir()
         (repository / ".tools" / "bin").mkdir(parents=True)
         base, out, crash = Path(directory) / "base", Path(directory) / "recorded", Path(directory) / "crash"
+        reached = Path(directory) / "reached"  # 強制終了の直前に filter が置く印
         hook = Path(directory) / "pre-push"
         hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "check.sh").write_text('#!/bin/sh\n'
@@ -2200,7 +2403,7 @@ def pre_push_interrupted_case() -> None:
         git("commit", "-q", "-m", "base")
         git("sparse-checkout", "set", "scripts")
         # 展開の途中で、フックのプロセスのグループ全体を強制終了する
-        git("config", "filter.crash.smudge", f'if [ -e "{crash}" ]; then kill -9 0; fi; cat')
+        git("config", "filter.crash.smudge", f'if [ -e "{crash}" ]; then touch "{reached}"; kill -9 0; fi; cat')
         head = git("rev-parse", "HEAD")
 
         def push(target: Path) -> "subprocess.CompletedProcess[str]":
@@ -2212,6 +2415,10 @@ def pre_push_interrupted_case() -> None:
         crash.write_text("", encoding="utf-8")
         first = push(base)
         crash.unlink()
+        # 1 回目が展開の途中の filter に達して強制終了したこと（別の理由の失敗を中断と取り違えない）。記録は 2 回目のものだけを見る
+        if not reached.exists():
+            failures.append(f"pre-push: 1 回目が展開の途中の強制終了に達していない（終了コード {first.returncode}）\n{first.stderr.strip()}")
+        out.unlink(missing_ok=True)
         # 強制終了で残ったロック（フックの案内と git の案内のとおり、利用者が削除するもの）
         for lock in list(base.glob("*.lock")):
             lock.rmdir()
@@ -2289,6 +2496,12 @@ def test_versions() -> None:
     reinstall_command_case()
     pre_push_interrupted_case()
     coverage_links_case()
+    pre_push_lock_case()
+    worktree_location_case()
+    tools_override_case()
+    ordinary_tools_snapshot_case()
+    setup_config_failure_case()
+    require_clean_child_case()
     # 引数が 1 個あれば空文字列でも引数として扱い、--hooks との完全一致を求める（ツールの導入より前に止まる）
     expect("setup: 空文字列の引数", [str(SCRIPTS / "setup.sh"), ""], 2, "使い方")
     expect("setup: 知らない引数", [str(SCRIPTS / "setup.sh"), "--hook"], 2, "使い方")
@@ -2324,7 +2537,7 @@ def test_versions() -> None:
     simulator_cases()
     lint_rules_config_cases()
     setup = str(SCRIPTS / "setup-tools.sh")
-    tools = str(ROOT / ".tools")
+    tools = str(TOOLS)
     original = (ROOT / "tools" / "versions").read_text(encoding="utf-8")
     expect("versions: 導入済みの版が一致する", [setup, "--verify"], 0, "OK")
     # 版と SHA-256 の負例は、現在の swiftlint の行から値を取り出して変える（ツールを更新しても負例を作れるように）
@@ -2480,6 +2693,35 @@ def test_versions() -> None:
         stub.symlink_to(other)
         expect("versions: 版のディレクトリの実行ファイルがリンク", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                      "--require", "gh"], 1, "通常のファイルでない")
+    # 版のディレクトリ・ツールのディレクトリが外の共有のディレクトリへのリンクなら、照合でも再利用の判定でも認めない
+    for level in ("版", "ツール"):
+        with tempfile.TemporaryDirectory() as directory:
+            dest, shared = Path(directory) / "tools", Path(directory) / "shared"
+            version, executable, sha = gh_rows[0].split()[1], gh_rows[0].split()[6], gh_rows[0].split()[-1]
+            stub = shared / version / executable
+            stub.parent.mkdir(parents=True)
+            stub.write_text(f"#!/bin/sh\necho 'gh version {version} (2000-01-01)'\n", encoding="utf-8")
+            stub.chmod(0o755)
+            (stub.parent / ".archive-sha256").write_text(sha + "\n", encoding="utf-8")
+            (dest / "bin").mkdir(parents=True)
+            if level == "版":
+                (dest / "gh").mkdir()
+                (dest / "gh" / version).symlink_to(shared / version)
+            else:
+                (dest / "gh").symlink_to(shared)
+            (dest / "bin" / "gh").symlink_to(f"../gh/{version}/{executable}")
+            versions = Path(directory) / "versions"
+            versions.write_text(gh_rows[0] + "\n", encoding="utf-8")
+            arguments = ["--versions", str(versions), "--dest", str(dest), "--require", "gh"]
+            expect(f"versions: {level}のディレクトリが外へのリンク", [setup, "--verify", *arguments], 1, "導入先の中にない")
+            # 導入は共有の実体を再利用せず、取得し直す（curl の代わりで失敗させる。通信しない）
+            shims = Path(directory) / "shims"
+            shims.mkdir()
+            (shims / "curl").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "curl").chmod(0o755)
+            expect(f"versions: {level}のディレクトリが外へのリンクの再利用", [setup, *arguments], 1,
+                   "配布ファイルを取得できない" if level == "版" else "シンボリックリンク",
+                   env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}"))
     # 配布ファイルの中の実行ファイル名が名前と違っても、検査が呼ぶリンクは名前（bin/<名前>）で照合する
     with tempfile.TemporaryDirectory() as directory:
         dest = Path(directory) / "tools"
@@ -2526,7 +2768,7 @@ def test_versions() -> None:
 
 def test_gitleaks() -> None:
     global count
-    gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
+    gitleaks = str(TOOLS / "bin" / "gitleaks")
     base = [gitleaks, "dir", "--no-banner", "--no-color", "--redact", "--config", str(ROOT / ".gitleaks.toml")]
     # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
     fake = "ghp_" + "x8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
@@ -2536,6 +2778,7 @@ def test_gitleaks() -> None:
     with tempfile.TemporaryDirectory() as directory:
         (Path(directory) / "config.txt").write_text('name = "sample"\n', encoding="utf-8")
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
+    gitleaks_newline_case()
     gitleaks_merge_case()
     gitleaks_broken_history_case()
     gitleaks_traversal_case()
@@ -2729,7 +2972,7 @@ def gitleaks_suppression_cases() -> None:
     外から引き継いだ GIT_DIR が別のリポジトリを指していても、引数のリポジトリを検査することも確かめる。
     """
     global count
-    gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
+    gitleaks = str(TOOLS / "bin" / "gitleaks")
     config = str(ROOT / ".gitleaks.toml")
     identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
                 "-c", f"core.hooksPath={os.devnull}"]
@@ -2788,7 +3031,7 @@ def gitleaks_suppression_cases() -> None:
             (repository / "scripts" / "check.sh").chmod(0o755)
             (repository / ".gitleaks.toml").write_text((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"), encoding="utf-8")
             (repository / ".gitignore").write_text("/.tools\n.gitleaksignore\n", encoding="utf-8")
-            (repository / ".tools").symlink_to(ROOT / ".tools")
+            (repository / ".tools").symlink_to(TOOLS)
             # 開発ツールの写しの照合に使う導入スクリプトと台帳（本物の .tools を照合する）
             for name in ("scripts/setup-tools.sh", "tools/versions"):
                 (repository / name).parent.mkdir(parents=True, exist_ok=True)
@@ -2828,7 +3071,7 @@ def gitleaks_suppression_cases() -> None:
             (repository / ".gitleaks.toml").write_text((ROOT / ".gitleaks.toml").read_text(encoding="utf-8"), encoding="utf-8")
             (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
             (repository / ".gitattributes").write_text(attributes, encoding="utf-8")
-            (repository / ".tools").symlink_to(ROOT / ".tools")
+            (repository / ".tools").symlink_to(TOOLS)
             # 開発ツールの写しの照合に使う導入スクリプトと台帳（本物の .tools を照合する）
             for name in ("scripts/setup-tools.sh", "tools/versions"):
                 (repository / name).parent.mkdir(parents=True, exist_ok=True)
@@ -2863,6 +3106,26 @@ def gitleaks_suppression_cases() -> None:
             failures.append(f"gitleaks: 引き継いだ GIT_DIR のリポジトリを検査した（終了コード {result.returncode}）")
 
 
+
+
+def gitleaks_newline_case() -> None:
+    """gitleaks-history.sh が、名前が改行で終わるリポジトリを、改行のない名前の別のリポジトリと取り違えずに検査すること。"""
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        key = "ghp_" + "n8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"  # 実行時に組み立てる
+        for name, content in (("target", "clean"), ("target\n", f'token = "{key}"')):
+            repository = Path(directory) / name
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            (repository / "config.txt").write_text(content + "\n", encoding="utf-8")
+            for arguments in (["add", "config.txt"], ["commit", "-q", "-m", "config"]):
+                subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env, check=True,
+                               capture_output=True)
+        history = str(SCRIPTS / "gitleaks-history.sh")
+        expect("gitleaks: 名前が改行で終わるリポジトリ", [history, str(Path(directory) / "target\n")], 1, "leaks found: 1", env=env)
+        expect("gitleaks: 改行のない名前のリポジトリ", [history, str(Path(directory) / "target")], 0, "no leaks found", env=env)
+
+
 def step3_tool_verify_case() -> None:
     """check.sh が手順 0 なしで手順 3 を実行するとき、先に開発ツールを照合し、照合に失敗したら手順 3 を実行しないこと。"""
     global count
@@ -2872,6 +3135,7 @@ def step3_tool_verify_case() -> None:
         env.pop("MINUTES_CHECK_ISOLATED", None)
         repository = Path(directory) / "repository"
         (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools").mkdir()  # 写す開発ツール
         out = Path(directory) / "recorded"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -2902,6 +3166,7 @@ def step_order_verify_case() -> None:
             env.pop("MINUTES_CHECK_ISOLATED", None)
             repository = Path(directory) / "repository"
             (repository / "scripts").mkdir(parents=True)
+            (repository / ".tools").mkdir()  # 写す開発ツール
             (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
             for name in ("test-checks.py", "setup-tools.sh", "gitleaks-history.sh", "verify-docs.py"):
                 (repository / "scripts" / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -2932,6 +3197,7 @@ def step3_history_case() -> None:
         env.pop("MINUTES_CHECK_ISOLATED", None)
         repository = Path(directory) / "repository"
         (repository / "scripts").mkdir(parents=True)
+        (repository / ".tools").mkdir()  # 写す開発ツール
         out = Path(directory) / "recorded"
         (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "test-checks.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -3014,7 +3280,7 @@ def gitleaks_merge_case() -> None:
     既定の動作では見落とすことも対照として確かめる（試験が効いていることの確認）。
     """
     global count
-    gitleaks = str(ROOT / ".tools" / "bin" / "gitleaks")
+    gitleaks = str(TOOLS / "bin" / "gitleaks")
     history = str(SCRIPTS / "gitleaks-history.sh")
     step3_history_case()
     step3_tool_verify_case()
@@ -3424,6 +3690,7 @@ def readlink_failure_case() -> None:
     count += 1
     directory = docs_case("リンク先を読めない文書の準備（整合した文書）", 0, "OK")
     (directory / "docs/extra.md").symlink_to("02-basic-design/sample.md")
+    (directory / "docs/later.md").write_text("# 後の文書\n", encoding="utf-8")  # 失敗する文書より後に読まれる文書
     spec = importlib.util.spec_from_file_location("verify_docs", SCRIPTS / "verify-docs.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -3444,7 +3711,7 @@ def readlink_failure_case() -> None:
         module.os.readlink = original
     if not any(message.startswith("docs/extra.md: 文書を読まない") for message in checker.errors):
         failures.append(f"docs: リンク先を読めない文書をそのパスで報告しない（{checker.errors}）")
-    if "docs/02-basic-design/sample.md" not in checker.texts:
+    if "docs/02-basic-design/sample.md" not in checker.texts or "docs/later.md" not in checker.texts:
         failures.append("docs: リンク先を読めない文書の後に、ほかの文書を読まない")
 
 
@@ -3947,6 +4214,15 @@ def run_docs_cases() -> None:
     readlink_failure_case()
     # 表は空行か別のブロックの始まりまで続き、「|」を含まない行もデータ行になる（GFM と同じ）
     docs_case("「|」を含まない表の行の定義", 1, "定義が重複", requirements, "| CON-01 | 制約 |\n", "| CON-01 | 制約 |\nCON-01\n")
+    # コメントで始まる行（HTML のブロック）は表の見出しにならない。始まった表のセルの中のコメントは、セルの一部のまま
+    docs_case("コメントの行を見出しにした対応表", 1, "対応表の行がない", detailed, "| 要件 | 試験 |\n", "<!-- 例 --> 要件 | 試験\n")
+    docs_case("1 行のコメントにした見出しの対応表", 1, "対応表の行がない", detailed, "| 要件 | 試験 |\n", "<!-- 要件 | 試験 -->\n")
+    docs_case("セルの中のコメントは表の一部", 0, "OK", detailed, "| FR-AAA-01 | 試験 |", "| FR-AAA-01 | <!-- 注 --> 試験 |")
+    # 短縮形の参照のリンク（[ラベル]）も、定義を通してリンク先を確かめる。定義の行・定義のないラベル・脚注は使用として数えない
+    link = "[要件](../01-requirements/requirements.md)"
+    docs_case("短縮形の参照のリンク", 0, "OK", basic, link, "[要件] と [x]\n\n[要件]: ../01-requirements/requirements.md")
+    docs_case("短縮形の参照の切れたリンク", 1, "リンクの先がない: missing.md", basic, link, "本文の [要件] を見る\n\n[要件]: missing.md")
+    docs_case("使われていない定義と脚注は確かめない", 0, "OK", basic, link, "注[^1] \\[要件]\n\n[要件]: missing.md\n[^1]: missing")
     # 複数行の HTML のコメントの中の表は、対応表・定義として数えない
     docs_case("コメントにした対応表", 1, "対応表の行がない", detailed,
               "| 要件 | 試験 |\n| --- | --- |\n| FR-AAA-01 | 試験 |\n",

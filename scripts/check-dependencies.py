@@ -139,6 +139,10 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
     for directory, subdirectories, files in os.walk(root, onerror=failed):
         skipped = SKIPPED_ANYWHERE | (SKIPPED_AT_ROOT if Path(directory) == root else set())
         subdirectories[:] = [entry for entry in subdirectories if entry not in skipped]
+        # 名前が合うディレクトリ（ディレクトリへのリンクを含む）は、ファイルとして検査できないので、ないものとせず読めないものとする
+        for entry in sorted(subdirectories):
+            if fnmatch.fnmatchcase(entry, name):
+                raise Unreadable(f"{Path(directory) / entry}: 通常のファイルでない（ディレクトリ）")
         found.extend(Path(directory) / entry for entry in files if fnmatch.fnmatchcase(entry, name))
     # 名前が合うのに通常のファイルとして確かめられないもの（壊れたシンボリックリンクなど）は、黙って除かず読めないものとする
     for path in found:

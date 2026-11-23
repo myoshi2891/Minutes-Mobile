@@ -28,7 +28,11 @@ def registered_worktrees(source: str) -> List[bytes]:
     一覧は NUL で区切った項目の並びで、記録（作業ツリー 1 つ）は空の項目で終わり、先頭の項目が「worktree <パス>」。
     改行を含むパスも 1 つのパスとして読む。git が失敗した・形が違う場合は、比べずに認めることはせず終了コード 2。
     """
-    listed = subprocess.run(["git", "-C", source, "worktree", "list", "--porcelain", "-z"], stdout=subprocess.PIPE, env=GIT_ENV)
+    try:
+        listed = subprocess.run(["git", "-C", source, "worktree", "list", "--porcelain", "-z"], stdout=subprocess.PIPE, env=GIT_ENV)
+    except OSError as error:  # 例外のままでは終了コード 1（認めない・登録なし）になり、判定できないことと区別できない
+        print(f"git を起動できない: {error}", file=sys.stderr)
+        sys.exit(2)
     if listed.returncode != 0:
         print(f"git worktree list が失敗した（終了コード {listed.returncode}）", file=sys.stderr)
         sys.exit(2)

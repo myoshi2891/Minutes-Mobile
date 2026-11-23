@@ -74,6 +74,9 @@ LINK_TITLE = re.compile(r"""\s+(?:"[^"]*"|'[^']*'|\([^)]*\))""")
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
 # 参照形式のリンクの使用（[文][ラベル] と、省略形の [ラベル][]）
 REFERENCE_LINK = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
+# 短縮形の参照のリンク（[ラベル]）。直後に「[」「(」が続くもの（ほかの形のリンク）・「]」の直後のもの（[文][ラベル] の後半）・
+# エスケープした「[」・脚注（[^1]）は除く
+SHORTCUT_LINK = re.compile(r"(?<![\\\]])\[(?!\^)([^\[\]]+)\](?![\[(])")
 # インラインのコード（`…`・``…``。開始と同じ長さのバッククォートで閉じる）。中のリンクの書き方はリンクにならない
 CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 DETAILED_MAPPING = "要件 ID ↔ テスト"
@@ -357,8 +360,9 @@ def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tupl
             found.append(table)
             table = None
         # 字下げしたコードブロックの行は表の行にしない（コードの中の対応表の例を、表として数えない）。
-        # 新しいブロック（引用など）の始まりの行は表の行にしない
-        if is_row(text) and not INDENTED_CODE.match(text) and not BLOCK_START.match(text):
+        # 新しいブロック（引用など）の始まりの行と、HTML のコメントで始まる行（行の全体が HTML のブロック）は表の行にしない
+        # （コメントの行を見出しに、続く区切りの行とデータ行を表と数えない。始まった表のセルの中のコメントには関わらない）
+        if is_row(text) and not INDENTED_CODE.match(text) and not BLOCK_START.match(text) and not COMMENT_OPEN.match(text):
             block.append(item)
             if (not failed and len(block) >= 2 and is_separator(block[-1][1])
                     and not is_separator(block[-2][1])):
@@ -749,6 +753,7 @@ class Checker:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
             unclosed, previous = 0, 0  # 同じ段落の前の行から開いたままの「[」の数と、前の行の番号
             for number, line in prose_lines(text):
+                is_definition = REFERENCE_DEFINITION.match(line) is not None
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
                 if number != previous + 1 or not line.strip() or BLOCK_START.match(line):
                     unclosed = 0
@@ -759,6 +764,11 @@ class Checker:
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
+                    if target is not None:
+                        targets.append(target)
+                # 定義の行の [ラベル] は使用ではない。定義のないラベルはリンクにならない
+                for label in [] if is_definition else SHORTCUT_LINK.findall(line):
+                    target = definitions.get(reference_label(label))
                     if target is not None:
                         targets.append(target)
                 for target in targets:

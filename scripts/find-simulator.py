@@ -22,8 +22,14 @@ UDID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-
 
 
 def version_key(text: str) -> Tuple[int, ...]:
-    """版を比較用のタプルにする。末尾の 0 は除く（27.2 と 27.2.0 を同じ版として扱う）。"""
-    parts = [int(part) for part in text.split(".")]
+    """版を比較用のタプルにする。末尾の 0 は除く（27.2 と 27.2.0 を同じ版として扱う）。
+
+    各要素は ASCII の数字 1 桁以上だけを認める（int が読める符号・空白・下線・全角数字の値を版としない）。
+    """
+    components = text.split(".")
+    if not all(re.fullmatch(r"[0-9]+", component) for component in components):
+        raise ValueError(f"版の形が違う: {text!r}")
+    parts = [int(component) for component in components]
     while len(parts) > 1 and parts[-1] == 0:
         parts.pop()
     return tuple(parts)

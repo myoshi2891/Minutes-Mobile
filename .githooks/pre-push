@@ -75,15 +75,30 @@ lock="$snapshot.lock"
 # フックの実行中に Git が設定する変数を外す（残すと、専用の作業ツリーでの git が元のリポジトリの作業ツリーを操作する）
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
 
+lock_held=""   # 作業ツリーのロックを自分が取った（後始末は自分のロックだけを消す）
+interrupted=""
+tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
+# 後始末。持ち主の印を先に外してからロックを外す（間で中断されても、別の実行の取り直したロックを消さない）
+release_locks() {
+  local held_tools=$tools_lock held=$lock_held
+  tools_lock=""
+  lock_held=""
+  if [ -n "$held_tools" ]; then rmdir "$held_tools" 2>/dev/null || true; fi
+  if [ -n "$held" ]; then rmdir "$lock" 2>/dev/null || true; fi
+}
+# 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
+trap 'status=$?; release_locks; exit "$status"' EXIT
+# ロックの取得の結果を記録するまで、中断は控えるだけにする（取った直後・記録の前に終了してロックを残さない。取れなかった
+# 場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して実行し、作った直後に止められて失敗と取り違えられないようにする
+trap 'interrupted=1' INT TERM
 # 同時に 2 つの push が同じ作業ツリーを使わないようにする
-if ! mkdir "$lock" 2>/dev/null; then
+if (trap '' INT TERM; exec mkdir "$lock") 2>/dev/null; then lock_held=1; fi
+trap 'exit 130' INT TERM
+if [ -n "$interrupted" ]; then exit 130; fi
+if [ -z "$lock_held" ]; then
   echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
   exit 1
 fi
-tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
-# 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
-trap 'status=$?; if [ -n "$tools_lock" ]; then rmdir "$tools_lock" 2>/dev/null || true; fi; rmdir "$lock" 2>/dev/null || true; exit "$status"' EXIT
-trap 'exit 130' INT TERM
 
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
 # 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）。

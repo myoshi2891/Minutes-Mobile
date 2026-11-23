@@ -47,9 +47,22 @@ if [ "$HOOKS" = 1 ]; then
     echo "NG: git が選ぶ作業ツリー（${selected}）がこのリポジトリ（${expected}）と違う。GIT_DIR・GIT_WORK_TREE などの変数を外してから実行し直す。フックを有効にしない" >&2
     exit 1
   fi
+  # 設定を読む。鍵がない（終了コード 1）は空として続け、それ以外の失敗は「鍵がない」と取り違えずに報告して失敗を返す
+  read_config() {
+    local value status=0
+    value=$(env -u GIT_CONFIG git -C "$ROOT" config "$@") || status=$?
+    case $status in
+      0) printf '%s\n' "$value" ;;
+      1) ;;
+      *)
+        echo "NG: git の設定を読み取れない（git config $*。終了コード ${status}）。共有の設定を変えずに止める" >&2
+        return 1
+        ;;
+    esac
+  }
   # 共有の設定（--local）より優先される設定（作業ツリーの設定・-c・GIT_CONFIG_* の環境変数）が別の値を指していれば、
   # 共有の値を書いても有効にならない。共有の値を変える前に止める
-  current=$(env -u GIT_CONFIG git -C "$ROOT" config --show-scope --get core.hooksPath || true)
+  current=$(read_config --show-scope --get core.hooksPath) || exit 1
   case "${current%%$'\t'*}" in
     worktree | command)
       if [ "${current#*$'\t'}" != .githooks ]; then
@@ -62,8 +75,8 @@ if [ "$HOOKS" = 1 ]; then
   # 共有の設定のファイルが取り込む設定（include.path と、今の作業ツリーで条件の当たる includeIf.*.path。onbranch を含む）の
   # core.hooksPath は、取り込みの位置で読まれるので、書き込む値より後に読まれて上書きしうる。取り込みからだけ得られる値
   # （取り込みを読んだ一覧から、共有のファイル自身の値を除いたもの）に .githooks 以外があれば、共有の値を書かずに止める
-  with_includes=$(env -u GIT_CONFIG git -C "$ROOT" config --local --includes --get-all core.hooksPath || true)
-  own=$(env -u GIT_CONFIG git -C "$ROOT" config --local --no-includes --get-all core.hooksPath || true)
+  with_includes=$(read_config --local --includes --get-all core.hooksPath) || exit 1
+  own=$(read_config --local --no-includes --get-all core.hooksPath) || exit 1
   included=$(comm -23 <(printf '%s\n' "$with_includes" | LC_ALL=C sort) <(printf '%s\n' "$own" | LC_ALL=C sort))
   while IFS= read -r value; do
     if [ -n "$value" ] && [ "$value" != .githooks ]; then

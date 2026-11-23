@@ -64,6 +64,16 @@ check_field() {
   [[ $value =~ $pattern ]] || fail "tools/versions の${label}が不正: '$value'"
 }
 
+# 版のディレクトリ（$DEST/<名前>/<版>）の実体が、導入先の実体の中のその位置そのものであること（<名前>・<版> のディレクトリが
+# 外の共有のディレクトリなどへのリンクなら認めない。共有の実体は、導入のロックの外で差し替えられうる）。導入先自体への
+# リンク（--dest のリンク）と、bin の相対リンクには関わらない
+contained_install() {
+  local base actual
+  base=$(cd -P "$DEST" 2>/dev/null && pwd) || return 1
+  actual=$(cd -P "$DEST/$1/$2" 2>/dev/null && pwd) || return 1
+  [ "$actual" = "$base/$1/$2" ]
+}
+
 # シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
 # 版ディレクトリの中の実行ファイルが、シンボリックリンクではない通常のファイルで、実行できること
 # （導入先の中のリンクで別の場所の実行ファイルを指させない）
@@ -90,6 +100,8 @@ verify_tool() {
   target_dir=$(link_directory "$link") || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
   expected_dir=$(cd -P "$DEST/$name/$version" 2>/dev/null && pwd) \
     || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
+  contained_install "$name" "$version" \
+    || fail "$name $version のディレクトリの実体が導入先の中にない（リンクなど）。scripts/setup-tools.sh を実行し直す"
   [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
     || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
   regular_binary "$DEST/$name/$version/$binary" \
@@ -105,9 +117,11 @@ verify_tool() {
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
   local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
+  # ツールのディレクトリがリンクなら、リンクの先の共有の場所を書き換えずに止める
+  [ ! -L "$DEST/$name" ] || fail "${DEST}/${name} がシンボリックリンク。削除してから実行し直す"
   # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
   # 版の表示に失敗した導入は、表示の内容によらず導入済みとして扱わない
-  if regular_binary "$target/$binary" && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
+  if contained_install "$name" "$version" && regular_binary "$target/$binary" && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
     cached=$(runtime_version "$name" "$target/$binary" 2>/dev/null) || cached=""
   fi
   if [ -n "$cached" ] && [ "$cached" = "$version" ]; then

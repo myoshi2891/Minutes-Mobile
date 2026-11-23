@@ -5,7 +5,8 @@ set -euo pipefail
 # 置き換えのオブジェクト（git replace の refs/replace/）を使わず、ステージした blob そのものを読む（台帳の書き出しと、
 # check.sh --staged の各手順の書き出し。子のプロセスにも引き継ぐ）
 export GIT_NO_REPLACE_OBJECTS=1
-root=$(git rev-parse --show-toplevel)
+# $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と git が付けた区切りの改行 1 つだけを外す（pre-push と同じ）
+root=$(git rev-parse --show-toplevel && printf x) && root=${root%x} && root=${root%$'\n'} || exit 1
 # 導入済みの開発ツールが、ステージした tools/versions（コミットする台帳）と一致することを先に確かめる。作業ツリーの台帳や
 # 古い導入のまま、コミットする台帳と違う版のツールで整形・静的解析・秘密情報を検査しない
 versions=$(mktemp)
@@ -17,8 +18,9 @@ if ! git cat-file blob :tools/versions > "$versions"; then
 fi
 # 導入し直す手順は、ステージした台帳と setup-tools.sh の両方を一時ファイルに書き出し、書き出したものを --versions・--dest を
 # 付けて実行する（作業ツリーのものは使わず、作業ツリーとステージした内容は変えない）。一時ファイルを消した後も、導入（または
-# 書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）。zsh では status が読み取り専用なので result に控える
-reinstall='(export GIT_NO_REPLACE_OBJECTS=1; root=$(git rev-parse --show-toplevel) || exit 1; versions=$(mktemp) || exit 1; setup=$(mktemp) || { rm -f -- "$versions"; exit 1; }; git cat-file blob :tools/versions > "$versions" && git cat-file blob :scripts/setup-tools.sh > "$setup" && /bin/bash "$setup" --versions "$versions" --dest "$root/.tools"; result=$?; rm -f -- "$versions" "$setup"; exit "$result")'
+# 書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）。zsh では status が読み取り専用なので result に控える。
+# 起点のパスは上と同じく末尾の改行を保つ（%?x は、印の x とその前の区切りの改行 1 文字を外す。引用符の中に書けるのでこの形にする）
+reinstall='(export GIT_NO_REPLACE_OBJECTS=1; root=$(git rev-parse --show-toplevel && printf x) || exit 1; root=${root%?x}; versions=$(mktemp) || exit 1; setup=$(mktemp) || { rm -f -- "$versions"; exit 1; }; git cat-file blob :tools/versions > "$versions" && git cat-file blob :scripts/setup-tools.sh > "$setup" && /bin/bash "$setup" --versions "$versions" --dest "$root/.tools"; result=$?; rm -f -- "$versions" "$setup"; exit "$result")'
 # 照合に使う setup-tools.sh も、作業ツリーではなくステージしたもの（コミットする内容）を一時ファイルに書き出して実行する
 # （ステージしていない作業ツリーの変更で照合の結果を変えない）。--versions・--dest を渡すので、置き場所に依存しない
 setup=$(mktemp)

@@ -11,6 +11,8 @@ set -euo pipefail
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# 開発ツールの場所。check.sh は照合した写しを MINUTES_TOOLS_DIR で渡す（なければリポジトリの .tools）
+TOOLS_DIR=${MINUTES_TOOLS_DIR:-$ROOT/.tools}
 # git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、既定の 2 つも書く。
 # --diff-merges=separate でマージのコミットの差分を親ごとに検査する（マージの解決で足した行を見落とさない。-m は
 # 形式が設定 log.diffMerges に左右されるので使わない）。--root で最初のコミットの差分も検査する（設定 log.showRoot=false
@@ -32,10 +34,14 @@ usage() {
 # 名前・途中で差し替えられたシンボリックリンクで、判定したものと別のリポジトリを検査しない）。「.」は現在の作業ツリーになる
 # 相対パスは ./ を付けてから cd する（「-」という名前のディレクトリを、cd が直前の場所（OLDPWD）と解釈しないように）
 case "$1" in /*) requested=$1 ;; *) requested=./$1 ;; esac
-repository=$(cd -P -- "$requested" 2>/dev/null && pwd) || {
+# $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
+# （名前が改行で終わるリポジトリを、改行のない名前の別のリポジトリと取り違えない）
+repository=$(cd -P -- "$requested" 2>/dev/null && pwd && printf x) || {
   echo "NG: リポジトリ ${1} を解決できない" >&2
   exit 1
 }
+repository=${repository%x}
+repository=${repository%$'\n'}
 shift
 # 追加の引数は報告の指定（--report-format・--report-path。値は次の引数）だけを、それぞれ 1 回まで認める。
 # ほかの指定（--no-git・--log-opts・--exit-code・--no-redact・--baseline-path・--config など）は、検査の方式や対象を変え、
@@ -119,7 +125,7 @@ SHIM
 chmod +x "$shim/git"
 result=0
 # --redact: 検出した値そのものを出力に残さない
-PATH="$shim:$PATH" MINUTES_REAL_GIT="$real_git" MINUTES_GIT_RECORD="$shim/record" "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
+PATH="$shim:$PATH" MINUTES_REAL_GIT="$real_git" MINUTES_GIT_RECORD="$shim/record" "$TOOLS_DIR/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
   "${GITLEAKS_SUPPRESSION[@]}" --log-opts="$GITLEAKS_LOG_OPTS" ${REPORT[@]+"${REPORT[@]}"} "$repository" || result=$?
 # git log は 1 回だけ起動され、最後まで終わっていること（起動の記録がない・途中で終わった・標準エラーに書いたものは失敗）
 if [ "$(cat "$shim/record" 2>/dev/null)" != $'started\ncomplete' ]; then
