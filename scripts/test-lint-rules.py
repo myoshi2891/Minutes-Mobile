@@ -7,8 +7,8 @@ tools/lint-fixtures/<規則名>/ の各ファイルを SwiftLint にかけ、
   violation.swift  検出される例（印が 1 行以上）
   violation/**     ほかの規則の例外の場所などのパスに置いた違反（印が 1 行以上。検出されること）
   ok.swift         検出されない例（印なし）
-  allowed/**       例外を認める場所のパスに置いた違反（印なし。検出されないこと）。対照として、同じ内容を
-                   例外の場所でないパス（リポジトリの外の一時ディレクトリ）に写すと検出されることも確かめる
+  allowed/**       例外を認める場所のパスに置いた違反（印なし。検出されないこと）。対照として、その規則の
+                   例外だけを除いた設定では、同じパスのまま検出されることも確かめる
 
 規則に試験用のファイルがない場合も失敗する（試験のない規則を作らせない）。
 使い方: scripts/test-lint-rules.py [--staged]
@@ -19,7 +19,6 @@ tools/lint-fixtures/<規則名>/ の各ファイルを SwiftLint にかけ、
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,7 +51,7 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
 
     規則名の行は末尾のコメント（「# …」）を許す。字下げ 2 の行で規則名として読めないものは、
     規則を黙って読み飛ばさないよう errors に入れる。
-    規則の属性（excluded など）は、規則名の直下の階層（最初の属性の行の字下げ）で判定する。この検査と excluded_patterns が
+    規則の属性（excluded など）は、規則名の直下の階層（最初の属性の行の字下げ）で判定する。この検査と without_excluded が
     読めるのは字下げ 4 の属性と字下げ 6 の excluded の項目だけなので、ほかの字下げで書いた属性・項目は、YAML として正しくても
     読み落とさないよう errors に入れる（excluded を見落として例外のない規則と取り違えない）。
     """
@@ -88,15 +87,15 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
                 if indent != 4:
                     errors.append(f".swiftlint.yml の規則 {current} の属性は字下げ 4 で書く（字下げ {indent} は読めない）: {body}")
             if in_excluded and body.startswith("-") and indent != 6:
-                # YAML は属性と同じ字下げの項目の並びも認めるが、excluded_patterns は字下げ 6 の項目だけを読む
+                # YAML は属性と同じ字下げの項目の並びも認めるが、without_excluded は字下げ 6 の項目だけを読む
                 errors.append(f".swiftlint.yml の規則 {current} の excluded の項目は字下げ 6 で書く（字下げ {indent} は読めない）: {body}")
             elif indent == attribute_indent:
                 # 「excluded :」のようにコロンの前の空白も許す。引用符で囲んだ鍵（'excluded'・"excluded"）も同じ鍵として扱う
                 in_excluded = excluded_key.match(body) is not None
                 if in_excluded:
                     rules[current] = True
-                    # 値を同じ行に書いた形（文字列・[a, b] の流れの形など）は excluded_patterns が読めないので認めない
-                    # （例外の場所を読み落としたまま、写しの置き場所を例外の場所でないと判定しない）
+                    # 値を同じ行に書いた形（文字列・[a, b] の流れの形など）は without_excluded が正しく除けないので認めない
+                    # （複数行にわたる値の続きを残し、対照の設定を壊さない）
                     value = body[excluded_key.match(body).end():].strip()
                     if value and not value.startswith("#"):
                         errors.append(f".swiftlint.yml の規則 {current} の excluded の値は同じ行に書かない（字下げ 6 の「- 」の並びで書く）: {body}")
@@ -105,31 +104,27 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
     return rules
 
 
-def excluded_patterns(config_text: str) -> List[str]:
-    """.swiftlint.yml の custom_rules の各規則の excluded に並ぶパターンを、YAML に書かれた字面のまま（引用符を含めて）取り出す。
-
-    対照の写し（check_allowed_controls）の置き場所が、どの規則の例外の場所にも当たらないことを確かめるために使う。
-    字面のまま試験用の設定に写すので、引用符やエスケープの解釈も SwiftLint と同じになる。
-    """
-    patterns: List[str] = []
+def without_excluded(config_text: str, rule: str) -> str:
+    """.swiftlint.yml から、規則 rule の excluded（鍵の行と字下げ 6 の項目）だけを除いた設定を返す（ほかの行は字面のまま）。"""
+    lines: List[str] = []
     in_block = in_excluded = False
+    current = ""
     for line in config_text.splitlines():
         if re.match(r"^custom_rules:\s*(?:#.*)?$", line):
             in_block = True
-            continue
-        if not in_block or not line.strip() or re.match(r"^\s*#", line):
-            continue
-        if re.match(r"^\S", line):
-            break
-        if re.match(r"""^    (?:excluded|'excluded'|"excluded")\s*:""", line):
+        elif re.match(r"^[^\s#]", line):
+            in_block = False
+        name = re.match(r"^  ([a-z][a-z0-9_]*):\s*(?:#.*)?$", line) if in_block else None
+        if name:
+            current = name.group(1)
+        if in_block and current == rule and re.match(r"""^    (?:excluded|'excluded'|"excluded")\s*:""", line):
             in_excluded = True
             continue
-        item = re.match(r"^      -\s+(\S.*?)\s*$", line) if in_excluded else None
-        if item:
-            patterns.append(item.group(1))
-        else:
-            in_excluded = False
-    return patterns
+        if in_excluded and (re.match(r"^      -\s", line) or re.match(r"^\s*(?:#.*)?$", line)):
+            continue
+        in_excluded = False
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 def read_fixture(path: Path) -> str:
@@ -359,68 +354,29 @@ def run_swiftlint(paths: List[Path], config: Optional[Path] = None) -> List[dict
     return report
 
 
-def excluded_locations(paths: List[Path], patterns: List[str], directory: Path) -> Dict[Path, List[str]]:
-    """paths のそれぞれに当たる例外の場所のパターンを、SwiftLint 自身に判定させて返す。
-
-    SwiftLint の正規表現（ICU）は Python の re と書き方が違う（\\p{Lu} など）ので、re では判定しない。パターンごとに、必ず
-    検出される規則へそのパターンだけを excluded に付けた設定を作り、検出されなかったものを「当たる」とする
-    （SwiftLint が読めないパターンの規則も検出されないので、当たるものとして止める側に倒れる）。
-    paths には判定用の内容を書く（呼び出し側が後で本来の内容を書く）。
-    """
-    if not patterns:
-        return {}
-    lines = ["only_rules:", "  - custom_rules", "custom_rules:"]
-    for index, pattern in enumerate(patterns):
-        lines += [f"  location_probe_{index}:", "    regex: 'minutesLocationProbe'", "    excluded:", f"      - {pattern}"]
-    config = directory / "location-probe.yml"
-    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    for path in paths:
-        path.write_text("let minutesLocationProbe = 0\n", encoding="utf-8")
-    hits: Dict[Path, List[str]] = {}
-    # 与えたパスと実体のパスの両方で確かめる（SwiftLint がどちらで照合しても当たらないように）
-    for spelled in (lambda path: path, lambda path: Path(os.path.realpath(path))):
-        found = {(os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", "")))
-                 for item in run_swiftlint([spelled(path) for path in paths], config)}
-        for path in paths:
-            for index, pattern in enumerate(patterns):
-                if (os.path.realpath(path), f"location_probe_{index}") not in found:
-                    hits.setdefault(path, []).append(pattern)
-    return hits
-
-
 def check_allowed_controls(cases: List[Tuple[Path, str, Set[int]]], rules: Dict[str, bool], errors: List[str]) -> None:
-    """allowed/ の各ファイルを、例外の場所でないパスに写すと規則が検出すること（例外が検出を止めていることの対照）。
+    """allowed/ の各ファイルが、その規則の excluded だけを除いた設定では、同じパスのまま検出されること
+    （例外が検出を止めていることの対照）。
 
-    allowed/ の中で検出されないことだけでは、そもそも違反を含まない内容でも通ってしまう。
-    写す先はリポジトリの外の一時ディレクトリ（作業ツリーを変えない）で、例外のパターンに当たる階層の名前を含まない。
-    入れ子の設定が効かない場所なので、通常の設定を --config で渡す。
+    allowed/ の中で検出されないことだけでは、そもそも違反を含まない内容でも通ってしまう。パスを変えずに設定だけを変えるので、
+    検出されない理由をパスの違い（ほかの例外の場所など）と取り違えない。本来の試験は元の設定で行う（ここでは変えない）。
+    --config に渡す設定は一時ディレクトリに置く（入れ子の設定は効かない）。
     """
-    allowed = [(path, rule) for path, rule, _ in cases if rules.get(rule) and "allowed" in path.relative_to(FIXTURES).parts]
-    if not allowed:
-        return
-    patterns = excluded_patterns(read_config(CONFIG).decode("utf-8"))
+    by_rule: Dict[str, List[Path]] = {}
+    for path, rule, _ in cases:
+        if rules.get(rule) and "allowed" in path.relative_to(FIXTURES).parts:
+            by_rule.setdefault(rule, []).append(path)
+    text = read_config(CONFIG).decode("utf-8")
     with tempfile.TemporaryDirectory() as directory:
-        copies: Dict[Path, Tuple[Path, str]] = {}
-        for index, (path, rule) in enumerate(allowed):
-            copy = Path(directory) / "Control" / f"Control{index}.swift"
-            copy.parent.mkdir(parents=True, exist_ok=True)
-            copies[copy] = (path, rule)
-        # 写しの置き場所（TMPDIR の下）が、どれかの規則の例外の場所に当たると、検出されないのが例外のためか規則のためかを
-        # 区別できない（TMPDIR が …/SystemDependencies/ の下なら no_direct_clock などが写しを除外する）。当たれば実行できない
-        # ものとして止める
-        for copy, hits in excluded_locations(sorted(copies), patterns, Path(directory)).items():
-            print(f"NG: 対照の写しの置き場所（{copy}）が例外の場所のパターン {sorted(set(hits))} に当たる。"
-                  "TMPDIR を例外の場所に当たらない場所にしてから実行し直す", file=sys.stderr)
-            sys.exit(2)
-        for copy, (path, _) in copies.items():
-            shutil.copyfile(path, copy)
-        found: Set[Tuple[str, str]] = set()
-        for item in run_swiftlint(sorted(copies), CONFIG):
-            found.add((os.path.realpath(str(item.get("file", ""))), str(item.get("rule_id", ""))))
-        for copy, (path, rule) in copies.items():
-            if (os.path.realpath(str(copy)), rule) not in found:
-                errors.append(f"{path.relative_to(ROOT)}: 例外の場所でないパスに写しても規則 {rule} が検出されない"
-                              "（例外の場所の試験にならない。違反する式を含める）")
+        config = Path(directory) / "control.yml"
+        for rule, paths in sorted(by_rule.items()):
+            config.write_text(without_excluded(text, rule), encoding="utf-8")
+            found = {os.path.realpath(str(item.get("file", ""))) for item in run_swiftlint(paths, config)
+                     if item.get("rule_id") == rule}
+            for path in paths:
+                if os.path.realpath(path) not in found:
+                    errors.append(f"{path.relative_to(ROOT)}: 例外を除いた設定でも規則 {rule} が検出されない"
+                                  "（例外の場所の試験にならない。違反する式を含める）")
 
 
 def main() -> int:

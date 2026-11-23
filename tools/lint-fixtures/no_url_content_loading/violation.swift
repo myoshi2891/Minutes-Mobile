@@ -9,3 +9,7 @@ let annotated: Data = try .init(contentsOf: url) // expect: no_url_content_loadi
 let bytes: NSMutableData = try .init(contentsOf: url, options: []) // expect: no_url_content_loading
 let mutableText: NSMutableString? = try .init(contentsOf: url, encoding: 4) // expect: no_url_content_loading
 let list: NSArray? = .init(contentsOf: url) // expect: no_url_content_loading
+let rich = try NSAttributedString(url: url, options: [:], documentAttributes: nil) // expect: no_url_content_loading
+let mutableRich = try NSMutableAttributedString.init(url: url, options: [:], documentAttributes: nil) // expect: no_url_content_loading
+let annotatedRich: NSAttributedString = try .init(url: url, options: [:], documentAttributes: nil) // expect: no_url_content_loading
+let annotatedMutable: NSMutableAttributedString? = try? .init(url: url, options: [:], documentAttributes: nil) // expect: no_url_content_loading

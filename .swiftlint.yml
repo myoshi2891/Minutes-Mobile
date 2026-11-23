@@ -67,9 +67,10 @@ custom_rules:
   # URL を受け取る読み込みの初期化子は、https:// などのリモートの URL も読めるので使わない（通信の経路になる）。
   # ローカルのファイルは、パスを受け取る API（contentsOfFile:・FileManager.contents(atPath:)・FileHandle）で読む。
   # append(contentsOf:) などコレクションの操作は対象外にするため、型の名前を付けた呼び出しと、型の注釈つきの .init だけを検出する
+  # NSAttributedString・NSMutableAttributedString は url: の初期化子もリモートの URL を読める（string: などは認める）
   no_url_content_loading:
     name: "URL を受け取る読み込みの禁止"
-    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:'
+    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:|\bNS(?:Mutable)?AttributedString\s*(?:\.\s*init\s*)?\(\s*url\s*:|:\s*(?:Foundation\s*\.\s*)?NS(?:Mutable)?AttributedString\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*url\s*:'
     match_kinds: *code
     message: "URL を受け取る読み込みはリモートの URL も読める。ローカルのファイルはパスを受け取る API で読む（SEC-NET-01）"
     severity: error
