@@ -211,6 +211,10 @@ install_tool() {
     fi
     # 退避した旧い導入は、公開するリンクの更新が成功するまで消さない（下の publish_link。失敗したら戻す）
   fi
+  # リンクの置き換えから巻き戻しの解除までの中断は控え、解除の後で従う（公開した新しい導入を、終了処理が巻き戻さない）。
+  # 置き換えに失敗した場合は、解除しないまま publish_link が止めるので、退避した旧い導入に戻る
+  interrupted=""
+  trap 'interrupted=1' INT TERM
   publish_link "$name" "$version" "$binary"
   # リンクを更新できたので、先に終了処理の巻き戻しを解いてから（場所の印を外してから）退避した旧い導入を消す。逆の順では、
   # 削除の失敗・中断で終了処理が、一部を消した旧い導入を公開済みの新しい導入と置き換えてしまう。PENDING_BACKUP を先に外す
@@ -218,6 +222,11 @@ install_tool() {
   local retired=$PENDING_BACKUP
   PENDING_BACKUP=""
   PENDING_TARGET=""
+  trap 'exit 130' INT TERM
+  if [ -n "$interrupted" ]; then
+    if [ -n "$retired" ]; then echo "警告: 中断したため、退避した旧い $name の導入（${retired}）が残った。新しい導入はそのまま使う。手で削除する" >&2; fi
+    exit 130
+  fi
   if [ -n "$retired" ]; then
     rm -rf -- "$retired" || echo "警告: 退避した旧い $name の導入を削除できない（${retired}）。新しい導入はそのまま使う。手で削除する" >&2
   fi
@@ -247,7 +256,8 @@ publish_link() {
   # ディレクトリを指すリンクは、mv がリンクの先のディレクトリの中へ移してしまうので、先に外す（壊れた導入の場合だけ）
   if [ -L "$link" ] && [ -d "$link" ]; then rm -f -- "$link"; fi
   rm -f -- "$temporary"
-  if ! ln -s "../$name/$version/$binary" "$temporary" || ! mv -f -- "$temporary" "$link"; then
+  # mv は中断を無視して実行する（置き換えた直後に止められて、失敗と取り違えられないようにする）
+  if ! ln -s "../$name/$version/$binary" "$temporary" || ! (trap '' INT TERM; exec mv -f -- "$temporary" "$link"); then
     rm -f -- "$temporary"
     restore_backup || true
     fail "$name の公開するリンク（${link}）を更新できない。既存の導入とリンクは残す"
@@ -884,7 +894,9 @@ release_coverage_lock() {
 # 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
 # 試験用のファイルなどを省きうるので使わず、一時のインデックスに読み込んで、追跡しているファイルをすべて blob のまま
 # 書き出す（write_index_entries。checkout-index の smudge のフィルタ・改行の変換を通さないので、測る内容は識別子の
-# ツリーの内容と一致する）。失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
+# ツリーの内容と一致する）。ローカルの Package とローカルのバイナリは check-dependencies.py が Packages/ の下（字面・実体）に
+# 限るので、Packages/ だけを写せば swift test が承認済みのものを解決できる。
+# 失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
 materialize_coverage_input() {
   local index entries status=0
   index=$(mktemp)
