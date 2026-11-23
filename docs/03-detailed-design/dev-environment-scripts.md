@@ -293,11 +293,22 @@ if [ -d "$DEST" ]; then
   }
   trap cleanup EXIT
   trap 'exit 130' INT TERM
+  # ロックを取る。取れたら LOCK_HELD に記録して 0 を返す。結果を記録するまで、中断は控えるだけにする（check.sh の take_lock と
+  # 同じ。取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を
+  # 無視して実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
+  take_install_lock() {
+    interrupted=""
+    trap 'interrupted=1' INT TERM
+    if lock_error=$(trap '' INT TERM; exec mkdir "$LOCK" 2>&1); then LOCK_HELD=1; fi
+    trap 'exit 130' INT TERM
+    if [ -n "$interrupted" ]; then exit 130; fi
+    [ -n "$LOCK_HELD" ]
+  }
   # 作れない理由を区別する。ロックのディレクトリがあるときだけ別の導入の実行中として待ち、
   # ないのに作れない場合（書き込めない導入先など）や、ディレクトリ以外のものがある場合は待たずに止める
   waited=0
   retried=""
-  until lock_error=$(mkdir "$LOCK" 2>&1); do
+  until take_install_lock; do
     if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then
       if [ "$waited" -ge 600 ]; then
         fail "別の導入が実行中（${LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
@@ -313,8 +324,10 @@ if [ -d "$DEST" ]; then
       fail "ロック（${LOCK}）を作れない: ${lock_error}"
     fi
   done
-  LOCK_HELD=1
   if [ "$MODE" = install ]; then
+    # 公開するリンクの置き場所（bin）がリンクなら、リンクの先の共有の場所を書き換えずに、導入を変える前に止める
+    # （導入先自体のリンクは認める）
+    [ ! -L "$DEST/bin" ] || fail "${DEST}/bin がシンボリックリンク。削除してから実行し直す"
     WORK=$(mktemp -d "$DEST/.work.XXXXXX") || fail "作業場所を作れない（${DEST}）"
   fi
 fi
@@ -786,7 +799,8 @@ step_0() {
 step_1() {
   if [ "$STAGED" = 1 ]; then
     if [ ${#STAGED_SWIFT[@]} -eq 0 ]; then echo "ステージした Swift ファイルはない"; return 0; fi
-    (cd "$STAGED_TREE" && "$TOOLS/swiftformat" --lint --cache ignore "${STAGED_SWIFT[@]}")
+    # ./ を付けて渡す（「-」で始まる名前を指定として解釈させない。手順 2 も同じ）
+    (cd "$STAGED_TREE" && "$TOOLS/swiftformat" --lint --cache ignore "${STAGED_SWIFT[@]/#/./}")
   else
     "$TOOLS/swiftformat" --lint --cache ignore .
   fi
@@ -796,7 +810,7 @@ step_2() {
   # --config を付けない（付けると、テストコード用の入れ子の設定が無効になる）
   if [ "$STAGED" = 1 ]; then
     if [ ${#STAGED_SWIFT[@]} -gt 0 ]; then
-      (cd "$STAGED_TREE" && "$TOOLS/swiftlint" lint --quiet --no-cache --force-exclude "${STAGED_SWIFT[@]}")
+      (cd "$STAGED_TREE" && "$TOOLS/swiftlint" lint --quiet --no-cache --force-exclude "${STAGED_SWIFT[@]/#/./}")
     else
       echo "ステージした Swift ファイルはない"
     fi
@@ -842,7 +856,13 @@ step_3() {
 
 step_4() {
   scripts/test-checks.py settings
-  scripts/check-project-settings.py
+  # 専用の作業ツリーの検査（上の isolated_checkout で確かめたもの）では、参照先の plist を、検査するコミットで追跡したものに限る。
+  # 環境変数ではなく引数で渡す（自己試験の子のプロセスに引き継がせない）
+  if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "${MINUTES_CHECK_ISOLATED:-}" ]; then
+    scripts/check-project-settings.py --tracked-only
+  else
+    scripts/check-project-settings.py
+  fi
 }
 
 step_5() {
@@ -1116,14 +1136,30 @@ verify_run_tools() {
   fi
 }
 
+# ディレクトリ $2 の実体のパスを変数 $1 に入れる。$(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が
+# 付けた区切りの改行 1 つだけを外す（名前が改行で終わるディレクトリを取り違えない）
+real_directory() {
+  local resolved_path
+  resolved_path=$(cd -P -- "$2" 2>/dev/null && pwd && printf x) || return 1
+  resolved_path=${resolved_path%x}
+  printf -v "$1" '%s' "${resolved_path%$'\n'}"
+}
+# 作業ツリー $2 の git rev-parse --path-format=absolute $3 のパスを変数 $1 に入れる（末尾の改行の扱いは real_directory と同じ）
+git_path() {
+  local printed_path
+  printed_path=$(git -C "$2" rev-parse --path-format=absolute "$3" 2>/dev/null && printf x) || return 1
+  printed_path=${printed_path%x}
+  printf -v "$1" '%s' "${printed_path%$'\n'}"
+}
+
 # 引き継いだ MINUTES_CHECK_ISOLATED を信じてよいか。この作業ツリーが、プッシュ前のフックか check.sh --require-clean が
 # この検査のために作った専用の作業ツリー（作成時に専用の管理ディレクトリへ書いた印があり、印の作業ツリーのパスが ROOT の
 # 実体のパスと一致する）なら 0 を返す。そうでなければ 1（元の作業ツリーで変数だけを引き継いでも、展開を省かせない）
 isolated_checkout() {
   local private common root_real mark file text
-  private=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) && private=$(cd -P "$private" && pwd) || return 1
-  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && common=$(cd -P "$common" && pwd) || return 1
-  root_real=$(cd -P "$ROOT" && pwd) || return 1
+  git_path private . --git-dir && real_directory private "$private" || return 1
+  git_path common . --git-common-dir && real_directory common "$common" || return 1
+  real_directory root_real "$ROOT" || return 1
   [ "$(dirname "$private")" = "$common/worktrees" ] || return 1
   for mark in "minutes-pre-push-owner:MinutesMobile pre-push" "minutes-check-owner:MinutesMobile check"; do
     file="$private/${mark%%:*}"
@@ -1364,8 +1400,8 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   git -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
   # 作った作業ツリーの専用の管理ディレクトリに印を書く（入れ子の check.sh が、引き継いだ MINUTES_CHECK_ISOLATED を
   # この作業ツリーのものと確かめる。isolated_checkout）
-  isolated_private=$(git -C "$ISOLATED_TREE" rev-parse --path-format=absolute --git-dir) \
-    && isolated_private=$(cd -P "$isolated_private" && pwd) && isolated_root=$(cd -P "$ISOLATED_TREE" && pwd) \
+  git_path isolated_private "$ISOLATED_TREE" --git-dir \
+    && real_directory isolated_private "$isolated_private" && real_directory isolated_root "$ISOLATED_TREE" \
     || fail "専用の作業ツリー（${ISOLATED_TREE}）の管理ディレクトリを特定できない"
   printf '%s\n' "MinutesMobile check ${isolated_root}" > "$isolated_private/minutes-check-owner"
   full_checkout "$ISOLATED_TREE"
