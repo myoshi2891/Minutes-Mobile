@@ -86,6 +86,16 @@ check_field() {
   [[ $value =~ $pattern ]] || fail "tools/versions の${label}が不正: '$value'"
 }
 
+# 版のディレクトリ（$DEST/<名前>/<版>）の実体が、導入先の実体の中のその位置そのものであること（<名前>・<版> のディレクトリが
+# 外の共有のディレクトリなどへのリンクなら認めない。共有の実体は、導入のロックの外で差し替えられうる）。導入先自体への
+# リンク（--dest のリンク）と、bin の相対リンクには関わらない
+contained_install() {
+  local base actual
+  base=$(cd -P "$DEST" 2>/dev/null && pwd) || return 1
+  actual=$(cd -P "$DEST/$1/$2" 2>/dev/null && pwd) || return 1
+  [ "$actual" = "$base/$1/$2" ]
+}
+
 # シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
 # 版ディレクトリの中の実行ファイルが、シンボリックリンクではない通常のファイルで、実行できること
 # （導入先の中のリンクで別の場所の実行ファイルを指させない）
@@ -112,6 +122,8 @@ verify_tool() {
   target_dir=$(link_directory "$link") || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
   expected_dir=$(cd -P "$DEST/$name/$version" 2>/dev/null && pwd) \
     || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
+  contained_install "$name" "$version" \
+    || fail "$name $version のディレクトリの実体が導入先の中にない（リンクなど）。scripts/setup-tools.sh を実行し直す"
   [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
     || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
   regular_binary "$DEST/$name/$version/$binary" \
@@ -127,9 +139,11 @@ verify_tool() {
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
   local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
+  # ツールのディレクトリがリンクなら、リンクの先の共有の場所を書き換えずに止める
+  [ ! -L "$DEST/$name" ] || fail "${DEST}/${name} がシンボリックリンク。削除してから実行し直す"
   # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
   # 版の表示に失敗した導入は、表示の内容によらず導入済みとして扱わない
-  if regular_binary "$target/$binary" && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
+  if contained_install "$name" "$version" && regular_binary "$target/$binary" && [ -f "$target/.archive-sha256" ] && [ "$(cat "$target/.archive-sha256")" = "$sha" ]; then
     cached=$(runtime_version "$name" "$target/$binary" 2>/dev/null) || cached=""
   fi
   if [ -n "$cached" ] && [ "$cached" = "$version" ]; then
@@ -390,12 +404,15 @@ unset CDPATH
 ROOT_GIVEN=0
 if [ "${1:-}" = --root ]; then
   case "${2:-}" in /*) ;; *) echo "使い方: --root には絶対パスを渡す" >&2; exit 2 ;; esac
-  ROOT=$(cd -P -- "$2" && pwd)
+  # $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
+  ROOT=$(cd -P -- "$2" && pwd && printf x) && ROOT=${ROOT%x} && ROOT=${ROOT%$'\n'} || exit 1
   ROOT_GIVEN=1
   shift 2
 else
   ROOT=$(cd "$(dirname "$0")/.." && pwd)
 fi
+# 開発ツールの写しの場所は、この実行が照合した写しだけを子に渡す（snapshot_run_tools）。引き継いだ値は使わない
+unset MINUTES_TOOLS_DIR
 # 部分的なコミット（git commit <パス>）のフックでは、Git が一時のインデックスを GIT_INDEX_FILE で渡す。相対パスは
 # 実行時の作業ディレクトリから解決されるので、ディレクトリを移る前に絶対パスにする（--staged の規則の試験は別の
 # ディレクトリで git を実行するので、相対パスのままでは別のインデックスを読む）
@@ -443,6 +460,7 @@ STAGED_INDEX_TREE=""  # --staged のとき、開始時のインデックスの�
 STAGED_HEAD=""  # --staged のとき、開始時の HEAD のコミット（HEAD がまだないなら空。終了時に同じであることを確かめる）
 STAGED_BASE=""  # --staged のとき、ステージしたファイルを選ぶ基点（開始時の HEAD。HEAD がまだないなら空のツリー）
 STAGED_TOOLS=""  # --staged のとき、開発ツールの写しと、照合に使うステージした台帳を置く一時ディレクトリ
+RUN_TOOLS=""  # 通常の実行が手順 1〜3 を含むとき、開発ツールの写しを置く一時ディレクトリ
 STAGED_INDEX_COPY=""  # --staged のとき、開始時のインデックスのツリーから作った専用のインデックス（検査はこれだけを読む）
 ORIGINAL_INDEX=""  # --staged のとき、本来のインデックスのファイル（終了時に開始時のツリーのままであることを確かめる）
 ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
@@ -497,7 +515,10 @@ done
 if [ "$ROOT_GIVEN" = 1 ]; then
   [ "$STAGED" = 1 ] || usage
   # 起点でないディレクトリ（下の階層・リポジトリの外）を検査しない
-  [ "$(cd -P -- "$(git rev-parse --show-toplevel)" && pwd)" = "$ROOT" ] || fail "--root（${ROOT}）がリポジトリの起点でない"
+  # （パスの末尾の改行は上と同じく保つ。cd に失敗した場合も一致させない）
+  toplevel=$(git rev-parse --show-toplevel && printf x) && toplevel=${toplevel%x} && toplevel=${toplevel%$'\n'} || fail "git の作業ツリーを特定できない"
+  selected=$(cd -P -- "$toplevel" && pwd && printf x) && selected=${selected%x} && selected=${selected%$'\n'} || fail "作業ツリー ${toplevel} を解決できない"
+  [ "$selected" = "$ROOT" ] || fail "--root（${ROOT}）がリポジトリの起点でない"
 fi
 if [ "$STAGED" = 1 ]; then
   # --staged はインデックスを検査する。作業ツリーの一致を求める --require-clean とは組み合わせない
@@ -734,7 +755,7 @@ title() {
 }
 
 step_0() {
-  scripts/setup-tools.sh --verify
+  verify_run_tools
   scripts/test-checks.py versions
 }
 
@@ -1035,6 +1056,25 @@ snapshot_staged_tools() {
   TOOLS="$STAGED_TOOLS/.tools/bin"
 }
 
+# 通常の実行（--staged 以外）の手順 1〜3 が使う開発ツールを固定する。元の .tools を導入のロックを取って一時ディレクトリへ写し、
+# 以後の手順はすべて写しを使う（照合の後に別の setup-tools.sh が元の導入を差し替えても、照合していない導入で検査しない）。
+# 手順 2・3 が呼ぶ test-lint-rules.py・gitleaks-history.sh・test-checks.py には MINUTES_TOOLS_DIR で写しの場所を渡す
+snapshot_run_tools() {
+  RUN_TOOLS=$(mktemp -d)
+  copy_tools "$ROOT/.tools" "$RUN_TOOLS/.tools"
+  TOOLS="$RUN_TOOLS/.tools/bin"
+  export MINUTES_TOOLS_DIR="$RUN_TOOLS/.tools"
+}
+
+# 使う開発ツールを、この作業ツリーの tools/versions と照合する（写しがあれば写しを、なければ元の .tools を照合する）
+verify_run_tools() {
+  if [ -n "$RUN_TOOLS" ]; then
+    scripts/setup-tools.sh --verify --dest "$RUN_TOOLS/.tools"
+  else
+    scripts/setup-tools.sh --verify
+  fi
+}
+
 # 引き継いだ MINUTES_CHECK_ISOLATED を信じてよいか。この作業ツリーが、プッシュ前のフックか check.sh --require-clean が
 # この検査のために作った専用の作業ツリー（作成時に専用の管理ディレクトリへ書いた印があり、印の作業ツリーのパスが ROOT の
 # 実体のパスと一致する）なら 0 を返す。そうでなければ 1（元の作業ツリーで変数だけを引き継いでも、展開を省かせない）
@@ -1194,6 +1234,7 @@ on_exit() {
   if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
   if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
   if [ -n "$STAGED_TOOLS" ]; then remove_or_report "$STAGED_TOOLS"; fi
+  if [ -n "$RUN_TOOLS" ]; then remove_or_report "$RUN_TOOLS"; fi
   if [ -n "$STAGED_INDEX_COPY" ]; then remove_or_report "$STAGED_INDEX_COPY"; fi
   if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
   if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
@@ -1256,6 +1297,9 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -n "${MINUTES_CHECK_ISOLATED:-}" ] && ! isolate
   unset MINUTES_CHECK_ISOLATED
 fi
 if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
+  # 呼び出し側のインデックス（GIT_INDEX_FILE）は、上の開始時の照合だけに使う。残すと、専用の作業ツリーの作成・展開・照合と
+  # 入れ子の check.sh の git が、専用の作業ツリーではなく呼び出し側のインデックスを読み書きする
+  unset GIT_INDEX_FILE
   # 一時の置き場所は TMPDIR（なければ /tmp）の下に明示的に作る（mktemp -d の既定は TMPDIR を使わない環境がある）
   temporary_root=${TMPDIR:-/tmp}
   ISOLATED_BASE=$(mktemp -d "${temporary_root%/}/minutes-check.XXXXXX")
@@ -1290,11 +1334,14 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   # 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。導入のロックを取って写し、手順 0 の照合と
   # 後の手順はすべてこの写しを使う（検査の途中の setup-tools.sh による差し替えの影響を受けない）
   copy_tools "$ROOT/.tools" "$ISOLATED_TREE/.tools"
+  # 入れ子の check.sh も同じ開始時のコミットを確かめる。呼び出し側の --expect-head（参照の名前などで、指すコミットが変わりうる）
+  # より後に置き、後の指定を優先させる
   echo "== 開始時のコミット ${START_HEAD} を専用の作業ツリー（${ISOLATED_TREE}）に展開して検査する"
-  MINUTES_CHECK_ISOLATED=1 "$ISOLATED_TREE/scripts/check.sh" "${ARGUMENTS[@]}"
+  MINUTES_CHECK_ISOLATED=1 "$ISOLATED_TREE/scripts/check.sh" "${ARGUMENTS[@]}" --expect-head "$START_HEAD"
   exit 0
 fi
 
+# 固定した開発ツールを使う手順（1・2・3）があれば、手順を始める前に開発ツールを写し、実行の全体で写しだけを使う。
 # 固定した開発ツールを使う手順（1・2・3）を、照合する手順 0 より先に（または手順 0 なしで）実行する場合も、使う導入がコミットした台帳（この作業ツリーの
 # tools/versions。専用の作業ツリーでは展開したコミットのもの、そこへ写した .tools）と一致することを先に確かめる（照合して
 # いない導入の結果で合格にしない）。手順 0 の自己試験（test-checks.py versions）は求めない。--staged は snapshot_staged_tools が
@@ -1308,9 +1355,10 @@ if [ "$STAGED" = 0 ]; then
       1 | 2 | 3) uses_tools=1 ;;
     esac
   done
+  if [ -n "$uses_tools" ]; then snapshot_run_tools; fi
   if [ -n "$uses_tools" ] && [ -z "$verified_first" ]; then
     echo "== 開発ツールの照合（手順 1〜3 が使う導入を tools/versions と照合する）"
-    scripts/setup-tools.sh --verify
+    verify_run_tools
   fi
 fi
 
