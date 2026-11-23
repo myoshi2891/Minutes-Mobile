@@ -9,36 +9,46 @@ swift test --enable-code-coverage が出す JSON から、指定したディレ�
 """
 import argparse
 import json
-import math
 import os
 import sys
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 
 
-def percentage(text: str) -> float:
-    """目標の %。有限の数で 0〜100 だけを認める（NaN・無限大・範囲外の値で比較を壊さない）。"""
+TARGET_DIGITS = 30  # 目標の小数の桁数の上限（1e-999999999 のような値を正確な分数に展開させない）
+
+
+def percentage(text: str) -> Decimal:
+    """目標の %。有限の 10 進数で 0〜100 だけを認める（NaN・無限大・範囲外の値で比較を壊さない）。"""
     try:
-        value = float(text)
-    except ValueError as error:
+        value = Decimal(text)
+    except InvalidOperation as error:
         raise argparse.ArgumentTypeError(f"数でない: {text}") from error
-    if not math.isfinite(value) or not 0 <= value <= 100:
+    if not value.is_finite() or not 0 <= value <= 100:
         raise argparse.ArgumentTypeError(f"0〜100 の有限の数でない: {text}")
+    exponent = value.as_tuple().exponent
+    if not isinstance(exponent, int) or exponent < -TARGET_DIGITS:
+        raise argparse.ArgumentTypeError(f"小数の桁が {TARGET_DIGITS} を超える: {text}")
     return value
 
 
-def shown(value: float, target: float) -> str:
+def shown(value: Fraction, target: Fraction) -> str:
     """表示する % の値。目標との大小が丸めで逆に見えない桁数まで出す（89.96% を 90.0% と表示して目標 90% に届いたと
-    見せない）。比較そのものは丸めない値で行う。"""
-    for digits in range(1, 16):
-        text = f"{value:.{digits}f}"
-        if (float(text) < target) == (value < target):
-            return text
-    return repr(value)
+    見せない）。丸めも正確な整数で行う。桁を増やせば丸めた値は value に近づくので、必ず終わる。"""
+    digits = 1
+    while True:
+        scale = 10 ** digits
+        scaled = round(value * scale)
+        if (Fraction(scaled, scale) < target) == (value < target):
+            return f"{scaled // scale}.{scaled % scale:0{digits}d}"
+        digits += 1
 
 
-def target_text(value: float) -> str:
+def target_text(value: Decimal) -> str:
     """目標の % を丸めずに表示する（90.5 を 90 や 91 と表示しない）。"""
-    return f"{value:.15g}"
+    text = f"{value:f}"
+    return (text.rstrip("0").rstrip(".") if "." in text else text) or "0"
 
 
 def main() -> int:
@@ -75,11 +85,12 @@ def main() -> int:
     if total == 0:
         print(f"NG: {arguments.sources} 配下に数える行がない", file=sys.stderr)
         return 2
-    # 先に割ってから 100 を掛ける（大きな整数の行数を float に直す途中で OverflowError にしない。整数どうしの割り算は正確に丸める）
-    percent = sum(covered for _, covered in lines) / total * 100.0
+    # 行数の比と目標を分数のまま正確に比べる（浮動小数点の丸めで、目標のすぐ下を届いたと、ちょうどを届かないと判定しない）
+    percent = Fraction(sum(covered for _, covered in lines) * 100, total)
+    goal = Fraction(arguments.target)
     target = target_text(arguments.target)
-    print(f"カバレッジ（{arguments.sources}）: 行 {shown(percent, arguments.target)}%（{len(lines)} ファイル・目標 {target}%）")
-    if percent < arguments.target:
+    print(f"カバレッジ（{arguments.sources}）: 行 {shown(percent, goal)}%（{len(lines)} ファイル・目標 {target}%）")
+    if percent < goal:
         print(f"警告: カバレッジが目標の {target}% に届いていない（TST-CI-07。初期は警告のみ）")
     return 0
 

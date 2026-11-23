@@ -170,10 +170,15 @@ install_tool() {
     # 退避した旧い導入は、公開するリンクの更新が成功するまで消さない（下の publish_link。失敗したら戻す）
   fi
   publish_link "$name" "$version" "$binary"
-  # リンクを更新できたので、退避した旧い導入を消す
-  if [ -n "$PENDING_BACKUP" ]; then rm -rf -- "${PENDING_BACKUP:?}"; fi
-  PENDING_TARGET=""
+  # リンクを更新できたので、先に終了処理の巻き戻しを解いてから（場所の印を外してから）退避した旧い導入を消す。逆の順では、
+  # 削除の失敗・中断で終了処理が、一部を消した旧い導入を公開済みの新しい導入と置き換えてしまう。PENDING_BACKUP を先に外す
+  # （restore_backup はこれが空なら何もしない）。削除の失敗は場所とともに報告し、公開した導入はそのまま使う
+  local retired=$PENDING_BACKUP
   PENDING_BACKUP=""
+  PENDING_TARGET=""
+  if [ -n "$retired" ]; then
+    rm -rf -- "$retired" || echo "警告: 退避した旧い $name の導入を削除できない（${retired}）。新しい導入はそのまま使う。手で削除する" >&2
+  fi
 }
 
 # 置き換えの途中で失敗したとき、置いた新しい導入をどけて、退避した旧い導入を元の場所に戻す（既存のリンクは同じ版の

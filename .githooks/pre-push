@@ -205,11 +205,14 @@ else
     exit 1
   fi
   # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
-  git -C "$source_root" -c core.autocrlf=false worktree add -q --force --detach "$snapshot" "$head"
+  # --no-checkout: 先に登録だけを行い、印を書いてから展開する（時間のかかる展開の途中で中断・失敗しても印が残り、次の検査が
+  # このフックの作業ツリーとして展開し直せる）
+  git -C "$source_root" worktree add -q --force --no-checkout --detach "$snapshot" "$head"
   # 作った作業ツリーの専用の管理ディレクトリに、このフックの印を書く（次の検査で再利用してよいかの判定に使う）
   private=$(git -C "$snapshot" rev-parse --path-format=absolute --git-dir) && private=$(cd -P "$private" && pwd) \
     || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
   printf '%s\n' "$owner_text" > "$private/$owner_mark"
+  git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout
 fi
 # 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では

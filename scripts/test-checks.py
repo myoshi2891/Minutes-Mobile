@@ -1789,6 +1789,22 @@ def lint_rules_config_cases() -> None:
             failures.append(f"lint-rules: {label}: 期待と違う（{errors}・{rules}）")
 
 
+    # 例外の場所に当たるかは SwiftLint（ICU の正規表現）に判定させる。Python の re が読めない書き方（\\p{Lu}）と、YAML の
+    # 引用符・エスケープを、元の設定の字面のまま扱う
+    count += 1
+    text = ("custom_rules:\n  rule_a:\n    regex: x\n    excluded:\n      - '.*/\\p{Lu}ontrol/.*\\.swift'\n"
+            '      - ".*/\\\\p{Lu}ther/.*" # 注\n      - .*/Plain/.*\n')
+    with tempfile.TemporaryDirectory() as directory:
+        inside, outside = Path(directory) / "Control" / "A.swift", Path(directory) / "lower" / "A.swift"
+        plain, other = Path(directory) / "Plain" / "A.swift", Path(directory) / "Other" / "A.swift"
+        for path in (inside, outside, plain, other):
+            path.parent.mkdir()
+        patterns = module.excluded_patterns(text)
+        hits = module.excluded_locations([inside, outside, plain, other], patterns, Path(directory))
+        if {path: len(set(found)) for path, found in hits.items()} != {inside: 1, plain: 1, other: 1}:
+            failures.append(f"lint-rules: 例外の場所の判定が SwiftLint と違う（{patterns}・{hits}）")
+
+
 def simulator_cases() -> None:
     """find-simulator.py が、形の違う一覧を取得の失敗（終了コード 2）とし、正しい空の一覧を候補なし（1）とすること。"""
     global count
@@ -1946,7 +1962,333 @@ def verify_lock_case(setup: str, versions: Path, dest: Path, stub: Path) -> None
         failures.append(f"versions: 照合の間に導入のロックを持っていない（gh の実行時の記録 {observed}）")
 
 
+def snapshot_tools(source: Path, dest: Path) -> None:
+    """開発ツールを、check.sh の copy_tools（導入のロックを取って写し、外す）そのもので写す。並行の導入の途中を写さない。"""
+    text = (SCRIPTS / "check.sh").read_text(encoding="utf-8")
+    found = re.search(r"^copy_tools\(\) \{\n.*?^\}\n", text, re.MULTILINE | re.DOTALL)
+    assert found is not None, "check.sh に copy_tools がない"
+    script = ('set -euo pipefail\nTOOLS_LOCK=""\nfail() { echo "NG: $*" >&2; exit 1; }\n'
+              'trap \'status=$?; if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" || true; fi; exit "$status"\' EXIT\n'
+              + found.group(0) + 'copy_tools "$1" "$2"\n')
+    result = subprocess.run(["/bin/bash", "-c", script, "copy-tools", str(source), str(dest)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"開発ツールを写せない: {result.stderr.strip()}")
+
+
+def snapshot_tools_case() -> None:
+    """snapshot_tools が、導入のロックが外れるまで待ってから写し、ロックを写さず、写した後に元のロックを外すこと。"""
+    global count
+    count += 1
+    import threading
+    with tempfile.TemporaryDirectory() as directory:
+        source, dest = Path(directory) / "source", Path(directory) / "dest"
+        (source / "bin").mkdir(parents=True)
+        lock = source / ".install.lock"
+        lock.mkdir()
+        thread = threading.Thread(target=snapshot_tools, args=(source, dest))
+        thread.start()
+        thread.join(0.5)
+        waited = thread.is_alive() and not dest.exists()
+        (source / "bin" / "tool").write_text("installed", encoding="utf-8")  # ロックを持つ導入が書き終える
+        lock.rmdir()
+        thread.join(60)
+        copied = (dest / "bin" / "tool").is_file() and not (dest / ".install.lock").exists()
+        if not waited or not copied or lock.exists():
+            failures.append(f"versions: 開発ツールの写しが導入のロックに従わない（待った {waited}・写した {copied}・"
+                            f"ロックが残った {lock.exists()}）")
+
+
+def retired_backup_case() -> None:
+    """setup-tools.sh が、リンクの公開の後に退避した旧い導入を消せなくても、警告して新しい導入を残すこと（巻き戻さない）。
+
+    curl の代わりに手元の配布ファイルを渡し、rm の代わりに、退避（.old.）の削除だけを中身の一部を消して失敗させる。
+    """
+    global count
+    count += 1
+    import hashlib
+    import tarfile
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory)
+        binary = base / "gh"
+        binary.write_text("#!/bin/sh\necho 'gh version 9.9.9 (2000-01-01)'\n# new\n", encoding="utf-8")
+        binary.chmod(0o755)
+        archive = base / "gh.tar.gz"
+        with tarfile.open(archive, "w:gz") as stream:
+            stream.add(binary, arcname="gh")
+        sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+        versions = base / "versions"
+        versions.write_text(f"gh 9.9.9 any cli/cli v9.9.9 gh.tar.gz gh {sha}\n", encoding="utf-8")
+        dest = base / "tools"
+        old = dest / "gh" / "9.9.9"
+        old.mkdir(parents=True)
+        (old / "gh").write_text("old", encoding="utf-8")
+        shims = base / "shims"
+        shims.mkdir()
+        (shims / "curl").write_text('#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\ncp "$MINUTES_TEST_ARCHIVE" "$2"\n',
+                                    encoding="utf-8")
+        (shims / "rm").write_text('#!/bin/bash\nfor last in "$@"; do :; done\ncase "$last" in *.old.*) '
+                                  'if [ -e "$last" ]; then /bin/rm -f "$last/gh"; exit 1; fi ;; esac\nexec /bin/rm "$@"\n',
+                                  encoding="utf-8")
+        for path in shims.iterdir():
+            path.chmod(0o755)
+        result = subprocess.run([str(SCRIPTS / "setup-tools.sh"), "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
+                                capture_output=True, text=True, timeout=60,
+                                env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_ARCHIVE=str(archive)))
+        installed = (dest / "gh" / "9.9.9" / "gh")
+        kept = installed.is_file() and installed.read_text(encoding="utf-8").endswith("# new\n")
+        leftovers = [path.name for path in (dest / "gh").iterdir() if ".old." in path.name]
+        if result.returncode != 0 or not kept or len(leftovers) != 1 or "退避した旧い gh の導入を削除できない" not in result.stderr:
+            failures.append(f"versions: 退避の削除の失敗で新しい導入を巻き戻した・報告しない（終了コード {result.returncode}・"
+                            f"残った新しい導入 {kept}・退避 {leftovers}）\n{(result.stdout + result.stderr).strip()}")
+
+
+def staged_scripts_case() -> None:
+    """コミット前のフックが、check.sh とその補助（worktree-location.py）もステージしたものを使い、元のリポジトリを検査すること。
+
+    作業ツリーの check.sh は失敗する内容、worktree-location.py は判定を拒否する内容に変える（ステージし直さない）。
+    元のリポジトリの Git・.tools・部分的なコミットの GIT_INDEX_FILE を使うことは、整形の代わりが読んだ内容で確かめる。
+    逆に、ステージした補助だけを拒否する内容にすると止まることも確かめる。
+    """
+    global count
+    for label, staged_location in (("作業ツリーの版を使わない", ""), ("ステージした補助を使う", "import sys\nsys.exit(1)\n")):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            (repository / ".tools" / "bin").mkdir(parents=True)
+            out = Path(directory) / "recorded"
+            check = repository / "scripts" / "check.sh"
+            check.write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            hook = Path(directory) / "pre-commit"
+            hook.write_text((ROOT / ".githooks" / "pre-commit").read_text(encoding="utf-8"), encoding="utf-8")
+            stage_tool_stubs(repository)
+            location = repository / "scripts" / "worktree-location.py"
+            valid_location = location.read_text(encoding="utf-8")
+            if staged_location:
+                location.write_text(staged_location, encoding="utf-8")
+            (repository / "scripts" / "verify-docs.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
+            (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+            for name, body in (("swiftformat", 'for last in "$@"; do :; done\ncat "$last" > "$MINUTES_TEST_OUT"\n'),
+                               ("swiftlint", "exit 0\n"), ("gitleaks", "exit 0\n")):
+                (repository / ".tools" / "bin" / name).write_text("#!/bin/sh\n" + body, encoding="utf-8")
+                (repository / ".tools" / "bin" / name).chmod(0o755)
+            # 書き出した補助のスクリプトと同じ場所に置かれたモジュールを読み込まないこと（mktemp の代わりで場所を決める）
+            shims, temporary, planted = Path(directory) / "shims", Path(directory) / "tmp", Path(directory) / "planted"
+            shims.mkdir()
+            temporary.mkdir()
+            (temporary / "subprocess.py").write_text(f"open({str(planted)!r}, 'w').close()\n", encoding="utf-8")
+            (shims / "mktemp").write_text(f'#!/bin/sh\nif [ $# -gt 0 ]; then exec /usr/bin/mktemp "$@"; fi\n'
+                                          f'exec /usr/bin/mktemp "{temporary}/t.XXXXXX"\n', encoding="utf-8")
+            (shims / "mktemp").chmod(0o755)
+            for path in (check, hook, repository / "scripts" / "verify-docs.py"):
+                path.chmod(0o755)
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            # 本来のインデックスには入れず、部分的なコミットの一時のインデックス（相対パス）にだけ入れる
+            env["GIT_INDEX_FILE"] = ".git/partial-index"
+            (repository / "Sample.swift").write_text("let staged = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repository, env=env, check=True, capture_output=True)
+            check.write_text("#!/bin/bash\necho 作業ツリーの check.sh >&2\nexit 1\n", encoding="utf-8")
+            location.write_text(valid_location if staged_location else "import sys\nsys.exit(1)\n", encoding="utf-8")
+            (repository / "Sample.swift").write_text("let worktree = 1\n", encoding="utf-8")
+            result = subprocess.run([str(hook)], cwd=repository, capture_output=True, text=True, timeout=60,
+                                    env=dict(env, MINUTES_TEST_OUT=str(out), PATH=f"{shims}:{env['PATH']}"))
+            output = result.stdout + result.stderr
+            if planted.exists():
+                failures.append(f"check: コミット前のフック（{label}）が一時ディレクトリのモジュールを読み込んだ")
+            if staged_location:
+                if result.returncode != 1 or "一時の置き場所" not in output or out.exists():
+                    failures.append(f"check: コミット前のフック（{label}）が止まらない（終了コード {result.returncode}）\n{output.strip()}")
+            elif result.returncode != 0 or not out.is_file() or out.read_bytes() != b"let staged = 1\n":
+                failures.append(f"check: コミット前のフック（{label}）がステージした内容で検査しない（終了コード {result.returncode}）\n"
+                                f"{output.strip()}")
+    check_path = str(SCRIPTS / "check.sh")
+    expect("check: --root は --staged 以外で使えない", [check_path, "--root", str(ROOT), "--steps", "10"], 2, "使い方")
+    expect("check: 相対パスの --root", [check_path, "--root", ".", "--staged"], 2, "絶対パス")
+    expect("check: 起点でない --root", [check_path, "--root", str(SCRIPTS), "--staged"], 1, "起点でない", env=isolated_git_env())
+
+
+def reinstall_command_case() -> None:
+    """コミット前のフックが案内する導入し直す手順が、bash と zsh の両方で、ステージした setup-tools.sh と台帳を使い、
+    終了コードを返し、一時ファイルを残さず、インデックスと作業ツリーを変えないこと。"""
+    global count
+    for shell in ("/bin/bash", "/bin/zsh"):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository = Path(directory) / "repository"
+            temporary = Path(directory) / "tmp"
+            temporary.mkdir()
+            (repository / "scripts").mkdir(parents=True)
+            (repository / "sub").mkdir()
+            (repository / ".tools").mkdir()
+            out = Path(directory) / "recorded"
+            stage_tool_stubs(repository)
+            setup = repository / "scripts" / "setup-tools.sh"
+            setup.write_text('#!/bin/bash\n[ "$1" != --verify ] || exit 1\ncat "$2" > "$MINUTES_TEST_OUT"\n'
+                             'printf "%s %s %s" "$1" "$3" "$4" >> "$MINUTES_TEST_OUT"\nexit 7\n', encoding="utf-8")
+            (repository / "tools" / "versions").write_text("staged\n", encoding="utf-8")
+            (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+            hook = Path(directory) / "pre-commit"
+            hook.write_text((ROOT / ".githooks" / "pre-commit").read_text(encoding="utf-8"), encoding="utf-8")
+            hook.chmod(0o755)
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "add", "-A"], env=env, check=True, capture_output=True)
+            setup.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+            (repository / "tools" / "versions").write_text("worktree\n", encoding="utf-8")
+            result = subprocess.run([str(hook)], cwd=repository, capture_output=True, text=True, env=env, timeout=60)
+            command = result.stderr.partition("導入し直してからコミットする: ")[2].strip()
+
+            def state() -> str:
+                return subprocess.run(["git", "-C", str(repository), "status", "--porcelain"], env=env, check=True, capture_output=True,
+                                      text=True).stdout + subprocess.run(["git", "-C", str(repository), "ls-files", "-s"], env=env,
+                                                                         check=True, capture_output=True, text=True).stdout
+
+            before = state()
+            # mktemp は macOS の既定では TMPDIR を使わないので、テンプレートを付けて呼ぶ代わりで残ったファイルを調べる
+            shims = Path(directory) / "shims"
+            shims.mkdir()
+            (shims / "mktemp").write_text(f'#!/bin/sh\nexec /usr/bin/mktemp "{temporary}/t.XXXXXX"\n', encoding="utf-8")
+            (shims / "mktemp").chmod(0o755)
+            ran = subprocess.run([shell, "-c", command], cwd=repository / "sub", capture_output=True, text=True, timeout=60,
+                                 env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_OUT=str(out)))
+            recorded = out.read_text(encoding="utf-8") if out.is_file() else ""
+            want = f"staged\n--versions --dest {os.path.realpath(repository)}/.tools"
+            leftovers = [path.name for path in temporary.iterdir()]
+            if ran.returncode != 7 or recorded != want or leftovers or state() != before:
+                failures.append(f"check: 導入し直す手順（{shell}）が期待と違う（終了コード {ran.returncode}・記録 {recorded!r}・"
+                                f"残ったもの {leftovers}）\n{command}\n{ran.stderr.strip()}")
+
+
+def pre_push_interrupted_case() -> None:
+    """プッシュ前のフックが、専用の作業ツリーの展開の途中で強制終了しても、次の検査で展開し直せること（印を展開の前に書く）。
+
+    あわせて、sparse checkout のリポジトリでも全体を展開すること、印のない既存の作業ツリーを変更せずに止めることを確かめる。
+    """
+    global count
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        (repository / "scripts").mkdir(parents=True)
+        (repository / "other").mkdir()
+        (repository / ".tools" / "bin").mkdir(parents=True)
+        base, out, crash = Path(directory) / "base", Path(directory) / "recorded", Path(directory) / "crash"
+        hook = Path(directory) / "pre-push"
+        hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "check.sh").write_text('#!/bin/sh\n'
+                                                         'cd "$(dirname "$0")/.." && cat marker.txt other/file.txt > "$MINUTES_TEST_OUT"\n',
+                                                         encoding="utf-8")
+        for path in (hook, repository / "scripts" / "check.sh"):
+            path.chmod(0o755)
+        copy_location_script(repository)
+        (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        (repository / ".gitattributes").write_text("marker.txt filter=crash\n", encoding="utf-8")
+        (repository / "marker.txt").write_text("marker\n", encoding="utf-8")
+        (repository / "other" / "file.txt").write_text("other\n", encoding="utf-8")
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        git("init", "-q", "--template=", "-b", "main")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        git("sparse-checkout", "set", "scripts")
+        # 展開の途中で、フックのプロセスのグループ全体を強制終了する
+        git("config", "filter.crash.smudge", f'if [ -e "{crash}" ]; then kill -9 0; fi; cat')
+        head = git("rev-parse", "HEAD")
+
+        def push(target: Path) -> "subprocess.CompletedProcess[str]":
+            return subprocess.run([str(hook)], cwd=repository, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
+                                  capture_output=True, text=True, timeout=120, start_new_session=True,
+                                  env=dict(env, MINUTES_PRE_PUSH_DIR=str(target), MINUTES_TEST_OUT=str(out)))
+
+        count += 1
+        crash.write_text("", encoding="utf-8")
+        first = push(base)
+        crash.unlink()
+        # 強制終了で残ったロック（フックの案内と git の案内のとおり、利用者が削除するもの）
+        for lock in list(base.glob("*.lock")):
+            lock.rmdir()
+        for lock in (repository / ".git" / "worktrees").glob("*/index.lock"):
+            lock.unlink()
+        second = push(base)
+        recorded = out.read_text(encoding="utf-8") if out.is_file() else ""
+        if first.returncode == 0 or second.returncode != 0 or recorded != "marker\nother\n":
+            failures.append(f"pre-push: 展開の途中の強制終了の後に検査し直せない（{first.returncode}・{second.returncode}・"
+                            f"記録 {recorded!r}）\n{second.stderr.strip()}")
+        count += 1
+        out.unlink(missing_ok=True)
+        # 中断のない初回の作成（登録 → 印 → 展開 → 照合）も通しで通り、印を書くこと
+        fresh = push(Path(directory) / "fresh")
+        recorded = out.read_text(encoding="utf-8") if out.is_file() else ""
+        marks = list((repository / ".git" / "worktrees").glob("*/minutes-pre-push-owner"))
+        if fresh.returncode != 0 or recorded != "marker\nother\n" or len(marks) != 2:
+            failures.append(f"pre-push: 初回の作成が通らない（終了コード {fresh.returncode}・記録 {recorded!r}・印 {len(marks)}）\n"
+                            f"{fresh.stderr.strip()}")
+        count += 1
+        out.unlink(missing_ok=True)
+        key = next((path.name for path in base.iterdir() if path.is_dir()), "missing")
+        foreign = Path(directory) / "foreign" / key
+        git("worktree", "add", "-q", "--detach", str(foreign), head)
+        (foreign / "mine.txt").write_text("mine", encoding="utf-8")
+        refused = push(foreign.parent)
+        if refused.returncode != 1 or not (foreign / "mine.txt").is_file() or out.exists():
+            failures.append(f"pre-push: 印のない作業ツリーを変更した・止まらない（終了コード {refused.returncode}）\n{refused.stderr.strip()}")
+
+
+def coverage_links_case() -> None:
+    """check.sh の手順 7 が、測る入力の写しの外を指すシンボリックリンクがあれば swift test の前に止め、写しの中の相対の
+    リンクは認めること（swift の代わりが呼ばれたかで確かめる）。"""
+    global count
+    for label, target, want_call in (("写しの中の相対のリンク", "../Shared/Real.swift", True),
+                                     ("写しの中のディレクトリのリンク", "../Shared", True),
+                                     ("写しの外を指すリンク", "../../../../../outside.swift", False),
+                                     ("写しの外を経由して中に戻るリンク",
+                                      "../../../../../.build/minutes-coverage-input/Packages/MinutesKit/Shared", False),
+                                     ("絶対パスのリンク", "/etc/hosts", False)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            package = repository / "Packages" / "MinutesKit"
+            (repository / "scripts").mkdir(parents=True)
+            (package / "Sources").mkdir(parents=True)
+            (package / "Shared").mkdir()
+            (package / "Package.swift").write_text("", encoding="utf-8")
+            (package / "Shared" / "Real.swift").write_text("", encoding="utf-8")
+            (repository / "outside.swift").write_text("", encoding="utf-8")
+            (package / "Sources" / "Link").symlink_to(target)
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "check.sh").chmod(0o755)
+            (repository / ".gitignore").write_text(".build/\n", encoding="utf-8")
+            shims, out = Path(directory) / "shims", Path(directory) / "called"
+            shims.mkdir()
+            (shims / "swift").write_text('#!/bin/sh\ntouch "$MINUTES_TEST_OUT"\nexit 1\n', encoding="utf-8")
+            (shims / "swift").chmod(0o755)
+            for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env, check=True,
+                               capture_output=True)
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "7"], capture_output=True, text=True,
+                                    timeout=60, env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_OUT=str(out)))
+            if out.exists() != want_call or (not want_call and "写しの外を指す" not in result.stderr):
+                failures.append(f"check: 手順 7 の入力の{label}の扱いが違う（swift の呼び出し {out.exists()}）\n{result.stderr.strip()}")
+
+
 def test_versions() -> None:
+    snapshot_tools_case()
+    retired_backup_case()
+    staged_scripts_case()
+    reinstall_command_case()
+    pre_push_interrupted_case()
+    coverage_links_case()
     # 引数が 1 個あれば空文字列でも引数として扱い、--hooks との完全一致を求める（ツールの導入より前に止まる）
     expect("setup: 空文字列の引数", [str(SCRIPTS / "setup.sh"), ""], 2, "使い方")
     expect("setup: 知らない引数", [str(SCRIPTS / "setup.sh"), "--hook"], 2, "使い方")
@@ -2058,14 +2400,7 @@ def test_versions() -> None:
     # 導入済みの写しで行う（取得しないので通信しない）
     with tempfile.TemporaryDirectory() as directory:
         dest = Path(directory) / "dest"
-        dest.mkdir()
-        for entry in Path(tools).iterdir():
-            if entry.name in (".install.lock",) or entry.name.startswith(".work."):
-                continue
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.copytree(entry, dest / entry.name, symlinks=True)
-            else:
-                shutil.copy2(entry, dest / entry.name, follow_symlinks=False)
+        snapshot_tools(Path(tools), dest)
         (dest / "bin").chmod(0o555)
         try:
             expect("versions: 公開するリンクを更新できない", [setup, "--dest", str(dest)], 1, "公開するリンク")
@@ -2203,6 +2538,7 @@ def test_gitleaks() -> None:
         expect("gitleaks: 鍵のないディレクトリは通る", base + [directory], 0, "no leaks found")
     gitleaks_merge_case()
     gitleaks_broken_history_case()
+    gitleaks_traversal_case()
     gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
     with tempfile.TemporaryDirectory() as directory:
@@ -2556,6 +2892,32 @@ def step3_tool_verify_case() -> None:
                             f"記録 {out.exists()}）\n{(result.stdout + result.stderr).strip()}")
 
 
+def step_order_verify_case() -> None:
+    """開発ツールを使う最初の手順より前に手順 0 があるときだけ、先の照合を省くこと（手順 0 が後なら照合する）。"""
+    global count
+    for steps, want in (("3,0", True), ("3", True), ("0,3", False), ("10", False), ("10,0", False), ("10,0,3", False), ("10,3,0", True)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            for name in ("test-checks.py", "setup-tools.sh", "gitleaks-history.sh", "verify-docs.py"):
+                (repository / "scripts" / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            for path in (repository / "scripts").iterdir():
+                path.chmod(0o755)
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                            "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "--allow-empty",
+                            "-m", "base"], env=env, check=True, capture_output=True)
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", steps], capture_output=True, text=True,
+                                    env=env, timeout=60)
+            if result.returncode != 0 or ("== 開発ツールの照合" in result.stdout) != want:
+                failures.append(f"check: --steps {steps} の先の照合が期待（{want}）と違う（終了コード {result.returncode}）\n"
+                                f"{(result.stdout + result.stderr).strip()}")
+
+
 def step3_history_case() -> None:
     """check.sh の手順 3 が、履歴の検査に scripts/gitleaks-history.sh を作業ツリーの起点で呼ぶこと。
 
@@ -2618,6 +2980,32 @@ def gitleaks_broken_history_case() -> None:
                "全履歴を git log で読めない", env=env)
 
 
+def gitleaks_traversal_case() -> None:
+    """先の確認の git log は通り、gitleaks 自身の git log だけが失敗・中断・標準エラーに出力した場合も「検出なし」で通さないこと。
+
+    PATH の git の代わりは、2 回目以降の log（gitleaks が起動するもの）だけを失敗させる。
+    """
+    global count
+    real = shutil.which("git")
+    assert real is not None
+    for label, failure, want in (("失敗しない", "exit 0", 0), ("終了コード 3", "exit 3", 1), ("強制終了", "kill -9 $$", 1),
+                                 ("標準エラーだけ", "echo warning: partial >&2; exit 0", 1)):
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository, shims, seen = Path(directory) / "repository", Path(directory) / "shims", Path(directory) / "seen"
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                            "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "--allow-empty",
+                            "-m", "base"], env=env, check=True, capture_output=True)
+            shims.mkdir()
+            (shims / "git").write_text(
+                f'#!/bin/bash\ncase " $* " in *" log "*) ;; *) exec "{real}" "$@" ;; esac\n'
+                f'if [ ! -e "{seen}" ]; then touch "{seen}"; exec "{real}" "$@"; fi\n"{real}" "$@"\n{failure}\n', encoding="utf-8")
+            (shims / "git").chmod(0o755)
+            expect(f"gitleaks: 走査中の git log が{label}", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], want,
+                   "最後まで終わらなかった" if want else "no leaks found", env=dict(env, PATH=f"{shims}:{env['PATH']}"))
+
+
 def gitleaks_merge_case() -> None:
     """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
 
@@ -2630,6 +3018,7 @@ def gitleaks_merge_case() -> None:
     history = str(SCRIPTS / "gitleaks-history.sh")
     step3_history_case()
     step3_tool_verify_case()
+    step_order_verify_case()
     count += 1
     # 偽の鍵は実行時に組み立てる（このファイル自体が検出されないようにする）
     normal_key = "ghp_" + "a8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi"
@@ -2686,7 +3075,7 @@ def gitleaks_merge_case() -> None:
 
 
 def coverage_case(label: str, want_code: int, want_text: str, count_value: object, covered_value: object, nested: bool = False,
-                  target: str = "90") -> None:
+                  target: str = "90", forbidden: str = "") -> None:
     with tempfile.TemporaryDirectory() as directory:
         sources = Path(directory) / "Sources"
         sources.mkdir()
@@ -2697,8 +3086,10 @@ def coverage_case(label: str, want_code: int, want_text: str, count_value: objec
             "lines": {"count": count_value, "covered": covered_value}}}]}]}), encoding="utf-8")
         if nested:
             report.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")  # json の読み込みが RecursionError になる深さ
-        expect(f"coverage: {label}", [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", target],
-               want_code, want_text)
+        command = [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", target]
+        expect(f"coverage: {label}", command, want_code, want_text)
+        if forbidden and forbidden in run(command)[1]:
+            failures.append(f"coverage: {label}: 出力に「{forbidden}」がある")
 
 
 def test_coverage() -> None:
@@ -2718,6 +3109,12 @@ def test_coverage() -> None:
     # 目標にわずかに届かない値を、丸めて目標以上に見せない（89.96% を 90.0% と表示しない）。小数の目標は丸めずに表示する
     coverage_case("目標にわずかに届かない", 0, "行 89.96%", 10000, 8996, target="90")
     coverage_case("小数の目標", 0, "目標の 90.5% に届いていない", 20, 18, target="90.5")
+    # 浮動小数点では目標ちょうどに丸まる不足を警告し、目標ちょうどは警告しない
+    coverage_case("浮動小数点で丸まる不足", 0, "警告: カバレッジが目標の 90%", 10**18, 9 * 10**17 - 1)
+    coverage_case("浮動小数点で丸まる不足の表示", 0, "行 89.9999999999999999%", 10**18, 9 * 10**17 - 1)
+    coverage_case("小数の目標ちょうど", 0, "行 57.1%", 1000, 571, target="57.1", forbidden="警告")
+    coverage_case("割り切れない目標ちょうど", 0, "行 64.1%", 1000, 641, target="64.10", forbidden="警告")
+    coverage_case("桁の多すぎる目標", 2, "--target", 20, 19, target="1e-999999999")
     coverage_case("深い入れ子の記録", 2, "RecursionError", 20, 19, nested=True)
     # 大きな行数でも、割ってから 100 を掛けるので float への変換の途中で桁あふれしない
     coverage_case("大きな行数", 0, "行 50.0%", 2 * 10**400, 10**400)
@@ -3515,6 +3912,35 @@ def run_docs_cases() -> None:
               extra={"docs/02-basic-design/design(v2).txt": "v2\n", "docs/02-basic-design/design(v2.txt": "v2\n"})
     docs_case("エスケープした括弧を含むリンク先がない", 1, "リンクの先がない: missing(v2.txt", basic,
               "[要件](../01-requirements/requirements.md)", "[要件](../01-requirements/requirements.md) [片](missing\\(v2.txt)")
+    # 対になるエスケープされていない「[」のない「](」はリンクにしない。ふつうのリンク・エスケープした「\\」の後のリンク・
+    # 画像を含むリンク・行をまたぐリンクの文は、これまでどおり確かめる
+    for label, text, want in (
+        ("エスケープした「[」", "\\[例](missing.md)", ""),
+        ("エスケープした「]」", "[例\\](missing.md)", ""),
+        ("対になる「[」のない「]」", "例](missing.md)", ""),
+        ("ふつうのリンク", "[例](missing.md)", "missing.md"),
+        ("エスケープした「\\」の後のリンク", "\\\\[例](missing.md)", "missing.md"),
+        ("エスケープした括弧を文に含むリンク", "[例\\]続き](missing.md)", "missing.md"),
+        ("画像を含むリンク", "[![図](../README.md)](missing.md)", "missing.md"),
+        ("行をまたぐリンクの文", "[例\n続き](missing.md)", "missing.md"),
+        ("段落をまたぐ括弧", "[例\n\n続き](missing.md)", ""),
+    ):
+        docs_case(f"リンクの文の括弧: {label}", 1 if want else 0, f"リンクの先がない: {want}" if want else "OK", basic,
+                  "[要件](../01-requirements/requirements.md)", f"[要件](../01-requirements/requirements.md)\n\n{text}")
+    # コード片の印のパスは空白を含んでよい。照合と書き直しの両方で読み、起点の外・パスのない印は不備として報告する
+    spaced = {"scripts/with space.sh": "echo spaced\n"}
+    file_marker = "<!-- file: scripts/sample.sh -->"
+    fenced = f"{FENCE}bash\necho one\necho two\necho three\n{FENCE}"
+    for label, path, body, options, want, want_text in (
+        ("一致", "scripts/with space.sh", "echo spaced", [], 0, "OK"),
+        ("不一致", "scripts/with space.sh", "echo stale", [], 1, "コード片が scripts/with space.sh と一致しない"),
+        ("書き直し", "scripts/with space.sh", "echo stale", ["--update-snippets"], 0, "コード片を書き直した"),
+        ("起点の外", "../out side.sh", "echo stale", ["--update-snippets"], 1, "--root の外にある"),
+        ("パスなし", "", "echo stale", [], 1, "印にパスがない"),
+        ("パスなしの書き直し", "", "echo stale", ["--update-snippets"], 1, "印にパスがない"),
+    ):
+        docs_case(f"コード片の印のパスの空白: {label}", want, want_text, detailed, f"{file_marker}\n\n{fenced}",
+                  f"<!-- file: {path} -->\n\n{FENCE}bash\n{body}\n{FENCE}", options=options, extra=spaced)
     # 印と見出しの文の間がタブの見出しも節として数え、冒頭の「満たす要件:」を確かめる
     docs_case("タブで区切った節の見出し", 1, "節「3a. 補足」の冒頭に「満たす要件:」の行がない", basic,
               "## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n", "## 3. テスト観点\n\n満たす要件: TST-AAA-01\n\n##\t3a. 補足\n\n本文\n\n")

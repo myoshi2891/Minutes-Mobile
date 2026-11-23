@@ -89,12 +89,41 @@ if [ -e "$repository/.gitleaksignore" ] || [ -L "$repository/.gitleaksignore" ];
   exit 1
 fi
 # gitleaks（8.30.1）は git log の失敗（壊れた・欠けたオブジェクトなど）を終了コードに反映せず、読めた分だけで「no leaks found」
-# として通しうる。そこで、同じ指定の git log で全履歴の差分を最後まで読めることを先に確かめ、読めなければ検査せずに失敗する
+# として通しうる（標準エラーに何か書かれた場合も、そこで走査をやめて通す）。そこで、同じ指定の git log で全履歴の差分を最後まで読めることを先に確かめ、読めなければ検査せずに失敗する
 # （出力は捨てる。値を表示しない）。gitleaks と同じく -p -U0 で差分を出す
 if ! git -C "$repository" log -p -U0 $GITLEAKS_LOG_OPTS > /dev/null; then
   echo "NG: ${repository} の全履歴を git log で読めない（壊れた・欠けたオブジェクトなど）。git fsck で確かめてから検査し直す" >&2
   exit 1
 fi
+# 上の確認の後に、gitleaks 自身の git log だけが失敗することもある。gitleaks は git を PATH から起動するので、実際の git を
+# 呼んで git log の終了コードと標準エラーの有無を記録する代わりの git を、gitleaks にだけ PATH の先頭で渡す。走査が最後まで
+# 終わった記録（終了コード 0・標準エラーなし）がなければ、検出なしでも失敗にする
+real_git=$(command -v git)
+case "$real_git" in /*) ;; *) echo "NG: git の場所を特定できない（${real_git}）" >&2; exit 1 ;; esac
+shim=$(mktemp -d)
+trap 'status=$?; rm -rf -- "$shim" || true; exit "$status"' EXIT
+trap 'exit 130' INT TERM
+cat > "$shim/git" <<'SHIM'
+#!/bin/bash
+# gitleaks が走査に使う「git … log …」だけを記録する（ほかの git の呼び出しはそのまま渡す）
+is_log=""
+for argument in "$@"; do if [ "$argument" = log ]; then is_log=1; fi; done
+if [ -z "$is_log" ]; then exec "$MINUTES_REAL_GIT" "$@"; fi
+echo "started" >> "$MINUTES_GIT_RECORD"
+"$MINUTES_REAL_GIT" "$@" 2> "$MINUTES_GIT_RECORD.stderr"
+status=$?
+cat "$MINUTES_GIT_RECORD.stderr" >&2
+if [ "$status" = 0 ] && [ ! -s "$MINUTES_GIT_RECORD.stderr" ]; then echo "complete" >> "$MINUTES_GIT_RECORD"; fi
+exit "$status"
+SHIM
+chmod +x "$shim/git"
+result=0
 # --redact: 検出した値そのものを出力に残さない
-exec "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
-  "${GITLEAKS_SUPPRESSION[@]}" --log-opts="$GITLEAKS_LOG_OPTS" ${REPORT[@]+"${REPORT[@]}"} "$repository"
+PATH="$shim:$PATH" MINUTES_REAL_GIT="$real_git" MINUTES_GIT_RECORD="$shim/record" "$ROOT/.tools/bin/gitleaks" git --no-banner --no-color --redact --config "$ROOT/.gitleaks.toml" \
+  "${GITLEAKS_SUPPRESSION[@]}" --log-opts="$GITLEAKS_LOG_OPTS" ${REPORT[@]+"${REPORT[@]}"} "$repository" || result=$?
+# git log は 1 回だけ起動され、最後まで終わっていること（起動の記録がない・途中で終わった・標準エラーに書いたものは失敗）
+if [ "$(cat "$shim/record" 2>/dev/null)" != $'started\ncomplete' ]; then
+  echo "NG: gitleaks の走査中の git log が最後まで終わらなかった（失敗・中断・標準エラーへの出力）。全履歴を検査できていない" >&2
+  if [ "$result" -eq 0 ]; then result=1; fi
+fi
+exit "$result"

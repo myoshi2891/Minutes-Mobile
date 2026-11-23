@@ -68,8 +68,7 @@ PHASES = re.compile(r"^(MVP|P2|P3)\b")
 # sections() が節の本文でコードフェンスの行の代わりに置く行。空行と違って節の冒頭を終わらせ、
 # 「|」で始まらないので表のまとまりも区切る（「- 」「### 」「満たす要件:」とも一致しない）
 FENCE_LINE = "\0fence"
-# インラインのリンクの始まり（「](」）と、リンク先の後に続けて書けるタイトル（"…"・'…'・(…)）
-LINK_START = re.compile(r"\]\(")
+# リンク先の後に続けて書けるタイトル（"…"・'…'・(…)）
 LINK_TITLE = re.compile(r"""\s+(?:"[^"]*"|'[^']*'|\([^)]*\))""")
 # 参照形式のリンクの定義（[ラベル]: リンク先）。字下げは空白 0〜3 個まで（CommonMark）
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
@@ -228,12 +227,37 @@ ASCII_PUNCTUATION = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
 LINK_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 
-def link_destinations(line: str) -> List[str]:
-    """行の中のインラインのリンクのリンク先を返す。リンク先は山括弧で囲んだもの（<…>）か、空白を含まず括弧の対が
+# コード片の印の行（<!-- file: パス --> と <!-- excerpt: パス -->）。パスは区切りの間の全体で、空白を含んでよい。
+# 照合（check_snippets）と書き直し（update_snippets）が同じ読み取りを使う
+SNIPPET_MARKER = re.compile(r"^<!--\s*(file|excerpt):(.*?)-->$")
+
+
+def snippet_marker(line: str) -> Optional[Tuple[str, str]]:
+    """コード片の印の行なら（種類, パス）を返す。パスが書かれていない印のパスは空文字列（check_snippets が不備として報告する）。"""
+    found = SNIPPET_MARKER.match(line.strip())
+    return (found.group(1), found.group(2).strip()) if found else None
+
+
+def link_destinations(line: str, unclosed: int = 0) -> Tuple[List[str], int]:
+    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」の数を返す。
+
+    リンクの文を閉じる「]」（エスケープされておらず、対になるエスケープされていない「[」がある）の直後の「(」だけをリンク先の
+    始まりとする（「\\[例](missing.md)」はリンクにならない）。リンクの文は同じ段落の中で行をまたげるので、前の行から
+    開いたままの「[」の数を unclosed で受け取る。リンク先は山括弧で囲んだもの（<…>）か、空白を含まず括弧の対が
     とれたもの（design(v2).md の「)」をリンクの終わりと取り違えない。CommonMark と同じ）。その後にタイトルを書ける。"""
     found: List[str] = []
-    for start in LINK_START.finditer(line):
-        at = start.end()
+    position = 0
+    while position < len(line):
+        char = line[position]
+        position += 2 if char == "\\" and line[position + 1:position + 2] in tuple(ASCII_PUNCTUATION) else 1
+        if char == "[":
+            unclosed += 1
+        if char != "]" or unclosed == 0:
+            continue
+        unclosed -= 1
+        if not line.startswith("(", position):
+            continue
+        at = position + 1
         # 「(」の直後の空白は読み飛ばす（CommonMark。「[設計]( missing.md)」もリンクとして確かめる）
         while at < len(line) and line[at] in " \t":
             at += 1
@@ -267,7 +291,8 @@ def link_destinations(line: str) -> List[str]:
             at += 1
         if line.startswith(")", at):
             found.append(destination)
-    return found
+            position = at + 1  # リンク先の中の括弧を、リンクの文の括弧と数えない
+    return found, unclosed
 
 
 def table_cells(line: str) -> List[str]:
@@ -722,10 +747,15 @@ class Checker:
                 found = REFERENCE_DEFINITION.match(line)
                 if found:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
+            unclosed, previous = 0, 0  # 同じ段落の前の行から開いたままの「[」の数と、前の行の番号
             for number, line in prose_lines(text):
+                # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
+                if number != previous + 1 or not line.strip() or BLOCK_START.match(line):
+                    unclosed = 0
+                previous = number
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
                 line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない
-                targets = link_destinations(line)
+                targets, unclosed = link_destinations(line, unclosed)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
@@ -917,8 +947,12 @@ class Checker:
             if inside:
                 continue  # フェンスの中の印は説明用の例であり、照合しない
             index = number - 1
-            marker = re.match(r"^<!-- (file|excerpt): (\S+) -->$", line.strip())
+            marker = snippet_marker(line)
             if not marker:
+                continue
+            kind, source = marker
+            if not source:
+                self.error(name, "コード片の印にパスがない", index + 1)
                 continue
             start = index + 1
             while start < len(lines) and not lines[start].strip():
@@ -931,28 +965,28 @@ class Checker:
             indent = fence_indent(lines[start])
             snippet = [dedent(line, indent) for line in lines[start + 1:end]]
             try:
-                path = self.snippet_source(marker.group(2))
+                path = self.snippet_source(source)
             except Unresolvable as error:
                 self.error(name, f"コード片の元のファイルのパスを解決できない: {error}", index + 1)
                 continue
             if path is None:
-                self.error(name, f"コード片の元のファイルが --root の外にある: {marker.group(2)}", index + 1)
+                self.error(name, f"コード片の元のファイルが --root の外にある: {source}", index + 1)
                 continue
             if not path.is_file():
-                self.error(name, f"コード片の元のファイルがない: {marker.group(2)}", index + 1)
+                self.error(name, f"コード片の元のファイルがない: {source}", index + 1)
                 continue
             try:
                 actual = split_lines(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError) as error:
-                self.error(name, f"コード片の元のファイルを読めない: {marker.group(2)}: {error}", index + 1)
+                self.error(name, f"コード片の元のファイルを読めない: {source}: {error}", index + 1)
                 continue
-            if marker.group(1) == "file":
+            if kind == "file":
                 matches = snippet == actual
             else:
                 size = len(snippet)
                 matches = size > 0 and any(actual[at:at + size] == snippet for at in range(len(actual) - size + 1))
             if not matches:
-                self.error(name, f"コード片が {marker.group(2)} と一致しない", index + 1)
+                self.error(name, f"コード片が {source} と一致しない", index + 1)
 
     def snippet_source(self, relative: str) -> Optional[Path]:
         """コード片の元のファイルのパス。シンボリックリンクを解決した後も --root の中にある場合だけ返す。"""
@@ -995,15 +1029,15 @@ class Checker:
             while index < len(lines):
                 out.append(lines[index])
                 out_endings.append(endings[index])
-                marker = re.match(r"^<!-- file: (\S+) -->$", lines[index].strip()) if index in outside else None
+                marker = snippet_marker(lines[index]) if index in outside else None
                 index += 1
-                if not marker:
-                    continue
+                if not marker or marker[0] != "file" or not marker[1]:
+                    continue  # パスのない印は検査の側（check_snippets）が報告する
                 start = index
                 while start < len(lines) and not lines[start].strip():
                     start += 1
                 try:
-                    path = self.snippet_source(marker.group(1))
+                    path = self.snippet_source(marker[1])
                 except Unresolvable:
                     continue  # 検査の側（check_snippets）が印の行とともに報告する
                 opened = fence_open(lines[start]) if start < len(lines) else None

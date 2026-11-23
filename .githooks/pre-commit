@@ -15,9 +15,10 @@ if ! git cat-file blob :tools/versions > "$versions"; then
   echo "NG: ステージした tools/versions を読めない" >&2
   exit 1
 fi
-# 導入し直す手順は、ステージした台帳を一時ファイルに書き出して --versions で渡す（作業ツリーの台帳とステージした内容は変えない）。
-# 一時ファイルを消した後も、導入（または書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）
-reinstall='(versions=$(mktemp) || exit 1; git cat-file blob :tools/versions > "$versions" && scripts/setup-tools.sh --versions "$versions"; status=$?; rm -f -- "$versions"; exit "$status")'
+# 導入し直す手順は、ステージした台帳と setup-tools.sh の両方を一時ファイルに書き出し、書き出したものを --versions・--dest を
+# 付けて実行する（作業ツリーのものは使わず、作業ツリーとステージした内容は変えない）。一時ファイルを消した後も、導入（または
+# 書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）。zsh では status が読み取り専用なので result に控える
+reinstall='(export GIT_NO_REPLACE_OBJECTS=1; root=$(git rev-parse --show-toplevel) || exit 1; versions=$(mktemp) || exit 1; setup=$(mktemp) || { rm -f -- "$versions"; exit 1; }; git cat-file blob :tools/versions > "$versions" && git cat-file blob :scripts/setup-tools.sh > "$setup" && /bin/bash "$setup" --versions "$versions" --dest "$root/.tools"; result=$?; rm -f -- "$versions" "$setup"; exit "$result")'
 # 照合に使う setup-tools.sh も、作業ツリーではなくステージしたもの（コミットする内容）を一時ファイルに書き出して実行する
 # （ステージしていない作業ツリーの変更で照合の結果を変えない）。--versions・--dest を渡すので、置き場所に依存しない
 setup=$(mktemp)
@@ -32,4 +33,13 @@ if ! /bin/bash "$setup" --verify --versions "$versions" --dest "$root/.tools"; t
 fi
 # check.sh --staged は、導入のロックを取って開発ツールを写し、写しをステージした台帳と照合してから、検査のすべてを写しで
 # 行う（照合の後に元の導入が差し替えられても、検査に使う導入は変わらない）。上の照合は、導入し直す手順を示すために先に行う
-"$root/scripts/check.sh" --staged
+# check.sh 自身もステージしたものを書き出して実行する（ステージしていない作業ツリーの変更で検査を変えない）。--root で元の
+# リポジトリを示すので、Git の操作・GIT_INDEX_FILE・.tools は元のリポジトリのまま。check.sh が呼ぶほかのスクリプト
+# （worktree-location.py・setup-tools.sh・test-lint-rules.py・verify-docs.py）は、check.sh がステージした内容から書き出して使う
+check=$(mktemp)
+trap 'status=$?; rm -f -- "$versions" "$setup" "$check" || true; exit "$status"' EXIT
+if ! git cat-file blob :scripts/check.sh > "$check"; then
+  echo "NG: ステージした scripts/check.sh を読めない" >&2
+  exit 1
+fi
+/bin/bash "$check" --root "$root" --staged
