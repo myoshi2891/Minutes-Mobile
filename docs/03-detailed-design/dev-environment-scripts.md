@@ -162,7 +162,8 @@ install_tool() {
     if [ "$name" = gh ]; then
       # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）。
       # ほかのツールは、GH_HOST の設定に取得先が左右されないよう、--repo にホスト（github.com）を明示する
-      curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      # 止まった転送でロックを持ち続けないよう、接続と転送の全体に上限（秒）を付ける（ロックを待つ上限の 600 秒より短くする）
+      curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
         -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     else
@@ -581,7 +582,11 @@ if [ "$STAGED" = 1 ]; then
   else
     fail "開始時の HEAD を読めない（まだないのでもない）"
   fi
-  ORIGINAL_INDEX=$(git rev-parse --path-format=absolute --git-path index) || fail "インデックスの場所を特定できない"
+  # $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と git が付けた区切りの改行 1 つだけを外す
+  # （git_path と同じ。GIT_INDEX_FILE があれば、呼び出し側の代わりのインデックスの場所になる）
+  ORIGINAL_INDEX=$(git rev-parse --path-format=absolute --git-path index && printf x) || fail "インデックスの場所を特定できない"
+  ORIGINAL_INDEX=${ORIGINAL_INDEX%x}
+  ORIGINAL_INDEX=${ORIGINAL_INDEX%$'\n'}
   STAGED_INDEX_COPY=$(mktemp)
   rm -f -- "$STAGED_INDEX_COPY"
   GIT_INDEX_FILE="$STAGED_INDEX_COPY" git read-tree "$STAGED_INDEX_TREE" || fail "控えたツリーから専用のインデックスを作れない"
@@ -1346,9 +1351,10 @@ if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree;
 START_HEAD=""
 START_CHANGES=""
 if [ "$STAGED" = 0 ]; then
-  # コミットの合格を求める実行は、置き換えのオブジェクト（git replace）を使わず、元のコミットのオブジェクトで開始時の
-  # 照合・専用の作業ツリーの展開・sparse checkout の解除・入れ子の check.sh の検査を行う（子のプロセスにも引き継ぐ）
-  if [ "$REQUIRE_CLEAN" = 1 ]; then export GIT_NO_REPLACE_OBJECTS=1; fi
+  # 置き換えのオブジェクト（git replace）を使わず、元のオブジェクトで開始時の照合・専用の作業ツリーの展開・sparse checkout の
+  # 解除・入れ子の check.sh の検査・カバレッジの入力の識別と書き出し（手順 7・8。--require-clean の有無によらない）を行う
+  # （子のプロセスにも引き継ぐ。置き換えがなければ結果は変わらない）
+  export GIT_NO_REPLACE_OBJECTS=1
   START_HEAD=$(git rev-parse HEAD)
   # 呼び出し元が照合した HEAD と、これから検査する HEAD が同じであること（A → A は通し、A → B は止める）
   if [ -n "$EXPECT_HEAD" ]; then
