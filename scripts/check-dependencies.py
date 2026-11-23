@@ -335,10 +335,15 @@ def regex_end(text: str, index: int) -> int:
     """index で始まる拡張の区切りの正規表現のリテラルの終わりの次の位置を返す。閉じていなければ読めないものとして扱う。"""
     hashes = len(text[index:]) - len(text[index:].lstrip("#"))
     closing = "/" + "#" * hashes
-    end = text.find(closing, index + hashes + 1)
-    if end < 0:
-        raise Unreadable("正規表現のリテラルが閉じていない")
-    return end + len(closing)
+    cursor = index + hashes + 1
+    while cursor < len(text):
+        if text[cursor] == "\\":
+            cursor += 2  # エスケープした 1 文字（「\\/#」の「/#」を終わりと取り違えない）
+        elif text.startswith(closing, cursor):
+            return cursor + len(closing)
+        else:
+            cursor += 1
+    raise Unreadable("正規表現のリテラルが閉じていない")
 
 
 def starts_string(text: str, index: int) -> bool:
@@ -661,6 +666,29 @@ def contained(root: Path, location: str) -> bool:
 LOCAL_PACKAGE_ROOT = "Packages"
 
 
+def leaves_coverage_input(root: Path, link: str, seen: Set[str]) -> bool:
+    """リンクが、カバレッジの測定の写し（Packages/ だけを展開する）の外を指すか。check.sh の verify_coverage_links と同じ規則で、
+    リンク先は相対パスに限り、途中の要素と経由するリンクもすべて Packages/ の中にあることを求める（起点そのものは通ってよい）。
+    """
+    if link in seen:
+        return False  # 循環するリンクは manifest を読めないので、manifest の有無の確認で止まる
+    seen.add(link)
+    top = os.path.realpath(root)
+    packages = os.path.join(top, LOCAL_PACKAGE_ROOT)
+    target = os.readlink(link)
+    if os.path.isabs(target):
+        return True
+    current = os.path.realpath(os.path.dirname(link))
+    for part in target.split(os.sep):
+        step = os.path.join(current, part)
+        if os.path.islink(step) and leaves_coverage_input(root, step, seen):
+            return True
+        current = os.path.realpath(step)
+        if current not in (top, packages) and not current.startswith(packages + os.sep):
+            return True
+    return False
+
+
 def local_package_errors(directory: str, path: str, summary: str, root: Optional[Path]) -> List[str]:
     """.package(path:) の参照先を、参照元の Package.swift のディレクトリから解決して確かめる。
 
@@ -691,6 +719,14 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
         return [f"ローカルの Package {location} の実体（{'/'.join(resolved)}）は検査の対象外のディレクトリにある: .package({summary})"]
     if not (target / "Package.swift").is_file():
         return [f"ローカルの Package {location} に manifest がない（Package.swift）: .package({summary})"]
+    # 測定の写しの外を指す manifest のリンクは、写しの中で解決できない（check.sh の手順 7 が拒否する）ので先に認めない
+    try:
+        manifest = os.path.join(target, "Package.swift")
+        if os.path.islink(manifest) and leaves_coverage_input(root, manifest, set()):
+            return [f"ローカルの Package {location} の manifest（Package.swift）が {LOCAL_PACKAGE_ROOT}/ の外を指すリンク: "
+                    f".package({summary})"]
+    except OSError as error:
+        raise Unreadable(f"{target}: {error}") from error
     return []
 
 

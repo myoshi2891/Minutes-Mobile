@@ -223,8 +223,9 @@ def strip_quote(line: str, limit: Optional[int] = None) -> Tuple[int, str]:
     return depth, line
 
 
-def quoted_fences(text: str) -> Iterator[Tuple[int, str]]:
-    """引用の中で開いたコードフェンスを（行番号, 情報文字列）で返す（ふつうのフェンス・コメント・<pre> の中の行は見ない）。
+def quoted_fences(text: str) -> Iterator[Tuple[int, Optional[str]]]:
+    """引用の中のコードフェンスの行を（行番号, 開いた行なら情報文字列・本文と閉じる行なら None）で返す
+    （ふつうのフェンス・コメント・<pre> の中の行は見ない）。
 
     開いたときと同じ深さの引用が続く間だけ、閉じるフェンスまでを中の行とする（引用が終わればフェンスも終わる。CommonMark）。
     """
@@ -238,6 +239,7 @@ def quoted_fences(text: str) -> Iterator[Tuple[int, str]]:
             if depth == current[0]:
                 if fence_closes(content, current[1]):
                     current = None
+                yield number, None
                 continue
             current = None
         depth, content = strip_quote(line)
@@ -291,6 +293,40 @@ class IndentedCode:
             return False
         self.paragraph = not ends
         return False
+
+
+def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, "re.Match[str]"]]:
+    """参照形式のリンクの定義（[ラベル]: リンク先）を（行番号, 一致）で返す。skipped の行（引用の中のフェンス）は本文として見ない。
+
+    定義は段落の始まりにだけ書ける（段落の文の続きの、定義の形の行は定義にならない。CommonMark）。定義の直後の行と、定義の
+    次の行に書いたタイトルの直後の行は、続けて定義を書ける。
+    """
+    code = IndentedCode()
+    previous = 0
+    untitled = False  # 直前の行が、タイトルのない定義
+    for number, line in prose_lines(text):
+        if number != previous + 1:
+            code.interrupt()
+            untitled = False
+        previous = number
+        if number in skipped or COMMENT_OPEN.match(line):
+            code.interrupt()
+            untitled = False
+            continue
+        starts = not code.paragraph
+        found = REFERENCE_DEFINITION.match(line)
+        if code.is_code(line):
+            untitled = False
+            continue
+        if found and starts:
+            yield number, found
+            code.interrupt()
+            untitled = not line[found.end():].strip()
+            continue
+        title = LINK_TITLE.match(" " + line) if untitled else None
+        if title and title.end() == len(line.rstrip()) + 1:
+            code.interrupt()
+        untitled = False
 
 
 def reversed_range(match: "re.Match[str]") -> bool:
@@ -646,6 +682,12 @@ class Checker:
                 if part in ("", "."):
                     continue
                 if part == "..":
+                    # 通常のファイルなどの「..」はファイルシステムではたどれないので、字面だけで親に戻さない
+                    try:
+                        if not stat.S_ISDIR(os.lstat(current).st_mode):
+                            raise Rejected(f"{current} がディレクトリでないのに「..」でたどっている")
+                    except OSError as error:
+                        raise Rejected(f"{current} を調べられない: {error.strerror or error}") from error
                     current = os.path.dirname(current)
                     if current != root and not current.startswith(root + os.sep):
                         raise Rejected(f"{current} が起点の外にある")
@@ -851,26 +893,32 @@ class Checker:
                 if fence_end(lines, number - 1) >= len(lines):
                     self.error(name, "コードフェンスが閉じていない", number)
             # 引用の中のフェンスは、言語の指定だけを確かめる（閉じていなくても、引用の終わりで終わる）
-            for number, info in quoted_fences(text):
-                if not info:
+            quoted = dict(quoted_fences(text))
+            for number, info in quoted.items():
+                if info == "":
                     self.error(name, "コードフェンスに言語の指定がない（引用の中）", number)
             # 参照形式のリンクは、定義（[ラベル]: リンク先）を通してリンク先を求め、インラインのリンクと同じく確かめる
             definitions: Dict[str, str] = {}
-            for _, line in prose_lines(text):
-                found = REFERENCE_DEFINITION.match(line)
-                if found:
-                    definitions.setdefault(reference_label(found.group(1)), found.group(2))
+            definition_lines: Set[int] = set()
+            for number, found in reference_definitions(text, set(quoted)):
+                definition_lines.add(number)
+                definitions.setdefault(reference_label(found.group(1)), found.group(2))
             openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」
             previous = 0  # 前の行の番号
             code = IndentedCode()
             for number, line in prose_lines(text):
-                is_definition = REFERENCE_DEFINITION.match(line) is not None
+                is_definition = number in definition_lines
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
                 if number != previous + 1 or not line.strip() or BLOCK_START.match(line):
                     openers = []
                 if number != previous + 1:
                     code.interrupt()
                 previous = number
+                # 引用の中のコードフェンスの行はリンクとして確かめない（言語の指定は上で確かめた）
+                if number in quoted:
+                    openers = []
+                    code.interrupt()
+                    continue
                 # 字下げしたコードブロックの中はリンクとして確かめない（段落の続きの行・箇条書きの中の段落は確かめる）
                 if code.is_code(line):
                     openers = []
@@ -1128,7 +1176,18 @@ class Checker:
             path = (root / relative).resolve()
         except (OSError, RuntimeError) as error:  # Python 3.9〜3.12 は循環するリンクで RuntimeError を送出する
             raise Unresolvable(f"{relative}: {error}") from error
-        return path if path.is_relative_to(root) else None
+        if not path.is_relative_to(root):
+            return None
+        # ないもの・通常のファイルでないものは、呼び出し側がこれまでどおり報告する
+        if not path.is_file():
+            return path
+        # 文書と同じく、解決の経路が追跡しない場所（専用の作業ツリーに残す .tools など）を通るものは、検査する入力の内容では
+        # ないので使わない（照合と書き直しの両方）。読むのは経路を確かめた実体
+        problem, real = self.resolve_document(self.root / os.path.relpath(root / relative, root)
+                                              if os.path.isabs(relative) else self.root / relative)
+        if problem or real is None:
+            raise Unresolvable(f"{relative}: {problem}")
+        return real
 
     def update_snippets(self) -> None:
         """全文のコード片を、実ファイルの内容で書き直す。"""

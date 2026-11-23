@@ -75,10 +75,17 @@ def check(requested: str, source: str) -> int:
     while True:
         for name in (".swiftformat", ".swift-version"):
             found = os.path.join(ancestor, name)
-            if os.path.lexists(found):
-                print(f"NG: 専用の作業ツリーの置き場所（{base}）の上に SwiftFormat の設定（{found}）がある。設定のない場所を指定する",
-                      file=sys.stderr)
-                return 1
+            # ないことを確かめられたときだけ次へ進む（権限などで調べられないものを、ないものとして認めない）
+            try:
+                os.lstat(found)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                print(f"NG: SwiftFormat の設定（{found}）の有無を調べられない: {error}", file=sys.stderr)
+                return 2
+            print(f"NG: 専用の作業ツリーの置き場所（{base}）の上に SwiftFormat の設定（{found}）がある。設定のない場所を指定する",
+                  file=sys.stderr)
+            return 1
         parent = os.path.dirname(ancestor)
         if parent == ancestor:
             break
