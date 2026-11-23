@@ -29,7 +29,8 @@ from typing import Dict, List, Optional, Set, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / ".swiftlint.yml"
 FIXTURES = ROOT / "tools" / "lint-fixtures"
-SWIFTLINT = ROOT / ".tools" / "bin" / "swiftlint"
+# 開発ツールの場所。check.sh は照合した写しを MINUTES_TOOLS_DIR で渡す（なければリポジトリの .tools）
+SWIFTLINT = Path(os.environ.get("MINUTES_TOOLS_DIR") or ROOT / ".tools") / "bin" / "swiftlint"
 # テストコードで外す組み込みの規則（入れ子の設定で無効にする）
 BUILTIN_RULES = ("force_try", "force_cast", "force_unwrapping")
 # テストコード用の入れ子の設定を試験するディレクトリと、同じ内容を置くテストのディレクトリ
@@ -94,6 +95,11 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
                 in_excluded = excluded_key.match(body) is not None
                 if in_excluded:
                     rules[current] = True
+                    # 値を同じ行に書いた形（文字列・[a, b] の流れの形など）は excluded_patterns が読めないので認めない
+                    # （例外の場所を読み落としたまま、写しの置き場所を例外の場所でないと判定しない）
+                    value = body[excluded_key.match(body).end():].strip()
+                    if value and not value.startswith("#"):
+                        errors.append(f".swiftlint.yml の規則 {current} の excluded の値は同じ行に書かない（字下げ 6 の「- 」の並びで書く）: {body}")
             elif excluded_key.match(body) and indent < attribute_indent:
                 errors.append(f".swiftlint.yml の規則 {current} の excluded の字下げ {indent} が属性の階層と違う: {body}")
     return rules
@@ -424,7 +430,7 @@ def main() -> int:
         return 2
     staged = arguments == ["--staged"]
     if not SWIFTLINT.exists():
-        print("NG: .tools/bin/swiftlint がない。scripts/setup-tools.sh を実行する", file=sys.stderr)
+        print(f"NG: {SWIFTLINT} がない。scripts/setup-tools.sh を実行する", file=sys.stderr)
         return 2
     if not CONFIG.is_file():
         # 設定がなければ試験を実行できない（read_config の読めない設定と同じく 2。検出行の不一致の 1 と区別する）

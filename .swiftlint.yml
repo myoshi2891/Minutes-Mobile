@@ -45,7 +45,7 @@ custom_rules:
     # 型の注釈を付けた省略形（let logger: Logger = .init(subsystem:category:)）も生成として検出する
     regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\(|:\s*(?:os\s*\.\s*)?Logger\s*[?!]?\s*=\s*\.\s*init\s*\('
     excluded:
-      - '.*/Logging/AppLogger\.swift'
+      - '.*/Logging/AppLogger\.swift\z'
     match_kinds: *code
     message: "Logger はログの型の中だけで使う（BD-ARC-06、SEC-LOG-03）"
     severity: error
@@ -119,7 +119,7 @@ custom_rules:
     name: "UserDefaults の直接の利用の禁止"
     regex: '\b(UserDefaults|NSUserDefaults|AppStorage)\b'
     excluded:
-      - '.*/Settings/SettingsStore\.swift'
+      - '.*/Settings/SettingsStore\.swift\z'
     match_kinds: *code
     message: "UserDefaults は設定の型の中だけで使う（SEC-DAT-07）"
     severity: error
@@ -136,8 +136,8 @@ custom_rules:
     name: "一時ディレクトリの直接の指定とディレクトリの直接の作成の禁止"
     regex: '\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
     excluded:
-      - '.*/Storage/StorageRoot\.swift'
-      - '.*/TestSupport/TemporaryDirectory\.swift'
+      - '.*/Storage/StorageRoot\.swift\z'
+      - '.*/TestSupport/TemporaryDirectory\.swift\z'
     match_kinds: *code
     message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03）"
     severity: error
@@ -146,7 +146,7 @@ custom_rules:
     name: "UIPasteboard と textSelection の直接の利用の禁止"
     regex: '\bUIPasteboard\b|\.textSelection\s*\('
     excluded:
-      - '.*/Clipboard/ClipboardWriter\.swift'
+      - '.*/Clipboard/ClipboardWriter\.swift\z'
     match_kinds: *code
     message: "コピーはコピーの型を経由する（SEC-PLT-01）"
     severity: error
@@ -194,7 +194,7 @@ custom_rules:
     regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)|:\s*(?:Foundation\s*\.\s*)?UUID\s*[?!]?\s*=\s*\.\s*init\s*\(\s*\)'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
-      - '.*/TestSupport/TemporaryDirectory\.swift'
+      - '.*/TestSupport/TemporaryDirectory\.swift\z'
     match_kinds: *code
     message: "UUID は注入した生成器から得る（TST-GEN-04・07）"
     severity: error
