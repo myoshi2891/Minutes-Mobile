@@ -192,10 +192,15 @@ install_tool() {
     # 退避した旧い導入は、公開するリンクの更新が成功するまで消さない（下の publish_link。失敗したら戻す）
   fi
   publish_link "$name" "$version" "$binary"
-  # リンクを更新できたので、退避した旧い導入を消す
-  if [ -n "$PENDING_BACKUP" ]; then rm -rf -- "${PENDING_BACKUP:?}"; fi
-  PENDING_TARGET=""
+  # リンクを更新できたので、先に終了処理の巻き戻しを解いてから（場所の印を外してから）退避した旧い導入を消す。逆の順では、
+  # 削除の失敗・中断で終了処理が、一部を消した旧い導入を公開済みの新しい導入と置き換えてしまう。PENDING_BACKUP を先に外す
+  # （restore_backup はこれが空なら何もしない）。削除の失敗は場所とともに報告し、公開した導入はそのまま使う
+  local retired=$PENDING_BACKUP
   PENDING_BACKUP=""
+  PENDING_TARGET=""
+  if [ -n "$retired" ]; then
+    rm -rf -- "$retired" || echo "警告: 退避した旧い $name の導入を削除できない（${retired}）。新しい導入はそのまま使う。手で削除する" >&2
+  fi
 }
 
 # 置き換えの途中で失敗したとき、置いた新しい導入をどけて、退避した旧い導入を元の場所に戻す（既存のリンクは同じ版の
@@ -366,6 +371,8 @@ echo "OK: 開発ツールの版は tools/versions と一致"
 #   scripts/check.sh --steps 0-8,10 指定した手順だけを実行する（プッシュ前のフックが使う）
 #   scripts/check.sh --staged       ステージしたファイルに対する手順 1〜3 と 10（コミット前のフックが使う）。
 #                                   手順 1・2・10 は作業ツリーではなくステージした内容（インデックス）を検査する
+#   check.sh --root <リポジトリ> --staged コミット前のフックが、ステージした check.sh を一時ファイルに書き出して実行するときに使う。
+#                                   最初の引数に置き、検査するリポジトリの起点を絶対パスで渡す（--staged 以外とは組み合わせない）
 #   scripts/check.sh --require-clean 未コミットの変更（追跡していないファイルを含む）があれば、手順を始めずに失敗する。
 #                                   開始時のコミットを専用の作業ツリー（リポジトリの外の一時ディレクトリ）に展開し、
 #                                   そこで検査する（元の作業ツリーを検査中に書き換えて戻しても、検査する内容は変わらない）。
@@ -379,7 +386,16 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# --root は、このスクリプトの置き場所によらず検査するリポジトリの起点を示す（書き出したステージした版を実行するとき）
+ROOT_GIVEN=0
+if [ "${1:-}" = --root ]; then
+  case "${2:-}" in /*) ;; *) echo "使い方: --root には絶対パスを渡す" >&2; exit 2 ;; esac
+  ROOT=$(cd -P -- "$2" && pwd)
+  ROOT_GIVEN=1
+  shift 2
+else
+  ROOT=$(cd "$(dirname "$0")/.." && pwd)
+fi
 # 部分的なコミット（git commit <パス>）のフックでは、Git が一時のインデックスを GIT_INDEX_FILE で渡す。相対パスは
 # 実行時の作業ディレクトリから解決されるので、ディレクトリを移る前に絶対パスにする（--staged の規則の試験は別の
 # ディレクトリで git を実行するので、相対パスのままでは別のインデックスを読む）
@@ -478,6 +494,11 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
+if [ "$ROOT_GIVEN" = 1 ]; then
+  [ "$STAGED" = 1 ] || usage
+  # 起点でないディレクトリ（下の階層・リポジトリの外）を検査しない
+  [ "$(cd -P -- "$(git rev-parse --show-toplevel)" && pwd)" = "$ROOT" ] || fail "--root（${ROOT}）がリポジトリの起点でない"
+fi
 if [ "$STAGED" = 1 ]; then
   # --staged はインデックスを検査する。作業ツリーの一致を求める --require-clean とは組み合わせない
   [ "$STEPS_GIVEN" = 0 ] && [ "$REQUIRE_CLEAN" = 0 ] && [ -z "$EXPECT_HEAD" ] || usage
@@ -553,14 +574,21 @@ fi
 # 認めない・判定できない場合は止める。認めた場所では、書き出した内容の設定（インデックスの .swiftformat など）をそのまま使う。
 # 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
 make_staged_tree() {
-  local location_out location_status=0 checked="" temporary_root=${TMPDIR:-/tmp}
+  local location_out location_script location_status=0 checked="" temporary_root=${TMPDIR:-/tmp}
   # 一時の置き場所は TMPDIR（なければ /tmp）の下に明示的に作る（--require-clean と同じ。mktemp -d の既定は TMPDIR を使わない
   # 環境がある）。判定で止めた場合も、終了処理が消せるように先に控える
   STAGED_TREE=$(mktemp -d "${temporary_root%/}/minutes-staged.XXXXXX")
+  # 判定に使うスクリプトもステージしたものを書き出して実行する（ステージしていない作業ツリーの変更で判定を変えない）
+  location_script=$(mktemp)
+  if ! git cat-file blob :scripts/worktree-location.py > "$location_script"; then
+    rm -f -- "$location_script"
+    fail "ステージした scripts/worktree-location.py を読めない"
+  fi
   location_out=$(mktemp)
-  "$ROOT/scripts/worktree-location.py" check "$STAGED_TREE" "$ROOT" > "$location_out" || location_status=$?
+  # -I: 書き出した場所（一時ディレクトリ）に置かれた同名のモジュール（subprocess.py など）を読み込ませない
+  /usr/bin/python3 -I "$location_script" check "$STAGED_TREE" "$ROOT" > "$location_out" || location_status=$?
   if [ "$location_status" = 0 ] && ! IFS= read -r -d '' checked < "$location_out"; then location_status=2; fi
-  rm -f -- "$location_out"
+  rm -f -- "$location_out" "$location_script"
   case $location_status in
     0) STAGED_TREE=$checked ;;
     1) fail "ステージした内容の一時の置き場所（${STAGED_TREE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
@@ -838,6 +866,54 @@ materialize_coverage_input() {
   return "$status"
 }
 
+# 書き出した写し（$1）のシンボリックリンクが、すべて写しの中を指すことを確かめる。写しの外を指すリンクを swift test がたどると、
+# 記録する入力の識別子に含まれない内容を測ってしまう。リンク先は相対パスに限り、「..」やほかのリンクを経由する途中も写しの中に
+# あることを求める（写しの中の相対リンクは認める）。満たさない・調べられない場合は非 0 を返す
+verify_coverage_links() {
+  /usr/bin/python3 -I - "$1" <<'PYTHON'
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+
+
+def inside(path):
+    return path == root or path.startswith(root + os.sep)
+
+
+def contained(link):
+    target = os.readlink(link)
+    if os.path.isabs(target):
+        return False
+    # 途中のリンクが外を経由するかは、写しの中のすべてのリンクをこの関数で調べるので、要素ごとの実体だけを見ればよい
+    current = os.path.realpath(os.path.dirname(link))
+    for part in target.split(os.sep):
+        current = os.path.realpath(os.path.join(current, part))
+        if not inside(current):
+            return False
+    return True
+
+
+def failed(error):
+    raise error
+
+
+bad = []
+try:
+    for directory, names, files in os.walk(root, onerror=failed):
+        for name in names + files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path) and not contained(path):
+                bad.append(path)
+except OSError as error:
+    print(f"NG: カバレッジの入力の写しを調べられない: {error}", file=sys.stderr)
+    sys.exit(1)
+for path in bad:
+    print(f"NG: カバレッジの入力のシンボリックリンク {os.path.relpath(path, root)!r} が写しの外を指す", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PYTHON
+}
+
 # 元の作業ツリーの開発ツール（$1。Git の管理外）を、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから
 # 専用の作業ツリー（$2）へ写す（.githooks/pre-push と同じ手順）。共有のリンクで指すと、検査の途中に別の setup-tools.sh が
 # bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。写しは APFS では
@@ -1011,6 +1087,7 @@ step_7() {
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
   mkdir -p "$COVERAGE_INPUT"
   materialize_coverage_input "${measured#* }" || fail "カバレッジを測る入力（${measured}）を展開できない"
+  verify_coverage_links "$COVERAGE_INPUT" || fail "カバレッジを測る入力（${measured}）のシンボリックリンクを確かめられない。測らない"
   # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
   # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
   COVERAGE_SCRATCH=$(mktemp -d)
@@ -1218,17 +1295,20 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   exit 0
 fi
 
-# 固定した開発ツールを使う手順（1・2・3）を、照合する手順 0 なしで実行する場合も、使う導入がコミットした台帳（この作業ツリーの
+# 固定した開発ツールを使う手順（1・2・3）を、照合する手順 0 より先に（または手順 0 なしで）実行する場合も、使う導入がコミットした台帳（この作業ツリーの
 # tools/versions。専用の作業ツリーでは展開したコミットのもの、そこへ写した .tools）と一致することを先に確かめる（照合して
 # いない導入の結果で合格にしない）。手順 0 の自己試験（test-checks.py versions）は求めない。--staged は snapshot_staged_tools が
 # ステージした台帳と照合済み
 if [ "$STAGED" = 0 ]; then
   uses_tools=""
-  runs_step_0=""
+  verified_first=""  # 開発ツールを使う最初の手順より前に手順 0 がある（--steps 1,0 のような後の手順 0 は数えない）
   for step in $STEPS; do
-    case "$step" in 0) runs_step_0=1 ;; 1 | 2 | 3) uses_tools=1 ;; esac
+    case "$step" in
+      0) if [ -z "$uses_tools" ]; then verified_first=1; fi ;;
+      1 | 2 | 3) uses_tools=1 ;;
+    esac
   done
-  if [ -n "$uses_tools" ] && [ -z "$runs_step_0" ]; then
+  if [ -n "$uses_tools" ] && [ -z "$verified_first" ]; then
     echo "== 開発ツールの照合（手順 1〜3 が使う導入を tools/versions と照合する）"
     scripts/setup-tools.sh --verify
   fi
