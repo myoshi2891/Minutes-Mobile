@@ -76,7 +76,6 @@ lock="$snapshot.lock"
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
 
 lock_held=""   # 作業ツリーのロックを自分が取った（後始末は自分のロックだけを消す）
-interrupted=""
 tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
 # 後始末。持ち主の印を先に外してからロックを外す（間で中断されても、別の実行の取り直したロックを消さない）
 release_locks() {
@@ -84,18 +83,27 @@ release_locks() {
   tools_lock=""
   lock_held=""
   if [ -n "$held_tools" ]; then rmdir "$held_tools" 2>/dev/null || true; fi
-  if [ -n "$held" ]; then rmdir "$lock" 2>/dev/null || true; fi
+  if [ -n "$held" ]; then rmdir "$held" 2>/dev/null || true; fi
 }
 # 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
 trap 'status=$?; release_locks; exit "$status"' EXIT
-# ロックの取得の結果を記録するまで、中断は控えるだけにする（取った直後・記録の前に終了してロックを残さない。取れなかった
-# 場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して実行し、作った直後に止められて失敗と取り違えられないようにする
-trap 'interrupted=1' INT TERM
+# ロック（ディレクトリ $1）を取り、取れたら変数 $2 に場所を記録して 0 を返す。結果を記録するまで、中断は控えるだけにする
+# （取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して
+# 実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
+take_lock() {
+  local taken=""
+  interrupted=""
+  trap 'interrupted=1' INT TERM
+  if (trap '' INT TERM; exec mkdir "$1") 2>/dev/null; then
+    printf -v "$2" '%s' "$1"
+    taken=1
+  fi
+  trap 'exit 130' INT TERM
+  if [ -n "$interrupted" ]; then exit 130; fi
+  [ -n "$taken" ]
+}
 # 同時に 2 つの push が同じ作業ツリーを使わないようにする
-if (trap '' INT TERM; exec mkdir "$lock") 2>/dev/null; then lock_held=1; fi
-trap 'exit 130' INT TERM
-if [ -n "$interrupted" ]; then exit 130; fi
-if [ -z "$lock_held" ]; then
+if ! take_lock "$lock" lock_held; then
   echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
   exit 1
 fi
@@ -249,7 +257,7 @@ if [ ! -d "$tools_source" ]; then
 fi
 waited=0
 retried=0  # ロックが消えていたときに、直ちに取り直した（1 回だけ）
-until mkdir "$tools_source/.install.lock" 2>/dev/null; do
+until take_lock "$tools_source/.install.lock" tools_lock; do
   # mkdir の失敗の後にロックが外れた（別の導入が終わった）場合は、待たずに 1 回だけ取り直す。
   # 取り直しても失敗し、ロックもない場合は、ロック以外の理由（書き込めないなど）として止める
   if [ ! -d "$tools_source/.install.lock" ] && [ "$retried" -eq 0 ]; then
@@ -265,7 +273,6 @@ until mkdir "$tools_source/.install.lock" 2>/dev/null; do
   sleep 1
   waited=$((waited + 1))
 done
-tools_lock="$tools_source/.install.lock"
 # 写した bin のリンクが写しの中を指すのは、リンクが相対パスの場合だけ。絶対パスのリンクは写しても元の導入を指し、手順 0 の
 # 照合が写しの導入先と合わずに失敗する（検査は弱まらないが原因が分からない）。写す前に、理由を示して止める（リンクは書き換えない）
 for link in "$tools_source"/bin/*; do

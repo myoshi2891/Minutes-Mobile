@@ -15,6 +15,7 @@
 終了コード: 0 = 問題なし / 1 = 不整合あり / 2 = 読むもの（docs/・定義文書）がない
 """
 import argparse
+import calendar
 import contextlib
 import datetime
 import os
@@ -28,7 +29,7 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_LINES = 2000
-STALE_DAYS = 92  # 確認日から 3 か月（docs/README.md §4）
+STALE_MONTHS = 3  # 確認日から再確認までの月数（docs/README.md §4）
 
 AREA_ID = r"(?:FR|NFR|SEC|TST|BD)-[A-Z]+-\d+"
 PLAIN_ID = r"(?:CON|INV|OQ|UD|COST)-\d+"
@@ -414,7 +415,9 @@ def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
     """
     hidden = commented_lines(text)
     lines = [(number, "" if inside or number in hidden else line) for number, line, inside, _ in fenced_lines(text)]
-    yield from find_tables(lines)
+    # HTML の <pre> ブロックの中の例も表にしない（行の数と位置は変わらず、ブロックの行は表の境界になる）
+    kept = without_html_pre([line for _, line in lines])
+    yield from find_tables([(number, line) for (number, _), line in zip(lines, kept)])
 
 
 def section_numbers(text: str) -> Dict[int, str]:
@@ -457,6 +460,15 @@ def dedent(line: str, indent: int) -> str:
     """CommonMark と同じく、フェンスの本文の行から開始行の字下げの分だけ（あるだけ）先頭の空白を除く。"""
     spaces = len(line) - len(line.lstrip(" "))
     return line[min(spaces, indent):]
+
+
+def stale(confirmed: datetime.date, today: datetime.date) -> bool:
+    """確認日から暦の STALE_MONTHS か月後の日（その月に同じ日がなければ月の最後の日）以降か。"""
+    months = confirmed.month - 1 + STALE_MONTHS
+    year, month = confirmed.year + months // 12, months % 12 + 1
+    if year > datetime.MAXYEAR:
+        return False
+    return today >= datetime.date(year, month, min(confirmed.day, calendar.monthrange(year, month)[1]))
 
 
 class Unresolvable(Exception):
@@ -1060,6 +1072,9 @@ class Checker:
                     source = split_lines(path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError):
                     continue  # このコード片は書き直さない。検査の側（check_snippets）が印の行とともに報告する
+                # 字下げを除いた本文が元のファイルと一致するコード片は、行も改行も変えない
+                if end < len(lines) and [dedent(line, len(indent)) for line in lines[start + 1:end]] == source:
+                    continue
                 content = [indent + line if line else line for line in source]
                 # このフェンスを閉じてしまう行を含む内容は書き込まない（長いフェンスに手で直す）
                 if end >= len(lines) or any(fence_closes(line, opened[0]) for line in content):
@@ -1121,9 +1136,9 @@ class Checker:
         with self.paths.get(name, self.root / name).open(encoding="utf-8", newline="") as handle:
             return handle.read()
 
-    def check_freshness(self) -> None:
-        """技術情報の確認日が 3 か月を過ぎた文書を警告する（失敗にはしない）。"""
-        today = datetime.date.today()
+    def check_freshness(self, today: Optional[datetime.date] = None) -> None:
+        """技術情報の確認日から暦の 3 か月以上経った文書を警告する（失敗にはしない）。"""
+        today = today or datetime.date.today()
         for name, text in self.texts.items():
             dates = []
             for found in re.findall(r"確認日 ?(\d{4})-(\d{2})-(\d{2})", text):
@@ -1131,8 +1146,8 @@ class Checker:
                     dates.append(datetime.date(*(int(part) for part in found)))
                 except ValueError:
                     self.error(name, f"確認日の日付が不正: {'-'.join(found)}")
-            if dates and (today - min(dates)).days > STALE_DAYS:
-                self.warnings.append(f"{name}: 確認日 {min(dates)} から 3 か月を過ぎた記述がある。再確認する")
+            if dates and stale(min(dates), today):
+                self.warnings.append(f"{name}: 確認日 {min(dates)} から 3 か月以上経った記述がある。再確認する")
 
     def missing_inputs(self) -> List[str]:
         """読むはずの docs/ と定義文書のうち、ないもの。ないまま検査すると、何も調べずに通るため。"""

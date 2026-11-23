@@ -11,6 +11,7 @@
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -39,9 +40,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="テストに使うシミュレータの UDID を出力する")
     parser.add_argument("--minimum-os", default="27.2")
     arguments = parser.parse_args()
+    # 単独で実行しても check.sh と同じ Xcode を使う（DEVELOPER_DIR がない・空のときだけ既定にし、利用者の指定は変えない）
+    env = dict(os.environ)
+    env["DEVELOPER_DIR"] = env.get("DEVELOPER_DIR") or "/Applications/Xcode.app/Contents/Developer"
     try:
         minimum = version_key(arguments.minimum_os)
-        listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True, check=True)
+        listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True, check=True, env=env)
         data = json.loads(listing.stdout)
         devices_by_runtime = data["devices"]
         # 形が違う一覧は取得の失敗として扱う（空の辞書は候補なしとして下で扱う）

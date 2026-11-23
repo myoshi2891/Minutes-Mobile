@@ -10,7 +10,10 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
+ROOT=$(cd "$(dirname "$0")/.." && pwd && printf x)
+ROOT=${ROOT%x}
+ROOT=${ROOT%$'\n'}
 # 開発ツールの場所。check.sh は照合した写しを MINUTES_TOOLS_DIR で渡す（なければリポジトリの .tools）
 TOOLS_DIR=${MINUTES_TOOLS_DIR:-$ROOT/.tools}
 # git log に渡す指定。--log-opts は既定の指定（--all --full-history）を置き換えるので、既定の 2 つも書く。

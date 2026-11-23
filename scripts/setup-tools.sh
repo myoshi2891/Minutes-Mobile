@@ -14,7 +14,10 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
+ROOT=$(cd "$(dirname "$0")/.." && pwd && printf x)
+ROOT=${ROOT%x}
+ROOT=${ROOT%$'\n'}
 VERSIONS="$ROOT/tools/versions"
 DEST="$ROOT/.tools"
 MODE=install
@@ -69,7 +72,10 @@ check_field() {
 # リンク（--dest のリンク）と、bin の相対リンクには関わらない
 contained_install() {
   local base actual
-  base=$(cd -P "$DEST" 2>/dev/null && pwd) || return 1
+  # 導入先のパスの末尾の改行も保つ（ROOT と同じ。actual は版の名前で終わる）
+  base=$(cd -P "$DEST" 2>/dev/null && pwd && printf x) || return 1
+  base=${base%x}
+  base=${base%$'\n'}
   actual=$(cd -P "$DEST/$1/$2" 2>/dev/null && pwd) || return 1
   [ "$actual" = "$base/$1/$2" ]
 }

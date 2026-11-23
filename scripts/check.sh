@@ -30,7 +30,7 @@ if [ "${1:-}" = --root ]; then
   ROOT_GIVEN=1
   shift 2
 else
-  ROOT=$(cd "$(dirname "$0")/.." && pwd)
+  ROOT=$(cd "$(dirname "$0")/.." && pwd && printf x) && ROOT=${ROOT%x} && ROOT=${ROOT%$'\n'} || exit 1
 fi
 # 開発ツールの写しの場所は、この実行が照合した写しだけを子に渡す（snapshot_run_tools）。引き継いだ値は使わない
 unset MINUTES_TOOLS_DIR
@@ -210,6 +210,14 @@ if [ "$STAGED" = 1 ]; then
   fi
 fi
 
+# $1 の下に、追跡しているパス $2 の親のディレクトリを作る（$(dirname …) はディレクトリの名前の末尾の改行を落とすので使わない）
+make_parent() {
+  case "$2" in
+    */*) mkdir -p -- "$1/${2%/*}" ;;
+    *) mkdir -p -- "$1" ;;
+  esac
+}
+
 # ステージした内容を書き出す一時ディレクトリ（STAGED_TREE）を作る。作った直後、ファイルを書く前に、--require-clean の専用の
 # 作業ツリーと同じ判定（scripts/worktree-location.py check）で置き場所を確かめる。TMPDIR が作業ツリーの中や、SwiftFormat の
 # 設定（.swiftformat・.swift-version）のある場所の下を指すと、書き出した内容の整形・静的解析に別の設定が混ざるため。
@@ -258,7 +266,7 @@ prepare_staged_tree() {
     object=${object%% *}
     path=${entry#*$'\t'}
     [ "$mode" = 160000 ] && continue  # サブモジュールは blob がない
-    mkdir -p "$STAGED_TREE/$(dirname "$path")"
+    make_parent "$STAGED_TREE" "$path"
     if ! git cat-file blob "$object" > "$STAGED_TREE/$path"; then
       rm -f -- "$entries"
       fail "ステージした ${path} の内容を読めない"
@@ -284,7 +292,7 @@ write_index_entries() {
       100644 | 100755 | 120000) ;;
       *) echo "NG: インデックスの ${path} のモード ${mode} を書き出せない" >&2; return 1 ;;
     esac
-    mkdir -p "$dest/$(dirname "$path")" || return 1
+    make_parent "$dest" "$path" || return 1
     rm -f -- "$dest/$path" || return 1
     if [ "$mode" = 120000 ]; then
       # 末尾の改行もリンク先の一部として保つ（$(…) は末尾の改行を落とすので、印の x を付けてから外す）
@@ -350,7 +358,7 @@ prepare_staged_secrets_tree() {
       rm -f -- "$entries"
       fail ".gitleaksignore をステージしている。検出の抑止の記録は使わない（gitleaks が指定によらず読むため）"
     fi
-    mkdir -p "$STAGED_SECRETS_TREE/$(dirname "$path")"
+    make_parent "$STAGED_SECRETS_TREE" "$path"
     if ! git cat-file blob "$object" > "$STAGED_SECRETS_TREE/$path"; then
       rm -f -- "$entries"
       fail "ステージした ${path} の内容を読めない"
@@ -556,6 +564,22 @@ sys.exit(1 if bad else 0)
 PYTHON
 }
 
+# ロック（ディレクトリ $1）を取り、取れたら変数 $2 に場所を記録して 0 を返す。結果を記録するまで、中断は控えるだけにする
+# （.githooks/pre-push と同じ。取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して
+# 実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
+take_lock() {
+  local taken=""
+  interrupted=""
+  trap 'interrupted=1' INT TERM
+  if (trap '' INT TERM; exec mkdir "$1") 2>/dev/null; then
+    printf -v "$2" '%s' "$1"
+    taken=1
+  fi
+  trap 'exit 130' INT TERM
+  if [ -n "$interrupted" ]; then exit 130; fi
+  [ -n "$taken" ]
+}
+
 # 元の作業ツリーの開発ツール（$1。Git の管理外）を、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから
 # 専用の作業ツリー（$2）へ写す（.githooks/pre-push と同じ手順）。共有のリンクで指すと、検査の途中に別の setup-tools.sh が
 # bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。写しは APFS では
@@ -564,7 +588,7 @@ PYTHON
 copy_tools() {
   local source=$1 copy=$2 waited=0 retried=0 entry
   [ -d "$source" ] || fail "開発ツールが導入されていない（${source}）。scripts/setup-tools.sh を実行してから実行し直す"
-  until mkdir "$source/.install.lock" 2>/dev/null; do
+  until take_lock "$source/.install.lock" TOOLS_LOCK; do
     # 作れなかった直後にロックが外れた場合は、待たずに 1 回だけ取り直す。取り直しても作れずロックもなければ止める
     if [ ! -d "$source/.install.lock" ] && [ "$retried" -eq 0 ]; then
       retried=1
@@ -578,7 +602,6 @@ copy_tools() {
     sleep 1
     waited=$((waited + 1))
   done
-  TOOLS_LOCK="$source/.install.lock"
   # 写した bin のリンクが写しの中を指すのは、リンクが相対パスの場合だけ（.githooks/pre-push と同じ）。絶対パスのリンクは
   # 写しても元の導入を指すので、写す前に理由を示して止める（リンクは書き換えない）
   for entry in "$source"/bin/*; do

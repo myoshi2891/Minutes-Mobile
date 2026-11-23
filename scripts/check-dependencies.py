@@ -203,8 +203,9 @@ def strip_comments(text: str) -> str:
             index = end
         elif starts_string(text, index):
             # 文字列リテラル（"…"・"""…"""・#"…"#）は、閉じるまでそのまま写す
+            # （補間の中の式のコメントだけは空白に置き換える。式の中の宣言の引数を、補間の外と同じに読むため）
             end = string_end(text, index)
-            out.append(text[index:end])
+            out.append(strip_interpolations(text, index, end))
             index = end
         elif text[index] == "/":
             # 区切りのない正規表現のリテラル（/…/）と除算は字句だけでは区別できない。取り違えると中の「"」で後ろの宣言を
@@ -213,6 +214,28 @@ def strip_comments(text: str) -> str:
         else:
             out.append(text[index])
             index += 1
+    return "".join(out)
+
+
+def strip_interpolations(text: str, index: int, end: int) -> str:
+    """index から end までの文字列リテラルを、補間の中の式のコメントだけを空白に置き換えて返す（本文と位置は変えない）。"""
+    hashes = len(text[index:]) - len(text[index:].lstrip("#"))
+    escape = "\\" + "#" * hashes
+    out: List[str] = []
+    cursor = index
+    while cursor < end:
+        if text.startswith(escape, cursor):
+            after = cursor + len(escape)
+            if text.startswith("(", after):
+                close = interpolation_end(text, after)
+                out.append(text[cursor:after + 1] + strip_comments(text[after + 1:close - 1]) + ")")
+                cursor = close
+            else:
+                out.append(text[cursor:after + 1])  # エスケープされた 1 文字
+                cursor = after + 1
+            continue
+        out.append(text[cursor])
+        cursor += 1
     return "".join(out)
 
 

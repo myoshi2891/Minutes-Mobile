@@ -9,7 +9,10 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
+ROOT=$(cd "$(dirname "$0")/.." && pwd && printf x)
+ROOT=${ROOT%x}
+ROOT=${ROOT%$'\n'}
 cd "$ROOT"
 
 HOOKS=0
@@ -40,11 +43,13 @@ if [ "$HOOKS" = 1 ]; then
   # git が選ぶ作業ツリー（GIT_DIR・GIT_WORK_TREE などの変数で別のリポジトリを指しうる）が、このスクリプトのある
   # リポジトリ（ROOT）であること。通常のクローンとリンクした作業ツリーの両方で、リンクを解決した作業ツリーのパスで比べる
   # （.git の配置を仮定しない）。違えば設定を変えない
-  toplevel=$(env -u GIT_CONFIG git -C "$ROOT" rev-parse --show-toplevel) || { echo "NG: git の作業ツリーを特定できない。フックを有効にしない" >&2; exit 1; }
-  selected=$(cd -P "$toplevel" 2>/dev/null && pwd) || { echo "NG: 作業ツリー ${toplevel} を解決できない。フックを有効にしない" >&2; exit 1; }
-  expected=$(cd -P "$ROOT" && pwd)
+  toplevel=$(env -u GIT_CONFIG git -C "$ROOT" rev-parse --show-toplevel && printf x) || { echo "NG: git の作業ツリーを特定できない。フックを有効にしない" >&2; exit 1; }
+  toplevel=${toplevel%x}
+  toplevel=${toplevel%$'\n'}
+  selected=$(cd -P "$toplevel" 2>/dev/null && pwd && printf x) || { echo "NG: 作業ツリー ${toplevel} を解決できない。フックを有効にしない" >&2; exit 1; }
+  expected=$(cd -P "$ROOT" && pwd && printf x)  # 3 つとも末尾の改行を保って比べる（selected と expected は印を付けたまま）
   if [ "$selected" != "$expected" ]; then
-    echo "NG: git が選ぶ作業ツリー（${selected}）がこのリポジトリ（${expected}）と違う。GIT_DIR・GIT_WORK_TREE などの変数を外してから実行し直す。フックを有効にしない" >&2
+    echo "NG: git が選ぶ作業ツリー（${toplevel}）がこのリポジトリ（${ROOT}）と違う。GIT_DIR・GIT_WORK_TREE などの変数を外してから実行し直す。フックを有効にしない" >&2
     exit 1
   fi
   # 設定を読む。鍵がない（終了コード 1）は空として続け、それ以外の失敗は「鍵がない」と取り違えずに報告して失敗を返す
