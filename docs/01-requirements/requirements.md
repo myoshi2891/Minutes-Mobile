@@ -126,7 +126,7 @@ AI 議事録（版管理。上書きしない）
 | FR-INT-02 | 割り込みが終わり OS が再開を許可したら、同じ会議の続きとして録音を自動で再開する。再開できなかったときは、録音が止まっていることを通知と画面で明示する。**例外:** 利用者が通知を許可していない場合は通知で知らせられない。この場合は、①録音の開始時に、通知が許可されていないため背面で録音が止まっても知らせられないことを表示し（録音の開始は妨げない）、②前面に戻ったときに画面で明示する。アプリが背面にある間に即時に知らせられないことは残る危険とする | MVP | 新規（iOS 固有。割り込みの後に OS が再開を勧める通知 `AVAudioSessionResumptionRecommendationNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18。Apple の文書: [resumptionRecommendationNotification](https://developer.apple.com/documentation/avfaudio/avaudiosession/resumptionrecommendationnotification)（iOS 27.0 以降。同じ SDK で従来の `AVAudioSessionInterruptionNotification` は iOS 27.0 で非推奨）。確認日 2026-11-19）、UD-08（OQ-01 を解決） |
 | FR-INT-03 | 入力経路が変わったとき（AirPods の切断など）は、OS が選んだ次の入力で録音を継続し、経路変更を記録する。どの入力も使えなくなったときは保存済みの音声を確定可能な状態にして録音を停止し、停止理由を記録する | MVP | P1 `mic_ended` の読み替え |
 | FR-INT-04 | オーディオのメディアサービスがリセットされたら、録音パイプラインを再構築して再開を試みる。失敗したら FR-INT-02 と同じく停止を明示する | MVP | 新規（iOS 固有。`AVAudioSessionMediaServicesWereResetNotification`。iOS 27.2 SDK の `AVAudioSessionTypes.h`。確認日 2026-11-18。Apple の文書: [mediaServicesWereResetNotification](https://developer.apple.com/documentation/avfaudio/avaudiosession/mediaserviceswereresetnotification)。確認日 2026-11-19） |
-| FR-INT-05 | 停止理由（`manual` / `interruption_unresumed` / `no_input` / `disk_full` / `terminated` など）と検出時刻を会議メタデータに記録する | MVP | Minutes README の停止理由確認（`stopReason`）の読み替え |
+| FR-INT-05 | 停止理由（`manual` / `interruption_unresumed` / `no_input` / `disk_full` / `write_failed` / `terminated` など）と検出時刻を会議メタデータに記録する | MVP | Minutes README の停止理由確認（`stopReason`）の読み替え |
 | FR-INT-06 | マイク権限は録音の開始の操作で確認する。①未決定のときは、同意確認（FR-CNS-01）の後に OS の許可を求め、許可されたときだけ録音を開始する。②拒否（または ①で許可されなかった）のときは録音を開始せず、設定アプリへの導線を表示する | MVP | P1 Browser DoD の読み替え |
 
 ### 5.4 Chunk 保存（SAV）
@@ -136,7 +136,7 @@ AI 議事録（版管理。上書きしない）
 | FR-SAV-01 | Chunk ファイルは「一時ファイルへ書き込み → 同期 → 正式名へ rename」の原子的な手順で保存し、書きかけのファイルを正式な Chunk として扱わない | MVP | P1 §12.1、§13 |
 | FR-SAV-02 | ファイル配置は `{AppData}/recordings/{meetingId}/mic/{sequenceNo 6 桁}.wav` とし、会議ごとにメタデータ（`meeting.json` 相当）を同じディレクトリに置く | MVP | P1 §13 |
 | FR-SAV-03 | 同じ `meetingId`・`sequenceNo` の Chunk を二重に書いても結果が 1 つになる（同一ハッシュなら冪等、異なるハッシュなら競合として記録） | MVP | P1 §11 |
-| FR-SAV-04 | 空き容量を監視し、3 段階で縮退する。①残りが想定録音時間に足りなければ警告。②さらに少なければ最上位の警告を出し、新規録音の開始を確認付きにする。③書き込みが失敗したら Chunk をメモリ上に保持して再試行し、次の例外を除き、どの段階でも利用者が止めるまで録音を止めない。**例外:** メモリ上の保持が上限（基本設計で決める）に達し、書き込み先がなく未保存 Chunk をメモリにも保持できなくなった場合は、NFR-REL-05 の例外（物理的に続けられない場合）として録音を停止する。このとき停止理由 `disk_full` を記録し（FR-INT-05）、停止したことと理由を利用者に知らせる（画面。アプリが背面にある場合はローカル通知。通知の権限がない場合は FR-INT-02 の例外と同じく、前面に戻ったときに画面で示す）。具体的な閾値は基本設計で決める | MVP | P1 §3.4、§21 の読み替え |
+| FR-SAV-04 | 空き容量を監視し、3 段階で縮退する。①残りが想定録音時間に足りなければ警告。②さらに少なければ最上位の警告を出し、新規録音の開始を確認付きにする。③書き込みが失敗したら Chunk をメモリ上に保持して再試行し、次の例外を除き、どの段階でも利用者が止めるまで録音を止めない。**例外:** メモリ上の保持が上限（基本設計で決める）に達し、書き込み先がなく未保存 Chunk をメモリにも保持できなくなった場合は、NFR-REL-05 の例外（物理的に続けられない場合）として録音を停止する。このとき停止理由を記録し（FR-INT-05）、`disk_full` は保存を妨げた原因がすべて空き容量の不足と判定できる場合だけに使う。それ以外（権限・破損などの書き込みの失敗、書き込みの遅れ、原因の混在、原因を判定できない場合）は `write_failed` とする。停止したことと理由を利用者に知らせる（画面。アプリが背面にある場合はローカル通知。通知の権限がない場合は FR-INT-02 の例外と同じく、前面に戻ったときに画面で示す）。具体的な閾値は基本設計で決める | MVP | P1 §3.4、§21 の読み替え |
 | FR-SAV-05 | メモリ上に保持した未保存 Chunk の件数を画面に表示する。アプリが終了するとこれは失われることを明示する | MVP | P1 §3.4 段階 3 |
 
 ### 5.5 停止・確定（FIN）
@@ -150,7 +150,7 @@ AI 議事録（版管理。上書きしない）
 ```mermaid
 stateDiagram-v2
     [*] --> recording: 同意確認 → 録音開始
-    recording --> stop_requested: 停止操作 / 入力喪失 / 容量枯渇
+    recording --> stop_requested: 停止操作 / 入力喪失 / 保持の上限（容量不足・書き込み失敗）
     recording --> stop_requested: 強制終了後の起動時復旧
     stop_requested --> finalizing: 末尾 Chunk の保存の試行が終了（成功・失敗とも。保存できなければ Barrier で止まる）
     finalizing --> finalized: Finalization Barrier 通過
