@@ -182,7 +182,7 @@ custom_rules:
     # 起動からの時間は ProcessInfo.processInfo.systemUptime の呼び出しで検出する（systemUptime という名前の変数・プロパティは認める）
     # 型の注釈を付けた省略形（let recordedAt: Date = .now・: Date = .init()）も現在時刻の読み取りとして検出する。
     # 型の注釈のない .now（clock.now など別の型のもの）と、: Date = .init(timeIntervalSince1970:) は認める
-    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|:\s*(?:Foundation\s*\.\s*)?Date\s*[?!]?\s*=\s*\.\s*(?:now\b|init\s*\(\s*(?:\)|timeIntervalSinceNow\s*:))|\.\s*timeIntervalSinceNow\b|\bDate\.now\b|\bDate\s*\.\s*timeIntervalSinceReferenceDate\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\.now\b|\bmach_(absolute|continuous)_time\b|\.\s*processInfo\s*\.\s*systemUptime\b'
+    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|:\s*(?:Foundation\s*\.\s*)?Date\s*[?!]?\s*=\s*\.\s*(?:now\b|init\s*\(\s*(?:\)|timeIntervalSinceNow\s*:))|\.\s*timeIntervalSinceNow\b|\bDate\s*\.\s*now\b|\bDate\s*\.\s*timeIntervalSinceReferenceDate\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\s*\.\s*now\b|\bmach_(absolute|continuous)_time\b|\.\s*processInfo\s*\.\s*systemUptime\b'
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
