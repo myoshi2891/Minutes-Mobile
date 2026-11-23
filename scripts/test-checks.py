@@ -450,6 +450,21 @@ def test_settings() -> None:
                   project=lambda t: replaced(info_plist_file("Config/App-Settings.plist")(t), '"GENERATE_INFOPLIST_FILE": "YES",',
                                              '"GENERATE_INFOPLIST_FILE": "YES",\n        "SHARING": "YES",'),
                   plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, UIFileSharingEnabled="$(SHARING)")})
+    # ビルドが参照先の plist の変数を展開しない構成では、NO に展開される変数も判定できないものとする（向きの検査と同じ）。
+    # リテラルの YES・NO は、展開しない構成でもそのまま判定する
+    for label, expansion, sharing_value, flag, want_code, want_text in (
+        ("展開しない構成の NO に展開される変数", "NO", "NO", "$(SHARING)", 1, "UIFileSharingEnabled の値を展開できない"),
+        ("展開するかを決められない構成の変数", "$(MINUTES_UNDEFINED)", "NO", "$(SHARING)", 1, "UIFileSharingEnabled の値を展開できない"),
+        ("展開する構成の NO に展開される変数", "YES", "NO", "$(SHARING)", 0, "OK"),
+        ("展開する構成の YES に展開される変数", "YES", "YES", "$(SHARING)", 1, "有効な値に展開される"),
+        ("展開しない構成のリテラルの YES", "NO", "NO", "YES", 1, "UIFileSharingEnabled を有効にしない"),
+        ("展開しない構成のリテラルの NO", "NO", "NO", "NO", 0, "OK"),
+    ):
+        settings_case(f"参照先の plist の有効にしない鍵: {label}", want_code, want_text,
+                      project=lambda t, e=expansion, s=sharing_value: replaced(
+                          info_plist_file("Config/App-Settings.plist")(t), '"GENERATE_INFOPLIST_FILE": "YES",',
+                          f'"GENERATE_INFOPLIST_FILE": "YES",\n        "INFOPLIST_EXPAND_BUILD_SETTINGS": "{e}",\n        "SHARING": "{s}",'),
+                      plists={"Config/App-Settings.plist": dict(OK_INFO_PLIST, UIFileSharingEnabled=flag)})
     settings_case("どのターゲットも参照しない plist の変数は判定できない", 1, "UIFileSharingEnabled の値を展開できない",
                   plists={"Other/Info.plist": {"UIFileSharingEnabled": "$(SHARING)"}})
 
@@ -867,46 +882,46 @@ def test_dependencies() -> None:
     # ローカルのバイナリ（.binaryTarget(path:)）は、承認済みの項目がある場合だけ認める
     binary = '.binaryTarget(name: "B", path: "Frameworks/B.xcframework")'
     # 承認したときの内容（ディレクトリ形式の成果物。配下のファイルも内容のハッシュに入る）
-    binary_files = {"Sub/Frameworks/B.xcframework/Info.plist": "info", "Sub/Frameworks/B.xcframework/ios/B": "bin"}
+    binary_files = {"Packages/Sub/Frameworks/B.xcframework/Info.plist": "info", "Packages/Sub/Frameworks/B.xcframework/ios/B": "bin"}
     with tempfile.TemporaryDirectory() as directory:
         for name, content in binary_files.items():
             (Path(directory) / name).parent.mkdir(parents=True, exist_ok=True)
             (Path(directory) / name).write_text(content, encoding="utf-8")
-        binary_digest = module.content_digest(Path(directory) / "Sub/Frameworks/B.xcframework")
+        binary_digest = module.content_digest(Path(directory) / "Packages/Sub/Frameworks/B.xcframework")
         # 内容のハッシュの形式を固定する（走査の方法を変えても、承認済みの値が変わらないこと）
         count += 1
         if binary_digest != "a501cc49233680d6426eb1efbe09a78d7c98d9fc4de0d9c26bd2748ab7443a29":
             failures.append(f"dependencies: ローカルのバイナリの内容のハッシュの形式が変わった（{binary_digest}）")
         # 成果物の中の読めないディレクトリは、欠けた内容のハッシュにせず、読めないものとして扱う
-        locked = Path(directory) / "Sub/Frameworks/B.xcframework/ios"
+        locked = Path(directory) / "Packages/Sub/Frameworks/B.xcframework/ios"
         locked.chmod(0)
         try:
             count += 1
             try:
-                module.content_digest(Path(directory) / "Sub/Frameworks/B.xcframework")
+                module.content_digest(Path(directory) / "Packages/Sub/Frameworks/B.xcframework")
                 failures.append("dependencies: 成果物の中の読めないディレクトリでハッシュを作った")
             except module.Unreadable:
                 pass
         finally:
             locked.chmod(0o755)
-    approved_binary = {"identity": "b", "path": "Sub/Frameworks/B.xcframework", "sha256": binary_digest, "version": "1.0.0",
+    approved_binary = {"identity": "b", "path": "Packages/Sub/Frameworks/B.xcframework", "sha256": binary_digest, "version": "1.0.0",
                        "license": "MIT", "approvedOn": "2026-11-18", "ledger": "dependencies-and-costs.md §3"}
-    dependencies_case("記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
-                      {"Sub/Package.swift": declare.format(binary)})
+    dependencies_case("記録のないローカルのバイナリ", 1, "ローカルのバイナリ Packages/Sub/Frameworks/B.xcframework",
+                      {"Packages/Sub/Package.swift": declare.format(binary)})
     # 入れ子の呼び出しの url: を宣言の取得元と見なさず、ローカルのバイナリとして path と内容のハッシュを照合する
     nested_binary = '.binaryTarget(name: targetName(url: "https://example.com/x"), path: "Frameworks/B.xcframework")'
-    dependencies_case("入れ子の url: を持つ記録のないローカルのバイナリ", 1, "ローカルのバイナリ Sub/Frameworks/B.xcframework",
-                      {"Sub/Package.swift": declare.format(nested_binary)})
-    nested_changed = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/B": "replaced",
-                                           "Sub/Package.swift": declare.format(nested_binary)})
+    dependencies_case("入れ子の url: を持つ記録のないローカルのバイナリ", 1, "ローカルのバイナリ Packages/Sub/Frameworks/B.xcframework",
+                      {"Packages/Sub/Package.swift": declare.format(nested_binary)})
+    nested_changed = dict(binary_files, **{"Packages/Sub/Frameworks/B.xcframework/ios/B": "replaced",
+                                           "Packages/Sub/Package.swift": declare.format(nested_binary)})
     dependencies_case("入れ子の url: を持つローカルのバイナリの内容の照合", 1, "内容が承認したものと違う", nested_changed,
                       [approved_binary])
-    dependencies_case("承認済みのローカルのバイナリ", 0, "OK", dict(binary_files, **{"Sub/Package.swift": declare.format(binary)}),
+    dependencies_case("承認済みのローカルのバイナリ", 0, "OK", dict(binary_files, **{"Packages/Sub/Package.swift": declare.format(binary)}),
                       [approved_binary])
     # 場所が一致しても、承認の後に内容（配下のファイルを含む）が変われば再承認を求める
-    changed = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/B": "replaced", "Sub/Package.swift": declare.format(binary)})
+    changed = dict(binary_files, **{"Packages/Sub/Frameworks/B.xcframework/ios/B": "replaced", "Packages/Sub/Package.swift": declare.format(binary)})
     dependencies_case("承認の後に内容が変わったローカルのバイナリ", 1, "内容が承認したものと違う", changed, [approved_binary])
-    added = dict(binary_files, **{"Sub/Frameworks/B.xcframework/ios/extra": "x", "Sub/Package.swift": declare.format(binary)})
+    added = dict(binary_files, **{"Packages/Sub/Frameworks/B.xcframework/ios/extra": "x", "Packages/Sub/Package.swift": declare.format(binary)})
     dependencies_case("承認の後にファイルが増えたローカルのバイナリ", 1, "内容が承認したものと違う", added, [approved_binary])
     # 承認の path は起点からの相対パスだけ（絶対パス・起点の外は許可リストとして読まない）
     for label, value in (("絶対パス", "/tmp/B.xcframework"), ("起点の外", "../B.xcframework")):
@@ -919,16 +934,31 @@ def test_dependencies() -> None:
             target = Path(outside) / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-        (Path(directory) / "Sub" / "Frameworks").mkdir(parents=True)
-        (Path(directory) / "Sub" / "Frameworks" / "B.xcframework").symlink_to(Path(outside) / "Sub/Frameworks/B.xcframework")
-        (Path(directory) / "Sub" / "Package.swift").write_text(declare.format(binary), encoding="utf-8")
+        (Path(directory) / "Packages" / "Sub" / "Frameworks").mkdir(parents=True)
+        (Path(directory) / "Packages" / "Sub" / "Frameworks" / "B.xcframework").symlink_to(Path(outside) / "Packages/Sub/Frameworks/B.xcframework")
+        (Path(directory) / "Packages" / "Sub" / "Package.swift").write_text(declare.format(binary), encoding="utf-8")
         allowlist = Path(directory) / "allowlist.json"
         allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": [approved_binary]}),
                              encoding="utf-8")
         expect("dependencies: 起点の外を指すリンクのローカルのバイナリ", [
             str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 1, "実体が起点の外")
+    # check.sh の手順 7 の写しは Packages/ だけなので、承認と内容が一致しても Packages/ の外（字面・実体）のバイナリは認めない
+    outside_files = {"Frameworks/B.xcframework/Info.plist": "info", "Frameworks/B.xcframework/ios/B": "bin",
+                     "Packages/Sub/Package.swift": declare.format(binary.replace('"Frameworks', '"../../Frameworks'))}
+    outside_binary = dict(approved_binary, path="Frameworks/B.xcframework")
+    dependencies_case("Packages/ の外の承認済みのローカルのバイナリ", 1, "B.xcframework は Packages/ の外にある", outside_files, [outside_binary])
+    with tempfile.TemporaryDirectory() as directory:
+        for name, content in dict(outside_files, **{"Packages/Sub/Package.swift": declare.format(binary)}).items():
+            (Path(directory) / name).parent.mkdir(parents=True, exist_ok=True)
+            (Path(directory) / name).write_text(content, encoding="utf-8")
+        (Path(directory) / "Packages" / "Sub" / "Frameworks").symlink_to(Path(directory) / "Frameworks")
+        allowlist = Path(directory) / "allowlist.json"
+        allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": [approved_binary]}),
+                             encoding="utf-8")
+        expect("dependencies: 実体が Packages/ の外のローカルのバイナリ", [
+            str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 1, "実体が Packages/ の外")
     # 前後に空白のあるパスは、空白を除いた承認済みのバイナリと取り違えずに拒否する
-    spaced = dict(binary_files, **{"Sub/Package.swift": declare.format(binary.replace('.xcframework"', '.xcframework "'))})
+    spaced = dict(binary_files, **{"Packages/Sub/Package.swift": declare.format(binary.replace('.xcframework"', '.xcframework "'))})
     dependencies_case("前後に空白のあるローカルのバイナリのパス", 1, "前後に空白のあるパス", spaced, [approved_binary])
     # 走査の失敗（読めないディレクトリ）は合格にしない。走査に失敗がなく依存のファイルもなければ通る
     with tempfile.TemporaryDirectory() as directory:
@@ -944,7 +974,7 @@ def test_dependencies() -> None:
         finally:
             (Path(directory) / "Sub" / "Locked").chmod(0o755)
     dependencies_case("承認済みのローカルのバイナリがない", 2, "ローカルのバイナリがない",
-                      {"Sub/Package.swift": declare.format(binary)}, [approved_binary])
+                      {"Packages/Sub/Package.swift": declare.format(binary)}, [approved_binary])
     dependencies_case("ローカルのバイナリの項目に sha256 がない", 2, "sha256",
                       {}, [{k: v for k, v in approved_binary.items() if k != "sha256"}])
     # リモートのバイナリは、承認した配布物の checksum と宣言の checksum の一致を求める
@@ -1272,6 +1302,32 @@ def setup_guard_cases() -> None:
         if result.returncode != 0 or configured(repository) != ".githooks":
             failures.append(f"setup: リンクした作業ツリーから --hooks が通らない（終了コード {result.returncode}）\n"
                             f"{result.stderr.strip()}")
+
+
+def setup_newline_override_case() -> None:
+    """setup.sh --hooks が、末尾に改行のある core.hooksPath の上書きを .githooks と取り違えず、共有の設定を書く前に止まること。
+    ちょうど .githooks の上書きは通ること。"""
+    global count
+    for label, value, want in (("末尾の改行", ".githooks\n", 1), ("空", "", 1), ("ちょうどの値", ".githooks", 0)):
+        for source in ("環境変数", "取り込む設定"):
+            count += 1
+            with tempfile.TemporaryDirectory() as directory:
+                env = isolated_git_env()
+                repository = setup_repository(directory, env)
+                if source == "環境変数":
+                    env_run = dict(env, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=value)
+                else:
+                    env_run = env
+                    subprocess.run(["git", "config", "--file", str(repository / ".git" / "extra.config"), "core.hooksPath", value],
+                                   env=env, check=True)
+                    subprocess.run(["git", "-C", str(repository), "config", "--local", "include.path", "extra.config"], env=env,
+                                   check=True)
+                result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], env=env_run, capture_output=True, text=True)
+                local = subprocess.run(["git", "-C", str(repository), "config", "--local", "--no-includes", "--get", "core.hooksPath"],
+                                       env=env, capture_output=True, text=True).stdout
+                if result.returncode != want or local != ("" if want else ".githooks\n"):
+                    failures.append(f"setup: {source}の core.hooksPath（{label}）の扱いが違う（終了コード {result.returncode}・"
+                                    f"共有の値 {local!r}）\n{result.stderr.strip()}")
 
 
 def setup_config_failure_case() -> None:
@@ -2058,6 +2114,15 @@ def lint_rules_config_cases() -> None:
     want = text.replace("    excluded:  # 注\n      - '.*/A\\.swift\\z'\n      # 注\n      - b\n", "")
     if module.without_excluded(text, "rule_a") != want:
         failures.append(f"lint-rules: 対照の設定が違う\n{module.without_excluded(text, 'rule_a')}")
+    # ほかの設定への参照は、対照の設定（一時ディレクトリに置く）から同じものを読めないので、試験の前に拒否する
+    for label, text, want in (
+        ("parent_config", "strict: true\nparent_config: base.yml\n", ["parent_config"]),
+        ("引用符の child_config", "\"child_config\" : child.yml\n", ["child_config"]),
+        ("参照のない設定", "strict: true\n# parent_config: base.yml\ncustom_rules:\n  rule_a:\n    message: parent_config\n", []),
+    ):
+        count += 1
+        if module.config_references(text) != want:
+            failures.append(f"lint-rules: {label}: 設定への参照の判定が違う（{module.config_references(text)}）")
     # 違反しない例外の例は、例外を除いても検出されないので失敗にする。元のパスのまま調べる
     count += 1
     errors = []
@@ -2070,6 +2135,19 @@ def lint_rules_config_cases() -> None:
                                   {"no_direct_logger": True}, errors)
     if errors or checked != [[allowed]]:
         failures.append(f"lint-rules: 例外の例の対照が元のパスで検出されない（{errors}・{checked}）")
+    # 参照のある設定では、SwiftLint を実行する前に終了コード 2 で止まる
+    count += 1
+    executed: List[bool] = []
+    module.run_swiftlint = lambda paths, config=None: executed.append(True) or []
+    original_read = module.read_config
+    module.read_config = lambda path: original_read(path) + b"\nparent_config: base.yml\n"
+    original_argv, sys.argv = sys.argv, ["test-lint-rules.py"]
+    with contextlib.redirect_stderr(io.StringIO()) as captured:
+        code = module.main()
+    sys.argv = original_argv
+    module.read_config = original_read
+    if code != 2 or executed or "ほかの設定への参照" not in captured.getvalue():
+        failures.append(f"lint-rules: ほかの設定への参照で止まらない（終了コード {code}・実行 {executed}）")
     count += 1
     module.run_swiftlint = lambda paths, config=None: []
     module.check_allowed_controls([(allowed, "no_direct_logger", set())], {"no_direct_logger": True}, errors)
@@ -2173,7 +2251,11 @@ def simulator_developer_dir_case() -> None:
             if value is not None:
                 env["DEVELOPER_DIR"] = value
             # /usr/bin/python3 は Xcode への中継で DEVELOPER_DIR を読む（不正な値では起動しない）ので、実体の python で起動する
-            subprocess.run([sys.executable, str(SCRIPTS / "find-simulator.py")], capture_output=True, text=True, env=env)
+            result = subprocess.run([sys.executable, str(SCRIPTS / "find-simulator.py")], capture_output=True, text=True, env=env)
+            # 代わりの xcrun が返す一覧は正しいが空なので、使える機種がない（終了コード 1）
+            if result.returncode != 1:
+                failures.append(f"simulator: DEVELOPER_DIR が {value!r} の空の一覧の終了コードが {result.returncode}（期待 1）\n"
+                                f"{result.stderr.strip()}")
             recorded = out.read_text(encoding="utf-8") if out.is_file() else None
             if recorded != want:
                 failures.append(f"simulator: DEVELOPER_DIR が {value!r} のとき {recorded!r} を使う（期待 {want!r}）")
@@ -2274,19 +2356,30 @@ def copy_tools_script() -> str:
             "trap 'exit 130' INT TERM\n" + "".join(match.group(0) for match in found if match) + 'copy_tools "$1" "$2"\n')
 
 
-def snapshot_tools(source: Path, dest: Path, timeout: float = SNAPSHOT_TIMEOUT) -> None:
+# 上限を過ぎた写しに TERM を送ってから、強制終了するまでの猶予（秒）
+SNAPSHOT_GRACE = 10
+
+
+def snapshot_tools(source: Path, dest: Path, timeout: float = SNAPSHOT_TIMEOUT, env: Optional[Dict[str, str]] = None) -> None:
     """開発ツールを、check.sh の copy_tools（導入のロックを取って写し、外す）そのもので写す。並行の導入の途中を写さない。
 
-    上限を過ぎたら、子の cp なども含むプロセスのグループの全体を止めて回収する（写しを続けさせない）。
+    上限を過ぎたら、子の cp なども含むプロセスのグループの全体を止めて回収する（写しを続けさせない）。まず TERM を送り、写しの
+    EXIT の trap が自分のロックを外すのを待つ。猶予を過ぎても終わらなければ強制終了する（このとき残ったロックは、持ち主を
+    確かめられないので消さない）。
     """
     process = subprocess.Popen(["/bin/bash", "-c", copy_tools_script(), "copy-tools", str(source), str(dest)],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
     try:
         _, stderr = process.communicate(timeout=timeout)
     except BaseException:
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.communicate(timeout=SNAPSHOT_GRACE)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
         raise
     if process.returncode != 0:
         raise RuntimeError(f"開発ツールを写せない: {stderr.strip()}")
@@ -2308,6 +2401,24 @@ def snapshot_timeout_case() -> None:
         left = subprocess.run(["pgrep", "-f", str(source)], capture_output=True, text=True).stdout.split()
         if not stopped or left or dest.exists() or not (source / ".install.lock").is_dir():
             failures.append(f"versions: 上限を過ぎた写しを止めない（止めた {stopped}・残ったプロセス {left}）")
+    # ロックを取った後（写しの途中）に上限を過ぎた場合は、写しが自分のロックを外して終わること
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        source, dest, shims = Path(directory) / "source", Path(directory) / "dest", Path(directory) / "shims"
+        reached = Path(directory) / "reached"  # ロックを取った後の cp に達した印
+        (source / "bin").mkdir(parents=True)
+        shims.mkdir()
+        (shims / "cp").write_text(f'#!/bin/bash\n[ -d "{source}/.install.lock" ] && touch "{reached}"\nexec sleep 60\n', encoding="utf-8")
+        (shims / "cp").chmod(0o755)
+        try:
+            snapshot_tools(source, dest, timeout=3, env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}"))
+            stopped = False
+        except subprocess.TimeoutExpired:
+            stopped = True
+        left = subprocess.run(["pgrep", "-f", str(source)], capture_output=True, text=True).stdout.split()
+        if not stopped or not reached.exists() or left or (source / ".install.lock").exists():
+            failures.append(f"versions: ロックを取った後に上限を過ぎた写しの扱いが違う（止めた {stopped}・写しに達した {reached.exists()}・"
+                            f"残ったプロセス {left}・残ったロック {(source / '.install.lock').exists()}）")
 
 
 def staged_newline_directory_case() -> None:
@@ -2444,6 +2555,59 @@ def retired_backup_case() -> None:
         if result.returncode != 0 or not kept or not published or len(leftovers) != 1 or "退避した旧い gh の導入を削除できない" not in result.stderr:
             failures.append(f"versions: 退避の削除の失敗で新しい導入を巻き戻した・報告しない（終了コード {result.returncode}・"
                             f"残った新しい導入 {kept}・公開するリンク {published}・退避 {leftovers}）\n{(result.stdout + result.stderr).strip()}")
+
+
+def publish_interrupted_case() -> None:
+    """setup-tools.sh が、公開するリンクの置き換えの前後の中断を、退避の印の更新まで控えること（公開した導入を巻き戻さない）。
+    置き換えに失敗した場合は、退避した旧い導入を戻すこと。
+
+    mv の代わりは、公開するリンクの置き換えのときだけ、呼び出し元へ TERM を送る。
+    """
+    global count
+    import hashlib
+    import tarfile
+    for label, action, want_code, want_new in (
+        ("置き換えの後の中断", '/bin/mv "$@"; result=$?; kill -TERM "$PPID"; sleep 1; exit "$result"', 130, True),
+        ("置き換えの途中の中断", 'kill -TERM "$PPID" $$; /bin/mv "$@"', 130, True),
+        ("置き換えの失敗と中断", 'kill -TERM "$PPID"; exit 1', 1, False),
+    ):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            binary = base / "gh"
+            binary.write_text("#!/bin/sh\necho 'gh version 9.9.9 (2000-01-01)'\n# new\n", encoding="utf-8")
+            binary.chmod(0o755)
+            archive = base / "gh.tar.gz"
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(binary, arcname="gh")
+            versions = base / "versions"
+            versions.write_text(f"gh 9.9.9 any cli/cli v9.9.9 gh.tar.gz gh {hashlib.sha256(archive.read_bytes()).hexdigest()}\n",
+                                encoding="utf-8")
+            dest = base / "tools"
+            installed = dest / "gh" / "9.9.9" / "gh"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("old", encoding="utf-8")
+            (dest / "bin").mkdir()
+            link = dest / "bin" / "gh"
+            link.symlink_to("../gh/9.9.9/gh")
+            shims, sent = base / "shims", base / "sent"
+            shims.mkdir()
+            (shims / "curl").write_text('#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\ncp "$MINUTES_TEST_ARCHIVE" "$2"\n',
+                                        encoding="utf-8")
+            (shims / "mv").write_text(f'#!/bin/bash\nfor last in "$@"; do :; done\nif [ "$last" = "{link}" ]; then touch "{sent}"; {action}; '
+                                      'else exec /bin/mv "$@"; fi\n', encoding="utf-8")
+            for path in shims.iterdir():
+                path.chmod(0o755)
+            result = subprocess.run([str(SCRIPTS / "setup-tools.sh"), "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
+                                    capture_output=True, text=True, timeout=60,
+                                    env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_ARCHIVE=str(archive)))
+            content = installed.read_text(encoding="utf-8") if installed.is_file() else ""
+            new = content.endswith("# new\n")
+            published = link.is_symlink() and os.path.realpath(link) == os.path.realpath(installed)
+            if (result.returncode != want_code or not sent.exists() or new != want_new or (not want_new and content != "old")
+                    or not published or (dest / ".install.lock").exists()):
+                failures.append(f"versions: {label}の扱いが違う（終了コード {result.returncode}・新しい導入 {new}・公開するリンク {published}）\n"
+                                f"{(result.stdout + result.stderr).strip()}")
 
 
 def staged_scripts_case() -> None:
@@ -2597,7 +2761,9 @@ def pre_push_interrupted_case() -> None:
         hook = Path(directory) / "pre-push"
         hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
         (repository / "scripts" / "check.sh").write_text('#!/bin/sh\n'
-                                                         'cd "$(dirname "$0")/.." && cat marker.txt other/file.txt > "$MINUTES_TEST_OUT"\n',
+                                                         'cd "$(dirname "$0")/.." && cat marker.txt other/file.txt > "$MINUTES_TEST_OUT"\n'
+                                                         'printf %s "${GIT_OBJECT_DIRECTORY-}${GIT_ALTERNATE_OBJECT_DIRECTORIES-}${GIT_COMMON_DIR-}" '
+                                                         '>> "$MINUTES_TEST_OUT"\n',
                                                          encoding="utf-8")
         for path in (hook, repository / "scripts" / "check.sh"):
             path.chmod(0o755)
@@ -2624,8 +2790,12 @@ def pre_push_interrupted_case() -> None:
         def push(target: Path) -> "subprocess.CompletedProcess[str]":
             return subprocess.run([str(hook)], cwd=repository, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
                                   capture_output=True, text=True, timeout=120, start_new_session=True,
-                                  env=dict(env, MINUTES_PRE_PUSH_DIR=str(target), MINUTES_TEST_OUT=str(out)))
+                                  env=dict(env, MINUTES_PRE_PUSH_DIR=str(target), MINUTES_TEST_OUT=str(out), **inherited))
 
+        # 外から引き継いだ変数は、検査（専用の作業ツリーの git）へ渡さない（代わりの check.sh が残った値を記録に書き足す）
+        objects = str(repository / ".git" / "objects")
+        inherited = {"GIT_OBJECT_DIRECTORY": objects, "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects,
+                     "GIT_COMMON_DIR": str(repository / ".git")}
         count += 1
         crash.write_text("", encoding="utf-8")
         first = push(base)
@@ -2707,6 +2877,7 @@ def coverage_links_case() -> None:
 def test_versions() -> None:
     snapshot_tools_case()
     retired_backup_case()
+    publish_interrupted_case()
     staged_scripts_case()
     reinstall_command_case()
     pre_push_interrupted_case()
@@ -2720,6 +2891,7 @@ def test_versions() -> None:
     tools_override_case()
     ordinary_tools_snapshot_case()
     setup_config_failure_case()
+    setup_newline_override_case()
     require_clean_child_case()
     # 引数が 1 個あれば空文字列でも引数として扱い、--hooks との完全一致を求める（ツールの導入より前に止まる）
     expect("setup: 空文字列の引数", [str(SCRIPTS / "setup.sh"), ""], 2, "使い方")
@@ -3002,6 +3174,7 @@ def test_gitleaks() -> None:
     gitleaks_merge_case()
     gitleaks_broken_history_case()
     gitleaks_traversal_case()
+    gitleaks_signature_case()
     gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
     with tempfile.TemporaryDirectory() as directory:
@@ -3492,6 +3665,36 @@ def gitleaks_traversal_case() -> None:
                    "最後まで終わらなかった" if want else "no leaks found", env=dict(env, PATH=f"{shims}:{env['PATH']}"))
 
 
+def gitleaks_signature_case() -> None:
+    """利用者の設定 log.showSignature=true で、署名の検証の出力（標準エラー）を走査の失敗と取り違えないこと。
+
+    署名つきのコミットを作り、検証のプログラムを起動できない設定にする（git が標準エラーに書く）。走査そのものの失敗の検出は gitleaks_traversal_case。
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        repository = Path(directory) / "repository"
+
+        def git(*arguments: str, content: Optional[str] = None) -> str:
+            return subprocess.run(["git", "-C", str(repository), *arguments], env=env, check=True, capture_output=True, text=True,
+                                  input=content).stdout.strip()
+
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+        tree = git("mktree", content="")
+        who = "test <test@example.invalid> 0 +0000"
+        signature = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n"
+        commit = git("hash-object", "-t", "commit", "-w", "--stdin",
+                     content=f"tree {tree}\nauthor {who}\ncommitter {who}\n{signature}\nbase\n")
+        git("update-ref", "refs/heads/main", commit)
+        git("config", "log.showSignature", "true")
+        git("config", "gpg.program", str(Path(directory) / "missing"))
+        # 対照: 指定のない git log は標準エラーに書く（試験が効いていること）
+        plain = subprocess.run(["git", "-C", str(repository), "log"], env=env, capture_output=True, text=True)
+        if plain.returncode != 0 or not plain.stderr.strip():
+            failures.append("gitleaks: 署名の試験の対照が標準エラーに書かない（試験にならない）")
+        expect("gitleaks: log.showSignature の署名の表示", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], 0,
+               "no leaks found", env=env)
+
+
 def gitleaks_merge_case() -> None:
     """履歴の検査（check.sh の手順 3）が、通常のコミットとマージのコミットで足した行の両方を検出すること。
 
@@ -3561,7 +3764,7 @@ def gitleaks_merge_case() -> None:
 
 
 def coverage_case(label: str, want_code: int, want_text: str, count_value: object, covered_value: object, nested: bool = False,
-                  target: str = "90", forbidden: str = "") -> None:
+                  target: str = "90", forbidden: str = "", duplicate: bool = False) -> None:
     with tempfile.TemporaryDirectory() as directory:
         sources = Path(directory) / "Sources"
         sources.mkdir()
@@ -3570,6 +3773,8 @@ def coverage_case(label: str, want_code: int, want_text: str, count_value: objec
         recorded = Path(os.path.realpath(sources)) / "A.swift"
         report.write_text(json.dumps({"data": [{"files": [{"filename": str(recorded), "summary": {
             "lines": {"count": count_value, "covered": covered_value}}}]}]}), encoding="utf-8")
+        if duplicate:
+            report.write_text(replaced(report.read_text(encoding="utf-8"), '"covered":', '"covered": 20, "covered":'), encoding="utf-8")
         if nested:
             report.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")  # json の読み込みが RecursionError になる深さ
         command = [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", target]
@@ -3604,6 +3809,8 @@ def test_coverage() -> None:
     coverage_case("深い入れ子の記録", 2, "RecursionError", 20, 19, nested=True)
     # 大きな行数でも、割ってから 100 を掛けるので float への変換の途中で桁あふれしない
     coverage_case("大きな行数", 0, "行 50.0%", 2 * 10**400, 10**400)
+    # 矛盾する重複した鍵の記録は、後の値を採用せずに読めないものとする
+    coverage_case("重複した鍵の記録", 2, "重複した鍵", 20, 5, duplicate=True)
     coverage_symlink_case()
 
 
@@ -4426,8 +4633,26 @@ def run_docs_cases() -> None:
     # 同じ行で閉じる HTML のコメントの中のリンクは表示されないので確かめない。コード片の印の照合は続ける
     docs_case("同じ行のコメントの中のリンク", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
               "[要件](../01-requirements/requirements.md) <!-- [旧](missing.md) -->")
-    docs_case("コメントの後ろのリンクは確かめる", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
-              "<!-- 注 --> [要件](missing.md)")
+    # コメントで始まる行は全体が HTML のブロックなので、後ろの文字もリンクにならない。次の行のリンクは確かめる
+    for label, text in (("インライン", "<!-- 注 --> [要件](missing.md)"), ("参照形式", "<!-- 注 --> [要件][a]\n\n[a]: missing.md"),
+                        ("開いた括弧", "<!-- 注 --> [要件\n続き](missing.md)"), ("前の行の括弧", "[例\n<!-- 注 -->\n続き](missing.md)")):
+        docs_case(f"コメントで始まる行の後ろは確かめない: {label}", 0, "OK", basic, "[要件](../01-requirements/requirements.md)", text)
+    docs_case("コメントの次の行のリンクは確かめる", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
+              "<!-- 注 -->\n[要件](missing.md)")
+    # <pre> の中は生の文字列。フェンスの印・コメントの始まりとして扱わず、</pre> の後は通常の検査に戻る
+    link_text = "[要件](../01-requirements/requirements.md)"
+    docs_case("<pre> の中のバッククォートはフェンスではない", 1, "リンクの先がない: missing.md", basic, link_text,
+              f"<pre>\n{FENCE}\n</pre>\n\n[要件](missing.md)")
+    docs_case("<pre> の中のコメントの始まり", 1, "リンクの先がない: missing.md", basic, link_text,
+              "<pre>\n<!-- 例\n</pre>\n\n[要件](missing.md)")
+    docs_case("<pre> の中のリンクとバッククォート", 0, "OK", basic, link_text,
+              f"{link_text}\n\n<pre>\n{FENCE}\n[例](missing.md)\n</pre>")
+    docs_case("<pre> の中の ID の参照は確かめる", 1, "定義されていない ID: FR-AAA-99", basic, link_text,
+              f"{link_text}\n\n<pre>\n{FENCE}\nFR-AAA-99\n</pre>")
+    docs_case("1 行の <pre> の次の行", 1, "リンクの先がない: missing.md", basic, link_text,
+              f"<pre>{FENCE}</pre>\n[要件](missing.md)")
+    docs_case("フェンスの中の <pre> はコードの本文", 1, "リンクの先がない: missing.md", basic, link_text,
+              f"{FENCE}html\n<pre>\n{FENCE}\n\n[要件](missing.md)")
     # 「(」の直後の空白を読み飛ばしてリンク先を確かめる（CommonMark）
     docs_case("「(」の直後に空白のあるリンク", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
               "[設計]( missing.md)")
@@ -4454,6 +4679,15 @@ def run_docs_cases() -> None:
         ("エスケープした括弧を文に含むリンク", "[例\\]続き](missing.md)", "missing.md"),
         ("画像を含むリンク", "[![図](../README.md)](missing.md)", "missing.md"),
         ("行をまたぐリンクの文", "[例\n続き](missing.md)", "missing.md"),
+        # リンクの中にリンクは入らない。内側がリンクになれば、外側の「[」は文字のまま表示される。画像の外側は無効にしない
+        ("入れ子のリンクの外側", "[外 [内](../README.md)](missing.md)", ""),
+        ("入れ子のリンクの内側", "[外 [内](missing.md)](../README.md)", "missing.md"),
+        ("行をまたぐ入れ子のリンクの外側", "[外 [内](../README.md)\n続き](missing.md)", ""),
+        ("入れ子のリンクの後のリンク", "[外 [内](../README.md)](x.md) [後](missing.md)", "missing.md"),
+        ("画像を含むリンクの画像", "[![図](missing.png)](../README.md)", "missing.png"),
+        ("画像の文の中のリンクの外側の画像", "![図 [内](../README.md)](missing.png)", "missing.png"),
+        ("画像の中のリンクで無効になる外側", "[外 ![図 [内](../README.md)](../README.md)](missing.md)", ""),
+        ("エスケープした「!」の入れ子の外側", "\\![外 [内](../README.md)](missing.md)", ""),
         ("段落をまたぐ括弧", "[例\n\n続き](missing.md)", ""),
     ):
         docs_case(f"リンクの文の括弧: {label}", 1 if want else 0, f"リンクの先がない: {want}" if want else "OK", basic,

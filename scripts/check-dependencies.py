@@ -656,8 +656,8 @@ def contained(root: Path, location: str) -> bool:
         raise Unreadable(f"{root / location}: リンクを解決できない（循環している）: {error}") from error
 
 
-# ローカルの Package を置ける場所（check.sh の手順 7 がカバレッジを測る写しに Packages/ だけを展開するので、その外の
-# Package を参照すると、写しの中で解決できない）
+# ローカルの Package とローカルのバイナリを置ける場所（check.sh の手順 7 がカバレッジを測る写しに Packages/ だけを展開するので、その外の
+# ものを参照すると、写しの中で解決できない）
 LOCAL_PACKAGE_ROOT = "Packages"
 
 
@@ -761,6 +761,12 @@ def manifest_errors(
                 errors.append(f"ローカルのバイナリ {location} は許可リストにない: .binaryTarget({summary})")
             elif root is not None and not contained(root, location):
                 errors.append(f"ローカルのバイナリ {location} の実体が起点の外にある（シンボリックリンクなど）: .binaryTarget({summary})")
+            elif location.split("/")[0] != LOCAL_PACKAGE_ROOT:
+                errors.append(f"ローカルのバイナリ {location} は {LOCAL_PACKAGE_ROOT}/ の外にある（カバレッジの測定の写しに含まれない）: "
+                              f".binaryTarget({summary})")
+            elif root is not None and (root / location).resolve().relative_to(root.resolve()).parts[:1] != (LOCAL_PACKAGE_ROOT,):
+                errors.append(f"ローカルのバイナリ {location} の実体が {LOCAL_PACKAGE_ROOT}/ の外にある（シンボリックリンクなど）: "
+                              f".binaryTarget({summary})")
             elif root is not None:
                 # 場所が一致しても、承認したときの内容と違えば認めない（再承認を求める）
                 actual = content_digest(root / location)

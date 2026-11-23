@@ -104,6 +104,16 @@ def custom_rules(config_text: str, errors: List[str]) -> Dict[str, bool]:
     return rules
 
 
+def config_references(config_text: str) -> List[str]:
+    """.swiftlint.yml の最上位にある、ほかの設定への参照（parent_config・child_config）の鍵を返す。
+
+    参照の相対パスは設定のファイルの場所から解決される。対照の設定は一時ディレクトリに置くので、元の設定と同じものを
+    読めない。参照のある設定では試験をしない（main が終了コード 2 で止める）。
+    """
+    found = re.finditer(r"""^(["']?)(parent_config|child_config)\1\s*:""", config_text, re.MULTILINE)
+    return [match.group(2) for match in found]
+
+
 def without_excluded(config_text: str, rule: str) -> str:
     """.swiftlint.yml から、規則 rule の excluded（鍵の行と字下げ 6 の項目）だけを除いた設定を返す（ほかの行は字面のまま）。"""
     lines: List[str] = []
@@ -393,7 +403,13 @@ def main() -> int:
         print("NG: .swiftlint.yml がない", file=sys.stderr)
         return 2
     errors: List[str] = []
-    rules = custom_rules(read_config(CONFIG).decode("utf-8"), errors)
+    config_text = read_config(CONFIG).decode("utf-8")
+    references = config_references(config_text)
+    if references:
+        print(f"NG: .swiftlint.yml にほかの設定への参照（{'・'.join(references)}）がある。対照の設定で同じものを読めないので試験できない。"
+              "参照を使わず 1 つの設定に書く", file=sys.stderr)
+        return 2
+    rules = custom_rules(config_text, errors)
     if not rules:
         errors.append(".swiftlint.yml に custom_rules が 1 つもない")
     for rule in BUILTIN_RULES:

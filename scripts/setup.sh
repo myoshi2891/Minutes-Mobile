@@ -52,10 +52,12 @@ if [ "$HOOKS" = 1 ]; then
     echo "NG: git が選ぶ作業ツリー（${toplevel}）がこのリポジトリ（${ROOT}）と違う。GIT_DIR・GIT_WORK_TREE などの変数を外してから実行し直す。フックを有効にしない" >&2
     exit 1
   fi
-  # 設定を読む。鍵がない（終了コード 1）は空として続け、それ以外の失敗は「鍵がない」と取り違えずに報告して失敗を返す
+  # 設定を読む。鍵がない（終了コード 1）は空として続け、それ以外の失敗は「鍵がない」と取り違えずに報告して失敗を返す。
+  # 値の末尾の改行も区別する（$(…) は落とす）ため、NUL 区切り（-z）で読み、記録ごとに 1 行の「=値」にして返す。
+  # 値の中の改行は制御文字（RS。8 進数 036）に置き換える（「.githooks＋改行」も空の値も、「=.githooks」と一致しない）
   read_config() {
     local value status=0
-    value=$(env -u GIT_CONFIG git -C "$ROOT" config "$@") || status=$?
+    value=$(env -u GIT_CONFIG git -C "$ROOT" config -z "$@" | LC_ALL=C tr '\n\000' '\036\n' | LC_ALL=C sed 's/^/=/') || status=$?
     case $status in
       0) printf '%s\n' "$value" ;;
       1) ;;
@@ -66,12 +68,14 @@ if [ "$HOOKS" = 1 ]; then
     esac
   }
   # 共有の設定（--local）より優先される設定（作業ツリーの設定・-c・GIT_CONFIG_* の環境変数）が別の値を指していれば、
-  # 共有の値を書いても有効にならない。共有の値を変える前に止める
+  # 共有の値を書いても有効にならない。共有の値を変える前に止める（1 行目が設定の段、2 行目が値）
   current=$(read_config --show-scope --get core.hooksPath) || exit 1
-  case "${current%%$'\t'*}" in
+  scope=${current%%$'\n'*}
+  scope=${scope#=}
+  case "$scope" in
     worktree | command)
-      if [ "${current#*$'\t'}" != .githooks ]; then
-        echo "NG: より優先される設定（${current%%$'\t'*}）の core.hooksPath が「${current#*$'\t'}」を指している。共有の設定を変えずに止める。" \
+      if [ "${current#*$'\n'}" != =.githooks ]; then
+        echo "NG: より優先される設定（${scope}）の core.hooksPath が「${current#*$'\n'=}」を指している。共有の設定を変えずに止める。" \
           "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
         exit 1
       fi
@@ -84,8 +88,8 @@ if [ "$HOOKS" = 1 ]; then
   own=$(read_config --local --no-includes --get-all core.hooksPath) || exit 1
   included=$(comm -23 <(printf '%s\n' "$with_includes" | LC_ALL=C sort) <(printf '%s\n' "$own" | LC_ALL=C sort))
   while IFS= read -r value; do
-    if [ -n "$value" ] && [ "$value" != .githooks ]; then
-      echo "NG: 共有の設定が取り込む設定（include・includeIf）の core.hooksPath が「${value}」を指している。共有の設定を変えずに止める。" \
+    if [ -n "$value" ] && [ "$value" != =.githooks ]; then
+      echo "NG: 共有の設定が取り込む設定（include・includeIf）の core.hooksPath が「${value#=}」を指している。共有の設定を変えずに止める。" \
         "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
       exit 1
     fi
@@ -93,13 +97,13 @@ if [ "$HOOKS" = 1 ]; then
   env -u GIT_CONFIG git -C "$ROOT" config --local core.hooksPath .githooks
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる
-  effective=$(env -u GIT_CONFIG git -C "$ROOT" config --get core.hooksPath || true)
-  if [ "$effective" != .githooks ]; then
-    echo "NG: core.hooksPath を .githooks に設定したが、実際に効く値は「${effective}」。" \
+  effective=$(read_config --get core.hooksPath) || exit 1
+  if [ "$effective" != =.githooks ]; then
+    echo "NG: core.hooksPath を .githooks に設定したが、実際に効く値は「${effective#=}」。" \
       "設定の出所を env -u GIT_CONFIG git config --show-origin --get-all core.hooksPath で確かめる" >&2
     exit 1
   fi
-  echo "OK: フックを有効にした（core.hooksPath = ${effective}）"
+  echo "OK: フックを有効にした（core.hooksPath = ${effective#=}）"
 else
   echo "OK: 開発ツールを導入した。フックは有効にしていない（有効にするときは --hooks を付ける）"
 fi

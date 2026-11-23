@@ -150,45 +150,58 @@ def heading(line: str) -> Optional[Tuple[int, str]]:
     return (len(found.group(1)), found.group(2).strip()) if found else None
 
 
-def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]], bool]]:
-    """各行を（行番号, 行, フェンスかコメントの中か, この行で開いたフェンス, 複数行の HTML のコメントの中か）で返す。
+# HTML のコードブロック（<pre>…</pre>）の始まりと終わり。中の行は表示どおりの文字で、Markdown（フェンス・表・リンク）にならない
+HTML_PRE_OPEN = re.compile(r"^ {0,3}<pre(?:\s|>|$)", re.IGNORECASE)
+HTML_PRE_CLOSE = re.compile(r"</pre\s*>", re.IGNORECASE)
+
+
+def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]], bool, bool]]:
+    """各行を（行番号, 行, フェンス・コメント・<pre> の中か, この行で開いたフェンス, 複数行の HTML の
+    コメントの中か, <pre> の中か）で返す。
 
     コードフェンスと複数行の HTML のコメント（同じ行で閉じない「<!--」から「-->」を含む行まで）の状態を同じ走査で追う。
     コメントの中のフェンスの印は、フェンスとして扱わない（コメントが閉じた後に通常の判定に戻る）。
     フェンスの中の「<!--」は、コードの本文として扱う。同じ行で閉じるコメント（コード片の印 <!-- file: … --> など）は含めない。
+    HTML の <pre> ブロック（始まりと終わりの行を含む）は「中」とする。中のフェンスの印・「<!--」は文字のまま扱い、</pre> を含む
+    行の次から通常の判定に戻る。
     """
     fence: Optional[Fence] = None
     comment = False
+    pre = False
     for number, line in enumerate(split_lines(text), start=1):
         if comment:
             comment = "-->" not in line
-            yield number, line, True, None, True
+            yield number, line, True, None, True, False
             continue
         if fence is not None:
             if fence_closes(line, fence):
                 fence = None
-            yield number, line, True, None, False
+            yield number, line, True, None, False, False
+            continue
+        if pre or HTML_PRE_OPEN.match(line):
+            pre = HTML_PRE_CLOSE.search(line) is None
+            yield number, line, True, None, False, True
             continue
         found = COMMENT_OPEN.match(line)
         if found and "-->" not in line[found.end():]:
             comment = True
-            yield number, line, True, None, True
+            yield number, line, True, None, True, False
             continue
         opened = fence_open(line)
         if opened:
             fence = opened[0]
-        yield number, line, opened is not None, opened, False
+        yield number, line, opened is not None, opened, False, False
 
 
 def fenced_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fence, str]]]]:
-    """各行を（行番号, 行, 中か, この行で開いたフェンス）で返す。フェンスの開始・終了の行と、複数行の HTML のコメントの
-    行は「中」とする（本文として検査しない）。"""
-    for number, line, inside, opened, _ in scanned_lines(text):
+    """各行を（行番号, 行, 中か, この行で開いたフェンス）で返す。フェンスの開始・終了の行と、複数行の HTML のコメント・
+    <pre> の行は「中」とする（本文として検査しない）。"""
+    for number, line, inside, opened, _, _ in scanned_lines(text):
         yield number, line, inside, opened
 
 
 def prose_lines(text: str) -> Iterator[Tuple[int, str]]:
-    """コードフェンスの外の行を、行番号つきで返す。"""
+    """コードフェンス・複数行の HTML のコメント・<pre> の外の行を、行番号つきで返す。"""
     for number, line, inside, _ in fenced_lines(text):
         if not inside:
             yield number, line
@@ -242,24 +255,36 @@ def snippet_marker(line: str) -> Optional[Tuple[str, str]]:
     return (found.group(1), found.group(2).strip()) if found else None
 
 
-def link_destinations(line: str, unclosed: int = 0) -> Tuple[List[str], int]:
-    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」の数を返す。
+class Opener:
+    """開いたままの「[」。画像の「![」か、リンクの始まりになりうるか（中にリンクがあれば、なりえない）を持つ。"""
+
+    def __init__(self, image: bool) -> None:
+        self.image = image
+        self.active = True
+
+
+def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tuple[List[str], List[Opener]]:
+    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」を返す。
 
     リンクの文を閉じる「]」（エスケープされておらず、対になるエスケープされていない「[」がある）の直後の「(」だけをリンク先の
     始まりとする（「\\[例](missing.md)」はリンクにならない）。リンクの文は同じ段落の中で行をまたげるので、前の行から
-    開いたままの「[」の数を unclosed で受け取る。リンク先は山括弧で囲んだもの（<…>）か、空白を含まず括弧の対が
+    開いたままの「[」を openers で受け取る。リンクの中にリンクは入らないので、画像でないリンクが成立したら、それを囲む画像でない
+    「[」はリンクの始まりにしない（画像を含むリンクは成立する。CommonMark と同じ）。リンク先は山括弧で囲んだもの（<…>）か、空白を含まず括弧の対が
     とれたもの（design(v2).md の「)」をリンクの終わりと取り違えない。CommonMark と同じ）。その後にタイトルを書ける。"""
     found: List[str] = []
+    stack = list(openers or [])
     position = 0
+    previous = ""  # 直前に読んだ文字（エスケープは「\\」と続く文字を 1 回で読むので、エスケープした「!」は残らない）
     while position < len(line):
         char = line[position]
+        before, previous = previous, char
         position += 2 if char == "\\" and line[position + 1:position + 2] in tuple(ASCII_PUNCTUATION) else 1
         if char == "[":
-            unclosed += 1
-        if char != "]" or unclosed == 0:
+            stack.append(Opener(before == "!"))
+        if char != "]" or not stack:
             continue
-        unclosed -= 1
-        if not line.startswith("(", position):
+        opener = stack.pop()
+        if not opener.active or not line.startswith("(", position):
             continue
         at = position + 1
         # 「(」の直後の空白は読み飛ばす（CommonMark。「[設計]( missing.md)」もリンクとして確かめる）
@@ -296,7 +321,11 @@ def link_destinations(line: str, unclosed: int = 0) -> Tuple[List[str], int]:
         if line.startswith(")", at):
             found.append(destination)
             position = at + 1  # リンク先の中の括弧を、リンクの文の括弧と数えない
-    return found, unclosed
+            previous = ""
+            if not opener.image:
+                for outer in stack:
+                    outer.active = outer.active and outer.image
+    return found, stack
 
 
 def table_cells(line: str) -> List[str]:
@@ -378,29 +407,6 @@ def find_tables(lines: List[Tuple[int, str]]) -> List[Tuple[List[str], List[Tupl
     return found
 
 
-# HTML のコードブロック（<pre>…</pre>）の始まりと終わり。中の行は表示どおりのコードで、Markdown の表にならない
-HTML_PRE_OPEN = re.compile(r"^ {0,3}<pre(?:\s|>|$)", re.IGNORECASE)
-HTML_PRE_CLOSE = re.compile(r"</pre\s*>", re.IGNORECASE)
-
-
-def without_html_pre(body: List[str]) -> List[str]:
-    """HTML の <pre> ブロックの行（始まりと終わりの行を含む）を空行に置き換える。空行なので表の境界にもなる
-    （ブロックの前後の行を 1 つの表にしない）。ブロックの外の Markdown の表はそのまま残す。"""
-    result: List[str] = []
-    inside = False
-    for line in body:
-        if not inside and HTML_PRE_OPEN.match(line):
-            inside = HTML_PRE_CLOSE.search(line[line.lower().index("<pre") + 4:]) is None
-            result.append("")
-            continue
-        if inside:
-            inside = HTML_PRE_CLOSE.search(line) is None
-            result.append("")
-            continue
-        result.append(line)
-    return result
-
-
 def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
     """本文（節の行の並び）の中の表ごとに、見出しの列とデータ行を返す（find_tables と同じ判定）。"""
     # コードフェンスの代わりの行（FENCE_LINE）は空行と同じく表を終わらせる（「|」のない行をデータ行にしない）
@@ -411,13 +417,11 @@ def table_blocks(body: List[str]) -> List[Tuple[List[str], List[str]]]:
 def tables(text: str) -> Iterator[Tuple[List[str], List[Tuple[int, str]]]]:
     """コードフェンスの外の表ごとに、見出しの列と、データ行（行番号, 行）を返す。
 
-    コードフェンスの中の行は表の候補のまとまりを区切る（フェンスをまたいだ行を 1 つの表にしない）。
+    コードフェンス・<pre> の中の行は表の候補のまとまりを区切る（またいだ行を 1 つの表にしない）。
     """
     hidden = commented_lines(text)
     lines = [(number, "" if inside or number in hidden else line) for number, line, inside, _ in fenced_lines(text)]
-    # HTML の <pre> ブロックの中の例も表にしない（行の数と位置は変わらず、ブロックの行は表の境界になる）
-    kept = without_html_pre([line for _, line in lines])
-    yield from find_tables([(number, line) for (number, _), line in zip(lines, kept)])
+    yield from find_tables(lines)
 
 
 def section_numbers(text: str) -> Dict[int, str]:
@@ -425,7 +429,7 @@ def section_numbers(text: str) -> Dict[int, str]:
     番号のない節と最初の節より前の行は空文字列。"""
     result: Dict[int, str] = {}
     current = ""
-    for number, line, inside, _, _ in scanned_lines(text):
+    for number, line, inside, _, _, _ in scanned_lines(text):
         found = None if inside else heading(line)
         if found and found[0] == 2:
             numbered = re.match(r"(\d+)\.", found[1])
@@ -436,7 +440,7 @@ def section_numbers(text: str) -> Dict[int, str]:
 
 def commented_lines(text: str) -> Set[int]:
     """複数行の HTML のコメントの行番号（scanned_lines と同じ判定）。表示されない内容なので、節・表の検査に数えない。"""
-    return {number for number, _, _, _, commented in scanned_lines(text) if commented}
+    return {number for number, _, _, _, commented, _ in scanned_lines(text) if commented}
 
 
 def reference_label(label: str) -> str:
@@ -659,9 +663,12 @@ class Checker:
     def check_references(self) -> None:
         prefixes = {identifier.rsplit("-", 1)[0] for identifier in self.defined}
         for name, text in self.texts.items():
-            for number, line in prose_lines(text):
+            for number, line, inside, _, _, pre in scanned_lines(text):
+                # <pre> の中は Markdown にならないが文字は表示されるので、ID の参照は確かめる
+                if inside and not pre:
+                    continue
                 # 同じ行で閉じる HTML のコメントは表示されないので、中の ID を参照として数えない（複数行のコメントは
-                # prose_lines が除く）。visible と同じ置き換えで、インラインのコード（`…`）の中の ID は検査に残す
+                # 上で除く）。visible と同じ置き換えで、インラインのコード（`…`）の中の ID は検査に残す
                 line = INLINE_COMMENT.sub("", line)
                 for match in ID_PATTERN.finditer(line):
                     if reversed_range(match):
@@ -728,7 +735,7 @@ class Checker:
                 if cells[0] == "満たす要件 ID" and len(cells) >= 2:
                     fields.append(cells[1])
         after_heading = False
-        for _, line, inside, _, commented in scanned_lines(text):
+        for _, line, inside, _, commented, _ in scanned_lines(text):
             if commented:
                 continue  # 複数行の HTML のコメントは空行と同じに扱う（sections() と同じ。中の「満たす要件:」は数えない）
             if inside:
@@ -763,16 +770,22 @@ class Checker:
                 found = REFERENCE_DEFINITION.match(line)
                 if found:
                     definitions.setdefault(reference_label(found.group(1)), found.group(2))
-            unclosed, previous = 0, 0  # 同じ段落の前の行から開いたままの「[」の数と、前の行の番号
+            openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」
+            previous = 0  # 前の行の番号
             for number, line in prose_lines(text):
                 is_definition = REFERENCE_DEFINITION.match(line) is not None
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
                 if number != previous + 1 or not line.strip() or BLOCK_START.match(line):
-                    unclosed = 0
+                    openers = []
                 previous = number
+                # コメントで始まる行は、行の全体が HTML のブロックで、閉じた後ろの文字もリンクにならない（CommonMark）。
+                # 段落も切れる。コード片の印の照合は check_snippets が別に行う
+                if COMMENT_OPEN.match(line):
+                    openers = []
+                    continue
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
                 line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない
-                targets, unclosed = link_destinations(line, unclosed)
+                targets, openers = link_destinations(line, openers)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
@@ -885,7 +898,7 @@ class Checker:
         for number, heading, body in sections:
             if DETAILED_MAPPING not in heading:
                 continue
-            for header, rows in table_blocks(without_html_pre(body)):
+            for header, rows in table_blocks(body):
                 columns = [at for at, cell in enumerate(header)
                            if at > 0 and any(word in cell for word in TEST_COLUMN_WORDS)]
                 for line in rows:
@@ -943,7 +956,7 @@ class Checker:
         rows: List[str] = []
         for _, heading, body in sections:
             if "申し送り" in heading:
-                rows.extend(row for header, block in table_blocks(without_html_pre(body)) if len(header) >= 2 and "解決" in header[1]
+                rows.extend(row for header, block in table_blocks(body) if len(header) >= 2 and "解決" in header[1]
                             for row in block)
         # 解決の列（2 列目）が空・空白だけ・コメントだけ（表示されない）の行は、解決したことにしない
         resolved = []

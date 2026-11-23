@@ -499,7 +499,9 @@ release_coverage_lock() {
 # 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
 # 試験用のファイルなどを省きうるので使わず、一時のインデックスに読み込んで、追跡しているファイルをすべて blob のまま
 # 書き出す（write_index_entries。checkout-index の smudge のフィルタ・改行の変換を通さないので、測る内容は識別子の
-# ツリーの内容と一致する）。失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
+# ツリーの内容と一致する）。ローカルの Package とローカルのバイナリは check-dependencies.py が Packages/ の下（字面・実体）に
+# 限るので、Packages/ だけを写せば swift test が承認済みのものを解決できる。
+# 失敗したら非 0 を返す（呼び出し側は条件の中で呼ぶので、set -e に頼らない）
 materialize_coverage_input() {
   local index entries status=0
   index=$(mktemp)

@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 
+from xcproj import reject_duplicate_keys
 
 TARGET_DIGITS = 30  # 目標の小数の桁数の上限（1e-999999999 のような値を正確な分数に展開させない）
 
@@ -58,7 +59,8 @@ def main() -> int:
     parser.add_argument("--target", type=percentage, required=True)
     arguments = parser.parse_args()
     try:
-        files = json.loads(arguments.report.read_text(encoding="utf-8"))["data"][0]["files"]
+        files = json.loads(arguments.report.read_text(encoding="utf-8"),
+                           object_pairs_hook=reject_duplicate_keys)["data"][0]["files"]
         # 数える対象かは、記録したパスで決める（現在のファイルシステムのシンボリックリンクをたどらない）。swift test の記録は
         # Package の起点を実体のパスに解決し、起点の中のパスはそのまま書く（2026-11-22 に一時的に置いた Package で、/tmp を
         # 経由して指定しても /private/tmp の起点になり、Sources の中のシンボリックリンクのファイルはリンクのパスのまま記録される

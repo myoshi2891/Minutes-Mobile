@@ -22,7 +22,8 @@ TOOLS_DIR=${MINUTES_TOOLS_DIR:-$ROOT/.tools}
 # でも省かない）。--no-textconv で .gitattributes の textconv を使わずに元の内容の差分を検査する（変換で鍵を隠させない）。
 # --text で .gitattributes の binary（-diff）の属性のファイルも本文の差分として出す（「Binary files differ」で鍵を隠させない）。
 # --no-color で設定 color.diff・color.ui=always の色づけの制御文字を差分に入れない（行が分断されて鍵の検出を逃させない）
-GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textconv --text --no-color"
+# --no-show-signature で設定 log.showSignature=true の署名の検証を行わない（検証の失敗が標準エラーに出て、走査の失敗と取り違える）
+GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textconv --text --no-color --no-show-signature"
 # 抑止の仕組みは使わない（どちらも承認の記録なしに検出を隠せるため）。--gitleaks-ignore-path に空のファイル（/dev/null）を
 # 渡して実行時の場所の .gitleaksignore を読ませず、--ignore-gitleaks-allow で行の「gitleaks:allow」のコメントも無視する。
 # gitleaks は検査するリポジトリの直下の .gitleaksignore を指定によらず読む（8.30.1 で確かめた）ので、それがあれば検査せずに失敗する

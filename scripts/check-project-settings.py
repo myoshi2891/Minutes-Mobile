@@ -696,7 +696,10 @@ def check(project_path: Path, root: Path) -> Tuple[List[str], List[str]]:
             for sdk in SDKS:
                 for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)[0]:
                     referenced.setdefault(path, []).append(
-                        lambda text, own=own, c=configuration, s=sdk: [expand_value(text, own, shared, c, s)])
+                        # ビルドが plist の変数を展開しない・展開するかを決められない構成では、展開後の値で判定しない
+                        # （None = 判定できない。check_plist_values・check_plist_orientation と同じ）
+                        lambda text, own=own, c=configuration, s=sdk: [
+                            expand_value(text, own, shared, c, s) if plist_expansion(own, shared, c, s) is True else None])
             entitlements.extend(
                 referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS")[0])
         check_required(name, own, shared, configurations, REQUIRED_ALL_TARGETS, errors)
