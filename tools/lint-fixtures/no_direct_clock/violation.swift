@@ -11,3 +11,5 @@ let spacedUptime = ProcessInfo . processInfo . systemUptime // expect: no_direct
 let recordedAt: Date = .now // expect: no_direct_clock
 let optionalAt: Date? = . now // expect: no_direct_clock
 let typedInit: Foundation.Date = .init() // expect: no_direct_clock
+let reference = Date.timeIntervalSinceReferenceDate // expect: no_direct_clock
+let spacedReference = Foundation.Date . timeIntervalSinceReferenceDate // expect: no_direct_clock
