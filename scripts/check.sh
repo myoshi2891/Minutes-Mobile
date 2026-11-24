@@ -149,6 +149,56 @@ elif [ "$STEPS_GIVEN" = 0 ]; then
   STEPS=$(expand_steps "0-$LAST_STEP")
 fi
 
+# 終了処理は、一時のファイル（--staged の専用のインデックスなど）を作る前に登録する（手順を始める前に止めた場合も残さない）
+current=""  # 実行中の手順の番号（手順の外では空。on_exit が失敗した手順の表示に使う）
+# 持ち主の印を先に外してからロックを外す（copy_tools と同じ。rmdir の途中で中断されても、後始末が別の実行の取り直した
+# ロックを消さない。中断でロックが残った場合は、残骸として案内のとおり削除する）
+release_coverage_lock() {
+  local held=$COVERAGE_LOCK_HELD
+  COVERAGE_LOCK_HELD=""
+  if [ -n "$held" ]; then rmdir "$COVERAGE_LOCK" 2>/dev/null || true; fi
+}
+# 後始末の削除。失敗は場所とともに報告し、set -e で後始末を止めない（後続の削除とロックの解放を飛ばさない）。
+# 失敗したら CLEANUP_FAILED を立て、終了コードを失敗にする
+CLEANUP_FAILED=""
+remove_or_report() {
+  rm -rf -- "$1" || { echo "NG: 一時の場所を削除できない（${1}）" >&2; CLEANUP_FAILED=1; }
+}
+on_exit() {
+  local status=$?
+  if [ -n "$STAGED_TREE" ]; then remove_or_report "$STAGED_TREE"; fi
+  if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then remove_or_report "$STAGED_GITLEAKS_CONFIG"; fi
+  if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
+  if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
+  if [ -n "$STAGED_TOOLS" ]; then remove_or_report "$STAGED_TOOLS"; fi
+  if [ -n "$RUN_TOOLS" ]; then remove_or_report "$RUN_TOOLS"; fi
+  if [ -n "$STAGED_INDEX_COPY" ]; then remove_or_report "$STAGED_INDEX_COPY"; fi
+  if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
+  if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
+  if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" 2>/dev/null || true; fi
+  # この実行で作った専用の作業ツリーだけを登録ごと消す。リポジトリ全体の git worktree prune は実行しない（ほかの作業ツリーの
+  # 登録を消さない）。消せなければ場所を報告して失敗にし、置き場所も残す（中身を確かめて git worktree remove で消せるように）
+  isolated_removed=1
+  # 作成の前に失敗した場合（ディレクトリがない）は消すものがない
+  if [ -n "$ISOLATED_TREE" ] && { [ -e "$ISOLATED_TREE" ] || [ -L "$ISOLATED_TREE" ]; } \
+    && ! git -C "$ROOT" worktree remove --force "$ISOLATED_TREE"; then
+    echo "NG: 専用の作業ツリーを削除できない（${ISOLATED_TREE}）。git worktree remove --force でその作業ツリーを削除する" >&2
+    CLEANUP_FAILED=1
+    isolated_removed=""
+  fi
+  if [ -n "$ISOLATED_BASE" ] && [ -n "$isolated_removed" ]; then remove_or_report "$ISOLATED_BASE"; fi
+  release_coverage_lock
+  if [ "$status" -eq 0 ] && [ -n "$CLEANUP_FAILED" ]; then exit 1; fi
+  # 成功も明示的に exit する（bash 3.2 は、trap の最後のコマンドの状態で終了コードを上書きすることがある）
+  if [ "$status" -eq 0 ]; then exit 0; fi
+  if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
+  # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
+  if [ "$status" -eq 2 ] && [ -z "$current" ]; then exit 2; fi
+  exit 1
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+
 # ステージした Swift ファイル（規則の試験用のファイルを除く）。
 # 一覧は一時ファイルに書き出し、git の失敗を空の一覧として扱わない（プロセス置換では終了コードを確かめられない）
 STAGED_SWIFT=()
@@ -497,14 +547,6 @@ take_coverage_lock() {
   mkdir "$COVERAGE_LOCK" 2>/dev/null \
     || fail "別のカバレッジの測定・集計が実行中（${COVERAGE_LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
   COVERAGE_LOCK_HELD=1
-}
-
-# 持ち主の印を先に外してからロックを外す（copy_tools と同じ。rmdir の途中で中断されても、後始末が別の実行の取り直した
-# ロックを消さない。中断でロックが残った場合は、残骸として案内のとおり削除する）
-release_coverage_lock() {
-  local held=$COVERAGE_LOCK_HELD
-  COVERAGE_LOCK_HELD=""
-  if [ -n "$held" ]; then rmdir "$COVERAGE_LOCK" 2>/dev/null || true; fi
 }
 
 # 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
@@ -893,47 +935,6 @@ step_10() {
 
 # 手順の関数は条件（if・&&・||）の中で呼ばない。条件の中では set -e が効かず、
 # 途中のコマンドが失敗しても最後のコマンドが成功すれば通過になってしまう。失敗の表示は EXIT の trap で行う。
-current=""
-# 後始末の削除。失敗は場所とともに報告し、set -e で後始末を止めない（後続の削除とロックの解放を飛ばさない）。
-# 失敗したら CLEANUP_FAILED を立て、終了コードを失敗にする
-CLEANUP_FAILED=""
-remove_or_report() {
-  rm -rf -- "$1" || { echo "NG: 一時の場所を削除できない（${1}）" >&2; CLEANUP_FAILED=1; }
-}
-on_exit() {
-  local status=$?
-  if [ -n "$STAGED_TREE" ]; then remove_or_report "$STAGED_TREE"; fi
-  if [ -n "$STAGED_GITLEAKS_CONFIG" ]; then remove_or_report "$STAGED_GITLEAKS_CONFIG"; fi
-  if [ -n "$STAGED_DOCS_TREE" ]; then remove_or_report "$STAGED_DOCS_TREE"; fi
-  if [ -n "$STAGED_SECRETS_TREE" ]; then remove_or_report "$STAGED_SECRETS_TREE"; fi
-  if [ -n "$STAGED_TOOLS" ]; then remove_or_report "$STAGED_TOOLS"; fi
-  if [ -n "$RUN_TOOLS" ]; then remove_or_report "$RUN_TOOLS"; fi
-  if [ -n "$STAGED_INDEX_COPY" ]; then remove_or_report "$STAGED_INDEX_COPY"; fi
-  if [ -n "$COVERAGE_SCRATCH" ]; then remove_or_report "$COVERAGE_SCRATCH"; fi
-  if [ -n "$COVERAGE_COPY" ]; then remove_or_report "$COVERAGE_COPY"; fi
-  if [ -n "$TOOLS_LOCK" ]; then rmdir "$TOOLS_LOCK" 2>/dev/null || true; fi
-  # この実行で作った専用の作業ツリーだけを登録ごと消す。リポジトリ全体の git worktree prune は実行しない（ほかの作業ツリーの
-  # 登録を消さない）。消せなければ場所を報告して失敗にし、置き場所も残す（中身を確かめて git worktree remove で消せるように）
-  isolated_removed=1
-  # 作成の前に失敗した場合（ディレクトリがない）は消すものがない
-  if [ -n "$ISOLATED_TREE" ] && { [ -e "$ISOLATED_TREE" ] || [ -L "$ISOLATED_TREE" ]; } \
-    && ! git -C "$ROOT" worktree remove --force "$ISOLATED_TREE"; then
-    echo "NG: 専用の作業ツリーを削除できない（${ISOLATED_TREE}）。git worktree remove --force でその作業ツリーを削除する" >&2
-    CLEANUP_FAILED=1
-    isolated_removed=""
-  fi
-  if [ -n "$ISOLATED_BASE" ] && [ -n "$isolated_removed" ]; then remove_or_report "$ISOLATED_BASE"; fi
-  release_coverage_lock
-  if [ "$status" -eq 0 ] && [ -n "$CLEANUP_FAILED" ]; then exit 1; fi
-  # 成功も明示的に exit する（bash 3.2 は、trap の最後のコマンドの状態で終了コードを上書きすることがある）
-  if [ "$status" -eq 0 ]; then exit 0; fi
-  if [ -n "$current" ]; then echo "NG: 手順 ${current}（$(title "$current")）で失敗" >&2; fi
-  # 明示的に終了コードを返す（bash 3.2 は、trap の最後のコマンドの状態でエラー終了を上書きすることがある）
-  if [ "$status" -eq 2 ] && [ -z "$current" ]; then exit 2; fi
-  exit 1
-}
-trap on_exit EXIT
-trap 'exit 130' INT TERM
 if [ "$STAGED" = 1 ]; then snapshot_staged_tools; fi
 if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
 # 通常の実行は作業ツリーを検査する。開始時と終了時の HEAD と未コミットの変更を控え、
@@ -994,7 +995,8 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   esac
   ISOLATED_TREE="$ISOLATED_BASE/tree"
   # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
-  git -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
+  # 利用者のフック（post-checkout）は、内部の展開では動かさない（.githooks/pre-push と同じ）
+  git -c core.hooksPath=/dev/null -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
   # 作った作業ツリーの専用の管理ディレクトリに印を書く（入れ子の check.sh が、引き継いだ MINUTES_CHECK_ISOLATED を
   # この作業ツリーのものと確かめる。isolated_checkout）
   git_path isolated_private "$ISOLATED_TREE" --git-dir \

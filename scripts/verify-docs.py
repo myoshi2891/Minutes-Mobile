@@ -73,6 +73,9 @@ FENCE_LINE = "\0fence"
 LINK_TITLE = re.compile(r"""\s+(?:"[^"]*"|'[^']*'|\([^)]*\))""")
 # 参照形式のリンクの定義（[ラベル]: リンク先）。字下げは空白 0〜3 個まで（CommonMark）
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
+# 定義のラベルだけの行と、次の行に書いたリンク先（CommonMark。リンク先の後はタイトルだけを書ける）
+REFERENCE_LABEL = re.compile(r"""^ {0,3}\[([^\]]+)\]:[ \t]*$""")
+REFERENCE_DESTINATION = re.compile(r"""^[ \t]*(<[^<>\n]+>|[^\s<]\S*)""")
 # 参照形式のリンクの使用（[文][ラベル] と、省略形の [ラベル][]）
 REFERENCE_LINK = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # 短縮形の参照のリンク（[ラベル]）。直後に「[」「(」が続くもの（ほかの形のリンク）・「]」の直後のもの（[文][ラベル] の後半）・
@@ -295,31 +298,47 @@ class IndentedCode:
         return False
 
 
-def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, "re.Match[str]"]]:
-    """参照形式のリンクの定義（[ラベル]: リンク先）を（行番号, 一致）で返す。skipped の行（引用の中のフェンス）は本文として見ない。
+def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, str, str]]:
+    """参照形式のリンクの定義（[ラベル]: リンク先）を（行番号, ラベル, リンク先）で返す。skipped の行（引用の中のフェンス）は本文として見ない。
 
     定義は段落の始まりにだけ書ける（段落の文の続きの、定義の形の行は定義にならない。CommonMark）。定義の直後の行と、定義の
-    次の行に書いたタイトルの直後の行は、続けて定義を書ける。
+    次の行に書いたタイトルの直後の行は、続けて定義を書ける。リンク先はラベルの次の行にも書ける（行番号はラベルの行）。
     """
     code = IndentedCode()
     previous = 0
     untitled = False  # 直前の行が、タイトルのない定義
+    pending: Optional[Tuple[int, str]] = None  # 直前の行が、リンク先をまだ書いていない定義のラベル（行番号, ラベル）
     for number, line in prose_lines(text):
         if number != previous + 1:
             code.interrupt()
             untitled = False
+            pending = None
         previous = number
+        label, pending = pending, None
         if number in skipped or COMMENT_OPEN.match(line):
             code.interrupt()
             untitled = False
             continue
+        if label is not None and not BLOCK_START.match(line) and not PARAGRAPH_END.match(line):
+            destination = REFERENCE_DESTINATION.match(line)
+            rest = line[destination.end():].rstrip() if destination else ""
+            if destination and (not rest or LINK_TITLE.fullmatch(rest)):
+                yield label[0], label[1], destination.group(1)
+                code.interrupt()
+                untitled = not rest
+                continue
         starts = not code.paragraph
         found = REFERENCE_DEFINITION.match(line)
         if code.is_code(line):
             untitled = False
             continue
+        bare = REFERENCE_LABEL.match(line)
+        if bare and starts:
+            pending = (number, bare.group(1))
+            untitled = False
+            continue
         if found and starts:
-            yield number, found
+            yield number, found.group(1), found.group(2)
             code.interrupt()
             untitled = not line[found.end():].strip()
             continue
@@ -791,7 +810,11 @@ class Checker:
     def check_references(self) -> None:
         prefixes = {identifier.rsplit("-", 1)[0] for identifier in self.defined}
         for name, text in self.texts.items():
+            quoted = dict(quoted_fences(text))
             for number, line, inside, _, _, pre in scanned_lines(text):
+                # 引用の中のコードフェンスの行は、ふつうのフェンスの中と同じく参照として数えない（地の文の引用は確かめる）
+                if number in quoted:
+                    continue
                 # <pre> の中は Markdown にならないが文字は表示されるので、ID の参照は確かめる
                 if inside and not pre:
                     continue
@@ -900,9 +923,9 @@ class Checker:
             # 参照形式のリンクは、定義（[ラベル]: リンク先）を通してリンク先を求め、インラインのリンクと同じく確かめる
             definitions: Dict[str, str] = {}
             definition_lines: Set[int] = set()
-            for number, found in reference_definitions(text, set(quoted)):
+            for number, label, destination in reference_definitions(text, set(quoted)):
                 definition_lines.add(number)
-                definitions.setdefault(reference_label(found.group(1)), found.group(2))
+                definitions.setdefault(reference_label(label), destination)
             openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」
             previous = 0  # 前の行の番号
             code = IndentedCode()

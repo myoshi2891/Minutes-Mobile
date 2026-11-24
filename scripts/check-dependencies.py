@@ -146,7 +146,11 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
         found.extend(Path(directory) / entry for entry in files if fnmatch.fnmatchcase(entry, name))
     # 名前が合うのに通常のファイルとして確かめられないもの（壊れたシンボリックリンクなど）は、黙って除かず読めないものとする
     for path in found:
-        if not path.is_file():
+        try:
+            regular = path.is_file()
+        except OSError as error:  # 調べられない（リンクの先の権限など）
+            raise Unreadable(f"{path}: {error}") from error
+        if not regular:
             raise Unreadable(f"{path}: 通常のファイルとして読めない（壊れたシンボリックリンクなど）")
     yield from sorted(found)
 
@@ -409,7 +413,8 @@ def interpolation_end(text: str, start: int) -> int:
 
 
 def call_arguments(text: str, start: int) -> str:
-    """start の位置の「(」に対応する「)」までの引数を返す。文字列リテラルの中の括弧は数えない。閉じていなければ末尾まで。"""
+    """start の位置の「(」に対応する「)」までの引数を返す。文字列リテラルの中の括弧は数えない。
+    閉じていなければ読めないものとして扱う。"""
     depth = 0
     index = start
     in_string = False
@@ -429,7 +434,7 @@ def call_arguments(text: str, start: int) -> str:
             if depth == 0:
                 return text[start + 1:index]
         index += 1
-    return text[start + 1:]
+    raise Unreadable("宣言の引数の括弧が閉じていない")
 
 
 # 版の指定（文字列リテラルだけ）。ブランチ・コミットの指定は版で固定していないものとして認めない。

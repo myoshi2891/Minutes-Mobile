@@ -213,8 +213,19 @@ def collect(rules: Dict[str, bool], errors: List[str]) -> List[Tuple[Path, str, 
     return cases
 
 
-def nested_configs_in_worktree() -> List[str]:
-    """作業ツリーの .swiftlint.yml を、Git が無視するものも含めて列挙する（リポジトリ直下からの相対パス）。"""
+def outside_walk(target: str) -> bool:
+    """リンクの先の実体 target が、走査する範囲の外（リポジトリの外、または走査で飛ばすディレクトリの中）にあるか。"""
+    relative = os.path.relpath(target, os.path.realpath(ROOT))
+    return relative == ".." or relative.startswith("../") or any(
+        relative == name or relative.startswith(f"{name}/") for name in WALK_SKIPPED)
+
+
+def nested_configs_in_worktree(errors: List[str]) -> List[str]:
+    """作業ツリーの .swiftlint.yml を、Git が無視するものも含めて列挙する（リポジトリ直下からの相対パス）。
+
+    SwiftLint はディレクトリへのシンボリックリンクをたどり、実体の場所の入れ子の設定を読む（0.65.1 で確かめた）。走査する範囲の
+    中を指すリンクの先は、実体の場所でこの走査が列挙する。範囲の外を指すリンクは、先の設定を列挙できないので errors に入れる。
+    """
     def failed(error: OSError) -> None:
         # 読めないディレクトリを黙って読み飛ばすと、その中の入れ子の設定（規則を外す抜け道）を見落とすので止める
         print(f"NG: {error.filename} を走査できない（入れ子の設定を列挙できない）: {error}", file=sys.stderr)
@@ -227,6 +238,11 @@ def nested_configs_in_worktree() -> List[str]:
             name for name in directories
             if (name if relative == "." else f"{relative}/{name}") not in WALK_SKIPPED
         )
+        for name in directories:
+            link = os.path.join(current, name)
+            if os.path.islink(link) and outside_walk(os.path.realpath(link)):
+                errors.append(f"走査する範囲の外を指すディレクトリのリンクがある（先の入れ子の設定を検査できない）: "
+                              f"{os.path.relpath(link, ROOT)}")
         # 大文字小文字を区別しない（既定の APFS では .SwiftLint.yml も SwiftLint が .swiftlint.yml として読む）。
         # 結果には実際のファイル名を入れる
         for name in sorted(name for name in files if name.casefold() == ".swiftlint.yml"):
@@ -276,7 +292,7 @@ def check_test_code(errors: List[str], staged: bool) -> List[Tuple[Path, str, Se
     # それ以外の場所に入れ子の設定を置かせない（規則を外す抜け道になる）
     allowed = {ROOT / name / ".swiftlint.yml" for name in TEST_CODE_DIRS} | {CONFIG, nested}
     # 通常は作業ツリー（Git が無視するファイルも含む）、--staged ではインデックスにある設定だけを調べる
-    listed = nested_configs_in_index() if staged else nested_configs_in_worktree()
+    listed = nested_configs_in_index() if staged else nested_configs_in_worktree(errors)
     for relative in listed:
         if ROOT / relative not in allowed:
             errors.append(f"許可していない場所に入れ子の設定がある: {relative}")

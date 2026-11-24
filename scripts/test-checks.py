@@ -1230,6 +1230,22 @@ def test_dependencies() -> None:
     dependencies_case("下位の .build は除外", 0, "OK", {"Sub/.build/Package.swift": declare.format(unlisted)})
     dependencies_case("版別の manifest の許可リスト外の依存", 1, "Package@swift-6.0.swift",
                       {"Package@swift-6.0.swift": declare.format(unlisted)})
+    # 閉じていない引数を末尾まで読んだことにしない。閉じた宣言はこれまでどおり読む
+    dependencies_case("引数の括弧が閉じていない", 2, "括弧が閉じていない",
+                      {"Packages/A/Package.swift": 'let p = [.package(path: "../Local"\n', "Packages/Local/Package.swift": local_manifest})
+    # 調べられない（権限のない）リンクの先は、終了コード 2 でパスとともに報告する
+    with tempfile.TemporaryDirectory() as directory:
+        root, hidden = Path(directory) / "root", Path(directory) / "hidden"
+        root.mkdir()
+        hidden.mkdir()
+        (hidden / "Package.swift").write_text(local_manifest, encoding="utf-8")
+        (root / "Package.swift").symlink_to(hidden / "Package.swift")
+        hidden.chmod(0)
+        try:
+            expect("dependencies: 調べられないリンクの先", [str(SCRIPTS / "check-dependencies.py"), "--root", str(root)], 2,
+                   "NG: 依存を読めない: " + str(root.resolve() / "Package.swift"))
+        finally:
+            hidden.chmod(0o700)
     expect("dependencies: 存在しない起点", [str(SCRIPTS / "check-dependencies.py"), "--root", str(ROOT / "no-such-directory")],
            2, "起点のディレクトリがない")
 
@@ -1728,6 +1744,10 @@ def require_clean_case(inherited: bool = False) -> None:
                     "-c", f"core.hooksPath={os.devnull}"]
         for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
             subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True, capture_output=True)
+        # 有効な post-checkout のフックが失敗しても、専用の作業ツリーの展開では動かさない
+        (repository / ".git" / "hooks").mkdir(exist_ok=True)
+        (repository / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (repository / ".git" / "hooks" / "post-checkout").chmod(0o755)
         # 代わりのスクリプトが書き換えた marker.txt を、終了の前に戻すことはしない（元の作業ツリーの変更は検査に影響しない）
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "10", "--require-clean"], capture_output=True,
                                 text=True, env=dict(env, MINUTES_TEST_OUT=str(out), MINUTES_TEST_ORIGINAL=str(repository)))
@@ -2154,9 +2174,19 @@ def staged_symlink_case() -> None:
         (repository / "Sample.swift").unlink()
         (repository / "Sample.swift").symlink_to("scripts/check.sh")
         git("add", "Sample.swift")
+        # 一時のファイルの場所を記録する mktemp（macOS の mktemp は TMPDIR を使わない環境があるので、明示した場所に作らせる）
+        temporary, shims = Path(directory) / "temporary", Path(directory) / "shims"
+        temporary.mkdir()
+        shims.mkdir()
+        (shims / "mktemp").write_text('#!/bin/sh\nexec /usr/bin/mktemp "$@" "$MINUTES_TEST_TMP/XXXXXXXX"\n', encoding="utf-8")
+        (shims / "mktemp").chmod(0o755)
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], cwd=repository, capture_output=True,
-                                text=True, env=env, timeout=60)
+                                text=True, timeout=60,
+                                env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_TMP=str(temporary)))
         output = result.stdout + result.stderr
+        left = sorted(path.name for path in temporary.iterdir())
+        if left:
+            failures.append(f"check: 手順を始める前に止めたとき、一時のファイルが残る（{left}）")
         if result.returncode != 1 or "Sample.swift はインデックスで通常のファイルでない" not in output or "== 手順" in output:
             failures.append(f"check: 種類を変えてステージした Swift のリンクを止めない（終了コード {result.returncode}）\n{output.strip()}")
 
@@ -2241,6 +2271,24 @@ def lint_rules_config_cases() -> None:
         lines = module.reported_lines(items, [(watched, "no_direct_logger", {3})], line_errors)
         if lines.get((os.path.realpath(watched), "no_direct_logger"), set()) != want_lines or len(line_errors) != want_errors:
             failures.append(f"lint-rules: 検出の行番号（{label}）の扱いが違う（{lines}・{line_errors}）")
+    # SwiftLint がたどるディレクトリのリンクが走査の範囲の外を指せば報告し、中を指すリンク・飛ばす場所のリンクは認める
+    original_root = module.ROOT
+    for label, link, target, want in (("外", "Sources", "external", 1), ("飛ばす場所の中", "Sources", "root/.build/inner", 1),
+                                      ("走査の範囲の中", "Sources", "root/App", 0), ("循環する中", "App/loop", "root", 0),
+                                      ("飛ばす場所のリンク", ".tools", "external", 0)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(os.path.realpath(directory))
+            for path in ("root/App", "root/.build/inner", "external"):
+                (base / path).mkdir(parents=True)
+                (base / path / ".swiftlint.yml").write_text("disabled_rules:\n  - no_print_logging\n", encoding="utf-8")
+            (base / "root" / link).symlink_to(base / target)
+            module.ROOT = base / "root"
+            link_errors: List[str] = []
+            listed = module.nested_configs_in_worktree(link_errors)
+        if listed != ["App/.swiftlint.yml"] or len(link_errors) != want or (want and link not in link_errors[0]):
+            failures.append(f"lint-rules: {label}を指すディレクトリのリンクの扱いが違う（{listed}・{link_errors}）")
+    module.ROOT = original_root
     # 参照のある設定では、SwiftLint を実行する前に終了コード 2 で止まる
     count += 1
     executed: List[bool] = []
@@ -2350,9 +2398,9 @@ def simulator_cases() -> None:
 def simulator_developer_dir_case() -> None:
     """find-simulator.py が、DEVELOPER_DIR がない・空なら check.sh と同じ既定を使い、利用者の指定は変えないこと。"""
     global count
-    default = re.search(r"^export DEVELOPER_DIR=\$\{DEVELOPER_DIR:-(.+)\}$", (SCRIPTS / "check.sh").read_text(encoding="utf-8"), re.MULTILINE)
-    assert default is not None
-    for value, want in ((None, default.group(1)), ("", default.group(1)), ("/custom", "/custom")):
+    found = re.search(r'env\["DEVELOPER_DIR"\] = env\.get\("DEVELOPER_DIR"\) or "(.+)"', (SCRIPTS / "find-simulator.py").read_text(encoding="utf-8"))
+    default = found.group(1) if found else "/Applications/Xcode.app/Contents/Developer"
+    for value, want in ((None, default), ("", default), ("/custom", "/custom")):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
             stub, out = Path(directory) / "xcrun", Path(directory) / "recorded"
@@ -2372,6 +2420,32 @@ def simulator_developer_dir_case() -> None:
             recorded = out.read_text(encoding="utf-8") if out.is_file() else None
             if recorded != want:
                 failures.append(f"simulator: DEVELOPER_DIR が {value!r} のとき {recorded!r} を使う（期待 {want!r}）")
+        # check.sh は、代わりの xcodebuild が受け取る値で確かめる（代入の書き方に左右されない）
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            repository, shims, out = Path(directory) / "repository", Path(directory) / "shims", Path(directory) / "recorded"
+            (repository / "scripts").mkdir(parents=True)
+            shims.mkdir()
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "check.sh").chmod(0o755)
+            env = {key: item for key, item in isolated_git_env().items() if key != "DEVELOPER_DIR"}
+            for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+                subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                                "-c", "commit.gpgsign=false", *arguments], env=env, check=True, capture_output=True)
+            # /usr/bin/git も Xcode への中継で DEVELOPER_DIR を読むので、git には渡さない
+            for name, text in (("xcodebuild", 'printf %s "${DEVELOPER_DIR-unset}" > "$MINUTES_TEST_OUT"'),
+                               ("git", 'unset DEVELOPER_DIR\nexec "$MINUTES_TEST_GIT" "$@"')):
+                (shims / name).write_text(f"#!/bin/sh\n{text}\n", encoding="utf-8")
+                (shims / name).chmod(0o755)
+            env.update(PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_OUT=str(out), MINUTES_TEST_GIT=shutil.which("git") or "/usr/bin/git")
+            if value is not None:
+                env["DEVELOPER_DIR"] = value
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "6"], cwd=repository, env=env,
+                                    capture_output=True, text=True, timeout=60)
+            recorded = out.read_text(encoding="utf-8") if out.is_file() else None
+            if result.returncode != 0 or recorded != want:
+                failures.append(f"check: DEVELOPER_DIR が {value!r} のとき {recorded!r} を使う（期待 {want!r}・終了コード {result.returncode}）\n"
+                                f"{result.stderr.strip()}")
 
 
 def verify_lock_case(setup: str, versions: Path, dest: Path, stub: Path) -> None:
@@ -2680,6 +2754,10 @@ def pre_push_newline_case() -> None:
         git(work, "add", "-A")
         git(work, "commit", "-q", "-m", "base")
         head = git(work, "rev-parse", "HEAD")
+        # 有効な post-checkout のフックが失敗しても、内部の展開（作成と再利用）は動かさない
+        (bare / "hooks").mkdir(exist_ok=True)
+        (bare / "hooks" / "post-checkout").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        (bare / "hooks" / "post-checkout").chmod(0o755)
         results = [subprocess.run([str(hook)], cwd=work, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
                                   capture_output=True, text=True, timeout=60, env=dict(env, MINUTES_PRE_PUSH_DIR=str(base)))
                    for _ in range(2)]
@@ -3519,6 +3597,16 @@ def test_versions() -> None:
         (dest / "bin" / "gh").symlink_to(f"../gh/other/{executable}")
         expect("versions: リンクが導入記録のない場所を指す", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
                                                   "--require", "gh"], 1, "導入先を指していない")
+        # 名前が改行で終わる別の実行ファイル・別の版のディレクトリを指すリンクを、改行のない名前のものと取り違えない
+        newline_dir = dest / "gh" / f"{version}\n"
+        newline_dir.mkdir()
+        for label, place in (("実行ファイル", dest / "gh" / version / f"{executable}\n"), ("版のディレクトリ", newline_dir / executable)):
+            place.write_text(stub.read_text(encoding="utf-8"), encoding="utf-8")
+            place.chmod(0o755)
+            (dest / "bin" / "gh").unlink()
+            (dest / "bin" / "gh").symlink_to(os.path.relpath(place, dest / "bin"))
+            expect(f"versions: リンクが改行で終わる{label}を指す", [setup, "--verify", "--versions", str(versions), "--dest", str(dest),
+                                                         "--require", "gh"], 1, "導入先を指していない")
         # 版のディレクトリの中の実行ファイルがシンボリックリンクなら、版の表示が合っていても合格にしない
         (dest / "bin" / "gh").unlink()
         (dest / "bin" / "gh").symlink_to(f"../gh/{version}/{executable}")
@@ -3618,6 +3706,7 @@ def test_gitleaks() -> None:
     gitleaks_signature_case()
     gitleaks_rename_case()
     gitleaks_notes_case()
+    gitleaks_format_case()
     gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
     with tempfile.TemporaryDirectory() as directory:
@@ -4189,6 +4278,34 @@ def gitleaks_notes_case() -> None:
         expect("gitleaks: ない注記の参照の警告", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], 0, "no leaks found", env=env)
         git("notes", "add", "-m", 'token = "' + "ghp_" + "x8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi" + '"', "HEAD")
         expect("gitleaks: 注記のコミットの鍵", [str(SCRIPTS / "gitleaks-history.sh"), str(repository)], 1, "leaks found: 1", env=env)
+
+
+def gitleaks_format_case() -> None:
+    """設定 format.pretty・log.abbrevCommit によらず、検出した鍵を完全なコミットの ID で報告すること。"""
+    global count
+    for key, value in (("format.pretty", "oneline"), ("log.abbrevCommit", "true")):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository, report = Path(directory) / "repository", Path(directory) / "report.json"
+            identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", f"core.hooksPath={os.devnull}"]
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(["git", "-C", str(repository), *identity, *arguments], env=env, check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            repository.mkdir()
+            git("init", "-q", "--template=", "-b", "main")
+            (repository / "config.txt").write_text('token = "' + "ghp_" + "x8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi" + '"\n', encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "base")
+            git("config", key, value)
+            result = subprocess.run([str(SCRIPTS / "gitleaks-history.sh"), str(repository), "--report-format", "json",
+                                     "--report-path", str(report)], env=env, capture_output=True, text=True)
+            commits = [item.get("Commit") for item in json.loads(report.read_text(encoding="utf-8"))] if report.is_file() else None
+            if result.returncode != 1 or commits != [git("rev-parse", "HEAD")]:
+                failures.append(f"gitleaks: {key}={value} の報告が違う（終了コード {result.returncode}・{commits}）\n{result.stderr.strip()}")
 
 
 def gitleaks_merge_case() -> None:
@@ -5035,6 +5152,23 @@ def run_docs_cases() -> None:
                   "### 小節\n[a]: ../01-requirements/requirements.md\n\"題\"\n[b]: missing.md\n\n[一][a] [二][b]"),
         docs_case("続けた定義", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
                   "[a]: ../01-requirements/requirements.md '題'\n[b]: missing.md\n\n[一][a] [二][b]"),
+        # リンク先をラベルの次の行に書いた定義も確かめる（段落の続き・リンク先の後に余分な文がある形は定義にならない）
+        docs_case("次の行にリンク先のある定義", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "[a]:\n  ../01-requirements/requirements.md '題'\n\n[一][a]"),
+        docs_case("次の行のリンク先が切れた定義", 1, "リンクの先がない: missing.md", basic,
+                  "[要件](../01-requirements/requirements.md)", "[a]:\n  missing.md\n\n[一][a]"),
+        docs_case("次の行のリンク先の後に続けた定義", 1, "リンクの先がない: missing.md", basic,
+                  "[要件](../01-requirements/requirements.md)",
+                  "[a]:\n<../01-requirements/requirements.md>\n\"題\"\n[b]:\nmissing.md\n\n[一][a] [二][b]"),
+        docs_case("段落の続きのラベルの行は定義でない", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "説明\n[a]:\nmissing.md\n\n[一][a]"),
+        docs_case("次の行に余分な文のある形は定義でない", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "[a]:\nmissing.md 余分な文\n\n[一][a]"),
+        # 引用の中のフェンスの ID は参照として数えない（引用の地の文の ID は確かめる）
+        docs_case("引用の中のフェンスの中の定義されていない ID", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  f"> {FENCE}text\n> FR-AAA-09\n> {FENCE}"),
+        docs_case("引用の地の文の定義されていない ID", 1, "定義されていない ID: FR-AAA-09", basic,
+                  "[要件](../01-requirements/requirements.md)", f"> {FENCE}text\n> 例\n> {FENCE}\n> FR-AAA-09"),
         # 引用の中のフェンスの本文はリンクとして確かめない（地の文と、フェンスの外の引用は確かめる）
         docs_case("引用の中のフェンスの中のリンク", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
                   f"> {FENCE}markdown\n> [例](missing.md)\n> {FENCE}"),

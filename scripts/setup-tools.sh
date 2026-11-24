@@ -80,7 +80,6 @@ contained_install() {
   [ "$actual" = "$base/$1/$2" ]
 }
 
-# シンボリックリンクの先のファイルがあるディレクトリを、実体のパスで返す（リンクの先が相対パスでもよい）
 # 版ディレクトリの中の実行ファイルが、シンボリックリンクではない通常のファイルで、実行できること
 # （導入先の中のリンクで別の場所の実行ファイルを指させない）
 regular_binary() {
@@ -88,11 +87,13 @@ regular_binary() {
   [ -f "$file" ] && [ ! -L "$file" ] && [ -x "$file" ]
 }
 
-link_directory() {
-  local link=$1 dest
-  dest=$(readlink "$link") || return 1
-  case "$dest" in /*) ;; *) dest="$(dirname "$link")/$dest" ;; esac
-  (cd -P "$(dirname "$dest")" 2>/dev/null && pwd)
+# ディレクトリ $2 の実体のパスを変数 $1 に入れる。$(…) は末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が
+# 付けた区切りの改行 1 つだけを外す（名前が改行で終わる別のディレクトリを取り違えない）
+real_directory() {
+  local resolved_path
+  resolved_path=$(cd -P -- "$2" 2>/dev/null && pwd && printf x) || return 1
+  resolved_path=${resolved_path%x}
+  printf -v "$1" '%s' "${resolved_path%$'\n'}"
 }
 
 verify_tool() {
@@ -102,13 +103,17 @@ verify_tool() {
   [ -x "$link" ] || fail "$name が導入されていない。scripts/setup-tools.sh を実行する"
   # 実行するのは、導入記録のある版のディレクトリの中の実行ファイルに限る（リンクの先を別の導入に差し替えさせない）。
   # bash 3.2 の macOS には readlink -f がないので、リンクの先のディレクトリを cd -P で実体に解決して比べる
-  local target_dir expected_dir
-  target_dir=$(link_directory "$link") || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
-  expected_dir=$(cd -P "$DEST/$name/$version" 2>/dev/null && pwd) \
+  # リンク先は 1 回だけ、末尾の改行も含めて読み、ディレクトリと名前の照合に同じ値を使う
+  local target target_path target_dir expected_dir
+  target=$(readlink -n -- "$link" && printf x) || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
+  target=${target%x}
+  case "$target" in /*) target_path=$target ;; *) target_path="$DEST/bin/$target" ;; esac
+  real_directory target_dir "${target_path%/*}/" || fail "$name のリンク（${link}）の先を解決できない。scripts/setup-tools.sh を実行し直す"
+  real_directory expected_dir "$DEST/$name/$version" \
     || fail "$name $version の導入先がない。scripts/setup-tools.sh を実行し直す"
   contained_install "$name" "$version" \
     || fail "$name $version のディレクトリの実体が導入先の中にない（リンクなど）。scripts/setup-tools.sh を実行し直す"
-  [ "$target_dir" = "$expected_dir" ] && [ "$(basename "$(readlink "$link")")" = "$binary" ] \
+  [ "$target_dir" = "$expected_dir" ] && [ "${target##*/}" = "$binary" ] \
     || fail "$name のリンク（${link}）が $name $version の導入先を指していない。scripts/setup-tools.sh を実行し直す"
   regular_binary "$DEST/$name/$version/$binary" \
     || fail "$name $version の実行ファイル（$DEST/$name/$version/${binary}）が通常のファイルでない。scripts/setup-tools.sh を実行し直す"

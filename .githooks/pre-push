@@ -214,8 +214,9 @@ verify_checkout_blobs() {
   return "$status"
 }
 # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
+# 利用者のフック（post-checkout）は、内部の展開では動かさない（失敗・書き換えで検査を左右させない。利用者の git には関わらない）
 if [ "$owned" -eq 1 ]; then
-  git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"
+  git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
   # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。-f を 2 回付け、中に .git を持つ
@@ -248,7 +249,7 @@ else
   git_path private "$snapshot" --git-dir && real_directory private "$private" \
     || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
   printf '%s\n' "$owner_text" > "$private/$owner_mark"
-  git -C "$snapshot" -c core.autocrlf=false checkout -q --detach --force "$head"
+  git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout
 fi
 # 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では
