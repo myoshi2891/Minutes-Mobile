@@ -26,8 +26,9 @@ TOOLS_DIR=${MINUTES_TOOLS_DIR:-$ROOT/.tools}
 # --no-renames で名前の変更を検出しない（数が設定 diff.renameLimit を超えると警告が標準エラーに出て、走査の失敗と取り違える）
 # --no-notes で注記（git notes）を表示しない（設定 notes.displayRef などの指す参照が読めないと警告が標準エラーに出て、走査の
 # 失敗と取り違える。注記のコミット自体は --all が refs/notes/ もたどるので検査する）
+# --no-relative で設定 diff.relative=true のときも、引数のサブディレクトリの外の差分を除かない（除くと外の鍵を見落とす）
 # --pretty=medium・--no-abbrev-commit で設定 format.pretty・log.abbrevCommit に左右されず、gitleaks が読む形式と完全なコミットの ID にする
-GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textconv --text --no-color --no-show-signature --no-renames --no-notes --pretty=medium --no-abbrev-commit"
+GITLEAKS_LOG_OPTS="--all --full-history --diff-merges=separate --root --no-textconv --text --no-color --no-show-signature --no-renames --no-notes --no-relative --pretty=medium --no-abbrev-commit"
 # 抑止の仕組みは使わない（どちらも承認の記録なしに検出を隠せるため）。--gitleaks-ignore-path に空のファイル（/dev/null）を
 # 渡して実行時の場所の .gitleaksignore を読ませず、--ignore-gitleaks-allow で行の「gitleaks:allow」のコメントも無視する。
 # gitleaks は検査するリポジトリの直下の .gitleaksignore を指定によらず読む（8.30.1 で確かめた）ので、それがあれば検査せずに失敗する

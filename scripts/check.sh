@@ -151,7 +151,7 @@ fi
 
 # 終了処理は、一時のファイル（--staged の専用のインデックスなど）を作る前に登録する（手順を始める前に止めた場合も残さない）
 current=""  # 実行中の手順の番号（手順の外では空。on_exit が失敗した手順の表示に使う）
-# 持ち主の印を先に外してからロックを外す（copy_tools と同じ。rmdir の途中で中断されても、後始末が別の実行の取り直した
+# 持ち主の印を先に外してからロックを外す（rmdir の途中で中断されても、後始末が別の実行の取り直した
 # ロックを消さない。中断でロックが残った場合は、残骸として案内のとおり削除する）
 release_coverage_lock() {
   local held=$COVERAGE_LOCK_HELD
@@ -298,6 +298,25 @@ make_staged_tree() {
     1) fail "ステージした内容の一時の置き場所（${STAGED_TREE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
     *) fail "ステージした内容の一時の置き場所（${STAGED_TREE}）が作業ツリーの中かを判定できない" ;;
   esac
+}
+
+# インデックスの整形・静的解析の設定がシンボリックリンクなら、ツールを実行する前に止める（prepare_staged_tree はリンク先の文字列を
+# 設定の内容として書き出し、prepare_rules_tree はリンクのまま書き出すので、どちらもステージした設定で検査できない）。
+# ステージした Swift ファイルがなくても、規則の試験が設定を使うので確かめる
+reject_staged_config_links() {
+  local entries entry path
+  entries=$(mktemp)
+  if ! git ls-files -s -z -- ':(glob)**/.swiftformat' ':(glob,icase)**/.swiftlint.yml' ':(glob)**/.swift-version' > "$entries"; then
+    rm -f -- "$entries"
+    fail "ステージした設定の一覧を取得できない"
+  fi
+  while IFS= read -r -d '' entry; do
+    if [ "${entry%% *}" != 120000 ]; then continue; fi
+    path=${entry#*$'\t'}
+    rm -f -- "$entries"
+    fail "${path} はインデックスでシンボリックリンク。整形・静的解析の設定は通常のファイルでステージする"
+  done < "$entries"
+  rm -f -- "$entries"
 }
 
 # ステージした Swift ファイルの内容（作業ツリーではなくインデックス）を、元の相対位置のまま一時ディレクトリへ書き出す。
@@ -541,12 +560,11 @@ coverage_input() {
   printf 'worktree %s\n' "$tree"
 }
 
-# カバレッジのロックを取る。待たずに失敗する（別の測定が実行中。残骸なら削除して実行し直す）
+# カバレッジのロックを取る。待たずに失敗する（別の測定が実行中。残骸なら削除して実行し直す）。取得の途中の中断は take_lock が控える
 take_coverage_lock() {
   mkdir -p .build
-  mkdir "$COVERAGE_LOCK" 2>/dev/null \
+  take_lock "$COVERAGE_LOCK" COVERAGE_LOCK_HELD \
     || fail "別のカバレッジの測定・集計が実行中（${COVERAGE_LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
-  COVERAGE_LOCK_HELD=1
 }
 
 # 入力の識別子が指すツリー（$1）から Packages/ を写しの場所へ書き出す。git archive は .gitattributes の export-ignore で
@@ -675,11 +693,15 @@ copy_tools() {
       cp -R -P -- "$entry" "$copy/" || fail "開発ツールを写せない（${entry}）"
     fi
   done
-  # 持ち主の印を先に外してからロックを外す（間で中断されても、後始末が別の実行の取り直したロックを消さない。
-  # 印を外した後・ロックを外す前に中断された場合はロックが残るが、導入の直列化は弱めない。残骸は案内のとおり削除する）
-  local held=$TOOLS_LOCK
-  TOOLS_LOCK=""
-  rmdir "$held"
+  # ロックを外して持ち主の印を外すまで、中断は控えるだけにする（.githooks/pre-push と同じ。間で終了してロックを残さず、
+  # 後始末が別の実行の取り直したロックを消さない）。外せなければ印を残して失敗し、控えた中断には印を外した後で従う
+  local released=1
+  interrupted=""
+  trap 'interrupted=1' INT TERM
+  if (trap '' INT TERM; exec rmdir "$TOOLS_LOCK"); then TOOLS_LOCK=""; else released=""; fi
+  trap 'exit 130' INT TERM
+  if [ -n "$interrupted" ]; then exit 130; fi
+  [ -n "$released" ] || fail "開発ツールの導入のロック（${TOOLS_LOCK}）を外せない"
 }
 
 # 元の作業ツリーが sparse checkout なら、専用の作業ツリー（$1）もその指定を引き継ぎ（git worktree add が写す）、一部のファイル
@@ -935,6 +957,7 @@ step_10() {
 
 # 手順の関数は条件（if・&&・||）の中で呼ばない。条件の中では set -e が効かず、
 # 途中のコマンドが失敗しても最後のコマンドが成功すれば通過になってしまう。失敗の表示は EXIT の trap で行う。
+if [ "$STAGED" = 1 ]; then reject_staged_config_links; fi
 if [ "$STAGED" = 1 ]; then snapshot_staged_tools; fi
 if [ "$STAGED" = 1 ] && [ ${#STAGED_SWIFT[@]} -gt 0 ]; then prepare_staged_tree; fi
 # 通常の実行は作業ツリーを検査する。開始時と終了時の HEAD と未コミットの変更を控え、

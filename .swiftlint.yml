@@ -133,9 +133,11 @@ custom_rules:
     message: "保存先は Application Support に限る（SEC-DAT-04）"
     severity: error
 
+  # temporaryDirectory は API の参照（FileManager.default.temporaryDirectory・URL.temporaryDirectory・省略形の .temporaryDirectory）
+  # だけを検出し、同じ名前の局所変数は認める
   no_direct_directory_access:
     name: "一時ディレクトリの直接の指定とディレクトリの直接の作成の禁止"
-    regex: '\bNSTemporaryDirectory\b|\btemporaryDirectory\b|\bcreateDirectory\s*\('
+    regex: '\bNSTemporaryDirectory\b|\.\s*`?temporaryDirectory\b|\bcreateDirectory\s*\('
     excluded:
       - '.*/Storage/StorageRoot\.swift\z'
       - '.*/TestSupport/TemporaryDirectory\.swift\z'

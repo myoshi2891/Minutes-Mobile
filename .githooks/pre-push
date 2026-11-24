@@ -216,6 +216,17 @@ verify_checkout_blobs() {
 # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
 # 利用者のフック（post-checkout）は、内部の展開では動かさない（失敗・書き換えで検査を左右させない。利用者の git には関わらない）
 if [ "$owned" -eq 1 ]; then
+  # 専用の作業ツリーの下に登録された別の作業ツリーがあれば、checkout・clean で中身を失わせうるので、変更せずに止める
+  nested=0
+  /usr/bin/python3 "$source_root/scripts/worktree-location.py" nested "$source_root" "$snapshot" || nested=$?
+  case $nested in
+    0) ;;
+    1) exit 1 ;;  # 理由とパスは worktree-location.py が標準エラーに書いた
+    *)
+      echo "NG: 専用の作業ツリー（${snapshot}）の下に別の作業ツリーがあるかを判定できない" >&2
+      exit 1
+      ;;
+  esac
   git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
@@ -228,10 +239,13 @@ if [ "$owned" -eq 1 ]; then
   # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
   # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
   # .build がシンボリックリンクなら、リンクの先（作業ツリーの外の場所）の中を消しうるので、消さずに止める
-  if [ -L "$snapshot/.build" ]; then
-    echo "NG: 専用の作業ツリーの ${snapshot}/.build がシンボリックリンク。中身を確かめて削除してから push し直す" >&2
-    exit 1
-  fi
+  # Package の .build も、リンクなら check.sh がカバレッジの記録をリンクの先に書くので、同じく止める
+  for build in "$snapshot/.build" "$snapshot/Packages/MinutesKit/.build"; do
+    if [ -L "$build" ]; then
+      echo "NG: 専用の作業ツリーの ${build} がシンボリックリンク。中身を確かめて削除してから push し直す" >&2
+      exit 1
+    fi
+  done
   rm -rf -- "$snapshot/.build/minutes-coverage.lock"
 else
   # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すもの・このフックの印のない
@@ -306,11 +320,15 @@ for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
     cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
   fi
 done
-# 持ち主の印（tools_lock）を先に外してからロックを外す。逆の順では、rmdir の後・印を外す前に中断されると、終了の trap が
-# その間に別の導入が取り直したロックを消しうる。この順では中断してもロックが残るだけで、導入の直列化は弱めない
-held_lock=$tools_lock
-tools_lock=""
-rmdir "$held_lock"
+# ロックを外して持ち主の印（tools_lock）を外すまで、中断は控えるだけにする（take_lock と同じ。間で終了してロックを残さず、
+# 終了の trap が別の導入の取り直したロックを消さない）。外せなければ印を残して失敗し、控えた中断には印を外した後で従う
+interrupted=""
+released=1
+trap 'interrupted=1' INT TERM
+if (trap '' INT TERM; exec rmdir "$tools_lock"); then tools_lock=""; else released=""; fi
+trap 'exit 130' INT TERM
+if [ -n "$interrupted" ]; then exit 130; fi
+if [ -z "$released" ]; then echo "NG: 開発ツールの導入のロック（${tools_lock}）を外せない" >&2; exit 1; fi
 
 # 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
 MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

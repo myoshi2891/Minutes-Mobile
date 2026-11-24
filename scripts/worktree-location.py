@@ -11,6 +11,9 @@
   scripts/worktree-location.py registered <元のリポジトリ> <パス>
       パスが作業ツリーとして登録されているか（git worktree list の記録の worktree の項目との完全な一致）。
       終了コード: 0 = 登録あり / 1 = 登録なし / 2 = 一覧を取得できない
+  scripts/worktree-location.py nested <元のリポジトリ> <パス>
+      パスの下（パス自身は含まない）に登録された作業ツリーがあるか。
+      終了コード: 0 = ない / 1 = ある（場所は標準エラー） / 2 = 判定できない
 """
 import os
 import subprocess
@@ -115,13 +118,38 @@ def check(requested: str, source: str) -> int:
     return 0
 
 
+def nested(source: str, parent_path: str) -> int:
+    parent_identity = identity(parent_path)
+    if parent_identity is None:
+        print(f"{parent_path}: ディレクトリがない", file=sys.stderr)
+        return 2
+    found = False
+    for listed in registered_worktrees(source):
+        path = os.fsdecode(listed)
+        # 祖先（自身は含まない）のどれかが同じディレクトリなら、その下にある（check と同じく文字列では比べない）
+        current = os.path.dirname(path)
+        while True:
+            if identity(current) == parent_identity:
+                print(f"NG: 専用の作業ツリー（{parent_path}）の下に別の作業ツリー（{path}）が登録されている。"
+                      "git worktree move か remove で外してからやり直す", file=sys.stderr)
+                found = True
+                break
+            upper = os.path.dirname(current)
+            if upper == current:
+                break
+            current = upper
+    return 1 if found else 0
+
+
 def main() -> int:
     arguments = sys.argv[1:]
     if len(arguments) == 3 and arguments[0] == "check":
         return check(arguments[1], arguments[2])
     if len(arguments) == 3 and arguments[0] == "registered":
         return 0 if os.fsencode(arguments[2]) in registered_worktrees(arguments[1]) else 1
-    print(f"使い方: {sys.argv[0]} check <置き場所> <元のリポジトリ> | registered <元のリポジトリ> <パス>", file=sys.stderr)
+    if len(arguments) == 3 and arguments[0] == "nested":
+        return nested(arguments[1], arguments[2])
+    print(f"使い方: {sys.argv[0]} check <置き場所> <元のリポジトリ> | registered <元のリポジトリ> <パス> | nested <元のリポジトリ> <パス>", file=sys.stderr)
     return 2
 
 

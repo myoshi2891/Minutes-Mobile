@@ -153,7 +153,8 @@ install_tool() {
       "$DEST/bin/gh" release download "$tag" --repo "github.com/$repo" --pattern "$asset" --dir "$work/download" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     fi
-    actual=$(shasum -a 256 "$work/download/$asset" | awk '{print $1}')
+    # 標準入力から読む（パスを渡すと、改行などを含むパスで shasum が行頭に「\」を付け、値の照合に失敗する）
+    actual=$(shasum -a 256 < "$work/download/$asset" | awk '{print $1}')
     # 一致しない配布ファイルは展開しない
     [ "$actual" = "$sha" ] \
       || fail "$name の SHA-256 が一致しない（tools/versions: $sha / 取得したファイル: ${actual}）。展開しない"

@@ -821,6 +821,62 @@ def manifest_errors(
     return errors
 
 
+def package_declarations(manifest: str, directory: str, root: Path) -> Tuple[List[Tuple[str, str, str, str]], List[Path]]:
+    """Package.swift の Package の依存を、リモート（URL, 引数, 文字列を除いた引数, 表示用の引数）とローカル（実体のディレクトリ）で返す。
+
+    取得元を判定できない宣言・認めないローカルの Package は含めない（manifest_errors が報告する）。
+    """
+    code = strip_comments(manifest)
+    masked = mask_strings(code)
+    remote: List[Tuple[str, str, str, str]] = []
+    local: List[Path] = []
+    for match in SOURCE_DECLARATION.finditer(masked):
+        if match.group(2) != "package":
+            continue
+        start = match.end() - 1
+        masked_arguments = call_arguments(masked, start)
+        arguments = code[start + 1:start + 1 + len(masked_arguments)]
+        summary = " ".join(arguments.split())[:80]
+        has_url, url = literal_argument(arguments, masked_arguments, "url", LITERAL_URL)
+        _, path = literal_argument(arguments, masked_arguments, "path", LITERAL_PATH)
+        if has_url:
+            if url is not None:
+                remote.append((normalize(url), arguments, masked_arguments, summary))
+        elif path is not None and path == path.strip() and not local_package_errors(directory, path, summary, root):
+            local.append((root / posixpath.join(directory, path)).resolve())
+    return remote, local
+
+
+def transitive_errors(root: Path, texts: Dict[Path, str], by_url: Dict[str, dict], approved: Dict[str, Set[str]],
+                      pins: Dict[Path, Dict[str, List[object]]]) -> List[str]:
+    """ビルドの起点になる各 Package について、ローカルの Package をたどった先のリモートの依存を、起点の Package.resolved と照合する。
+
+    SwiftPM は起点の Package.resolved だけを使い、ローカルの Package 自身のものは読まない（自身のものは単独の起点として照合する）。
+    """
+    remote: Dict[Path, List[Tuple[Path, Tuple[str, str, str, str]]]] = {}
+    local: Dict[Path, List[Path]] = {}
+    for path, text in texts.items():
+        declared, locations = package_declarations(text, path.parent.relative_to(root).as_posix(), root)
+        remote.setdefault(path.parent, []).extend((path, declaration) for declaration in declared)
+        local.setdefault(path.parent, []).extend(locations)
+    errors: List[str] = []
+    for start in sorted(local):
+        visited = {start}
+        waiting = list(local[start])
+        while waiting:
+            directory = waiting.pop()
+            if directory in visited:
+                continue
+            visited.add(directory)
+            waiting.extend(local.get(directory, []))
+            for path, (url, arguments, masked, summary) in remote.get(directory, []):
+                if url not in by_url:
+                    continue  # 許可リストにないことは、その manifest の検査が報告する
+                found = version_errors(arguments, masked, summary, approved.get(url, set()), pins.get(start, {}).get(url))
+                errors.extend(f"{start.relative_to(root).as_posix()} を起点とする {path.relative_to(root)}: {message}" for message in found)
+    return errors
+
+
 def manifests(root: Path) -> Iterator[Path]:
     """Package.swift と、版別の manifest（Package@swift-<版>.swift）を返す。版別の manifest も同じ検査にかける
     （SwiftPM はツールの版に合う版別の manifest を Package.swift より優先して読むため）。"""
@@ -832,6 +888,8 @@ def check(root: Path, allowlist: Path) -> List[str]:
     # 存在しない起点を走査すると対象が 0 件になり合格してしまうので、読めないものとして扱う
     if not root.is_dir():
         raise Unreadable(f"{root}: 探す起点のディレクトリがない")
+    # 実体のパスでたどる（ローカルの Package の実体のディレクトリと、走査で見つけた manifest のディレクトリを対応させる）
+    root = root.resolve()
     by_pin, by_url, by_path = load_allowlist(allowlist)
     # by_url は URL ごとに 1 項目しか持たないので、版の照合には by_pin から作った URL → 承認した版を使う
     approved_versions: Dict[str, Set[str]] = {}
@@ -869,6 +927,7 @@ def check(root: Path, allowlist: Path) -> List[str]:
                     errors.append(f"{source}: {identity} {version} の取得元 {location} が許可リスト（{'・'.join(same)}）と違う")
                 else:
                     errors.append(f"{source}: {identity} {version} は許可リストにない")
+    texts: Dict[Path, str] = {}
     for path in manifests(root):
         try:
             manifest = path.read_text(encoding="utf-8")
@@ -883,6 +942,8 @@ def check(root: Path, allowlist: Path) -> List[str]:
         except RecursionError as error:  # 深い入れ子の補間は RecursionError（JSON の読み込みと同じく読めないものとする）
             raise Unreadable(f"{path}: 入れ子が深すぎて読めない: {error!r}") from error
         errors.extend(f"{path.relative_to(root)}: {message}" for message in found)
+        texts[path] = manifest
+    errors.extend(transitive_errors(root, texts, by_url, approved_versions, pins_by_directory))
     for path in find_files(root, "project.xcproj"):
         source = path.relative_to(root)
         # 同じ .xcodeproj の中（project.xcworkspace/xcshareddata/swiftpm など）の Package.resolved だけと照合する

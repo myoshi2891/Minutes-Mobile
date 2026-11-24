@@ -70,7 +70,7 @@ PHASES = re.compile(r"^(MVP|P2|P3)\b")
 # 「|」で始まらないので表のまとまりも区切る（「- 」「### 」「満たす要件:」とも一致しない）
 FENCE_LINE = "\0fence"
 # リンク先の後に続けて書けるタイトル（"…"・'…'・(…)）
-LINK_TITLE = re.compile(r"""\s+(?:"[^"]*"|'[^']*'|\([^)]*\))""")
+LINK_TITLE = re.compile(r"""\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\))""")
 # 参照形式のリンクの定義（[ラベル]: リンク先）。字下げは空白 0〜3 個まで（CommonMark）
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
 # 定義のラベルだけの行と、次の行に書いたリンク先（CommonMark。リンク先の後はタイトルだけを書ける）
@@ -338,10 +338,13 @@ def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, s
             untitled = False
             continue
         if found and starts:
-            yield number, found.group(1), found.group(2)
-            code.interrupt()
-            untitled = not line[found.end():].strip()
-            continue
+            # リンク先の後には完全なタイトルだけを書ける。ほかの文字が続く行は定義ではなく段落（CommonMark）
+            rest = line[found.end():].rstrip()
+            if not rest or LINK_TITLE.fullmatch(rest):
+                yield number, found.group(1), found.group(2)
+                code.interrupt()
+                untitled = not rest
+                continue
         title = LINK_TITLE.match(" " + line) if untitled else None
         if title and title.end() == len(line.rstrip()) + 1:
             code.interrupt()
@@ -394,6 +397,28 @@ def snippet_marker(line: str) -> Optional[Tuple[str, str]]:
     """コード片の印の行なら（種類, パス）を返す。パスが書かれていない印のパスは空文字列（check_snippets が不備として報告する）。"""
     found = SNIPPET_MARKER.match(line.strip())
     return (found.group(1), found.group(2).strip()) if found else None
+
+
+def snippet_markers(text: str) -> Dict[int, Tuple[str, str]]:
+    """コード片の印を、行の位置（0 始まり）→（種類, パス）で返す。照合と書き直しが同じ判定を使う。
+
+    フェンス・複数行のコメント・<pre> の中と、字下げしたコードブロックの中の印は、説明用の例なので含めない。
+    """
+    markers: Dict[int, Tuple[str, str]] = {}
+    code = IndentedCode()
+    previous = 0
+    for number, line in prose_lines(text):
+        if number != previous + 1:
+            code.interrupt()
+        previous = number
+        if code.is_code(line):
+            continue
+        if COMMENT_OPEN.match(line):
+            code.interrupt()
+        marker = snippet_marker(line)
+        if marker:
+            markers[number - 1] = marker
+    return markers
 
 
 class Opener:
@@ -1147,14 +1172,7 @@ class Checker:
 
     def check_snippets(self, name: str, text: str) -> None:
         lines = split_lines(text)
-        for number, line, inside, _ in fenced_lines(text):
-            if inside:
-                continue  # フェンスの中の印は説明用の例であり、照合しない
-            index = number - 1
-            marker = snippet_marker(line)
-            if not marker:
-                continue
-            kind, source = marker
+        for index, (kind, source) in snippet_markers(text).items():
             if not source:
                 self.error(name, "コード片の印にパスがない", index + 1)
                 continue
@@ -1236,15 +1254,14 @@ class Checker:
             raw = split_lines(raw_text, keepends=True)
             lines = [line.rstrip("\r\n") for line in raw]
             endings = [line[len(line.rstrip("\r\n")):] for line in raw]
-            # フェンスの外の行の位置（フェンスの中の印は説明用の例であり、書き直さない）
-            outside = {number - 1 for number, _, inside, _ in fenced_lines(text) if not inside}
+            markers = snippet_markers(text)  # 照合と同じ判定（説明用の例は書き直さない）
             out: List[str] = []
             out_endings: List[str] = []  # out の各行の改行
             index = 0
             while index < len(lines):
                 out.append(lines[index])
                 out_endings.append(endings[index])
-                marker = snippet_marker(lines[index]) if index in outside else None
+                marker = markers.get(index)
                 index += 1
                 if not marker or marker[0] != "file" or not marker[1]:
                     continue  # パスのない印は検査の側（check_snippets）が報告する

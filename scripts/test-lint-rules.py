@@ -243,6 +243,12 @@ def nested_configs_in_worktree(errors: List[str]) -> List[str]:
             if os.path.islink(link) and outside_walk(os.path.realpath(link)):
                 errors.append(f"走査する範囲の外を指すディレクトリのリンクがある（先の入れ子の設定を検査できない）: "
                               f"{os.path.relpath(link, ROOT)}")
+        # Swift のファイルのリンクも、SwiftLint は実体の場所の入れ子の設定で検査する（0.65.1 で確かめた）
+        for name in sorted(name for name in files if name.casefold().endswith(".swift")):
+            link = os.path.join(current, name)
+            if os.path.islink(link) and outside_walk(os.path.realpath(link)):
+                errors.append(f"走査する範囲の外を指す Swift のファイルのリンクがある（先の入れ子の設定を検査できない）: "
+                              f"{os.path.relpath(link, ROOT)}")
         # 大文字小文字を区別しない（既定の APFS では .SwiftLint.yml も SwiftLint が .swiftlint.yml として読む）。
         # 結果には実際のファイル名を入れる
         for name in sorted(name for name in files if name.casefold() == ".swiftlint.yml"):
