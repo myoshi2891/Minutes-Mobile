@@ -378,6 +378,8 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
   check_field "リポジトリ" "${repo:-}" '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
   check_field "タグ" "${tag:-}" '^v?[0-9]+(\.[0-9]+)*$'
   check_field "配布ファイル" "${asset:-}" '^[A-Za-z0-9_.-]+$'
+  # 展開できる形式だけを認める（展開のときの判定は、二重の確認として残す）
+  case "$asset" in *.zip | *.tar.gz) ;; *) fail "tools/versions の配布ファイルの形式に対応していない: $asset" ;; esac
   check_field "実行ファイル" "${binary:-}" '^[a-z][a-z0-9-]*$'
   check_field "SHA-256" "${sha:-}" '^[0-9a-f]{64}$'
   case "$seen" in *" $name "*) ;; *) seen="$seen$name " ;; esac
@@ -484,7 +486,8 @@ MINIMUM_OS=27.2
 PACKAGE_COVERAGE_TARGET=90
 # 手順 7 がカバレッジを測った入力の記録（手順 8 が集計の前に現在の入力と照合する）。
 # 1 行目は入力（未コミットの変更がなければ「commit <HEAD>」、あれば「worktree <作業ツリーのツリーのハッシュ>」）、
-# 2 行目は測った結果のカバレッジの JSON（COVERAGE_JSON）の SHA-256（手順 7 と 8 の間に JSON が書き換えられていないこと）
+# 2 行目は測った結果のカバレッジの JSON（COVERAGE_JSON）の SHA-256（手順 7 と 8 の間に JSON が書き換えられていないこと）、
+# 3 行目から末尾までは測った Sources の実体のパス（JSON のパスの起点。測った後に作業ツリーを移しても、測ったものを数える）
 COVERAGE_HEAD="$PACKAGE/.build/minutes-coverage-head"
 # 手順 7 がその測定の JSON を写して置く場所（手順 8 はこれだけを集計する。swift test の共有の出力先は読まない）
 COVERAGE_JSON="$PACKAGE/.build/minutes-coverage.json"
@@ -516,6 +519,7 @@ STAGED_INDEX_COPY=""  # --staged のとき、開始時のインデックスの�
 ORIGINAL_INDEX=""  # --staged のとき、本来のインデックスのファイル（終了時に開始時のツリーのままであることを確かめる）
 ISOLATED_BASE=""  # --require-clean のとき、開始時のコミットを展開する専用の作業ツリーを置く一時ディレクトリ
 ISOLATED_TREE=""  # その専用の作業ツリー（git worktree で登録する）
+ISOLATED_COMMON=""  # その専用の作業ツリーを登録したリポジトリの共通のディレクトリ（後始末で登録ごと消す）
 COVERAGE_SCRATCH=""  # 手順 7 の測定ごとの swift test の出力先（一時ディレクトリ）
 COVERAGE_COPY=""  # 手順 8 が照合と集計に使う、カバレッジの記録の写し（一時ファイル）
 TOOLS_LOCK=""  # --require-clean のとき、元の .tools の導入のロック（写している間だけ持つ）
@@ -533,6 +537,9 @@ fail() {
 expand_steps() {
   local spec=$1 part first last number out=""
   local IFS=,
+  # 「,」で分けるだけで、ファイル名の展開はしない（「[0-9]」などを実行時の場所のファイルの名前に置き換えて、番号として読まない）。
+  # 呼び出しは $(…) の中なので、set -f は呼び出し側に残らない
+  set -f
   for part in $spec; do
     case "$part" in
       *-*) first=${part%-*}; last=${part#*-} ;;
@@ -611,7 +618,7 @@ on_exit() {
   isolated_removed=1
   # 作成の前に失敗した場合（ディレクトリがない）は消すものがない
   if [ -n "$ISOLATED_TREE" ] && { [ -e "$ISOLATED_TREE" ] || [ -L "$ISOLATED_TREE" ]; } \
-    && ! git -C "$ROOT" worktree remove --force "$ISOLATED_TREE"; then
+    && ! git --git-dir="$ISOLATED_COMMON" worktree remove --force "$ISOLATED_TREE"; then
     echo "NG: 専用の作業ツリーを削除できない（${ISOLATED_TREE}）。git worktree remove --force でその作業ツリーを削除する" >&2
     CLEANUP_FAILED=1
     isolated_removed=""
@@ -1286,7 +1293,7 @@ coverage_digest() {
 step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
-  local measured report digest
+  local measured report digest sources
   local resolution=()
   mkdir -p "$PACKAGE/.build"
   take_coverage_lock
@@ -1297,6 +1304,7 @@ step_7() {
   measured=$(coverage_input) || fail "カバレッジを測る入力を識別できない"
   mkdir -p "$COVERAGE_INPUT"
   materialize_coverage_input "${measured#* }" || fail "カバレッジを測る入力（${measured}）を展開できない"
+  real_directory sources "$COVERAGE_INPUT/$PACKAGE" || fail "カバレッジを測る入力の場所を特定できない"
   verify_coverage_links "$COVERAGE_INPUT" || fail "カバレッジを測る入力（${measured}）のシンボリックリンクを確かめられない。測らない"
   # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
   # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
@@ -1315,7 +1323,7 @@ step_7() {
   cp -- "$report" "$COVERAGE_JSON.$$"
   digest=$(coverage_digest "$COVERAGE_JSON.$$") || fail "カバレッジの記録のハッシュを計算できない"
   mv -f -- "$COVERAGE_JSON.$$" "$COVERAGE_JSON"
-  printf '%s\n%s\n' "$measured" "$digest" > "$COVERAGE_HEAD.$$"
+  printf '%s\n%s\n%s\n' "$measured" "$digest" "$sources/Sources" > "$COVERAGE_HEAD.$$"
   mv -f -- "$COVERAGE_HEAD.$$" "$COVERAGE_HEAD"
   rm -rf -- "$COVERAGE_SCRATCH"
   COVERAGE_SCRATCH=""
@@ -1327,7 +1335,7 @@ step_7() {
 
 step_8() {
   # current は EXIT の trap が使う手順の番号なので、局所変数の名前に使わない（隠すと失敗した手順の表示が壊れる）
-  local measured present recorded_digest
+  local measured present recorded_digest recorded_sources
   scripts/test-checks.py coverage
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   # 別の入力（別のコミット・別の作業ツリーの内容）で測った記録を集計しない
@@ -1339,11 +1347,12 @@ step_8() {
     fi
     fail "カバレッジを測った入力の記録がない。手順 7 を先に実行する"
   fi
-  # 2 行を同じ開いたファイルから読む（2 回開くと、その間に記録が置き換えられたとき別の記録の行を組み合わせうる）。
+  # 記録のすべてを同じ開いたファイルから読む（2 回開くと、その間に記録が置き換えられたとき別の記録の行を組み合わせうる）。
   # 行がなければ空のまま続け、下の照合で失敗させる（set -e で黙って止めない）
   measured=""
   recorded_digest=""
-  { IFS= read -r measured || :; IFS= read -r recorded_digest || :; } < "$COVERAGE_HEAD"
+  recorded_sources=""
+  { IFS= read -r measured || :; IFS= read -r recorded_digest || :; IFS= read -r -d '' recorded_sources || :; } < "$COVERAGE_HEAD"
   present=$(coverage_input) || fail "カバレッジを集計する入力を識別できない"
   [ "$measured" = "$present" ] || fail "カバレッジは別の入力（${measured}）で測ったもの。手順 7 を実行し直す"
   # 照合と集計で同じバイト列を使う。記録を一時ファイルへ写し、写しのハッシュを照合してから同じ写しを集計する
@@ -1354,11 +1363,14 @@ step_8() {
   # 手順 7 の後に別の測定で記録が書き換えられていれば、入力が同じでも集計しない
   [ -n "$recorded_digest" ] && [ "$(coverage_digest "$COVERAGE_COPY")" = "$recorded_digest" ] \
     || fail "カバレッジの記録が手順 7 で測ったものと違う。手順 7 を実行し直す"
+  # 末尾の改行 1 つだけを外す（パスに含まれる改行は保つ）。前の形式の記録（パスがない）は使わない
+  recorded_sources=${recorded_sources%$'\n'}
+  [ -n "$recorded_sources" ] || fail "カバレッジの記録に測った場所がない。手順 7 を実行し直す"
   case "$measured" in
     worktree*) echo "注意: カバレッジは未コミットの変更を含む作業ツリーで測った。コミットの記録としては扱わない" >&2 ;;
   esac
-  # 手順 7 が測ったのは固定した入力の写しなので、写しの Sources の行を数える
-  scripts/coverage-report.py "$COVERAGE_COPY" --sources "$COVERAGE_INPUT/$PACKAGE/Sources" --target "$PACKAGE_COVERAGE_TARGET"
+  # 手順 7 が測ったのは固定した入力の写しなので、測ったときの写しの Sources の行を数える（現在の場所から求め直さない）
+  scripts/coverage-report.py "$COVERAGE_COPY" --measured-sources "$recorded_sources" --target "$PACKAGE_COVERAGE_TARGET"
   release_coverage_lock
   echo "警告: アプリ側（全体 70%）の集計は、アプリのテストターゲットを追加する作業で実装する（TST-CI-07）"
 }
@@ -1452,10 +1464,14 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
     1) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
     *) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）が作業ツリーの中かを判定できない" ;;
   esac
+  git_path ISOLATED_COMMON "$ROOT" --git-common-dir || fail "共通のディレクトリを特定できない"
   ISOLATED_TREE="$ISOLATED_BASE/tree"
   # 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
   # 利用者のフック（post-checkout）は、内部の展開では動かさない（.githooks/pre-push と同じ）
   git -c core.hooksPath=/dev/null -c core.autocrlf=false worktree add -q --detach "$ISOLATED_TREE" "$START_HEAD"
+  # 引き継いだ GIT_DIR・GIT_WORK_TREE（元のリポジトリを選ぶのに使った）を、展開した後に外す。残すと、以後の git と入れ子の
+  # check.sh が、専用の作業ツリーではなく元の作業ツリーを読み書きする
+  unset GIT_DIR GIT_WORK_TREE
   # 作った作業ツリーの専用の管理ディレクトリに印を書く（入れ子の check.sh が、引き継いだ MINUTES_CHECK_ISOLATED を
   # この作業ツリーのものと確かめる。isolated_checkout）
   git_path isolated_private "$ISOLATED_TREE" --git-dir \
