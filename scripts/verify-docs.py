@@ -220,8 +220,12 @@ def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fe
             fence = opened[0]
             code.leave(indent)
             code.interrupt()
-        else:
-            code.is_code(line)
+        elif not code.is_code(line) and code.started:
+            # 箇条書きの印と同じ行のフェンス（「- ```swift」）。項目の本文の位置から開き、閉じるフェンスも同じ位置から数える
+            opened = fence_open(" " * code.started + line.expandtabs(4)[code.started:], code.started)
+            if opened:
+                fence = opened[0]
+                code.interrupt()
         yield number, line, opened is not None, opened, False, False
 
 
@@ -296,6 +300,7 @@ class IndentedCode:
     def __init__(self) -> None:
         self.paragraph = False  # 直前の行が段落で、次の行が続きになりうる
         self.items: List[int] = []  # 開いている箇条書きの項目の、本文の位置（外側から）
+        self.started = 0  # 直前に判定した行が項目の始まりなら、その項目の本文の位置（始まりでなければ 0）
 
     def interrupt(self) -> None:
         self.paragraph = False
@@ -312,6 +317,7 @@ class IndentedCode:
 
     def is_code(self, line: str) -> bool:
         expanded = line.expandtabs(4)
+        self.started = 0
         if not expanded.strip():
             self.paragraph = False
             return False
@@ -327,7 +333,8 @@ class IndentedCode:
         if item and not (self.paragraph and indent - self.base(indent) >= 4):
             self.leave(indent)
             spaces = len(item.group(3))
-            self.items.append(indent + len(item.group(2)) + (spaces if 1 <= spaces <= 4 else 1))
+            self.started = indent + len(item.group(2)) + (spaces if 1 <= spaces <= 4 else 1)
+            self.items.append(self.started)
             self.paragraph = bool(expanded[item.end():].strip())
             return False
         self.paragraph = not ends
@@ -449,15 +456,22 @@ def snippet_marker(line: str) -> Optional[Tuple[str, str]]:
     return (found.group(1), found.group(2).strip()) if found else None
 
 
-def snippet_markers(text: str) -> Dict[int, Tuple[str, str]]:
-    """コード片の印を、行の位置（0 始まり）→（種類, パス）で返す。照合と書き直しが同じ判定を使う。
+def snippet_markers(text: str) -> Dict[int, Tuple[str, str, int]]:
+    """コード片の印を、行の位置（0 始まり）→（種類, パス, 囲む箇条書きの項目の本文の位置）で返す。照合と書き直しが同じ判定を使う。
 
     フェンス・複数行のコメント・<pre> の中と、字下げしたコードブロックの中の印は、説明用の例なので含めない。
     """
-    markers: Dict[int, Tuple[str, str]] = {}
+    markers: Dict[int, Tuple[str, str, int]] = {}
     code = IndentedCode()
     previous = 0
-    for number, line in prose_lines(text):
+    for number, line, inside, opened in fenced_lines(text):
+        if inside:
+            # フェンスの開始行も項目を閉じ・始めうる（scanned_lines と同じ）
+            if opened and in_item(line, opened[0][2]) is None:
+                code.is_code(line)
+            elif opened:
+                code.leave(len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip(" ")))
+            continue
         if number != previous + 1:
             code.interrupt()
         previous = number
@@ -467,8 +481,23 @@ def snippet_markers(text: str) -> Dict[int, Tuple[str, str]]:
             code.interrupt()
         marker = snippet_marker(line)
         if marker:
-            markers[number - 1] = marker
+            indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip(" "))
+            markers[number - 1] = (*marker, code.leave(indent))
     return markers
+
+
+def paired_fence(lines: List[str], opened_fences: Dict[int, Tuple[Fence, str]], index: int, base: int) -> Optional[int]:
+    """行 index の印に対応するフェンスの開始行（空行を挟んだ次の行）を返す。照合と書き直しが同じ対応を使う。
+
+    印と同じ箇条書きの項目の中（項目の外なら最上位）のフェンスだけに対応させる。次の項目を始める行のフェンス（「- ```」）は、
+    本文の位置が同じでも別の項目なので対応させない。
+    """
+    start = index + 1
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start not in opened_fences or opened_fences[start][0][2] != base or in_item(lines[start], base) is None:
+        return None
+    return start
 
 
 class Opener:
@@ -1258,15 +1287,13 @@ class Checker:
     def check_snippets(self, name: str, text: str) -> None:
         lines = split_lines(text)
         opened_fences = fences(text)
-        for index, (kind, source) in snippet_markers(text).items():
+        for index, (kind, source, base) in snippet_markers(text).items():
             if not source:
                 self.error(name, "コード片の印にパスがない", index + 1)
                 continue
-            start = index + 1
-            while start < len(lines) and not lines[start].strip():
-                start += 1
-            if start not in opened_fences:
-                self.error(name, "印の直後にコードフェンスがない", index + 1)
+            start = paired_fence(lines, opened_fences, index, base)
+            if start is None:
+                self.error(name, "印の直後に、同じ箇条書きの項目（項目の外なら最上位）のコードフェンスがない", index + 1)
                 continue
             end = fence_end(lines, start, opened_fences[start][0])
             # 字下げしたフェンスの本文は、開始行の字下げの分を除いてから照合する
@@ -1335,7 +1362,7 @@ class Checker:
         sources: Dict[Path, List[Path]] = {}
         for document, aliases in names.items():
             sources[document] = []
-            for kind, source in snippet_markers(self.texts[aliases[0]]).values():
+            for kind, source, _ in snippet_markers(self.texts[aliases[0]]).values():
                 try:
                     path = self.snippet_source(source) if kind == "file" and source else None
                 except Unresolvable:
@@ -1412,15 +1439,15 @@ class Checker:
                 index += 1
                 if not marker or marker[0] != "file" or not marker[1]:
                     continue  # パスのない印は検査の側（check_snippets）が報告する
-                start = index
-                while start < len(lines) and not lines[start].strip():
-                    start += 1
+                start = paired_fence(lines, opened_fences, index - 1, marker[2])
                 try:
                     path = self.snippet_source(marker[1])
                 except Unresolvable:
                     continue  # 検査の側（check_snippets）が印の行とともに報告する
-                opened = opened_fences.get(start)
-                if not opened or path is None or not path.is_file():
+                if start is None:
+                    continue  # 対応するフェンスがない印も、検査の側が報告する
+                opened = opened_fences[start]
+                if path is None or not path.is_file():
                     continue  # 不備（root の外の参照先を含む）は検査の側で報告する
                 end = fence_end(lines, start, opened[0])
                 # 字下げしたフェンスには、開始行と同じ字下げを付けて書く（空行には付けない）

@@ -16,6 +16,7 @@
       終了コード: 0 = ない / 1 = ある（場所は標準エラー） / 2 = 判定できない
 """
 import os
+import stat
 import subprocess
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -72,9 +73,23 @@ def confirm_enumerable(source: str) -> None:
         directory = os.path.join(common.stdout[:-1], b"worktrees")
         for entry in os.listdir(directory):
             try:
-                os.lstat(os.path.join(directory, entry))  # 名前だけ読めて、中を調べられない場合も省かれる
+                # 名前だけ読めて、中を調べられない場合も省かれる
+                if not stat.S_ISDIR(os.stat(os.path.join(directory, entry)).st_mode):
+                    continue  # 登録ではない（Finder の .DS_Store など）
             except FileNotFoundError:
                 continue  # 列挙の後に外された登録
+            # 登録された場所の記録（gitdir）を読めない・空の登録も省かれる。登録先のディレクトリがないことは問わない
+            record = os.path.join(directory, entry, b"gitdir")
+            try:
+                with open(record, "rb") as handle:
+                    readable = bool(handle.read().strip())
+            except FileNotFoundError:
+                if not os.path.isdir(os.path.join(directory, entry)):
+                    continue  # 列挙の後に外された登録
+                readable = False
+            if not readable:
+                print(f"作業ツリーの登録を列挙できない: {os.fsdecode(record)} がないか空", file=sys.stderr)
+                sys.exit(2)
     except FileNotFoundError:
         return  # 登録がない（git がなければ一覧の取得で止まっている）
     except OSError as error:

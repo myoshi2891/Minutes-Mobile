@@ -156,7 +156,7 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
 
 
 def pin_identity(pin: dict, legacy: bool) -> str:
-    """同じ Package.resolved の中の重複の判定に使う名前。なければ空文字列（名前のない依存は check が報告する）。
+    """同じ Package.resolved の中の重複の判定と、承認（許可リスト）の照合に使う名前。なければ空文字列（名前のない依存は check が報告する）。
 
     SwiftPM と同じく、identity の項目（大文字小文字を区別しない）で決まる。古い形式（version 1）は package ではなく
     repositoryURL の最後の要素（末尾の「/」と .git を除く）で決まる。2026-11-25 に Xcode 27.2 の swift package resolve で確かめた。
@@ -170,7 +170,8 @@ def pin_identity(pin: dict, legacy: bool) -> str:
     return value.lower()
 
 
-def resolved_pins(path: Path) -> List[dict]:
+def resolved_pins(path: Path) -> List[Tuple[str, dict]]:
+    """Package.resolved の依存を（名前, 記録）で返す。名前は pin_identity の値（重複の判定と承認の照合に同じ値を使う）。"""
     try:
         # 重複した鍵は後の値で前の値を隠すので読めないものとする（xcproj.py と同じ。ValueError で送出される）
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
@@ -189,11 +190,12 @@ def resolved_pins(path: Path) -> List[dict]:
         raise Unreadable(f"{path}: pins の形式が違う")
     # 同じ名前の依存が重なると、どの確定版が使われるか決まらない（SwiftPM も壊れたファイルとして拒否する）
     seen: Set[str] = set()
-    for identity in filter(None, (pin_identity(pin, legacy) for pin in pins)):
+    named = [(pin_identity(pin, legacy), pin) for pin in pins]
+    for identity in filter(None, (name for name, _ in named)):
         if identity in seen:
             raise Unreadable(f"{path}: {identity} が重複している")
         seen.add(identity)
-    return pins
+    return named
 
 
 def strings(node: object) -> Iterator[str]:
@@ -1051,14 +1053,13 @@ def check(root: Path, allowlist: Path) -> List[str]:
     for path in find_files(root, "Package.resolved"):
         source = path.relative_to(root)
         pinned_locations.setdefault(path, set())
-        for pin in resolved_pins(path):
+        for identity, pin in resolved_pins(path):
             pin_location = pin.get("location") or pin.get("repositoryURL")
             pin_state = pin.get("state") if isinstance(pin.get("state"), dict) else {}
             if isinstance(pin_location, str):
                 pins_by_directory.setdefault(path.parent, {}).setdefault(normalize(pin_location), []).append(
                     pin_state.get("version"))
                 pinned_locations[path].add(normalize(pin_location))
-            identity = str(pin.get("identity") or pin.get("package") or "").lower()
             state = pin.get("state") if isinstance(pin.get("state"), dict) else {}
             version = state.get("version")
             if not identity:

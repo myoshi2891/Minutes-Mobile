@@ -1032,11 +1032,19 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   # 検査に別の設定が混ざる。作業ツリーの外で、設定を継がない一時ディレクトリは認める
   # 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
   location_status=0
+  # 判定に使うスクリプトは開始時のコミットから書き出して実行する（元の作業ツリーが sparse checkout で scripts/ の一部が
+  # なくても判定でき、途中の書き換えで判定が変わらない）
+  location_script=$(mktemp)
+  if ! git cat-file blob "$START_HEAD:scripts/worktree-location.py" > "$location_script"; then
+    rm -f -- "$location_script"
+    fail "開始時のコミットの scripts/worktree-location.py を読めない"
+  fi
   location_out=$(mktemp)
-  "$ROOT/scripts/worktree-location.py" check "$ISOLATED_BASE" "$ROOT" > "$location_out" || location_status=$?
+  # -I: 書き出した場所（一時ディレクトリ）に置かれた同名のモジュール（subprocess.py など）を読み込ませない
+  /usr/bin/python3 -I "$location_script" check "$ISOLATED_BASE" "$ROOT" > "$location_out" || location_status=$?
   checked_base=""
   if [ "$location_status" = 0 ] && ! IFS= read -r -d '' checked_base < "$location_out"; then location_status=2; fi
-  rm -f -- "$location_out"
+  rm -f -- "$location_out" "$location_script"
   case $location_status in
     0) ISOLATED_BASE=$checked_base ;;
     1) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;

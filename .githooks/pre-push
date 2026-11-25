@@ -109,6 +109,11 @@ release_locks() {
 }
 # 専用の作業ツリーを合わせる間だけ移しておく場所（推測できない名前の一時のディレクトリ。中の tree が専用の作業ツリー）
 staging=""
+# 戻す途中で元の場所にほかのものができると、専用の作業ツリーがその中（${snapshot}/tree）に移っていることがある。そこに作業ツリーらしき
+# ものがあるときだけ、可能性として知らせる（この専用の作業ツリーだとは確かめていないので、動かさず、消さない）
+nested_hint() {
+  if [ -e "$snapshot/tree/.git" ]; then printf '%s' "（専用の作業ツリーが ${snapshot}/tree に移っている可能性がある。そこも確かめる）"; fi
+}
 # 移しておいた専用の作業ツリーを元の場所に戻す。元の場所に別のもの（移している間に登録された作業ツリーなど）があれば、どちらも
 # 変えずに失敗する（次の検査が、元の場所が空いていれば戻す）
 restore_staging() {
@@ -123,11 +128,11 @@ restore_staging() {
   # 移す途中の強制終了で、登録されたパスと実際の場所が食い違っている場合だけ、登録を直してから戻す。移動は中断を無視して実行する
   if ! worktree_location registered "$source_root" "$held/tree"; then git -C "$held/tree" worktree repair > /dev/null || true; fi
   (trap '' INT TERM; exec git -C "$source_root" worktree move "$held/tree" "$snapshot") \
-    || { echo "NG: 専用の作業ツリー（${held}/tree）を元の場所（${snapshot}）に戻せない" >&2; return 1; }
+    || { echo "NG: 専用の作業ツリー（${held}/tree）を元の場所（${snapshot}）に戻せない$(nested_hint)" >&2; return 1; }
   rmdir "$held" 2>/dev/null || true
   # 確かめてから移すまでの間に元の場所ができると、git worktree move はその中に移す（上書きはしない）。検査せずに止める
   if [ ! -e "$snapshot/.git" ] || [ -e "$snapshot/tree/.git" ]; then
-    echo "NG: 専用の作業ツリーを元の場所（${snapshot}）に戻す間に、そこに別のものができた。中身を確かめて外してから push し直す" >&2
+    echo "NG: 専用の作業ツリーを元の場所（${snapshot}）に戻す間に、そこに別のものができた。中身を確かめて外してから push し直す$(nested_hint)" >&2
     return 1
   fi
 }
@@ -326,7 +331,7 @@ else
   # 作業ツリーなど）が置き場所にあれば、変更せずに止める（中身が何かを確かめられないものを checkout・clean・rm -rf しない）。
   # 登録も置き場所もないとき（初回）だけ作る
   if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
-    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないもの（このフックの印のない作業ツリーを含む）がある。中身を確かめて削除する（作業ツリーなら git worktree remove）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す" >&2
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないもの（このフックの印のない作業ツリーを含む）がある。中身を確かめて削除する（作業ツリーなら git worktree remove）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す$(nested_hint)" >&2
     exit 1
   fi
   # 登録だけが残っている場合は、上書きせずに止める（作業ツリーを別の場所へ移した・外した場所に置いた場合に、その登録を奪わない）

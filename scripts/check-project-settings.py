@@ -252,8 +252,14 @@ def check_required(
             if undecided:
                 missing.append(build)
             for key, value in effective:
-                if value not in allowed:
-                    wrong.setdefault(f"{key} = {value}", []).append(build)
+                # 変数はその組のビルド設定で展開してから比べる。展開できない値は許す値と見なさない
+                expanded = expand_value(value, own, shared, configuration, variant, setting=name,
+                                        from_target=key in own and as_text(own[key]) == value)
+                if expanded is None:
+                    wrong.setdefault(f"{key} = {value}（展開できない）", []).append(build)
+                elif expanded not in allowed:
+                    label = f"{key} = {value}" if expanded == value else f"{key} = {value}（{expanded} に展開される）"
+                    wrong.setdefault(label, []).append(build)
         if missing:
             errors.append(f"[{reason}] {target}: {name} が設定されていない（構成 {'・'.join(missing)}。必要な値: {allowed[0]}）")
         for label, used in wrong.items():
@@ -700,11 +706,21 @@ def resolved(path: Path) -> Path:
 MAX_PLIST_DEPTH = 100  # plist の入れ子の段数の上限
 
 
+class UniqueKeys(dict):
+    """重複した鍵を拒否する辞書（plistlib は XML・バイナリ形式のどちらも、既定で後の値を黙って採用し、前の値を検査から隠す）。"""
+
+    def __setitem__(self, key: object, value: object) -> None:
+        if key in self:
+            raise ValueError(f"重複した鍵 {key!r}")
+        super().__setitem__(key, value)
+
+
 def load_plist(path: Path) -> dict:
     try:
         with path.open("rb") as handle:
-            data = plistlib.load(handle)
+            data = plistlib.load(handle, dict_type=UniqueKeys)
     # 壊れた XML は ExpatError、形の違う日付（<date>）は AttributeError になる（plistlib が照合の失敗を確かめない）
+    # 重複した鍵は ValueError（UniqueKeys）
     # バイナリ形式の深い入れ子は、plistlib の読み込みが RecursionError になる
     except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, AttributeError, RecursionError) as error:
         raise Unreadable(f"{path}: {error!r}") from error
