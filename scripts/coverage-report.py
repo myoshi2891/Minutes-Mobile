@@ -5,6 +5,8 @@ swift test --enable-code-coverage が出す JSON から、指定したディレ�
 （合計にはテストコードと自動生成のファイルが混ざるため）。
 
 使い方: scripts/coverage-report.py <codecov の JSON> --sources <数える対象のディレクトリ> --target <目標の %>
+  --measured-sources <絶対パス>  --sources の代わりに、測ったときに記録した実体のパスを渡す（現在のファイルシステムで解決しない。
+                                 測った後に作業ツリーを移しても、記録したパスのまま数える）
 終了コード: 0 = 集計できた（目標未満は警告を出す） / 2 = 読めない・対象のファイルがない
 """
 import argparse
@@ -55,9 +57,14 @@ def target_text(value: Decimal) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Package のカバレッジの集計")
     parser.add_argument("report", type=Path)
-    parser.add_argument("--sources", type=Path, required=True)
+    origin = parser.add_mutually_exclusive_group(required=True)
+    origin.add_argument("--sources")
+    origin.add_argument("--measured-sources")
     parser.add_argument("--target", type=percentage, required=True)
     arguments = parser.parse_args()
+    if arguments.measured_sources is not None and not os.path.isabs(arguments.measured_sources):
+        parser.error(f"--measured-sources が絶対パスでない: {arguments.measured_sources}")
+    sources = arguments.measured_sources if arguments.measured_sources is not None else os.path.realpath(arguments.sources)
     try:
         files = json.loads(arguments.report.read_text(encoding="utf-8"),
                            object_pairs_hook=reject_duplicate_keys)["data"][0]["files"]
@@ -66,7 +73,7 @@ def main() -> int:
         # 経由して指定しても /private/tmp の起点になり、Sources の中のシンボリックリンクのファイルはリンクのパスのまま記録される
         # ことを確かめた）。そこで起点の側だけを実体のパスにし、記録したパスは字面のまま正規化して比べる
         # 区切りは末尾に 1 つだけ付ける（起点が「/」のときに「//」にしない。名前の似た隣のディレクトリは含めない）
-        prefix = os.path.realpath(arguments.sources).rstrip(os.sep) + os.sep
+        prefix = os.path.normpath(sources).rstrip(os.sep) + os.sep
         lines = []
         for item in files:
             filename = item["filename"]
@@ -86,13 +93,13 @@ def main() -> int:
         return 2
     total = sum(count for count, _ in lines)
     if total == 0:
-        print(f"NG: {arguments.sources} 配下に数える行がない", file=sys.stderr)
+        print(f"NG: {sources} 配下に数える行がない", file=sys.stderr)
         return 2
     # 行数の比と目標を分数のまま正確に比べる（浮動小数点の丸めで、目標のすぐ下を届いたと、ちょうどを届かないと判定しない）
     percent = Fraction(sum(covered for _, covered in lines) * 100, total)
     goal = Fraction(arguments.target)
     target = target_text(arguments.target)
-    print(f"カバレッジ（{arguments.sources}）: 行 {shown(percent, goal)}%（{len(lines)} ファイル・目標 {target}%）")
+    print(f"カバレッジ（{sources}）: 行 {shown(percent, goal)}%（{len(lines)} ファイル・目標 {target}%）")
     if percent < goal:
         print(f"警告: カバレッジが目標の {target}% に届いていない（TST-CI-07。初期は警告のみ）")
     return 0

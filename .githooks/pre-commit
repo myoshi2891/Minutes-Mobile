@@ -28,9 +28,10 @@ if ! setup_blob=$(git rev-parse --verify -q :scripts/setup-tools.sh) || ! git ca
 fi
 # 導入し直す手順は、ステージした台帳と setup-tools.sh の両方を一時ファイルに書き出し、書き出したものを --versions・--dest を
 # 付けて実行する（作業ツリーのものは使わず、作業ツリーとステージした内容は変えない）。一時ファイルを消した後も、導入（または
-# 書き出し）の終了コードを返す（削除の成功で導入の失敗を隠さない）。zsh では status が読み取り専用なので result に控える。
+# 書き出し）の終了コードを返す（削除の成否で導入の結果を変えない。利用者のシェルが set -e を引き継いでいても後始末まで進むよう、
+# 導入は if の条件で実行する）。zsh では status が読み取り専用なので result に控える。
 # 起点のパスは上と同じく末尾の改行を保つ（%?x は、印の x とその前の区切りの改行 1 文字を外す。引用符の中に書けるのでこの形にする）
-reinstall='(export GIT_NO_REPLACE_OBJECTS=1; root=$(git rev-parse --show-toplevel && printf x) || exit 1; root=${root%?x}; versions=$(mktemp) || exit 1; setup=$(mktemp) || { rm -f -- "$versions"; exit 1; }; git cat-file blob '"$versions_blob"' > "$versions" && git cat-file blob '"$setup_blob"' > "$setup" && /bin/bash "$setup" --versions "$versions" --dest "$root/.tools"; result=$?; rm -f -- "$versions" "$setup"; exit "$result")'
+reinstall='(export GIT_NO_REPLACE_OBJECTS=1; root=$(git rev-parse --show-toplevel && printf x) || exit 1; root=${root%?x}; versions=$(mktemp) || exit 1; setup=$(mktemp) || { rm -f -- "$versions"; exit 1; }; if git cat-file blob '"$versions_blob"' > "$versions" && git cat-file blob '"$setup_blob"' > "$setup" && /bin/bash "$setup" --versions "$versions" --dest "$root/.tools"; then result=0; else result=$?; fi; rm -f -- "$versions" "$setup" || true; exit "$result")'
 if ! /bin/bash "$setup" --verify --versions "$versions" --dest "$root/.tools"; then
   echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。ステージした台帳で導入し直してからコミットする: ${reinstall}" >&2
   exit 1

@@ -107,8 +107,32 @@ release_locks() {
   if [ -n "$held_tools" ]; then rmdir "$held_tools" 2>/dev/null || true; fi
   if [ -n "$held" ]; then rmdir "$held" 2>/dev/null || true; fi
 }
+# 専用の作業ツリーを合わせる間だけ移しておく場所（推測できない名前の一時のディレクトリ。中の tree が専用の作業ツリー）
+staging=""
+# 移しておいた専用の作業ツリーを元の場所に戻す。元の場所に別のもの（移している間に登録された作業ツリーなど）があれば、どちらも
+# 変えずに失敗する（次の検査が、元の場所が空いていれば戻す）
+restore_staging() {
+  local held=$staging
+  if [ -z "$held" ]; then return 0; fi
+  staging=""
+  if [ ! -e "$held/tree" ]; then rmdir "$held" 2>/dev/null || true; return 0; fi
+  if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、検査の間に別のものができた。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す（元の専用の作業ツリーは ${held}/tree に残した）: $(ls -A -- "$snapshot" 2>/dev/null | sed 's|$|/|' | tr '\n' ' ')" >&2
+    return 1
+  fi
+  # 移す途中の強制終了で、登録されたパスと実際の場所が食い違っている場合だけ、登録を直してから戻す。移動は中断を無視して実行する
+  if ! worktree_location registered "$source_root" "$held/tree"; then git -C "$held/tree" worktree repair > /dev/null || true; fi
+  (trap '' INT TERM; exec git -C "$source_root" worktree move "$held/tree" "$snapshot") \
+    || { echo "NG: 専用の作業ツリー（${held}/tree）を元の場所（${snapshot}）に戻せない" >&2; return 1; }
+  rmdir "$held" 2>/dev/null || true
+  # 確かめてから移すまでの間に元の場所ができると、git worktree move はその中に移す（上書きはしない）。検査せずに止める
+  if [ ! -e "$snapshot/.git" ] || [ -e "$snapshot/tree/.git" ]; then
+    echo "NG: 専用の作業ツリーを元の場所（${snapshot}）に戻す間に、そこに別のものができた。中身を確かめて外してから push し直す" >&2
+    return 1
+  fi
+}
 # 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
-trap 'status=$?; release_locks; rm -f -- "$location_script"; exit "$status"' EXIT
+trap 'status=$?; restore_staging || true; release_locks; rm -f -- "$location_script"; exit "$status"' EXIT
 # ロック（ディレクトリ $1）を取り、取れたら変数 $2 に場所を記録して 0 を返す。結果を記録するまで、中断は控えるだけにする
 # （取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して
 # 実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
@@ -130,6 +154,35 @@ if ! take_lock "$lock" lock_held; then
   exit 1
 fi
 
+# このフックが作った印。作業ツリーの専用の管理ディレクトリ（<共通のディレクトリ>/worktrees/<名前>。作業ツリーの中ではないので
+# checkout・clean で消えない）に、このフックの名前と作業ツリーの実体のパスを書く。置き場所と共通のディレクトリが合うだけでは、
+# このフックが作った作業ツリーであることの証拠にならない（利用者が同じ場所に git worktree add した作業ツリーなど）
+owner_mark="minutes-pre-push-owner"
+owner_text="MinutesMobile pre-push ${snapshot}"
+# $1 が、起点がその場所で、共通のディレクトリが元のリポジトリのもので、専用の管理ディレクトリにこのフックの印がある作業ツリーか
+owned_tree() {
+  local top common source_common private
+  git_path top "$1" --show-toplevel && real_directory top "$top" \
+    && git_path common "$1" --git-common-dir && real_directory common "$common" \
+    && real_directory source_common "$common_dir" \
+    && [ "$top" = "$1" ] && [ "$common" = "$source_common" ] \
+    && git_path private "$1" --git-dir && real_directory private "$private" && [ "$(dirname "$private")" = "$source_common/worktrees" ] \
+    && [ -f "$private/$owner_mark" ] && [ ! -L "$private/$owner_mark" ] \
+    && [ "$(cat "$private/$owner_mark")" = "$owner_text" ]
+}
+# 前の検査が、専用の作業ツリーを移したまま終わった（強制終了・元の場所に別のものができた）場合は、先に元の場所へ戻す。元の場所に
+# 残ったのが空のディレクトリだけなら除く（空でないものには触れない）
+for held in "$snapshot".work.*; do
+  if [ ! -d "$held" ] || [ -L "$held" ]; then continue; fi
+  if [ -e "$held/tree" ] && ! owned_tree "$held/tree"; then
+    echo "NG: ${held}/tree がこの検査の作業ツリーと確かめられない。中身を確かめて外してから push し直す" >&2
+    exit 1
+  fi
+  if [ -e "$held/tree" ] && [ -d "$snapshot" ] && [ ! -L "$snapshot" ]; then find "$snapshot" -type d -empty -delete; fi
+  staging=$held
+  restore_staging
+done
+
 # 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
 # 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）。
 # 照合は記録の worktree の項目（パスの全体）との完全な一致。終了コード: 0 = 登録あり / 1 = 登録なし / 2 = 取得できない
@@ -142,38 +195,27 @@ case $registration in
     exit 1
     ;;
 esac
-# このフックが作った印。作業ツリーの専用の管理ディレクトリ（<共通のディレクトリ>/worktrees/<名前>。作業ツリーの中ではないので
-# checkout・clean で消えない）に、このフックの名前と作業ツリーの実体のパスを書く。置き場所と共通のディレクトリが合うだけでは、
-# このフックが作った作業ツリーであることの証拠にならない（利用者が同じ場所に git worktree add した作業ツリーなど）
-owner_mark="minutes-pre-push-owner"
-owner_text="MinutesMobile pre-push ${snapshot}"
 # 再利用するのは、登録があり、ディレクトリの git が専用の作業ツリーそのもの（作業ツリーの起点がこの場所で、
 # 共通のディレクトリが元のリポジトリのもの）を指し、専用の管理ディレクトリにこのフックの印がある場合だけ。
 # .git のファイルを失ったなどで別のリポジトリや親のディレクトリを指す場合・印がない場合に、そちらを checkout・clean しない
 # （その場合は下で止める）
 owned=0
 if [ "$registration" -eq 0 ] && [ -d "$snapshot" ]; then
-  git_path top "$snapshot" --show-toplevel && real_directory top "$top" \
-    && git_path common "$snapshot" --git-common-dir && real_directory common "$common" \
-    && real_directory source_common "$common_dir" \
-    && [ "$top" = "$snapshot" ] && [ "$common" = "$source_common" ] \
-    && git_path private "$snapshot" --git-dir && real_directory private "$private" && [ "$(dirname "$private")" = "$source_common/worktrees" ] \
-    && [ -f "$private/$owner_mark" ] && [ ! -L "$private/$owner_mark" ] \
-    && [ "$(cat "$private/$owner_mark")" = "$owner_text" ] && owned=1
+  if owned_tree "$snapshot"; then owned=1; fi
 fi
 # 元の作業ツリーが sparse checkout なら、専用の作業ツリーもその指定を引き継ぎ（git worktree add が写す）、一部のファイル
 # しかない状態で検査することになる。専用の作業ツリーで sparse checkout を有効にしていれば、そこでだけ解除して全体を
 # 展開する（作業ツリーごとの設定に書くので、元の作業ツリーは sparse のまま）。有効でなければ解除しない（解除の操作は
 # sparse でないリポジトリにも作業ツリーごとの設定の拡張を書き足すため）。設定を読めない場合は止める
 full_checkout() {
-  local sparse status=0
+  local tree=$1 sparse status=0
   # GIT_CONFIG を外して読む（設定されていると git config はそのファイルだけを読み、専用の作業ツリーの設定を見ない）
-  sparse=$(env -u GIT_CONFIG git -C "$snapshot" config --type=bool --get core.sparseCheckout) || status=$?
+  sparse=$(env -u GIT_CONFIG git -C "$tree" config --type=bool --get core.sparseCheckout) || status=$?
   case $status in
-    0) if [ "$sparse" = true ]; then git -C "$snapshot" -c core.autocrlf=false sparse-checkout disable; fi ;;
+    0) if [ "$sparse" = true ]; then git -C "$tree" -c core.autocrlf=false sparse-checkout disable; fi ;;
     1) ;;  # 設定がない（sparse でない）
     *)
-      echo "NG: 専用の作業ツリーの sparse checkout の設定を読めない（${snapshot}）" >&2
+      echo "NG: 専用の作業ツリーの sparse checkout の設定を読めない（${tree}）" >&2
       exit 1
       ;;
   esac
@@ -235,19 +277,32 @@ if [ "$owned" -eq 1 ]; then
       exit 1
       ;;
   esac
-  git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
-  full_checkout
+  # 上の判定の後に利用者が登録した作業ツリー（git worktree add はこのフックのロックを見ないので止められない）を壊さないよう、
+  # 専用の作業ツリーを推測できない名前の場所へ rename で移し、そこで確かめ、合わせてから、元の場所へ戻す。移した後に元の場所の下へ
+  # 登録された作業ツリーは、合わせる作業ツリーとは別の場所になる（checkout・clean・rm が及ばない）。移すまでに登録されたものは
+  # 一緒に移り（中身は変わらない）、下の .git の検査で止めて元の場所へ戻す。検査する場所とビルドの成果物は変わらない
+  staging=$(mktemp -d "$snapshot.work.XXXXXX")
+  (trap '' INT TERM; exec git -C "$source_root" worktree move "$snapshot" "$staging/tree") \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）を移せない" >&2; exit 1; }
+  # 中に別の作業ツリー・リポジトリ（.git を持つもの）があれば、何も変えずに止める。残すビルドの成果物（.build）は変えないので、
+  # その中（取得した依存など）は調べない
+  inner=$(cd "$staging/tree" && find . \( -path ./.build -o -path ./Packages/MinutesKit/.build \) -prune \
+    -o -name .git ! -path ./.git -print) \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）の中に別の作業ツリーがあるかを調べられない" >&2; exit 1; }
+  if [ -n "$inner" ]; then
+    echo "NG: 専用の作業ツリー（${snapshot}）に、別の作業ツリーかリポジトリがある。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す: ${inner}" >&2
+    exit 1
+  fi
+  git -C "$staging/tree" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
+  full_checkout "$staging/tree"
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
-  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールの写し（/.tools。下で
-  # 作り直す）と、check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
-  # ほかの階層の .build（docs/.build など）は消す。上で専用の作業ツリーそのものであることを確かめてから実行する。
-  # 上の nested の判定の後に利用者が登録した作業ツリー（git worktree add はこのフックのロックを見ないので止められない）を
-  # 消さないよう、-f は 1 回だけ付ける。git clean は、消す直前に .git（ディレクトリかファイル）を持つと分かったディレクトリを残す
-  # （git worktree add は内容より先に .git を書く）。残ったもの（別の作業ツリー・追跡していない複製など）は下で確かめて止める
-  kept=(-e /.tools -e /.build -e /Packages/MinutesKit/.build)
-  git -C "$snapshot" clean -q -f -d -x "${kept[@]}"
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは check.sh が使うビルドの成果物の場所
+  # （直下の /.build と Package の /Packages/MinutesKit/.build）だけ。ほかの階層の .build（docs/.build など）は消す
+  # -f は 1 回だけ付け、.git を持つディレクトリを消さない
+  kept=(-e /.build -e /Packages/MinutesKit/.build)
+  git -C "$staging/tree" clean -q -f -d -x "${kept[@]}"
   # -n: 消さずに、残っているもの（-f を 2 回付けると消えるもの）を調べる
-  remaining=$(git -C "$snapshot" clean -n -f -f -d -x "${kept[@]}") \
+  remaining=$(git -C "$staging/tree" clean -n -f -f -d -x "${kept[@]}") \
     || { echo "NG: 専用の作業ツリー（${snapshot}）に追跡していないものが残っているかを調べられない" >&2; exit 1; }
   if [ -n "$remaining" ]; then
     echo "NG: 専用の作業ツリー（${snapshot}）に、別の作業ツリーかリポジトリがある。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す: ${remaining}" >&2
@@ -258,13 +313,14 @@ if [ "$owned" -eq 1 ]; then
   # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
   # .build がシンボリックリンクなら、リンクの先（作業ツリーの外の場所）の中を消しうるので、消さずに止める
   # Package の .build も、リンクなら check.sh がカバレッジの記録をリンクの先に書くので、同じく止める
-  for build in "$snapshot/.build" "$snapshot/Packages/MinutesKit/.build"; do
+  for build in "$staging/tree/.build" "$staging/tree/Packages/MinutesKit/.build"; do
     if [ -L "$build" ]; then
-      echo "NG: 専用の作業ツリーの ${build} がシンボリックリンク。中身を確かめて削除してから push し直す" >&2
+      echo "NG: 専用の作業ツリーの ${build#"$staging/tree/"} がシンボリックリンク。中身を確かめて削除してから push し直す" >&2
       exit 1
     fi
   done
-  rm -rf -- "$snapshot/.build/minutes-coverage.lock"
+  rm -rf -- "$staging/tree/.build/minutes-coverage.lock"
+  restore_staging
 else
   # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すもの・このフックの印のない
   # 作業ツリーなど）が置き場所にあれば、変更せずに止める（中身が何かを確かめられないものを checkout・clean・rm -rf しない）。
@@ -282,7 +338,7 @@ else
     || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
   printf '%s\n' "$owner_text" > "$private/$owner_mark"
   git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
-  full_checkout
+  full_checkout "$snapshot"
 fi
 # 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では
 # smudge のフィルタは止まらない。変わった内容を送信するコミットの合格として検査しない）
@@ -327,7 +383,7 @@ for link in "$tools_source"/bin/*; do
     exit 1
   fi
 done
-rm -rf -- "$tools_copy"
+# 前の写しは、上で専用の作業ツリーを合わせるときに消してある（ここで消すと、後から登録された作業ツリーを消しうる）
 mkdir "$tools_copy"
 for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
   if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi  # 一致するものがないときの glob の文字列

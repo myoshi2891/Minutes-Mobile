@@ -128,9 +128,10 @@ custom_rules:
     severity: error
 
   # Documents は保存ルートの型の中でも使わない（保存先は Application Support に限る）。例外の場所を持たない
+  # documentsDirectory は API の参照（URL.documentsDirectory・省略形の .documentsDirectory）だけを検出し、同じ名前の局所変数は認める
   no_documents_directory:
     name: "Documents ディレクトリの禁止"
-    regex: '\.documentDirectory\b|\bdocumentsDirectory\b'
+    regex: '\.documentDirectory\b|\.\s*`?documentsDirectory\b'
     match_kinds: *code
     message: "保存先は Application Support に限る（SEC-DAT-04）"
     severity: error

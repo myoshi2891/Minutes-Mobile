@@ -528,18 +528,21 @@ def target_expander(
 
     key を指定した場合（ビルド設定の値を展開する場合）は、その書き方の条件（config・sdk）に合う構成・SDK だけで展開し
     （Debug だけの書き方を Release の値で判定しない）、$(inherited) をその設定の継承元で展開する。
-    arch の条件は構成・SDK では決まらないので、どの構成・SDK でも効きうるものとして展開する。
+    arch の条件も同じく、合う arch だけで展開する（arm64 だけの書き方が参照する arm64 だけの設定を、展開できないとしない）。
     """
     condition = conditions(key) if key is not None else {}
     setting = key.split("[", 1)[0] if key is not None else None
 
-    def applies(configuration: str, sdk: str) -> bool:
+    def applies(configuration: str, variant: Variant) -> bool:
         if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
             return False
-        return "sdk" not in condition or sdk_matches(sdk, condition["sdk"], str(key))
+        # arch の条件の書き方があれば build_variants は arch を持つ組を返す（arch が None の組には arch の条件がない）
+        if "arch" in condition and variant.arch is not None and not fnmatch.fnmatchcase(variant.arch, condition["arch"]):
+            return False
+        return "sdk" not in condition or sdk_matches(variant.sdk, condition["sdk"], str(key))
 
-    return lambda text: [expand_value(text, own, shared, c, Variant(s), setting=setting, from_target=from_target)
-                         for c in configurations for s in SDKS if applies(c, s)]
+    return lambda text: [expand_value(text, own, shared, c, v, setting=setting, from_target=from_target)
+                         for c in configurations for v in build_variants(own, shared) if applies(c, v)]
 
 
 def combined_expander(expanders: List[Expander]) -> Expander:

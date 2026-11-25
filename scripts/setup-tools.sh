@@ -356,6 +356,8 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
   check_field "リポジトリ" "${repo:-}" '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
   check_field "タグ" "${tag:-}" '^v?[0-9]+(\.[0-9]+)*$'
   check_field "配布ファイル" "${asset:-}" '^[A-Za-z0-9_.-]+$'
+  # 展開できる形式だけを認める（展開のときの判定は、二重の確認として残す）
+  case "$asset" in *.zip | *.tar.gz) ;; *) fail "tools/versions の配布ファイルの形式に対応していない: $asset" ;; esac
   check_field "実行ファイル" "${binary:-}" '^[a-z][a-z0-9-]*$'
   check_field "SHA-256" "${sha:-}" '^[0-9a-f]{64}$'
   case "$seen" in *" $name "*) ;; *) seen="$seen$name " ;; esac

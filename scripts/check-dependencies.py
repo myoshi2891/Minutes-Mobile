@@ -712,6 +712,16 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
         return [f"ローカルの Package {location} は検査の対象外のディレクトリにある: .package({summary})"]
     if root is None:
         return []
+    # 参照先の途中の要素を含め、測定の写しの外を指す（絶対パスで中を指すものも含む）ディレクトリのリンクは、解決した先が Packages/ の
+    # 中でも写しの中で解決できないので、解決する前に認めない
+    try:
+        for depth in range(1, len(parts) + 1):
+            alias = os.path.join(root, *parts[:depth])
+            if os.path.islink(alias) and leaves_coverage_input(root, alias, set()):
+                return [f"ローカルの Package {location} の {'/'.join(parts[:depth])} が {LOCAL_PACKAGE_ROOT}/ の外を指すリンク: "
+                        f".package({summary})"]
+    except OSError as error:
+        raise Unreadable(f"{root / location}: {error}") from error
     try:
         target = (root / location).resolve()
     except RuntimeError as error:  # 循環するリンク（Python 3.9〜3.12）

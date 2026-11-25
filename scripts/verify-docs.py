@@ -27,7 +27,7 @@ import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_LINES = 2000
@@ -445,8 +445,12 @@ class Opener:
         self.active = True
 
 
-def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tuple[List[str], List[Opener], str]:
-    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」と、リンク先とタイトルの中を空白にした行を返す。
+def link_destinations(line: str, openers: Optional[List[Opener]] = None,
+                      following: Sequence[str] = ()) -> Tuple[List[str], List[Opener], List[str]]:
+    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」と、リンク先とタイトルの中を空白にした行（following を含む）を返す。
+
+    following は同じ段落の続きの行。この行で始まったリンクのタイトルと閉じる「)」は続きの行にも書ける（GFM と同じ）。
+    続きの行で始まるリンクは読まない（呼び出し側が、空白にした続きの行をこの後に渡す）。
 
     参照形式のリンクは返した行から探す（リンク先・タイトルの中の「[文][ラベル]」は参照にならない。「(」「)」と位置は変えない）。
 
@@ -457,61 +461,62 @@ def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tupl
     とれたもの（design(v2).md の「)」をリンクの終わりと取り違えない。CommonMark と同じ）。その後にタイトルを書ける。"""
     found: List[str] = []
     stack = list(openers or [])
-    rest = line
+    text = "\n".join([line, *following])
+    rest = text
     position = 0
     previous = ""  # 直前に読んだ文字（エスケープは「\\」と続く文字を 1 回で読むので、エスケープした「!」は残らない）
     while position < len(line):
-        char = line[position]
+        char = text[position]
         before, previous = previous, char
-        position += 2 if char == "\\" and line[position + 1:position + 2] in tuple(ASCII_PUNCTUATION) else 1
+        position += 2 if char == "\\" and text[position + 1:position + 2] in tuple(ASCII_PUNCTUATION) else 1
         if char == "[":
             stack.append(Opener(before == "!"))
         if char != "]" or not stack:
             continue
         opener = stack.pop()
-        if not opener.active or not line.startswith("(", position):
+        if not opener.active or not text.startswith("(", position):
             continue
         at = position + 1
         # 「(」の直後の空白は読み飛ばす（CommonMark。「[設計]( missing.md)」もリンクとして確かめる）
-        while at < len(line) and line[at] in " \t":
+        while at < len(text) and text[at] in " \t":
             at += 1
-        if line.startswith("<", at):
-            close = line.find(">", at)
-            if close < 0 or re.search(r"[<\n]", line[at + 1:close]) or close == at + 1:
+        if text.startswith("<", at):
+            close = text.find(">", at)
+            if close < 0 or re.search(r"[<\n]", text[at + 1:close]) or close == at + 1:
                 continue
-            destination = line[at:close + 1]
+            destination = text[at:close + 1]
             at = close + 1
         else:
             begin, depth = at, 0
-            while at < len(line) and not line[at].isspace():
+            while at < len(text) and not text[at].isspace():
                 # エスケープした文字（「\(」「\)」など）は括弧の対として数えない（CommonMark）。エスケープは check_link が戻す
-                if line[at] == "\\" and at + 1 < len(line) and line[at + 1] in ASCII_PUNCTUATION:
+                if text[at] == "\\" and at + 1 < len(text) and text[at + 1] in ASCII_PUNCTUATION:
                     at += 2
                     continue
-                if line[at] == "(":
+                if text[at] == "(":
                     depth += 1
-                elif line[at] == ")":
+                elif text[at] == ")":
                     if depth == 0:
                         break
                     depth -= 1
                 at += 1
             if depth != 0 or at == begin:
                 continue
-            destination = line[begin:at]
-        title = LINK_TITLE.match(line, at)
+            destination = text[begin:at]
+        title = LINK_TITLE.match(text, at)
         if title:
             at = title.end()
-        while at < len(line) and line[at].isspace():
+        while at < len(text) and text[at].isspace():
             at += 1
-        if line.startswith(")", at):
+        if text.startswith(")", at):
             found.append(destination)
-            rest = rest[:position + 1] + " " * (at - position - 1) + rest[at:]
+            rest = rest[:position + 1] + re.sub(r"[^\n]", " ", rest[position + 1:at]) + rest[at:]
             position = at + 1  # リンク先の中の括弧を、リンクの文の括弧と数えない
             previous = ""
             if not opener.image:
                 for outer in stack:
                     outer.active = outer.active and outer.image
-    return found, stack, rest
+    return found, stack, rest.split("\n")
 
 
 def table_cells(line: str) -> List[str]:
@@ -971,42 +976,57 @@ class Checker:
             for number, label, destination in reference_definitions(text, set(quoted)):
                 definition_lines.add(number)
                 definitions.setdefault(reference_label(label), destination)
-            openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」
+            rows = {number for _, block in tables(text) for number, _ in block}
+            # 確かめる行（行番号, 本文, 前の行と同じ段落の続きか）。先に集め、リンクのタイトルを同じ段落の続きの行から読めるようにする
+            entries: List[Tuple[int, str, bool]] = []
             previous = 0  # 前の行の番号
+            continued = False  # 前の行が段落の途中で、次の行に続きうる
             code = IndentedCode()
             for number, line in prose_lines(text):
-                is_definition = number in definition_lines
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
-                if number != previous + 1 or not line.strip() or BLOCK_START.match(line):
-                    openers = []
+                starts = number != previous + 1 or not line.strip() or BLOCK_START.match(line) is not None or not continued
                 if number != previous + 1:
                     code.interrupt()
                 previous = number
+                continued = False
                 # 引用の中のコードフェンスの行はリンクとして確かめない（言語の指定は上で確かめた）
                 if number in quoted:
-                    openers = []
                     code.interrupt()
                     continue
                 # 字下げしたコードブロックの中はリンクとして確かめない（段落の続きの行・箇条書きの中の段落は確かめる）
                 if code.is_code(line):
-                    openers = []
                     continue
                 # コメントで始まる行は、行の全体が HTML のブロックで、閉じた後ろの文字もリンクにならない（CommonMark）。
                 # 段落も切れる。コード片の印の照合は check_snippets が別に行う
                 if COMMENT_OPEN.match(line):
-                    openers = []
                     code.interrupt()
                     continue
+                # 見出し・区切りの線・表の行は 1 行で終わり、次の行に続かない
+                alone = PARAGRAPH_END.match(line) is not None or number in rows or is_separator(line) or not line.strip()
+                continued = not alone
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
                 line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない
-                targets, openers, line = link_destinations(line, openers)
+                entries.append((number, line, not (starts or alone)))
+            openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」
+            pending: List[str] = []  # 同じ段落の続きの行（前の行のリンクの一部を空白にしたもの）
+            for at, (number, line, continues) in enumerate(entries):
+                if continues:
+                    line = pending.pop(0)
+                else:
+                    openers = []
+                    pending = []
+                    for _, later, joined in entries[at + 1:]:
+                        if not joined:
+                            break
+                        pending.append(later)
+                targets, openers, (line, *pending) = link_destinations(line, openers, pending)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
                     if target is not None:
                         targets.append(target)
                 # 定義の行の [ラベル] は使用ではない。定義のないラベルはリンクにならない
-                for label in [] if is_definition else SHORTCUT_LINK.findall(line):
+                for label in [] if number in definition_lines else SHORTCUT_LINK.findall(line):
                     target = definitions.get(reference_label(label))
                     if target is not None:
                         targets.append(target)
@@ -1279,27 +1299,39 @@ class Checker:
                     continue  # 検査の側（check_snippets）が印の行とともに報告する
                 if path in names:
                     sources[document].append(path)
+        # 自身に到達できる文書が循環に属する（処理の順序によらず、引用の関係だけで決める）
+        reachable: Dict[Path, Set[Path]] = {}
+        for document in names:
+            reachable[document] = set()
+            waiting = list(sources[document])
+            while waiting:
+                source = waiting.pop()
+                if source not in reachable[document]:
+                    reachable[document].add(source)
+                    waiting.extend(sources[source])
+        cyclic = {document for document in names if document in reachable[document]}
+        reported: Set[Path] = set()
+        for document in names:
+            if document not in cyclic or document in reported:
+                continue
+            # 互いに到達できる文書のまとまりごとに 1 回報告する
+            group = [path for path in names if path in reachable[document] and document in reachable[path]]
+            reported.update(group)
+            shown = "・".join(names[path][0] for path in group)
+            self.error(names[document][0], f"全文のコード片の引用が循環している（{shown}）。コード片を書き直さない")
         order: List[Path] = []
-        finished: Set[Path] = set()
-        cyclic: Set[Path] = set()
+        visited: Set[Path] = set()
 
-        def visit(document: Path, trail: List[Path]) -> None:
-            if document in trail:
-                cycle = trail[trail.index(document):]
-                if not cyclic.issuperset(cycle):
-                    cyclic.update(cycle)
-                    shown = " → ".join(names[path][0] for path in cycle + [document])
-                    self.error(names[document][0], f"全文のコード片の引用が循環している（{shown}）。コード片を書き直さない")
+        def visit(document: Path) -> None:
+            if document in visited:
                 return
-            if document in finished:
-                return
+            visited.add(document)
             for source in sources[document]:
-                visit(source, trail + [document])
-            finished.add(document)
+                visit(source)
             order.append(document)
 
         for document in names:
-            visit(document, [])
+            visit(document)
         return [name for document in order if document not in cyclic for name in names[document]]
 
     def update_snippets(self) -> None:
