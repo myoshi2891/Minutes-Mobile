@@ -124,6 +124,18 @@ def check(requested: str, source: str) -> int:
     return 0
 
 
+def under(path: str, parent_identity: Tuple[int, int]) -> bool:
+    """登録されたパスの祖先（自身は含まない）のどれかが、parent_identity のディレクトリと同じか。"""
+    current = os.path.dirname(path)
+    while True:
+        if identity(current, registered=True) == parent_identity:
+            return True
+        upper = os.path.dirname(current)
+        if upper == current:
+            return False
+        current = upper
+
+
 def nested(source: str, parent_path: str) -> int:
     parent_identity = identity(parent_path)
     if parent_identity is None:
@@ -132,18 +144,12 @@ def nested(source: str, parent_path: str) -> int:
     found = False
     for listed in registered_worktrees(source):
         path = os.fsdecode(listed)
-        # 祖先（自身は含まない）のどれかが同じディレクトリなら、その下にある（check と同じく文字列では比べない）
-        current = os.path.dirname(path)
-        while True:
-            if identity(current, registered=True) == parent_identity:
-                print(f"NG: 専用の作業ツリー（{parent_path}）の下に別の作業ツリー（{path}）が登録されている。"
-                      "git worktree move か remove で外してからやり直す", file=sys.stderr)
-                found = True
-                break
-            upper = os.path.dirname(current)
-            if upper == current:
-                break
-            current = upper
+        # 祖先（自身は含まない）のどれかが同じディレクトリなら、その下にある（check と同じく文字列では比べない）。登録の後に
+        # 途中の要素がシンボリックリンクに置き換わると、登録されたパスの祖先には現れないので、リンクを解決したパスの祖先も比べる
+        if under(path, parent_identity) or under(os.path.realpath(path), parent_identity):
+            print(f"NG: 専用の作業ツリー（{parent_path}）の下に別の作業ツリー（{path}）が登録されている。"
+                  "git worktree move か remove で外してからやり直す", file=sys.stderr)
+            found = True
     return 1 if found else 0
 
 

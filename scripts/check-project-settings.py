@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 from xml.parsers.expat import ExpatError
 
 from xcproj import Unreadable, load_project
@@ -131,16 +131,42 @@ def conditions(key: str) -> Dict[str, str]:
     return dict(re.findall(r"\[(\w+)=([^\]]*)\]", key))
 
 
+class Variant(NamedTuple):
+    """ビルドの SDK と arch。arch が None なら、arch の条件の書き方は決まらないものとして扱う。"""
+    sdk: str
+    arch: Optional[str] = None
+
+    def label(self) -> str:
+        return self.sdk if self.arch is None else f"{self.sdk}・{self.arch}"
+
+
+# arch の条件を判定する代表の値。書き方に現れる値と、どの名前とも一致しない値（条件の外のビルド）を build_variants が足す
+ARCHS = ("arm64", "arm64e", "x86_64")
+OTHER_ARCH = "その他の arch"
+
+
+def build_variants(own: dict, shared: dict) -> List[Variant]:
+    """判定する SDK と arch の組。arch の条件の書き方がなければ SDK だけの組を返す（arch で結果が変わらない）。"""
+    patterns = {conditions(key)["arch"] for level in (own, shared) for key in level if "arch" in conditions(key)}
+    if not patterns:
+        return [Variant(sdk) for sdk in SDKS]
+    literals = sorted({pattern.replace("*", "").replace("?", "x") for pattern in patterns} - {""})
+    return [Variant(sdk, arch) for sdk in SDKS for arch in dict.fromkeys([*ARCHS, *literals, OTHER_ARCH])]
+
+
 def resolve(
-    own: dict, shared: dict, name: str, configurations: List[str], sdk: Optional[str] = None
+    own: dict, shared: dict, name: str, configurations: List[str], variant: Optional[Variant] = None
 ) -> Tuple[Dict[Tuple[str, str], List[str]], List[str]]:
     """構成ごとに効く書き方を求める。戻り値は（鍵, 値）→ 構成の一覧 と、どの段でも決まらない構成の一覧。
 
     ターゲットの設定がプロジェクトの設定を上書きし、同じ段では構成の条件が一致する書き方が条件のない書き方を上書きする。
-    sdk を指定しない場合、構成以外の条件（sdk・arch）の書き方は、その条件のビルドで効きうるので、すべて検査の対象にする。
-    sdk を指定した場合は、sdk の条件も構成と同じく一致するものだけを使い、構成と sdk の条件だけを持つ書き方で決まったとみなす。
+    variant を指定しない場合、構成以外の条件（sdk・arch）の書き方は、その条件のビルドで効きうるので、すべて検査の対象にする。
+    指定した場合は、sdk の条件（arch も指定していれば arch の条件）も構成と同じく一致するものだけを使い、それらの条件だけを持つ
+    書き方で決まったとみなす。
     """
-    decided = {"config"} if sdk is None else {"config", "sdk"}
+    decided = {"config"}
+    if variant is not None:
+        decided |= {"sdk"} if variant.arch is None else {"sdk", "arch"}
     effective: Dict[Tuple[str, str], List[str]] = {}
     missing: List[str] = []
     for configuration in configurations:
@@ -151,7 +177,10 @@ def resolve(
                 condition = conditions(key)
                 if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
                     continue
-                if sdk is not None and "sdk" in condition and not sdk_matches(sdk, condition["sdk"], key):
+                if variant is not None and "sdk" in condition and not sdk_matches(variant.sdk, condition["sdk"], key):
+                    continue
+                if (variant is not None and variant.arch is not None and "arch" in condition
+                        and not fnmatch.fnmatchcase(variant.arch, condition["arch"])):
                     continue
                 applicable.append((key, value, condition))
             if any(condition and set(condition) <= decided for _, _, condition in applicable):
@@ -177,7 +206,7 @@ def check_required(
         missing: List[str] = []
         wrong: Dict[str, List[str]] = {}
         for sdk in SDKS:
-            effective, undecided = resolve(own, shared, name, configurations, sdk)
+            effective, undecided = resolve(own, shared, name, configurations, Variant(sdk))
             missing.extend(f"{configuration}（{sdk}）" for configuration in undecided)
             for (key, value), used in effective.items():
                 if value not in allowed:
@@ -196,18 +225,18 @@ ORIENTATION_KEYS = ("UISupportedInterfaceOrientations~iphone", "UISupportedInter
                     "UISupportedInterfaceOrientations-iphoneos", "UISupportedInterfaceOrientations-iphoneos~iphone")
 
 
-def setting_value(own: dict, shared: dict, name: str, configuration: str, sdk: str) -> Optional[Tuple[str, bool]]:
+def setting_value(own: dict, shared: dict, name: str, configuration: str, variant: Variant) -> Optional[Tuple[str, bool]]:
     """その構成・SDK で効く設定の値と、値がターゲットの段のものかを返す。1 つの値に決まらなければ None。
 
     resolve と同じく、ターゲットの段で決まればプロジェクトの段は効かない。ターゲットの段に条件（arch など）付きの
     書き方だけがある場合は、どちらの段の値が効くか決まらないので None とする。
     """
-    effective, undecided = resolve(own, {}, name, [configuration], sdk)
+    effective, undecided = resolve(own, {}, name, [configuration], variant)
     from_target = not undecided
     if not from_target:
         if effective:
             return None
-        effective, undecided = resolve({}, shared, name, [configuration], sdk)
+        effective, undecided = resolve({}, shared, name, [configuration], variant)
         if undecided:
             return None
     values = {value for (_, value) in effective}
@@ -215,7 +244,7 @@ def setting_value(own: dict, shared: dict, name: str, configuration: str, sdk: s
 
 
 def expand_value(
-    text: str, own: dict, shared: dict, configuration: str, sdk: str, depth: int = 0,
+    text: str, own: dict, shared: dict, configuration: str, variant: Variant, depth: int = 0,
     setting: Optional[str] = None, from_target: bool = False
 ) -> Optional[str]:
     """値の中の $(NAME)・${NAME} を、その構成・SDK のビルド設定で展開する。決められなければ None（未確定）。
@@ -236,21 +265,21 @@ def expand_value(
             if setting is None or not from_target:
                 unresolved = True
                 return ""
-            effective, undecided = resolve({}, shared, setting, [configuration], sdk)
+            effective, undecided = resolve({}, shared, setting, [configuration], variant)
             values = {value for (_, value) in effective}
             if undecided or len(values) != 1:
                 unresolved = True
                 return ""
-            inherited = expand_value(values.pop(), own, shared, configuration, sdk, depth + 1, setting, False)
+            inherited = expand_value(values.pop(), own, shared, configuration, variant, depth + 1, setting, False)
             if inherited is None:
                 unresolved = True
                 return ""
             return inherited
-        found_value = setting_value(own, shared, name, configuration, sdk)
+        found_value = setting_value(own, shared, name, configuration, variant)
         if found_value is None:
             unresolved = True
             return ""
-        expanded = expand_value(found_value[0], own, shared, configuration, sdk, depth + 1, name, found_value[1])
+        expanded = expand_value(found_value[0], own, shared, configuration, variant, depth + 1, name, found_value[1])
         if expanded is None:
             unresolved = True
             return ""
@@ -266,18 +295,18 @@ def expand_value(
 EXPAND_PLIST_SETTING = "INFOPLIST_EXPAND_BUILD_SETTINGS"
 
 
-def plist_expansion(own: dict, shared: dict, configuration: str, sdk: str) -> Optional[bool]:
+def plist_expansion(own: dict, shared: dict, configuration: str, variant: Variant) -> Optional[bool]:
     """その構成・SDK で、INFOPLIST_FILE の参照先の値の変数をビルドが展開するか。決められなければ None。
 
     設定がなければ Xcode の既定（YES）とする。条件（arch など）付きの書き方だけで決まらない場合、展開できない値の場合、
     値が書き方によって分かれる場合は None（展開される・されないの両方がありうる）。
     """
-    effective, undecided = resolve(own, shared, EXPAND_PLIST_SETTING, [configuration], sdk)
+    effective, undecided = resolve(own, shared, EXPAND_PLIST_SETTING, [configuration], variant)
     if not effective:
         return True
     results = set()
     for key, value in effective:
-        expanded = expand_value(value, own, shared, configuration, sdk, setting=EXPAND_PLIST_SETTING,
+        expanded = expand_value(value, own, shared, configuration, variant, setting=EXPAND_PLIST_SETTING,
                                 from_target=key in own and as_text(own[key]) == value)
         if expanded is None:
             return None
@@ -288,22 +317,22 @@ def plist_expansion(own: dict, shared: dict, configuration: str, sdk: str) -> Op
 
 
 def infoplist_sources(
-    project_path: Path, target_name: str, own: dict, shared: dict, configuration: str, sdk: str
+    project_path: Path, target_name: str, own: dict, shared: dict, configuration: str, variant: Variant
 ) -> Tuple[set, List[Tuple[Path, dict]], bool]:
     """その構成・SDK で、生成するか（GENERATE_INFOPLIST_FILE の取りうる値）と、INFOPLIST_FILE の参照先の内容と、
     参照先が条件なしに決まらない（または明示的に空の書き方がある）かを返す。"""
-    generate, generate_undecided = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], sdk)
+    generate, generate_undecided = resolve(own, shared, "GENERATE_INFOPLIST_FILE", [configuration], variant)
     modes = set()
     for key, value in generate:
         # 変数（$(NAME)）はその構成・SDK で展開してから判定する。展開できなければ、生成する・しないの両方の経路を検査する
-        expanded = expand_value(value, own, shared, configuration, sdk, setting="GENERATE_INFOPLIST_FILE",
+        expanded = expand_value(value, own, shared, configuration, variant, setting="GENERATE_INFOPLIST_FILE",
                                 from_target=key in own and as_text(own[key]) == value)
         modes.update({True, False} if expanded is None else {enabled(expanded)})
     # 条件（arch など）なしに決まらない構成では、設定のない場合（生成しない）も起こりうる
     if generate_undecided or not modes:
         modes.add(False)
     plists, plists_undecided = referenced_files(
-        project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk)
+        project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", variant)
     return modes, [(path, load_plist(path)) for path in plists], plists_undecided
 
 
@@ -349,9 +378,9 @@ def check_plist_values(
         empty: Dict[str, List[str]] = {}
         # 効きうる候補のうち展開できないもの。ほかの候補で補えるかによらず違反とする（展開できない値を見逃さない）
         unresolved: Dict[str, List[str]] = {}
-        for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
-            build = f"{configuration}（{sdk}）"
-            modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, sdk)
+        for configuration, variant in ((c, v) for c in configurations for v in build_variants(own, shared)):
+            build = f"{configuration}（{variant.label()}）"
+            modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, variant)
             from_files: List[Tuple[str, str]] = []
             lacking = False  # 参照先の plist のうち、鍵を持たない・値を決められないものがある
             for path, data in plists:
@@ -366,12 +395,12 @@ def check_plist_values(
                     # 決められない構成・SDK では、変数を含む値を展開後の値で認めない（向きの検査と同じ。ビルドの結果に変数の
                     # 文字列がそのまま残りうる）。変数を含まない値は、これまでどおり空でなければ認める
                     if (isinstance(value, str) and VARIABLE.search(value)
-                            and plist_expansion(own, shared, configuration, sdk) is not True):
+                            and plist_expansion(own, shared, configuration, variant) is not True):
                         lacking = True
                         unresolved.setdefault(f"{source} の {key}（{EXPAND_PLIST_SETTING} で変数が展開されない構成）",
                                               []).append(build)
                         continue
-                    expanded = expand_value(value, own, shared, configuration, sdk) if isinstance(value, str) else ""
+                    expanded = expand_value(value, own, shared, configuration, variant) if isinstance(value, str) else ""
                     if expanded is None:
                         lacking = True
                         unresolved.setdefault(f"{source} の {key}", []).append(build)
@@ -381,16 +410,16 @@ def check_plist_values(
             settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
             if True in modes:
                 # ビルド設定も、iPhone のビルドで使われる鍵（最も具体的な組のうち、その構成・SDK で効く書き方があるもの）を検査する
-                chosen = applicable_keys(name, lambda candidate, c=configuration, s=sdk: bool(
-                    resolve(own, shared, f"INFOPLIST_KEY_{candidate}", [c], s)[0]))
+                chosen = applicable_keys(name, lambda candidate, c=configuration, v=variant: bool(
+                    resolve(own, shared, f"INFOPLIST_KEY_{candidate}", [c], v)[0]))
                 settings_unresolved = False
                 undecided: List[str] = []
                 for candidate in chosen:
                     setting = f"INFOPLIST_KEY_{candidate}"
-                    effective, missing_here = resolve(own, shared, setting, [configuration], sdk)
+                    effective, missing_here = resolve(own, shared, setting, [configuration], variant)
                     undecided.extend(missing_here)
                     for key, value in effective:
-                        expanded = expand_value(value, own, shared, configuration, sdk, setting=setting,
+                        expanded = expand_value(value, own, shared, configuration, variant, setting=setting,
                                                 from_target=key in own and as_text(own[key]) == value)
                         if expanded is None:
                             settings_unresolved = True
@@ -435,9 +464,9 @@ def check_plist_orientation(
     """
     missing: List[str] = []
     wrong: Dict[str, List[str]] = {}
-    for configuration, sdk in ((c, s) for c in configurations for s in SDKS):
-        build = f"{configuration}（{sdk}）"
-        modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, sdk)
+    for configuration, variant in ((c, v) for c in configurations for v in build_variants(own, shared)):
+        build = f"{configuration}（{variant.label()}）"
+        modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, variant)
         covered = bool(plists) and not plists_undecided
         for path, data in plists:
             present = [key for key in ORIENTATION_KEYS if key in data]
@@ -451,12 +480,12 @@ def check_plist_orientation(
                 # 変数の文字列がそのまま残りうる）
                 value = data[key]
                 items = value if isinstance(value, list) else None
-                expands = plist_expansion(own, shared, configuration, sdk)
+                expands = plist_expansion(own, shared, configuration, variant)
                 if items is not None and expands is not True and any(isinstance(item, str) and VARIABLE.search(item)
                                                                        for item in items):
                     wrong.setdefault(f"{source} の {key}（{EXPAND_PLIST_SETTING} で変数が展開されない構成）", []).append(build)
                     continue
-                expanded = ([expand_value(item, own, shared, configuration, sdk) if isinstance(item, str) else None
+                expanded = ([expand_value(item, own, shared, configuration, variant) if isinstance(item, str) else None
                              for item in items] if items is not None else None)
                 if expanded is not None and any(item is None for item in expanded):
                     wrong.setdefault(f"{source} の {key}（展開できない）", []).append(build)
@@ -464,11 +493,11 @@ def check_plist_orientation(
                     wrong.setdefault(f"{source} の {key}", []).append(build)
         settings_cover = False  # ビルド設定の値が、この構成・SDK で条件（arch など）なしに効く
         if True in modes:
-            effective, undecided = resolve(own, shared, ORIENTATION_SETTING, [configuration], sdk)
+            effective, undecided = resolve(own, shared, ORIENTATION_SETTING, [configuration], variant)
             for (key, value), _ in effective.items():
                 # 変数（$(NAME)）はその構成・SDK で展開してから判定する（GENERATE_INFOPLIST_FILE と同じ）。
                 # 展開できない値は縦だけと見なさない
-                expanded = expand_value(value, own, shared, configuration, sdk, setting=ORIENTATION_SETTING,
+                expanded = expand_value(value, own, shared, configuration, variant, setting=ORIENTATION_SETTING,
                                         from_target=key in own and as_text(own[key]) == value)
                 if expanded is None:
                     wrong.setdefault(f"{key} = {value}（展開できない）", []).append(build)
@@ -509,7 +538,7 @@ def target_expander(
             return False
         return "sdk" not in condition or sdk_matches(sdk, condition["sdk"], str(key))
 
-    return lambda text: [expand_value(text, own, shared, c, s, setting=setting, from_target=from_target)
+    return lambda text: [expand_value(text, own, shared, c, Variant(s), setting=setting, from_target=from_target)
                          for c in configurations for s in SDKS if applies(c, s)]
 
 
@@ -624,7 +653,8 @@ def load_plist(path: Path) -> dict:
     try:
         with path.open("rb") as handle:
             data = plistlib.load(handle)
-    except (OSError, plistlib.InvalidFileException, ValueError, ExpatError) as error:  # 壊れた XML は ExpatError になる
+    # 壊れた XML は ExpatError、形の違う日付（<date>）は AttributeError になる（plistlib が照合の失敗を確かめない）
+    except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, AttributeError) as error:
         raise Unreadable(f"{path}: {error}") from error
     if not isinstance(data, dict):
         raise Unreadable(f"{path}: 最上位が辞書でない")
@@ -656,7 +686,7 @@ def require_tracked(source: str, path: Path, root: Path, tracked: Optional[Set[P
 
 def referenced_files(
     project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str,
-    sdk: Optional[str] = None, root: Optional[Path] = None, tracked: Optional[Set[Path]] = None
+    variant: Optional[Variant] = None, root: Optional[Path] = None, tracked: Optional[Set[Path]] = None
 ) -> Tuple[List[Path], bool]:
     """ビルド設定（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）がその構成で指すファイルと、
     参照先が条件（arch など）なしには決まらないか（resolve の未確定、または空の書き方が効きうる）を返す。
@@ -671,7 +701,7 @@ def referenced_files(
     parent = resolved(project_path).parent
     source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
     known = {"SRCROOT": str(source_root), "PROJECT_DIR": str(source_root), "TARGET_NAME": target}
-    effective, undecided = resolve(own, shared, setting, [configuration], sdk)
+    effective, undecided = resolve(own, shared, setting, [configuration], variant)
     paths: List[Path] = []
     explicit_empty = False  # 空の書き方（INFOPLIST_FILE[arch=arm64] = "" など）が効きうる
     for (key, value), _ in effective.items():
@@ -734,14 +764,14 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
         for configuration in configurations:
-            for sdk in SDKS:
-                for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", sdk,
+            for variant in build_variants(own, shared):
+                for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", variant,
                                              root, tracked)[0]:
                     referenced.setdefault(path, []).append(
                         # ビルドが plist の変数を展開しない・展開するかを決められない構成では、展開後の値で判定しない
                         # （None = 判定できない。check_plist_values・check_plist_orientation と同じ）
-                        lambda text, own=own, c=configuration, s=sdk: [
-                            expand_value(text, own, shared, c, s) if plist_expansion(own, shared, c, s) is True else None])
+                        lambda text, own=own, c=configuration, v=variant: [
+                            expand_value(text, own, shared, c, v) if plist_expansion(own, shared, c, v) is True else None])
             entitlements.extend(
                 referenced_files(project_path, target_name, own, shared, configuration, "CODE_SIGN_ENTITLEMENTS",
                                  None, root, tracked)[0])

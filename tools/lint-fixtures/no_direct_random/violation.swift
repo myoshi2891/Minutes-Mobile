@@ -25,3 +25,5 @@ let deeper = Int.random(in: 0..<f(g(h(i(1)))), using: &generator) // expect: no_
 let inRawString = Int.random(in: 0..<#"a", using: &generator"#.count) // expect: no_direct_random
 let inDoubleRaw = Int.random(in: 0..<##"a"#, using: &generator"##.count) // expect: no_direct_random
 let inNestedRaw = Int.random(in: 0..<length(of: #"a"), using: &generator"#)) // expect: no_direct_random
+// 「.」と名前の間の空白があっても検出する
+let spaced = Int . random(in: 0...1) // expect: no_direct_random

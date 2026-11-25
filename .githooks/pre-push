@@ -65,11 +65,19 @@ base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
 # 置き場所の判定（実体のパスへの解決・SwiftFormat の設定のある祖先の拒否・元のリポジトリと登録されたすべての作業ツリーの
 # 中の拒否）は scripts/worktree-location.py が行う（check.sh --require-clean と共用する）。中に置くと、SwiftFormat などが
 # 親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る（中にディレクトリを残さない）。
-# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める
+# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。
+# スクリプトは、送信するコミット（最初に解決した HEAD）から 1 回だけ書き出し、3 つの操作（check・registered・nested）に同じものを使う
+# （元の作業ツリーが sparse checkout で scripts/ がなくても判定でき、途中の書き換えで判定が変わらない）
+location_script=$(mktemp)
+trap 'status=$?; rm -f -- "$location_script"; exit "$status"' EXIT
+git cat-file blob "$head:scripts/worktree-location.py" > "$location_script" \
+  || { echo "NG: 送信するコミットの scripts/worktree-location.py を読めない" >&2; exit 1; }
+# -I: 書き出した場所（一時ディレクトリ）に置かれた同名のモジュール（subprocess.py など）を読み込ませない
+worktree_location() { /usr/bin/python3 -I "$location_script" "$@"; }
 # 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
 location_status=0
 location_out=$(mktemp)
-/usr/bin/python3 "$source_root/scripts/worktree-location.py" check "$base" "$source_root" > "$location_out" || location_status=$?
+worktree_location check "$base" "$source_root" > "$location_out" || location_status=$?
 resolved_base=""
 if [ "$location_status" = 0 ] && ! IFS= read -r -d '' resolved_base < "$location_out"; then location_status=2; fi
 rm -f -- "$location_out"
@@ -100,7 +108,7 @@ release_locks() {
   if [ -n "$held" ]; then rmdir "$held" 2>/dev/null || true; fi
 }
 # 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
-trap 'status=$?; release_locks; exit "$status"' EXIT
+trap 'status=$?; release_locks; rm -f -- "$location_script"; exit "$status"' EXIT
 # ロック（ディレクトリ $1）を取り、取れたら変数 $2 に場所を記録して 0 を返す。結果を記録するまで、中断は控えるだけにする
 # （取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して
 # 実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
@@ -126,7 +134,7 @@ fi
 # 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）。
 # 照合は記録の worktree の項目（パスの全体）との完全な一致。終了コード: 0 = 登録あり / 1 = 登録なし / 2 = 取得できない
 registration=0
-/usr/bin/python3 "$source_root/scripts/worktree-location.py" registered "$source_root" "$snapshot" || registration=$?
+worktree_location registered "$source_root" "$snapshot" || registration=$?
 case $registration in
   0 | 1) ;;
   *)
@@ -218,7 +226,7 @@ verify_checkout_blobs() {
 if [ "$owned" -eq 1 ]; then
   # 専用の作業ツリーの下に登録された別の作業ツリーがあれば、checkout・clean で中身を失わせうるので、変更せずに止める
   nested=0
-  /usr/bin/python3 "$source_root/scripts/worktree-location.py" nested "$source_root" "$snapshot" || nested=$?
+  worktree_location nested "$source_root" "$snapshot" || nested=$?
   case $nested in
     0) ;;
     1) exit 1 ;;  # 理由とパスは worktree-location.py が標準エラーに書いた
@@ -230,11 +238,21 @@ if [ "$owned" -eq 1 ]; then
   git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout
   # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
-  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。-f を 2 回付け、中に .git を持つ
-  # 入れ子のリポジトリ（追跡していない複製など）も消す（1 回では残る）。残すのは開発ツールの写し（/.tools。下で作り直す）と、
-  # check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
-  # ほかの階層の .build（docs/.build など）は消す。上で専用の作業ツリーそのものであることを確かめてから実行する
-  git -C "$snapshot" clean -q -f -f -d -x -e /.tools -e /.build -e /Packages/MinutesKit/.build
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは開発ツールの写し（/.tools。下で
+  # 作り直す）と、check.sh が使うビルドの成果物の場所（直下の /.build と Package の /Packages/MinutesKit/.build）だけ。
+  # ほかの階層の .build（docs/.build など）は消す。上で専用の作業ツリーそのものであることを確かめてから実行する。
+  # 上の nested の判定の後に利用者が登録した作業ツリー（git worktree add はこのフックのロックを見ないので止められない）を
+  # 消さないよう、-f は 1 回だけ付ける。git clean は、消す直前に .git（ディレクトリかファイル）を持つと分かったディレクトリを残す
+  # （git worktree add は内容より先に .git を書く）。残ったもの（別の作業ツリー・追跡していない複製など）は下で確かめて止める
+  kept=(-e /.tools -e /.build -e /Packages/MinutesKit/.build)
+  git -C "$snapshot" clean -q -f -d -x "${kept[@]}"
+  # -n: 消さずに、残っているもの（-f を 2 回付けると消えるもの）を調べる
+  remaining=$(git -C "$snapshot" clean -n -f -f -d -x "${kept[@]}") \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）に追跡していないものが残っているかを調べられない" >&2; exit 1; }
+  if [ -n "$remaining" ]; then
+    echo "NG: 専用の作業ツリー（${snapshot}）に、別の作業ツリーかリポジトリがある。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す: ${remaining}" >&2
+    exit 1
+  fi
   # 残したビルドの成果物の場所には、中断した前回の検査のカバレッジのロック（check.sh の手順 7・8 が直下の .build に作る）が
   # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
   # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）

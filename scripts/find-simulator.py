@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
 # シミュレータの UDID は UUID（8-4-4-4-12 桁の 16 進数）。simctl は大文字で出すが、大文字小文字は区別しない
@@ -79,11 +79,13 @@ def main() -> int:
                     raise TypeError(f"devices の {runtime} の isAvailable が真偽値でない")
                 if not isinstance(device.get("deviceTypeIdentifier", ""), str):
                     raise TypeError(f"devices の {runtime} の deviceTypeIdentifier が文字列でない")
-        runtimes = {
-            item["identifier"]: version_key(item["version"])
-            for item in data["runtimes"]
-            if item.get("platform") == "iOS" and item.get("isAvailable")
-        }
+        runtimes: Dict[str, Tuple[int, ...]] = {}
+        for item in data["runtimes"]:
+            if item.get("platform") == "iOS" and item.get("isAvailable"):
+                # 同じ識別子が重なると、後の版で前の版を隠して最低 OS の判定を誤るので、形の違う一覧とする
+                if item["identifier"] in runtimes:
+                    raise ValueError(f"runtimes の使える iOS のランタイムの identifier が重複している: {item['identifier']!r}")
+                runtimes[item["identifier"]] = version_key(item["version"])
         # 候補になりうる機種（最低 OS 以上の使えるランタイムの、使える機種）は、機種の識別子が空でない文字列であること
         # （ない・空の識別子を iPhone でないとして読み飛ばし、候補なしと取り違えない）
         for runtime, devices in devices_by_runtime.items():

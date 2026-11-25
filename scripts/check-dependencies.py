@@ -630,13 +630,15 @@ def literal_argument(arguments: str, masked: str, label: str, pattern: "re.Patte
 
     戻り値は（キーワードがコードにあるか, 文字列リテラルの内容。リテラルでなければ None）。
     """
-    # コメントを除いた跡の空白（url /* … */ : "…"）があってもラベルとして読む。探すのは宣言の最上位の引数だけ
-    # （入れ子の呼び出しの引数、例えば name: targetName(url: …) の url: を、宣言の取得元と見なさない）
-    found = re.search(rf"\b{label}\s*:", top_level_only(masked))
-    if not found:
-        return False, None
-    literal = pattern.match(arguments, found.start())
-    return True, literal.group(1) if literal else None
+    # コメントを除いた跡の空白（url /* … */ : "…"）があってもラベルとして読む。探すのは宣言の最上位の引数の先頭だけ
+    # （入れ子の呼び出しの引数、例えば name: targetName(url: …) の url: や、引数の式の中の「条件 ? url : …」の url : を、
+    # 宣言の取得元と見なさない）。文字列リテラルの中の「,」で区切らないよう、区切りは masked で決める
+    for argument, masked_argument in zip(top_level_arguments(arguments, masked), top_level_arguments(masked, masked)):
+        found = re.match(rf"\s*{label}\s*:", masked_argument)
+        if found:
+            literal = pattern.match(argument.lstrip())
+            return True, literal.group(1) if literal else None
+    return False, None
 
 
 def version_errors(arguments: str, masked: str, summary: str, approved: Set[str], pinned: Optional[List[object]]) -> List[str]:
@@ -850,7 +852,9 @@ def package_declarations(manifest: str, directory: str, root: Path) -> Tuple[Lis
 
 Edition = Tuple[Tuple[int, ...], Path]  # 版別の manifest の（接尾辞の版, パス）
 VARIANT_NAME = re.compile(r"Package@swift-(\d+(?:\.\d+){0,2})\.swift")
-TOOLS_VERSION = re.compile(r"\s*//\s*swift-tools-version\s*:\s*(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+# 行頭の「//」で始まる指定の行（行の区切りは LF・CR）。最初に一致した行を読む
+TOOLS_VERSION = re.compile(r"(?:\A|[\r\n])[^\S\r\n]*//[^\S\r\n]*swift-tools-version[^\S\r\n]*:[^\S\r\n]*(\d+)\.(\d+)(?:\.(\d+))?",
+                           re.IGNORECASE)
 
 
 def padded(version: Tuple[int, ...]) -> Version:
@@ -859,9 +863,15 @@ def padded(version: Tuple[int, ...]) -> Version:
 
 
 def tools_version(text: str) -> Optional[Version]:
-    """manifest の先頭の swift-tools-version。読み取れなければ None。"""
-    found = TOOLS_VERSION.match(text)
-    return (int(found.group(1)), int(found.group(2)), int(found.group(3) or 0)) if found else None
+    """manifest の swift-tools-version。読み取れなければ None。
+
+    6.0 以降の指定は、先頭の行でなくてもよい（ほかのコメントの後など）。5.x までの指定は、空行を除く先頭の行だけを認める
+    （後の行の 5.x の指定は SwiftPM がエラーにする）。2026-11-25 に Swift 6.4.2 の swift package dump-package で確かめた。
+    """
+    found = TOOLS_VERSION.search(text)
+    if found is None or (int(found.group(1)) < 6 and text[:found.start()].strip()):
+        return None
+    return int(found.group(1)), int(found.group(2)), int(found.group(3) or 0)
 
 
 def selected_manifests(texts: Dict[Path, str], directory: Path, editions: List[Edition], toolchain: Version) -> List[Path]:
@@ -869,8 +879,9 @@ def selected_manifests(texts: Dict[Path, str], directory: Path, editions: List[E
 
     選び方（2026-11-25 に Swift 6.4.2 の swift package dump-package で確かめた）: 接尾辞が major.minor.patch・major.minor・major と
     一致するものをこの順に選ぶ。なければ、接尾辞がツールの版以下で最も新しいものを、その tools-version が Package.swift の
-    tools-version より新しい場合だけ選び、それ以外は Package.swift を選ぶ。ツールより新しい tools-version の manifest は
-    そのツールでは読めないので、たどらない。
+    tools-version より新しい場合と、Package.swift の tools-version がツールより新しい（そのツールで読めない）場合に選び、
+    それ以外は Package.swift を選ぶ。選んだ manifest の tools-version がツールより新しければ、そのツールでは読めないので
+    たどらない（次に新しいものへは移らない）。
     """
     regular = directory / "Package.swift"
     by_suffix = dict(editions)
@@ -886,9 +897,9 @@ def selected_manifests(texts: Dict[Path, str], directory: Path, editions: List[E
         # 同じ版を表す接尾辞（6 と 6.0）が並ぶときの優先は確かめていないので、どちらもありうるものとする
         for newest in [path for suffix, path in lower if padded(suffix) == highest]:
             ours = tools_version(texts[newest])
-            if regular not in texts or ours is None or base is None or ours > base:
+            if regular not in texts or ours is None or base is None or ours > base or base > toolchain:
                 chosen.append(newest)
-            if regular in texts and (ours is None or base is None or ours <= base):
+            if regular in texts and (ours is None or base is None or (ours <= base and base <= toolchain)):
                 chosen.append(regular)
         if not lower and regular in texts:
             chosen = [regular]

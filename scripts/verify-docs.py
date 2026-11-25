@@ -445,8 +445,10 @@ class Opener:
         self.active = True
 
 
-def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tuple[List[str], List[Opener]]:
-    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」を返す。
+def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tuple[List[str], List[Opener], str]:
+    """行の中のインラインのリンクのリンク先と、行末で開いたままの「[」と、リンク先とタイトルの中を空白にした行を返す。
+
+    参照形式のリンクは返した行から探す（リンク先・タイトルの中の「[文][ラベル]」は参照にならない。「(」「)」と位置は変えない）。
 
     リンクの文を閉じる「]」（エスケープされておらず、対になるエスケープされていない「[」がある）の直後の「(」だけをリンク先の
     始まりとする（「\\[例](missing.md)」はリンクにならない）。リンクの文は同じ段落の中で行をまたげるので、前の行から
@@ -455,6 +457,7 @@ def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tupl
     とれたもの（design(v2).md の「)」をリンクの終わりと取り違えない。CommonMark と同じ）。その後にタイトルを書ける。"""
     found: List[str] = []
     stack = list(openers or [])
+    rest = line
     position = 0
     previous = ""  # 直前に読んだ文字（エスケープは「\\」と続く文字を 1 回で読むので、エスケープした「!」は残らない）
     while position < len(line):
@@ -502,12 +505,13 @@ def link_destinations(line: str, openers: Optional[List[Opener]] = None) -> Tupl
             at += 1
         if line.startswith(")", at):
             found.append(destination)
+            rest = rest[:position + 1] + " " * (at - position - 1) + rest[at:]
             position = at + 1  # リンク先の中の括弧を、リンクの文の括弧と数えない
             previous = ""
             if not opener.image:
                 for outer in stack:
                     outer.active = outer.active and outer.image
-    return found, stack
+    return found, stack, rest
 
 
 def table_cells(line: str) -> List[str]:
@@ -995,7 +999,7 @@ class Checker:
                     continue
                 line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
                 line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない
-                targets, openers = link_destinations(line, openers)
+                targets, openers, line = link_destinations(line, openers)
                 for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
@@ -1022,7 +1026,8 @@ class Checker:
             return
         # パーセント符号化（%20 など）は、節へのリンクを分けた後に戻してから解決する（GitHub の表示と同じく、符号化した
         # 名前のリンクも実際のファイルを指す）
-        path = (self.root / name).parent / urllib.parse.unquote(target.split("#", 1)[0])
+        # クエリ（?plain=1 など）もファイル名ではない。符号化した %23・%3F は名前の文字なので、分けた後に戻す
+        path = (self.root / name).parent / urllib.parse.unquote(re.split("[?#]", target, maxsplit=1)[0])
         if not path.exists():
             self.error(name, f"リンクの先がない: {target}", number)
 
@@ -1253,13 +1258,56 @@ class Checker:
             raise Unresolvable(f"{relative}: {problem}")
         return real
 
+    def snippet_order(self) -> List[str]:
+        """全文のコード片を書き直す詳細設計の名前を、引用する側より引用される側を先にして返す。
+
+        先に書き直さないと、書き直す前の内容を写した文書が残り、1 回の書き直しでそろわない。順序を決めるのは全文のコード片の
+        元のファイルが詳細設計の文書の場合だけ（スクリプトなどの元のファイルは書き直さない）。互いに引用する文書はどの順でも
+        そろわないので、循環として報告し、書き直さない。同じ実体を指す名前（リンクの文書）は 1 つの文書として扱う。
+        """
+        names: Dict[Path, List[str]] = {}
+        for name in sorted(self.texts):
+            if name.startswith(DETAILED + "/"):
+                names.setdefault(self.paths[name], []).append(name)
+        sources: Dict[Path, List[Path]] = {}
+        for document, aliases in names.items():
+            sources[document] = []
+            for kind, source in snippet_markers(self.texts[aliases[0]]).values():
+                try:
+                    path = self.snippet_source(source) if kind == "file" and source else None
+                except Unresolvable:
+                    continue  # 検査の側（check_snippets）が印の行とともに報告する
+                if path in names:
+                    sources[document].append(path)
+        order: List[Path] = []
+        finished: Set[Path] = set()
+        cyclic: Set[Path] = set()
+
+        def visit(document: Path, trail: List[Path]) -> None:
+            if document in trail:
+                cycle = trail[trail.index(document):]
+                if not cyclic.issuperset(cycle):
+                    cyclic.update(cycle)
+                    shown = " → ".join(names[path][0] for path in cycle + [document])
+                    self.error(names[document][0], f"全文のコード片の引用が循環している（{shown}）。コード片を書き直さない")
+                return
+            if document in finished:
+                return
+            for source in sources[document]:
+                visit(source, trail + [document])
+            finished.add(document)
+            order.append(document)
+
+        for document in names:
+            visit(document, [])
+        return [name for document in order if document not in cyclic for name in names[document]]
+
     def update_snippets(self) -> None:
         """全文のコード片を、実ファイルの内容で書き直す。"""
         # 書き直した実体のパス → 書き直した内容。同じ実体を指す別の名前（リンクの文書）は書き直さず、読んだ内容を更新する
         written: Dict[Path, str] = {}
-        for name, text in sorted(self.texts.items()):
-            if not name.startswith(DETAILED + "/"):
-                continue
+        for name in self.snippet_order():
+            text = self.texts[name]
             if self.paths.get(name) in written:
                 self.texts[name] = written[self.paths[name]]
                 continue
