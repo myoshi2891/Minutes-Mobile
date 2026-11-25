@@ -127,6 +127,7 @@ stateDiagram-v2
     capturing --> stopping: 利用者が停止・使える入力がない（no_input）・保持の上限（disk_full / write_failed）
     interrupted --> stopping: 利用者が停止（空白区間を停止時刻で閉じる）
     stopping --> idle: 末尾の Chunk を保存
+    stopping --> idle: 時間の上限までに末尾の Chunk を保存できない（PCM を未保存として保持したまま停止を終える。§4）
 ```
 
 ### 5.1 事象ごとの扱い
