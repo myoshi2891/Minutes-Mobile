@@ -41,4 +41,11 @@ func sample() throws {
     do { try work() } catch let error where error.message == #"""
         a" {}
         """# { recorder.record(.failed) }
+    // 条件のふつうの複数行の文字列の中の「"」「{}」を、文字列の終わりや空の本体と取り違えない
+    do { try work() } catch let error where error.message == """
+        a" {}
+        """ { recorder.record(.failed) }
+    do { try work() } catch let error where check("""
+        a" ) {}
+        """, error) { recorder.record(.failed) }
 }

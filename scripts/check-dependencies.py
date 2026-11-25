@@ -176,11 +176,15 @@ def resolved_pins(path: Path) -> List[dict]:
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:  # 深い入れ子は RecursionError
         raise Unreadable(f"{path}: {error!r}") from error
-    legacy = False
-    pins = data.get("pins") if isinstance(data, dict) else None
-    if pins is None and isinstance(data, dict) and isinstance(data.get("object"), dict):
-        pins = data["object"].get("pins")  # 古い形式（version 1）
-        legacy = True
+    # 形式の版ごとに pins の位置が決まる（版 1 は object の中、版 2・3 は最上位）。知らない版・位置が合わないものは読まない
+    version = data.get("version") if isinstance(data, dict) else None
+    if type(version) is not int or version not in (1, 2, 3):
+        raise Unreadable(f"{path}: 対応していない形式の版（version {version!r}）")
+    legacy = version == 1
+    if ("object" in data) != legacy or ("pins" in data) == legacy:
+        raise Unreadable(f"{path}: 形式の版（version {version}）と pins の位置が合わない")
+    holder = data["object"] if legacy else data
+    pins = holder.get("pins") if isinstance(holder, dict) else None
     if not isinstance(pins, list) or not all(isinstance(pin, dict) for pin in pins):
         raise Unreadable(f"{path}: pins の形式が違う")
     # 同じ名前の依存が重なると、どの確定版が使われるか決まらない（SwiftPM も壊れたファイルとして拒否する）

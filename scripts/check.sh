@@ -489,8 +489,15 @@ step_2() {
     fi
     # 規則・試験用のファイル・入れ子の設定・テストのディレクトリ（入れ子の設定の置き忘れを検査する）を変えたときだけ、
     # 規則の試験を回す。テストのディレクトリの一覧は prepare_rules_tree と scripts/test-lint-rules.py の TEST_CODE_DIRS と同じ
-    if git diff --cached --quiet "$STAGED_BASE" -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
-      MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests; then return 0; fi
+    # 終了コードは 0 = 変更なし / 1 = 変更あり。それ以外は照会の失敗なので、変更があると見なさずに止める
+    local lint_changed=0
+    git diff --cached --quiet "$STAGED_BASE" -- ':(glob,icase)**/.swiftlint.yml' tools/lint-fixtures scripts/test-lint-rules.py \
+      MinutesMobileTests MinutesMobileUITests Packages/MinutesKit/Tests || lint_changed=$?
+    case $lint_changed in
+      0) return 0 ;;
+      1) ;;
+      *) fail "規則の試験に関わるステージした変更の有無を調べられない（git diff の終了コード ${lint_changed}）" ;;
+    esac
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
     (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \

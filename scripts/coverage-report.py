@@ -75,12 +75,18 @@ def main() -> int:
         # 区切りは末尾に 1 つだけ付ける（起点が「/」のときに「//」にしない。名前の似た隣のディレクトリは含めない）
         prefix = os.path.normpath(sources).rstrip(os.sep) + os.sep
         lines = []
+        counted = set()
         for item in files:
             filename = item["filename"]
             if not isinstance(filename, str) or not os.path.isabs(filename):
                 raise ValueError(f"記録したパスが絶対パスでない: {filename!r}")
-            if not os.path.normpath(filename).startswith(prefix):
+            normalized = os.path.normpath(filename)
+            if not normalized.startswith(prefix):
                 continue
+            # 同じファイルを 2 回数えない（どちらの記録が正しいか決まらない）
+            if normalized in counted:
+                raise ValueError(f"同じファイルの記録が重複している: {normalized!r}")
+            counted.add(normalized)
             count, covered = item["summary"]["lines"]["count"], item["summary"]["lines"]["covered"]
             # 整数（bool を除く）で 0 <= covered <= count のものだけを数える。不正な記録を丸めて集計しない
             if type(count) is not int or type(covered) is not int or not 0 <= covered <= count:

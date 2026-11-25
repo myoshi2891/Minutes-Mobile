@@ -64,7 +64,7 @@ BD_SECTION_OF = {f"{BASIC}/architecture.md": "3"}
 DETAILED = "docs/03-detailed-design"
 
 
-Fence = Tuple[str, int]  # フェンスの文字（` か ~）と長さ
+Fence = Tuple[str, int, int]  # （文字, 長さ, 囲む箇条書きの項目の本文の位置）
 # フェンスの字下げは空白 0〜3 個まで（CommonMark）。4 個以上の字下げの行はコードの本文として扱う
 FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 PHASES = re.compile(r"^(MVP|P2|P3)\b")
@@ -107,31 +107,47 @@ def split_lines(text: str, keepends: bool = False) -> List[str]:
     return lines
 
 
-def fence_open(line: str) -> Optional[Tuple[Fence, str]]:
-    """フェンスの開始行なら（フェンス, 情報文字列）を返す。バッククォートのフェンスの情報文字列にはバッククォートを含められない。"""
-    found = FENCE_OPEN.match(line)
+def in_item(line: str, base: int) -> Optional[str]:
+    """行から、囲む箇条書きの項目の本文の位置（base）までの字下げを除く。字下げが足りなければ（項目が終わる行なら）None。"""
+    if not base:
+        return line
+    expanded = line.expandtabs(4)
+    return None if expanded[:base].strip() else expanded[base:]
+
+
+def fence_open(line: str, base: int = 0) -> Optional[Tuple[Fence, str]]:
+    """フェンスの開始行なら（フェンス, 情報文字列）を返す。バッククォートのフェンスの情報文字列にはバッククォートを含められない。
+    字下げは、囲む箇条書きの項目の本文の位置（base）から数える。"""
+    content = in_item(line, base)
+    found = FENCE_OPEN.match(content) if content is not None else None
     if not found:
         return None
     marker, info = found.group(1), found.group(2)
     if marker[0] == "`" and "`" in info:
         return None
-    return (marker[0], len(marker)), info.strip()
+    return (marker[0], len(marker), base), info.strip()
 
 
 def fence_closes(line: str, fence: Fence) -> bool:
     """字下げが空白 0〜3 個で、開始と同じ文字が開始以上の長さで並び、その後が空白だけの行だけが、フェンスを閉じる。"""
-    char, length = fence
-    return re.fullmatch(rf" {{0,3}}{re.escape(char)}{{{length},}}\s*", line) is not None
+    char, length, base = fence
+    content = in_item(line, base)
+    return content is not None and re.fullmatch(rf" {{0,3}}{re.escape(char)}{{{length},}}\s*", content) is not None
 
 
-def fence_end(lines: List[str], start: int) -> int:
-    """lines[start] で開いたフェンスを閉じる行の位置を返す。閉じていなければ len(lines)。"""
-    opened = fence_open(lines[start])
-    assert opened is not None
+def fence_end(lines: List[str], start: int, fence: Fence) -> int:
+    """lines[start] で開いたフェンスを閉じる行の位置を返す。閉じていなければ（閉じる前に囲む項目が終われば） len(lines)。"""
     end = start + 1
-    while end < len(lines) and not fence_closes(lines[end], opened[0]):
+    while end < len(lines) and not fence_closes(lines[end], fence):
+        if in_item(lines[end], fence[2]) is None:
+            return len(lines)
         end += 1
     return end
+
+
+def fences(text: str) -> Dict[int, Tuple[Fence, str]]:
+    """フェンスの開始行の位置（0 始まり）→（フェンス, 情報文字列）。"""
+    return {number - 1: opened for number, _, _, opened in fenced_lines(text) if opened}
 
 
 # 複数行の HTML のコメントの始まり（字下げは空白 0〜3 個）
@@ -173,7 +189,11 @@ def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fe
     fence: Optional[Fence] = None
     comment = False
     pre = False
+    code = IndentedCode()  # 箇条書きの項目の本文の位置（フェンスの字下げは、囲む項目の本文の位置から数える）
     for number, line in enumerate(split_lines(text), start=1):
+        # 閉じる前に囲む項目が終われば、フェンスも終わる（CommonMark）
+        if fence is not None and in_item(line, fence[2]) is None:
+            fence = None
         if comment:
             comment = "-->" not in line
             yield number, line, True, None, True, False
@@ -185,16 +205,23 @@ def scanned_lines(text: str) -> Iterator[Tuple[int, str, bool, Optional[Tuple[Fe
             continue
         if pre or HTML_PRE_OPEN.match(line):
             pre = HTML_PRE_CLOSE.search(line) is None
+            code.interrupt()
             yield number, line, True, None, False, True
             continue
         found = COMMENT_OPEN.match(line)
         if found and "-->" not in line[found.end():]:
             comment = True
+            code.interrupt()
             yield number, line, True, None, True, False
             continue
-        opened = fence_open(line)
+        indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip(" "))
+        opened = fence_open(line, code.base(indent)) if line.strip() else None
         if opened:
             fence = opened[0]
+            code.leave(indent)
+            code.interrupt()
+        else:
+            code.is_code(line)
         yield number, line, opened is not None, opened, False, False
 
 
@@ -279,6 +306,10 @@ class IndentedCode:
             self.items.pop()
         return self.items[-1] if self.items else 0
 
+    def base(self, indent: int) -> int:
+        """字下げ indent の行を囲む項目の本文の位置（項目を閉じない）。"""
+        return max([at for at in self.items if at <= indent], default=0)
+
     def is_code(self, line: str) -> bool:
         expanded = line.expandtabs(4)
         if not expanded.strip():
@@ -288,9 +319,12 @@ class IndentedCode:
         if not self.paragraph and indent - self.leave(indent) >= 4:
             return True
         ends = PARAGRAPH_END.match(expanded)
+        # 見出し・区切りの線・引用などは段落の続きにならず、その字下げより深い項目を閉じる
+        if ends or BLOCK_START.match(expanded):
+            self.leave(indent)
         item = None if ends else LIST_ITEM.match(expanded)
         # 段落の続きの行は、項目の本文の位置から 4 個以上の字下げなら、項目の始まりではなく続き
-        if item and not (self.paragraph and indent - max([at for at in self.items if at <= indent], default=0) >= 4):
+        if item and not (self.paragraph and indent - self.base(indent) >= 4):
             self.leave(indent)
             spaces = len(item.group(3))
             self.items.append(indent + len(item.group(2)) + (spaces if 1 <= spaces <= 4 else 1))
@@ -970,7 +1004,7 @@ class Checker:
                     continue
                 if not opened[1]:
                     self.error(name, "コードフェンスに言語の指定がない", number)
-                if fence_end(lines, number - 1) >= len(lines):
+                if fence_end(lines, number - 1, opened[0]) >= len(lines):
                     self.error(name, "コードフェンスが閉じていない", number)
             # 引用の中のフェンスは、言語の指定だけを確かめる（閉じていなくても、引用の終わりで終わる）
             quoted = dict(quoted_fences(text))
@@ -1049,7 +1083,8 @@ class Checker:
         # パーセント符号化は、その後でこれまでどおり戻す
         # 文字参照も同時に戻す
         target = unescape_link(target)
-        if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
+        # URL の scheme は大文字小文字を区別しない（RFC 3986）。パスの大文字小文字は区別したまま
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target) or target.startswith("#"):
             return
         # パーセント符号化（%20 など）は、節へのリンクを分けた後に戻してから解決する（GitHub の表示と同じく、符号化した
         # 名前のリンクも実際のファイルを指す）
@@ -1222,6 +1257,7 @@ class Checker:
 
     def check_snippets(self, name: str, text: str) -> None:
         lines = split_lines(text)
+        opened_fences = fences(text)
         for index, (kind, source) in snippet_markers(text).items():
             if not source:
                 self.error(name, "コード片の印にパスがない", index + 1)
@@ -1229,10 +1265,10 @@ class Checker:
             start = index + 1
             while start < len(lines) and not lines[start].strip():
                 start += 1
-            if start >= len(lines) or not fence_open(lines[start]):
+            if start not in opened_fences:
                 self.error(name, "印の直後にコードフェンスがない", index + 1)
                 continue
-            end = fence_end(lines, start)
+            end = fence_end(lines, start, opened_fences[start][0])
             # 字下げしたフェンスの本文は、開始行の字下げの分を除いてから照合する
             indent = fence_indent(lines[start])
             snippet = [dedent(line, indent) for line in lines[start + 1:end]]
@@ -1364,6 +1400,7 @@ class Checker:
             raw = split_lines(raw_text, keepends=True)
             lines = [line.rstrip("\r\n") for line in raw]
             endings = [line[len(line.rstrip("\r\n")):] for line in raw]
+            opened_fences = fences(text)
             markers = snippet_markers(text)  # 照合と同じ判定（説明用の例は書き直さない）
             out: List[str] = []
             out_endings: List[str] = []  # out の各行の改行
@@ -1382,10 +1419,10 @@ class Checker:
                     path = self.snippet_source(marker[1])
                 except Unresolvable:
                     continue  # 検査の側（check_snippets）が印の行とともに報告する
-                opened = fence_open(lines[start]) if start < len(lines) else None
+                opened = opened_fences.get(start)
                 if not opened or path is None or not path.is_file():
                     continue  # 不備（root の外の参照先を含む）は検査の側で報告する
-                end = fence_end(lines, start)
+                end = fence_end(lines, start, opened[0])
                 # 字下げしたフェンスには、開始行と同じ字下げを付けて書く（空行には付けない）
                 indent = " " * fence_indent(lines[start])
                 try:

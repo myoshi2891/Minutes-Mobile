@@ -5,10 +5,11 @@
 #   scripts/setup-tools.sh            導入する（導入済みで版と SHA-256 が一致するものは取得しない）
 #   scripts/setup-tools.sh --verify   取得せず、導入済みの版が tools/versions と一致するかだけ確かめる（check.sh の手順 0）
 # 試験用の指定（検査の自己試験が使う）: --versions <ファイル>  --dest <ディレクトリ>
+#   --download-limit <秒>  gh での取得の上限（1〜300。既定は 300）
 #   --require "<名前 …>"  台帳に行が要るツールの集合（既定は検査が使う 4 種。一部だけの台帳で試験するときに明示する）
 #
 # 終了コード: 0 = 一致 / 1 = 不一致・取得や照合の失敗 / 2 = 使い方の誤り
-# 前提: curl・shasum・unzip・tar（OS 同梱）。gh は記録した版を curl で取得して .tools/ に入れ、
+# 前提: curl・shasum・unzip・tar（OS 同梱）と、Xcode 同梱の python3。gh は記録した版を curl で取得して .tools/ に入れ、
 # ほかのツールの取得には、その版の gh（.tools/bin/gh）だけを使う（PATH や Homebrew の gh は使わない）
 set -euo pipefail
 
@@ -21,6 +22,8 @@ ROOT=${ROOT%$'\n'}
 VERSIONS="$ROOT/tools/versions"
 DEST="$ROOT/.tools"
 MODE=install
+# gh での取得の全体の上限（秒）。止まった取得でロックを持ち続けない（ロックを待つ上限の 600 秒より短くする）
+DOWNLOAD_LIMIT=300
 # 検査（check.sh）が使うツール。台帳から行が消えても見落とさないよう、台帳の内容ではなくこの集合で必須を決める
 REQUIRED="gh swiftlint swiftformat gitleaks"
 
@@ -34,6 +37,7 @@ while [ $# -gt 0 ]; do
     --verify) MODE=verify; shift ;;
     --versions) [ $# -ge 2 ] || usage; VERSIONS=$2; shift 2 ;;
     --dest) [ $# -ge 2 ] || usage; DEST=$2; shift 2 ;;
+    --download-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; DOWNLOAD_LIMIT=$2; shift 2 ;;
     --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; REQUIRED=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -139,6 +143,22 @@ find_paths() {
   done < "$work/found"
 }
 
+# コマンドを時間の上限（秒。$1）つきで実行する。上限を過ぎたら止め、終わるのを待ってから 124 を返す（中断でも止めて待つ）
+run_limited() {
+  /usr/bin/python3 -I -c '
+import subprocess
+import sys
+try:
+    code = subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode
+except subprocess.TimeoutExpired:
+    print(f"NG: {sys.argv[1]} 秒を過ぎても終わらないので止めた", file=sys.stderr)
+    code = 124
+except OSError as error:
+    print(f"NG: 起動できない: {error}", file=sys.stderr)
+    code = 127
+sys.exit(code if code >= 0 else 128 - code)' "$@"
+}
+
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
   local target="$DEST/$name/$version" work="$WORK/$name" actual found cached=""
@@ -164,7 +184,7 @@ install_tool() {
         -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     else
-      "$DEST/bin/gh" release download "$tag" --repo "github.com/$repo" --pattern "$asset" --dir "$work/download" </dev/null \
+      run_limited "$DOWNLOAD_LIMIT" "$DEST/bin/gh" release download "$tag" --repo "github.com/$repo" --pattern "$asset" --dir "$work/download" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     fi
     # 標準入力から読む（パスを渡すと、改行などを含むパスで shasum が行頭に「\」を付け、値の照合に失敗する）

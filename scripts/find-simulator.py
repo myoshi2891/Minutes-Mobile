@@ -17,6 +17,7 @@ import subprocess
 import sys
 from typing import Dict, List, Tuple
 
+from xcproj import reject_duplicate_keys
 
 # シミュレータの UDID は UUID（8-4-4-4-12 桁の 16 進数）。simctl は大文字で出すが、大文字小文字は区別しない
 UDID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
@@ -46,7 +47,8 @@ def main() -> int:
     try:
         minimum = version_key(arguments.minimum_os)
         listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True, check=True, env=env)
-        data = json.loads(listing.stdout)
+        # 重複した鍵は後の値で前の値を隠すので、形の違う一覧とする（ValueError で送出される）
+        data = json.loads(listing.stdout, object_pairs_hook=reject_duplicate_keys)
         devices_by_runtime = data["devices"]
         # 形が違う一覧は取得の失敗として扱う（空の辞書は候補なしとして下で扱う）
         if not isinstance(devices_by_runtime, dict):

@@ -240,17 +240,20 @@ def check_required(
     target: str, own: dict, shared: dict, configurations: List[str],
     rules: Dict[str, Tuple[Tuple[str, ...], str]], errors: List[str]
 ) -> None:
-    """各設定を、構成ごと・SDK（SDKS）ごとに求めて確かめる。どれかの SDK で値が決まらない・許す値でなければ違反とする
-    （SDK の条件付きの書き方だけで、片方の SDK の値を欠く・違う値にすることを見逃さない）。"""
+    """各設定を、実際にビルドする構成・SDK・arch の組ごとに求めて確かめる。どれかの組で値が決まらない・許す値でなければ違反とする
+    （SDK・arch の条件付きの書き方だけで、一部の組の値を欠く・違う値にすることを見逃さない）。"""
+    builds = [(c, v) for sdk in SDKS for c in configurations for v in build_variants(own, shared, c) if v.sdk == sdk]
     for name, (allowed, reason) in rules.items():
         missing: List[str] = []
         wrong: Dict[str, List[str]] = {}
-        for sdk in SDKS:
-            effective, undecided = resolve(own, shared, name, configurations, Variant(sdk))
-            missing.extend(f"{configuration}（{sdk}）" for configuration in undecided)
-            for (key, value), used in effective.items():
+        for configuration, variant in builds:
+            build = f"{configuration}（{variant.label()}）"
+            effective, undecided = resolve(own, shared, name, [configuration], variant)
+            if undecided:
+                missing.append(build)
+            for key, value in effective:
                 if value not in allowed:
-                    wrong.setdefault(f"{key} = {value}", []).extend(f"{configuration}（{sdk}）" for configuration in used)
+                    wrong.setdefault(f"{key} = {value}", []).append(build)
         if missing:
             errors.append(f"[{reason}] {target}: {name} が設定されていない（構成 {'・'.join(missing)}。必要な値: {allowed[0]}）")
         for label, used in wrong.items():
@@ -694,16 +697,28 @@ def resolved(path: Path) -> Path:
         raise Unreadable(f"{path}: パスを解決できない: {error!r}") from error
 
 
+MAX_PLIST_DEPTH = 100  # plist の入れ子の段数の上限
+
+
 def load_plist(path: Path) -> dict:
     try:
         with path.open("rb") as handle:
             data = plistlib.load(handle)
     # 壊れた XML は ExpatError、形の違う日付（<date>）は AttributeError になる（plistlib が照合の失敗を確かめない）
-    except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, AttributeError) as error:
-        raise Unreadable(f"{path}: {error}") from error
+    # バイナリ形式の深い入れ子は、plistlib の読み込みが RecursionError になる
+    except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, AttributeError, RecursionError) as error:
+        raise Unreadable(f"{path}: {error!r}") from error
     if not isinstance(data, dict):
         raise Unreadable(f"{path}: 最上位が辞書でない")
-    return data
+    # 検査は入れ子をたどるので、深すぎるものと循環するもの（バイナリ形式では作れる）を読めないものとする。深さごとに、
+    # 同じオブジェクトを 1 つにまとめて下りる（循環していれば、いつまでも空にならない）
+    level: List[object] = [data]
+    for _ in range(MAX_PLIST_DEPTH):
+        children = [child for item in level for child in (item.values() if isinstance(item, dict) else item)]
+        level = list({id(child): child for child in children if isinstance(child, (dict, list))}.values())
+        if not level:
+            return data
+    raise Unreadable(f"{path}: 入れ子が深すぎるか循環している（{MAX_PLIST_DEPTH} 段を超える）")
 
 
 def tracked_files(root: Path) -> Set[Path]:

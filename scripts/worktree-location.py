@@ -54,7 +54,32 @@ def registered_worktrees(source: str) -> List[bytes]:
                 sys.exit(2)
             paths.append(field[len(b"worktree "):])
             first = False
+    confirm_enumerable(source)
     return paths
+
+
+def confirm_enumerable(source: str) -> None:
+    """登録の置き場所（<共通のディレクトリ>/worktrees）を列挙できること。できなければ終了コード 2（ないのは認める）。
+
+    git worktree list は、列挙できない登録を黙って省いて成功する（終了コード 0）ので、一覧が欠けていないことを別に確かめる。
+    """
+    try:
+        common = subprocess.run(["git", "-C", source, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                stdout=subprocess.PIPE, env=GIT_ENV)
+        if common.returncode != 0 or not common.stdout.endswith(b"\n"):
+            print(f"共通のディレクトリを特定できない（終了コード {common.returncode}）", file=sys.stderr)
+            sys.exit(2)
+        directory = os.path.join(common.stdout[:-1], b"worktrees")
+        for entry in os.listdir(directory):
+            try:
+                os.lstat(os.path.join(directory, entry))  # 名前だけ読めて、中を調べられない場合も省かれる
+            except FileNotFoundError:
+                continue  # 列挙の後に外された登録
+    except FileNotFoundError:
+        return  # 登録がない（git がなければ一覧の取得で止まっている）
+    except OSError as error:
+        print(f"作業ツリーの登録を列挙できない: {error}", file=sys.stderr)
+        sys.exit(2)
 
 
 def identity(path: str, registered: bool = False) -> Optional[Tuple[int, int]]:

@@ -34,4 +34,17 @@ func sample() {
     // 条件に拡張区切りの文字列がある空の本体を検出する
     do { try work() } catch let error where error.message == #"a" { x }"# {} // expect: no_empty_catch
     do { try work() } catch let error where check(##"a"# ) {"##, error) { } // expect: no_empty_catch
+    // 条件にふつうの複数行の文字列がある空の本体を検出する（最上位と 1・2 段の括弧の中）
+    do { try work() } catch let error // expect: no_empty_catch
+        where error.message == """
+        a " { x \"""
+        """ {}
+    do { try work() } catch let error // expect: no_empty_catch
+        where check("""
+        a " ) {
+        """, error) {}
+    do { try work() } catch let error // expect: no_empty_catch
+        where check(f("""
+        a " ) {
+        """)) { /* 何もしない */ }
 }

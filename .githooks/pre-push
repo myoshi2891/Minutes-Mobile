@@ -284,10 +284,10 @@ if [ "$owned" -eq 1 ]; then
   staging=$(mktemp -d "$snapshot.work.XXXXXX")
   (trap '' INT TERM; exec git -C "$source_root" worktree move "$snapshot" "$staging/tree") \
     || { echo "NG: 専用の作業ツリー（${snapshot}）を移せない" >&2; exit 1; }
-  # 中に別の作業ツリー・リポジトリ（.git を持つもの）があれば、何も変えずに止める。残すビルドの成果物（.build）は変えないので、
-  # その中（取得した依存など）は調べない
-  inner=$(cd "$staging/tree" && find . \( -path ./.build -o -path ./Packages/MinutesKit/.build \) -prune \
-    -o -name .git ! -path ./.git -print) \
+  # 中に別の作業ツリー・リポジトリ（.git を持つもの）があれば、何も変えずに止める。残すビルドの成果物（.build）の中の .git の
+  # ディレクトリ（取得した依存の複製）は認めるが、ディレクトリでない .git（登録された作業ツリーが持つファイル）は認めない
+  inner=$(cd "$staging/tree" && find . -name .git ! -path ./.git \
+    \( ! -type d -o ! -path './.build/*' ! -path './Packages/MinutesKit/.build/*' \) -print) \
     || { echo "NG: 専用の作業ツリー（${snapshot}）の中に別の作業ツリーがあるかを調べられない" >&2; exit 1; }
   if [ -n "$inner" ]; then
     echo "NG: 専用の作業ツリー（${snapshot}）に、別の作業ツリーかリポジトリがある。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す: ${inner}" >&2
@@ -337,11 +337,22 @@ else
   # --force は付けない（上の照合の後に登録された場合も、git が拒否する）
   # --no-checkout: 先に登録だけを行い、印を書いてから展開する（時間のかかる展開の途中で中断・失敗しても印が残り、次の検査が
   # このフックの作業ツリーとして展開し直せる）
-  git -C "$source_root" worktree add -q --no-checkout --detach "$snapshot" "$head"
-  # 作った作業ツリーの専用の管理ディレクトリに、このフックの印を書く（次の検査で再利用してよいかの判定に使う）
-  git_path private "$snapshot" --git-dir && real_directory private "$private" \
-    || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
-  printf '%s\n' "$owner_text" > "$private/$owner_mark"
+  # 登録してから、作った作業ツリーの専用の管理ディレクトリにこのフックの印を書く（次の検査で再利用してよいかの判定に使う）まで、
+  # 中断を無視する（間で終わって、印のない作業ツリーを残さない。このシェルの trap は、サブシェルの終了を待ってから動くので、
+  # 控えた中断にはその後で従う）。登録に失敗したら、既存のものに印を書かずに止める
+  created=0
+  (
+    trap '' INT TERM
+    git -C "$source_root" worktree add -q --no-checkout --detach "$snapshot" "$head" || exit 1
+    git_path private "$snapshot" --git-dir && real_directory private "$private" || exit 2
+    printf '%s\n' "$owner_text" > "$private/$owner_mark" || exit 3
+  ) || created=$?
+  case $created in
+    0) ;;
+    1) echo "NG: 専用の作業ツリー（${snapshot}）を作れない" >&2; exit 1 ;;
+    2) echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1 ;;
+    *) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けない" >&2; exit 1 ;;
+  esac
   git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout "$snapshot"
 fi
