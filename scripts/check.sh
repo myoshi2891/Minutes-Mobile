@@ -21,6 +21,9 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
+# パス指定の解釈を変える変数（git --literal-pathspecs commit などのフックに引き継がれる）を外す。残すと '*.swift' などの指定が
+# 別の意味になり、ステージしたファイルを 1 つも選ばずに合格しうる。集めた名前での照会は --literal-pathspecs を付ける
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
 # --root は、このスクリプトの置き場所によらず検査するリポジトリの起点を示す（書き出したステージした版を実行するとき）
 ROOT_GIVEN=0
 if [ "${1:-}" = --root ]; then

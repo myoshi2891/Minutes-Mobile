@@ -155,17 +155,40 @@ def find_files(root: Path, name: str) -> Iterator[Path]:
     yield from sorted(found)
 
 
+def pin_identity(pin: dict, legacy: bool) -> str:
+    """同じ Package.resolved の中の重複の判定に使う名前。なければ空文字列（名前のない依存は check が報告する）。
+
+    SwiftPM と同じく、identity の項目（大文字小文字を区別しない）で決まる。古い形式（version 1）は package ではなく
+    repositoryURL の最後の要素（末尾の「/」と .git を除く）で決まる。2026-11-25 に Xcode 27.2 の swift package resolve で確かめた。
+    """
+    value = pin.get("repositoryURL") if legacy else pin.get("identity")
+    if not isinstance(value, str):
+        return ""
+    if legacy:
+        value = value.rstrip("/").rsplit("/", 1)[-1]
+        value = value[:-4] if value.endswith(".git") else value
+    return value.lower()
+
+
 def resolved_pins(path: Path) -> List[dict]:
     try:
         # 重複した鍵は後の値で前の値を隠すので読めないものとする（xcproj.py と同じ。ValueError で送出される）
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:  # 深い入れ子は RecursionError
         raise Unreadable(f"{path}: {error!r}") from error
+    legacy = False
     pins = data.get("pins") if isinstance(data, dict) else None
     if pins is None and isinstance(data, dict) and isinstance(data.get("object"), dict):
         pins = data["object"].get("pins")  # 古い形式（version 1）
+        legacy = True
     if not isinstance(pins, list) or not all(isinstance(pin, dict) for pin in pins):
         raise Unreadable(f"{path}: pins の形式が違う")
+    # 同じ名前の依存が重なると、どの確定版が使われるか決まらない（SwiftPM も壊れたファイルとして拒否する）
+    seen: Set[str] = set()
+    for identity in filter(None, (pin_identity(pin, legacy) for pin in pins)):
+        if identity in seen:
+            raise Unreadable(f"{path}: {identity} が重複している")
+        seen.add(identity)
     return pins
 
 
@@ -696,6 +719,35 @@ def leaves_coverage_input(root: Path, link: str, seen: Set[str]) -> bool:
     return False
 
 
+def outside_link(root: Path, location: str) -> Optional[str]:
+    """location の途中の要素（自身を含む）のうち、カバレッジの測定の写しの外を指すリンク。なければ None。"""
+    parts = location.split("/")
+    try:
+        for depth in range(1, len(parts) + 1):
+            alias = os.path.join(root, *parts[:depth])
+            if os.path.islink(alias) and leaves_coverage_input(root, alias, set()):
+                return "/".join(parts[:depth])
+    except OSError as error:
+        raise Unreadable(f"{root / location}: {error}") from error
+    return None
+
+
+def outside_inner_link(root: Path, location: str) -> Optional[str]:
+    """ローカルのバイナリ（content_digest が読めたもの）の中の、カバレッジの測定の写しの外を経由するリンク。なければ None。"""
+    def failed(error: OSError) -> None:
+        raise Unreadable(f"{error.filename}: {error}")
+
+    try:
+        for directory, subdirectories, files in os.walk(root / location, onerror=failed):
+            for name in sorted(subdirectories + files):
+                link = os.path.join(directory, name)
+                if os.path.islink(link) and leaves_coverage_input(root, link, set()):
+                    return os.path.relpath(link, root)
+    except OSError as error:
+        raise Unreadable(f"{root / location}: {error}") from error
+    return None
+
+
 def local_package_errors(directory: str, path: str, summary: str, root: Optional[Path]) -> List[str]:
     """.package(path:) の参照先を、参照元の Package.swift のディレクトリから解決して確かめる。
 
@@ -714,14 +766,9 @@ def local_package_errors(directory: str, path: str, summary: str, root: Optional
         return []
     # 参照先の途中の要素を含め、測定の写しの外を指す（絶対パスで中を指すものも含む）ディレクトリのリンクは、解決した先が Packages/ の
     # 中でも写しの中で解決できないので、解決する前に認めない
-    try:
-        for depth in range(1, len(parts) + 1):
-            alias = os.path.join(root, *parts[:depth])
-            if os.path.islink(alias) and leaves_coverage_input(root, alias, set()):
-                return [f"ローカルの Package {location} の {'/'.join(parts[:depth])} が {LOCAL_PACKAGE_ROOT}/ の外を指すリンク: "
-                        f".package({summary})"]
-    except OSError as error:
-        raise Unreadable(f"{root / location}: {error}") from error
+    alias = outside_link(root, location)
+    if alias is not None:
+        return [f"ローカルの Package {location} の {alias} が {LOCAL_PACKAGE_ROOT}/ の外を指すリンク: .package({summary})"]
     try:
         target = (root / location).resolve()
     except RuntimeError as error:  # 循環するリンク（Python 3.9〜3.12）
@@ -820,12 +867,20 @@ def manifest_errors(
             elif root is not None and (root / location).resolve().relative_to(root.resolve()).parts[:1] != (LOCAL_PACKAGE_ROOT,):
                 errors.append(f"ローカルのバイナリ {location} の実体が {LOCAL_PACKAGE_ROOT}/ の外にある（シンボリックリンクなど）: "
                               f".binaryTarget({summary})")
+            elif root is not None and outside_link(root, location) is not None:
+                # 実体が Packages/ の中でも、絶対パスなどのリンクは測定の写しで解決できない（check.sh の verify_coverage_links が拒否する）
+                errors.append(f"ローカルのバイナリ {location} の {outside_link(root, location)} が {LOCAL_PACKAGE_ROOT}/ の外を指すリンク: "
+                              f".binaryTarget({summary})")
             elif root is not None:
                 # 場所が一致しても、承認したときの内容と違えば認めない（再承認を求める）
                 actual = content_digest(root / location)
                 if actual != by_path[location]["sha256"]:
                     errors.append(f"ローカルのバイナリ {location} の内容が承認したものと違う（現在 {actual}）。"
                                   "確かめてから許可リストの sha256 を更新し、再承認を得る")
+                inner = outside_inner_link(root, location)
+                if inner is not None:
+                    errors.append(f"ローカルのバイナリ {location} の中の {inner} が {LOCAL_PACKAGE_ROOT}/ の外を経由するリンク: "
+                                  f".binaryTarget({summary})")
         else:
             # ローカルの Package（.package(path:)）は、起点の中で検査の対象になる manifest を指す場合だけ認める
             # （起点の中の manifest はすべて manifests() で検査するので、参照先の未承認の依存・バイナリも検出される）

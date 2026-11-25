@@ -27,3 +27,18 @@ let rawQuoted = Int.random(in: 0..<length(of: #"a" ) ("#), using: &generator)
 let rawTopLevel = Int.random(in: 0..<##"a"# ( "##.count, using: &generator)
 // 「.」と名前の間に空白があっても、注入した生成器を渡す呼び出しは認める
 let spaced = Int . random(in: 0...1, using: &generator)
+// ふつうの複数行の文字列（「"」と括弧を含む）があっても、後ろの using: を認める（最上位と 1〜3 段の入れ子）
+let multiline = Int.random(in: 0..<"""
+a "quoted" ) ( \""" ,
+""".count, using: &generator)
+let multilineNested = Int.random(in: 0..<length(of: """
+a "quoted" ) (
+"""), using: &generator)
+let multilineDeeper = Int.random(in: 0..<f(g("""
+a "b" ) (
+""")), using: &generator)
+let multilineDeepest = Int.random(in: 0..<f(g(h("""
+a "b" ) (
+"""))), using: &generator)
+// 空の文字列は、複数行の文字列の始まりではない
+let emptyString = Int.random(in: 0..<length(of: ""), using: &generator)

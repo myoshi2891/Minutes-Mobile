@@ -653,7 +653,7 @@ def test_settings() -> None:
     mic = '"INFOPLIST_KEY_NSMicrophoneUsageDescription": "会議を録音するためにマイクを使用します。",'
     for label, added, base_value, want, want_text in (
         ("~iphone が arm64 だけで、元の鍵がある", "~iphone[arch=arm64]", "会議を録音する。", 0, "OK"),
-        ("~iphone が arm64 だけで、元の鍵が空", "~iphone[arch=arm64]", "", 1, "が空（構成 Debug（iphoneos・arm64e）"),
+        ("~iphone が arm64 だけで、元の鍵が空", "~iphone[arch=arm64]", "", 1, "が空（構成 Debug（iphonesimulator・x86_64）"),
         ("~iphone のワイルドカードの arch と元の鍵", "~iphone[arch=arm64*]", "会議を録音する。", 0, "OK"),
         ("~iphone がすべての arch なら元の鍵は効かない", "~iphone[arch=*]", "", 0, "OK"),
     ):
@@ -662,6 +662,34 @@ def test_settings() -> None:
                     f'        "INFOPLIST_KEY_NSMicrophoneUsageDescription{added}": "会議を録音する。",'))
     settings_case("arch の条件: 元の鍵がなければ条件の外の arch が欠落", 1, "x86_64", project=lambda t: replaced(
         t, mic, '"INFOPLIST_KEY_NSMicrophoneUsageDescription~iphone[arch=arm64]": "会議を録音する。",'))
+    # 欠落の判定は、実際にビルドする arch（ARCHS から EXCLUDED_ARCHS を除いたもの。指定がなければ Xcode の既定）だけで行う
+    only = '"INFOPLIST_KEY_NSMicrophoneUsageDescription[arch=arm64]": "会議を録音する。"'
+    for label, extra, want, want_text in (
+        ("ARCHS が arm64", '"ARCHS": "arm64"', 0, "OK"),
+        ("除いた x86_64", '"EXCLUDED_ARCHS[sdk=iphonesimulator*]": "x86_64"', 0, "OK"),
+        ("継承した値から除いた x86_64", '"EXCLUDED_ARCHS": "$(inherited) x86_64"', 0, "OK"),
+        ("既定の変数", '"ARCHS": "$(ARCHS_STANDARD)"', 1, "がない（構成 Debug（iphonesimulator・x86_64）・Release（iphonesimulator・x86_64）。"),
+        ("既定の継承", '"ARCHS": "$(inherited)"', 1, "がない（構成 Debug（iphonesimulator・x86_64）・Release（iphonesimulator・x86_64）。"),
+        ("既定のまま", "", 1, "がない（構成 Debug（iphonesimulator・x86_64）・Release（iphonesimulator・x86_64）。"),
+        ("構成で違う ARCHS", '"ARCHS[config=Debug]": "arm64"', 1, "がない（構成 Release（iphonesimulator・x86_64）。"),
+        ("実機にもほかの arch", '"ARCHS[sdk=iphoneos*]": "arm64 arm64e"', 1, "Debug（iphoneos・arm64e）"),
+        # 決められない値では判定を弱めない
+        ("展開できない ARCHS", '"ARCHS": "$(UNKNOWN)"', 1, "Debug（iphoneos・arm64e）"),
+        ("空の ARCHS", '"ARCHS": ""', 1, "Debug（iphoneos・arm64e）"),
+        ("arch の条件付きだけの ARCHS", '"ARCHS[arch=arm64]": "arm64"', 1, "Debug（iphoneos・arm64e）"),
+    ):
+        settings_case(f"ビルドする arch: {label}", want, want_text, project=lambda t, extra=extra: replaced(
+            t, mic, f"{only},\n        {extra}," if extra else f"{only},"))
+    # ビルドしない arch だけの参照先の変数も、当たりうる組で展開して判定する
+    for value, want, want_text in (("YES", 1, "有効な値に展開される"), ("NO", 0, "OK"), ("$(UNKNOWN)", 1, "UIFileSharingEnabled の値を展開できない")):
+        settings_case(f"ビルドする arch: armv7 だけの参照先の変数（{value}）", want, want_text, project=lambda t, value=value: replaced(
+            info_plist_file("Config/App-Settings.plist")(t), '"INFOPLIST_FILE":', f'"SHARE": "{value}",\n        "INFOPLIST_FILE[arch=armv7]":'),
+            plists={"Config/App-Settings.plist": dict(microphone, UIFileSharingEnabled="$(SHARE)")})
+    settings_case("ビルドする arch: armv7 だけの書き方の変数", 1, "有効な値に展開される", project=lambda t: replaced(
+        t, mic, f'{mic}\n        "INFOPLIST_KEY_UIFileSharingEnabled[arch=armv7]": "$(SHARE)",\n        "SHARE": "YES",'))
+    settings_case("ビルドする arch: ARCHS の arch だけの変数", 0, "OK", project=lambda t: replaced(
+        t, mic, f'{mic}\n        "ARCHS": "arm64",\n        "INFOPLIST_KEY_UIFileSharingEnabled": "$(SHARE)",\n'
+                '        "SHARE[arch=arm64]": "NO",'))
     # 生成する arch は参照先が空でもビルド設定の値で、生成しない arch は参照先の plist で判定する
     for label, generated, want, want_text in (("生成する arch だけ参照先が空", "arm64", 0, "OK"),
                                               ("生成しない arch の参照先が空", "x86_64", 1, "Debug（iphoneos・arm64）")):
@@ -1187,6 +1215,34 @@ def test_dependencies() -> None:
                       [remote_binary, dict(remote_binary, version="1.0.1", checksum="b" * 64)])
     dependencies_case("別のディレクトリのローカルのバイナリは承認と一致しない", 1, "ローカルのバイナリ Frameworks/B.xcframework",
                       {"Package.swift": declare.format(binary)}, [approved_binary])
+    # 途中のディレクトリと成果物の中のリンクは、実体が Packages/ の中でも、測定の写しで解決できるものだけを認める
+    for label, alias, inner, want in (
+        ("途中が相対のリンク", "Real", None, 0),
+        ("途中が起点を経由する相対のリンク", "../Packages/Real", None, 0),
+        ("途中が絶対パスのリンク", "absolute", None, 1),
+        ("成果物の中が相対のリンク", "Real", "ios/B", 0),
+        ("成果物の中が起点の外を経由するリンク", "Real", "../../../../{root}/Packages/Real/Frameworks/B.xcframework/ios/B", 1),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(os.path.realpath(directory))
+            for name, content in binary_files.items():
+                target = root / name.replace("Packages/Sub/", "Packages/Real/")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            artifact = root / "Packages" / "Real" / "Frameworks" / "B.xcframework"
+            if inner is not None:
+                # 成果物から起点まで 4 段、起点の親まで 5 段（起点の名前で戻る）
+                (artifact / "Link").symlink_to(inner.replace("../../../../{root}", f"../../../../../{root.name}"))
+            (root / "Packages" / "Sub").symlink_to(root / "Packages" / "Real" if alias == "absolute" else alias)
+            (root / "Packages" / "A").mkdir()
+            (root / "Packages" / "A" / "Package.swift").write_text(
+                declare.format('.binaryTarget(name: "B", path: "../Sub/Frameworks/B.xcframework")'), encoding="utf-8")
+            allowlist = root / "allowlist.json"
+            allowlist.write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": [
+                dict(approved_binary, sha256=module.content_digest(artifact))]}), encoding="utf-8")
+            expect(f"dependencies: ローカルのバイナリの{label}", [
+                str(SCRIPTS / "check-dependencies.py"), "--root", str(root), "--allowlist", str(allowlist)], want,
+                "するリンク" if want and inner else "外を指すリンク" if want else "OK")
     # 正規化すると同じパスになる承認が 2 つあると、後の項目が先の sha256 を黙って上書きする
     dependencies_case("同じパスのローカルのバイナリの承認の重複", 2, "同じパスで重複",
                       {}, [approved_binary, dict(approved_binary, path="./" + approved_binary["path"], sha256="b" * 64)])
@@ -1382,6 +1438,27 @@ def test_dependencies() -> None:
     dependencies_case("重複した鍵の Package.resolved", 2, "重複した鍵",
                       {"Package.resolved": '{"pins": [{"identity": "x", "location": "https://example.com/x", "state": {}}], '
                                            '"pins": [], "version": 3}'})
+    # 同じ Package.resolved の中の依存の名前の重複（SwiftPM と同じ規則。swift package resolve で確かめた組）
+    def pins(version: int, *rows: Tuple[str, str]) -> str:
+        if version == 1:
+            return json.dumps({"object": {"pins": [{"package": name, "repositoryURL": url, "state": {"version": "1.0.0"}}
+                                                   for name, url in rows]}, "version": 1})
+        return json.dumps({"pins": [{"identity": name, "location": url, "state": {"version": "1.0.0"}} for name, url in rows],
+                           "version": version})
+
+    for label, version, first, second, want in (
+        ("版 2 の同じ identity", 2, ("foo", "https://x.invalid/foo"), ("foo", "https://y.invalid/foo"), 2),
+        ("版 2 の大文字小文字だけが違う identity", 2, ("foo", "https://x.invalid/foo"), ("Foo", "https://y.invalid/foo"), 2),
+        ("版 3 の同じ identity", 3, ("foo", "https://x.invalid/foo"), ("foo", "https://y.invalid/foo"), 2),
+        ("版 2 の違う identity と同じ名前の URL", 2, ("foo", "https://x.invalid/foo"), ("bar", "https://y.invalid/foo"), 1),
+        ("版 1 の違う package と同じ名前の URL", 1, ("foo", "https://x.invalid/aaa.git"), ("bar", "https://y.invalid/AAA"), 2),
+        ("版 1 の同じ package と違う名前の URL", 1, ("foo", "https://x.invalid/aaa"), ("foo", "https://y.invalid/bbb"), 1),
+        ("版 1 の「/」のない scp の形の URL", 1, ("foo", "git@x.invalid:aaa.git"), ("bar", "https://y.invalid/aaa/"), 1),
+    ):
+        dependencies_case(f"依存の名前の重複（{label}）", want, "重複している" if want == 2 else "許可リストにない",
+                          {"Package.resolved": pins(version, first, second)})
+    dependencies_case("別の Package.resolved の同じ名前の依存", 0, "OK",
+                      {"Package.resolved": resolved, "Packages/Sub/Package.resolved": resolved}, [approved])
     # 許可リストの重複した鍵（後の approvedPackages で前の承認を隠す）も読めないものとする
     with tempfile.TemporaryDirectory() as directory:
         allowlist = Path(directory) / "allowlist.json"
@@ -2532,7 +2609,8 @@ def lint_rules_config_cases() -> None:
     original_argv, sys.argv = sys.argv, ["test-lint-rules.py"]
     # custom_rules の読めない書き方でも、対照の設定で SwiftLint を実行する前に止まる
     count += 1
-    module.read_config = lambda path: original_read(path) + b"\n  rule_z:\n    excluded:\n      [a,\n      b]\n"
+    # 実際の設定には足さない（custom_rules の後に最上位の鍵があると、足した rule_z が custom_rules の外になる）
+    module.read_config = lambda path: b"custom_rules:\n  rule_z:\n    excluded:\n      [a,\n      b]\n"
     with contextlib.redirect_stdout(io.StringIO()) as printed:
         code = module.main()
     if code != 1 or executed or "「- 値」の並びで書く" not in printed.getvalue():
@@ -2633,6 +2711,24 @@ def simulator_cases() -> None:
             elif want_code == 0 and result.stdout != f"{SIM_X}\n":
                 # 成功の場合は、選んだ機種の UDID（試験用の一覧の SIM_X）だけを出力すること
                 failures.append(f"simulator: {label}: 出力が {result.stdout!r}（期待 {SIM_X!r}）")
+
+
+def simulator_stderr_case() -> None:
+    """find-simulator.py が、xcrun の失敗の理由（標準エラー）を標準エラーに示し、標準出力には何も出さないこと。"""
+    global count
+    for detail in ("simctl is broken", ""):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            stub = Path(directory) / "xcrun"
+            stub.write_text(f"#!/bin/sh\nprintf '%s' '{detail}' >&2\necho partial\nexit 72\n", encoding="utf-8")
+            stub.chmod(0o755)
+            result = subprocess.run([str(SCRIPTS / "find-simulator.py")], capture_output=True, text=True,
+                                    env=dict(os.environ, PATH=f"{directory}:{os.environ.get('PATH', '')}"))
+            lines = result.stderr.splitlines()
+            if (result.returncode != 2 or result.stdout or not lines or "シミュレータの一覧を取得できない" not in lines[0]
+                    or lines[1:] != ([detail] if detail else [])):
+                failures.append(f"simulator: xcrun の失敗（標準エラー {detail!r}）の報告が違う（終了コード {result.returncode}・"
+                                f"{result.stdout!r}）\n{result.stderr.strip()}")
 
 
 def simulator_developer_dir_case() -> None:
@@ -2962,6 +3058,45 @@ def staged_symlink_config_case() -> None:
                                 f"ツールの実行 {out.exists()}）\n{result.stderr.strip()}")
 
 
+def staged_pathspec_case() -> None:
+    """check.sh --staged が、引き継いだパス指定の変数（GIT_LITERAL_PATHSPECS など）で、検査する対象を変えないこと。"""
+    global count
+    for variable in ("GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"):
+        for linked in (False, True):
+            count += 1
+            with tempfile.TemporaryDirectory() as directory:
+                env = isolated_git_env()
+                env.pop("MINUTES_CHECK_ISOLATED", None)
+                repository, out = Path(directory) / "repository", Path(directory) / "recorded"
+                (repository / "scripts").mkdir(parents=True)
+                (repository / ".tools" / "bin").mkdir(parents=True)
+                (repository / "Sub").mkdir()
+                check = repository / "scripts" / "check.sh"
+                check.write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+                check.chmod(0o755)
+                stage_tool_stubs(repository)
+                # 整形の代わり: 渡された引数を記録し、手順 1 で止める
+                formatter = repository / ".tools" / "bin" / "swiftformat"
+                formatter.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$MINUTES_TEST_OUT"\nexit 1\n', encoding="utf-8")
+                formatter.chmod(0o755)
+                # 拡張子が大文字のファイルは、変数がなければ選ばない（ICASE で選ばれると対象が変わる）
+                for name in ("Sub/Nested.swift", "Sub/Upper.SWIFT"):
+                    (repository / name).write_text("let sample = 1\n", encoding="utf-8")
+                (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+                if linked:
+                    (repository / "Sub" / ".swiftlint.yml").symlink_to("config")
+                subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(repository), "add", "-A"], env=env, check=True, capture_output=True)
+                result = subprocess.run([str(check), "--staged"], capture_output=True, text=True, timeout=60,
+                                        env=dict(env, MINUTES_TEST_OUT=str(out), **{variable: "1"}))
+                recorded = out.read_text(encoding="utf-8") if out.is_file() else ""
+                found = ("Sub/.swiftlint.yml はインデックスでシンボリックリンク" in result.stderr if linked
+                         else "Nested.swift" in recorded and "Upper.SWIFT" not in recorded and "NG: 手順 1" in result.stderr)
+                if result.returncode != 1 or not found:
+                    failures.append(f"check: --staged が {variable} で検査する対象を変える（リンクの設定 {linked}・終了コード {result.returncode}・"
+                                    f"記録 {recorded!r}）\n{result.stderr.strip()}")
+
+
 def snapshot_timeout_case() -> None:
     """snapshot_tools が、上限を過ぎたら子のプロセスも止めて戻ること（ロックを待ち続ける写しを残さない）。"""
     global count
@@ -3243,9 +3378,14 @@ def linked_bin_case() -> None:
             (shims / "curl").write_text('#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\ncp "$MINUTES_TEST_ARCHIVE" "$2"\n',
                                         encoding="utf-8")
             (shims / "curl").chmod(0o755)
-            result = subprocess.run([str(SCRIPTS / "setup-tools.sh"), "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
-                                    capture_output=True, text=True, timeout=60,
+            command = [str(SCRIPTS / "setup-tools.sh"), "--versions", str(versions), "--dest", str(dest), "--require", "gh"]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60,
                                     env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_ARCHIVE=str(archive)))
+            if linked == "dest" and result.returncode == 0:
+                # 導入が成功したら、同じ導入先（リンク）の照合も通ること
+                verified = subprocess.run([*command, "--verify"], capture_output=True, text=True, timeout=60)
+                if verified.returncode != 0:
+                    failures.append(f"versions: 導入先がリンクの導入を照合できない（終了コード {verified.returncode}）\n{verified.stderr.strip()}")
             unchanged = linked == "dest" or (not list(shared.iterdir()) and sorted(path.name for path in (dest / "gh").iterdir()) == ["9.9.9"]
                                              and (dest / "gh" / "9.9.9" / "gh").read_text(encoding="utf-8") == "old")
             if result.returncode != want or not unchanged or (dest / ".install.lock").exists():
@@ -3689,7 +3829,8 @@ def pre_push_interrupted_case() -> None:
             failures.append(f"pre-push: 初回の作成が通らない（終了コード {fresh.returncode}・記録 {recorded!r}・印 {len(marks)}）\n"
                             f"{fresh.stderr.strip()}")
         # 再利用する専用の作業ツリーの下に登録された別の作業ツリーがあれば、どちらも変更せずに止める
-        snapshot = next(path for path in base.iterdir() if path.is_dir())
+        # 実体のパスで扱う（git に登録され、フックが表示するのは実体のパス）
+        snapshot = Path(os.path.realpath(next(path for path in base.iterdir() if path.is_dir())))
         count += 1
         out.unlink(missing_ok=True)
         inner = snapshot / "nested" / "inner"
@@ -3753,7 +3894,6 @@ def pre_push_interrupted_case() -> None:
         git("add", "-A")
         git("commit", "-q", "-m", "race")
         head = git("rev-parse", "HEAD")
-        snapshot = Path(os.path.realpath(snapshot))  # フックが git に渡すのは実体のパス
         late = snapshot / "scripts" / "race" / "inner"
         for label, pattern in (("移す直前", f"worktree move {snapshot} "), ("展開の直前", " checkout -q "), ("戻す直前", f"/tree {snapshot} ")):
             count += 1
@@ -3803,6 +3943,22 @@ def pre_push_interrupted_case() -> None:
         if (repository / "scripts").exists() or resumed.returncode != 0 or not out.exists() or (snapshot / "junk").exists():
             failures.append(f"pre-push: 元の作業ツリーに scripts/ がないと検査できない・追跡していないものを残した（終了コード {resumed.returncode}）\n"
                             f"{resumed.stderr.strip()}")
+        # ディレクトリがなく登録だけが残っていれば、登録を上書きせずに止める。登録を外せば作り直して検査できる
+        count += 1
+        out.unlink(missing_ok=True)
+        away = Path(directory) / "away"
+        snapshot.rename(away)
+        listed = git("worktree", "list", "--porcelain")
+        refused = push(base)
+        if (refused.returncode != 1 or out.exists() or snapshot.exists() or git("worktree", "list", "--porcelain") != listed
+                or f"（{snapshot}）は、ディレクトリがないのに作業ツリーとして登録されている" not in refused.stderr):
+            failures.append(f"pre-push: 登録だけが残った置き場所で止まらない・登録を変えた（終了コード {refused.returncode}）\n{refused.stderr.strip()}")
+        count += 1
+        out.unlink(missing_ok=True)
+        subprocess.run(["git", "-C", str(repository), "worktree", "remove", "--force", str(snapshot)], env=env, capture_output=True)
+        renewed = push(base)
+        if renewed.returncode != 0 or not out.exists():
+            failures.append(f"pre-push: 登録を外した後に作り直せない（終了コード {renewed.returncode}）\n{renewed.stderr.strip()}")
         count += 1
         out.unlink(missing_ok=True)
         key = next((path.name for path in base.iterdir() if path.is_dir()), "missing")
@@ -4097,8 +4253,13 @@ def publish_failure_case(setup: str) -> None:
         curl.chmod(0o755)
         env = dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_ARCHIVE=str(archive), MINUTES_TEST_CALLED=str(called))
         command = [setup, "--versions", str(versions), "--dest", str(dest), "--require", "gh"]
+        recorded = len(failures)
         expect("versions: 公開の失敗の試験の導入", command, 0, env=env)
         curl.write_text('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$MINUTES_TEST_CALLED"\nexit 1\n', encoding="utf-8")
+        if not (dest / "bin" / "gh").is_symlink():
+            if len(failures) == recorded:  # 導入の失敗なら、上の expect が記録した
+                failures.append("versions: 公開の失敗の試験の導入が成功したのに、公開するリンクがない")
+            return
         link = os.readlink(dest / "bin" / "gh")
         (dest / "bin").chmod(0o555)
         try:
@@ -4106,7 +4267,8 @@ def publish_failure_case(setup: str) -> None:
         finally:
             (dest / "bin").chmod(0o755)
         expect("versions: 更新できなかった後もリンクと導入が残る", [*command, "--verify"], 0, "OK", env=env)
-        if called.exists() or os.readlink(dest / "bin" / "gh") != link:
+        kept = os.readlink(dest / "bin" / "gh") if (dest / "bin" / "gh").is_symlink() else None
+        if called.exists() or kept != link:
             failures.append(f"versions: 公開の失敗の試験で取得した（{called.exists()}）・リンクが変わった")
 
 
@@ -4197,6 +4359,7 @@ def test_versions() -> None:
     setup_include_case()
     staged_symlink_case()
     staged_symlink_config_case()
+    staged_pathspec_case()
     install_unlock_case()
     coverage_lock_case()
     staged_index_change_case()
@@ -4225,6 +4388,7 @@ def test_versions() -> None:
         for value in ("0-8,10", "10"):
             expect(f"check: 正しい --steps（{value!r}）", [str(copy), "--steps", value], 1, "", timeout=30, env=isolated_git_env())
     simulator_cases()
+    simulator_stderr_case()
     simulator_developer_dir_case()
     lint_rules_config_cases()
     setup = str(SCRIPTS / "setup-tools.sh")
@@ -5359,7 +5523,9 @@ DOCS = {
         "| FR-AAA-01 | 一 | MVP |\n| FR-AAA-02 | 二 | MVP |\n| FR-AAA-03 | 三 | P2 |\n\n"
         "| ID | 制約 |\n| --- | --- |\n| CON-01 | 制約 |\n"
     ),
-    "docs/01-requirements/security-requirements.md": "# SEC\n\n| ID | 要件 | フェーズ |\n| --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP |\n",
+    "docs/01-requirements/security-requirements.md": (
+        "# SEC\n\n| ID | 要件 | フェーズ | MASVS |\n| --- | --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP | STORAGE |\n"
+    ),
     "docs/01-requirements/test-requirements.md": "# TST\n\n| ID | 要件 |\n| --- | --- |\n| TST-AAA-01 | 一 |\n",
     "docs/01-requirements/dependencies-and-costs.md": "# COST\n\n| ID | 項目 |\n| --- | --- |\n| COST-01 | 一 |\n",
     "docs/02-basic-design/sample.md": (
@@ -6019,7 +6185,16 @@ def run_docs_cases() -> None:
         # FR / NFR / SEC はフェーズ（MVP / P2 / P3）を持つ
         docs_case("フェーズを読めない", 1, "FR-AAA-02 のフェーズ「未定」", requirements, "| FR-AAA-02 | 二 | MVP |", "| FR-AAA-02 | 二 | 未定 |"),
         docs_case("フェーズの列がない", 1, "SEC-AAA-01 のフェーズの列がない", "docs/01-requirements/security-requirements.md",
-                  "| ID | 要件 | フェーズ |\n| --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP |", "| ID | 要件 |\n| --- | --- |\n| SEC-AAA-01 | 一 |"),
+                  "| ID | 要件 | フェーズ | MASVS |\n| --- | --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP | STORAGE |",
+                  "| ID | 要件 | MASVS |\n| --- | --- | --- |\n| SEC-AAA-01 | 一 | STORAGE |"),
+        # SEC は MASVS 分類を必ず持つ（列がない・値が空・コメントだけ・行に列が足りない）
+        docs_case("MASVS の列がない", 1, "security-requirements.md:5: SEC-AAA-01 の MASVS 分類の列がない",
+                  "docs/01-requirements/security-requirements.md",
+                  "| ID | 要件 | フェーズ | MASVS |\n| --- | --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP | STORAGE |",
+                  "| ID | 要件 | フェーズ |\n| --- | --- | --- |\n| SEC-AAA-01 | 一 | MVP |"),
+        *[docs_case(f"MASVS 分類が{label}", 1, "SEC-AAA-01 の MASVS 分類が空", "docs/01-requirements/security-requirements.md",
+                    "| MVP | STORAGE |", row)
+          for label, row in (("空", "| MVP |  |"), ("コメントだけ", "| MVP | <!-- 未定 --> |"), ("行にない", "| MVP |"))],
         # 「満たす要件の例」などの説明文は、網羅に数えない
         docs_case("説明文の要件は網羅に数えない", 1, "MVP の要件 FR-AAA-02", extra={basic: replaced(replaced(
             DOCS[basic], "FR-AAA-01・02、", "FR-AAA-01、"),
@@ -6384,6 +6559,10 @@ def run_docs_cases() -> None:
         ("画像の中のリンクで無効になる外側", "[外 ![図 [内](../README.md)](../README.md)](missing.md)", ""),
         ("エスケープした「!」の入れ子の外側", "\\![外 [内](../README.md)](missing.md)", ""),
         ("段落をまたぐ括弧", "[例\n\n続き](missing.md)", ""),
+        ("次の行のリンク先", '[例](\nmissing.md)', "missing.md"),
+        ("次の行の字下げした山括弧のリンク先", '[例]( \n  <missing file.md>\n"題")', "missing file.md"),
+        ("次の行のあるリンク先", '[例](\n../README.md)', ""),
+        ("段落をまたぐリンク先はリンクでない", '[例](\n\nmissing.md)', ""),
         ("次の行のタイトル", '[例](missing.md\n"題")', "missing.md"),
         ("行をまたぐタイトル", '[例](missing.md "題\n続き"\n)', "missing.md"),
         ("段落をまたぐタイトル", '[例](missing.md\n\n"題")', ""),

@@ -109,6 +109,9 @@ def main() -> int:
     # 深い入れ子の一覧は json の読み込みが RecursionError になる（形の違う一覧と同じく取得の失敗として扱う）
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, RecursionError, KeyError, TypeError, ValueError) as error:
         print(f"NG: シミュレータの一覧を取得できない: {error!r}", file=sys.stderr)
+        # xcrun が失敗の理由を標準エラーに出していれば示す（例外の表示には含まれない）
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr and error.stderr.strip():
+            print(error.stderr.strip(), file=sys.stderr)
         return 2
     if not candidates:
         print(

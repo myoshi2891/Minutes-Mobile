@@ -324,15 +324,20 @@ if [ "$owned" -eq 1 ]; then
 else
   # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すもの・このフックの印のない
   # 作業ツリーなど）が置き場所にあれば、変更せずに止める（中身が何かを確かめられないものを checkout・clean・rm -rf しない）。
-  # ないとき（初回・登録だけが残った場合）だけ作る
+  # 登録も置き場所もないとき（初回）だけ作る
   if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
     echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないもの（このフックの印のない作業ツリーを含む）がある。中身を確かめて削除する（作業ツリーなら git worktree remove）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す" >&2
     exit 1
   fi
-  # --force: 登録が残ったままディレクトリを消された場合も作り直す（ほかの作業ツリーの登録には触れない）
+  # 登録だけが残っている場合は、上書きせずに止める（作業ツリーを別の場所へ移した・外した場所に置いた場合に、その登録を奪わない）
+  if [ "$registration" -eq 0 ]; then
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）は、ディレクトリがないのに作業ツリーとして登録されている。移したものなら git worktree repair で登録を直し、不要なら git worktree remove で登録を外してから push し直す" >&2
+    exit 1
+  fi
+  # --force は付けない（上の照合の後に登録された場合も、git が拒否する）
   # --no-checkout: 先に登録だけを行い、印を書いてから展開する（時間のかかる展開の途中で中断・失敗しても印が残り、次の検査が
   # このフックの作業ツリーとして展開し直せる）
-  git -C "$source_root" worktree add -q --force --no-checkout --detach "$snapshot" "$head"
+  git -C "$source_root" worktree add -q --no-checkout --detach "$snapshot" "$head"
   # 作った作業ツリーの専用の管理ディレクトリに、このフックの印を書く（次の検査で再利用してよいかの判定に使う）
   git_path private "$snapshot" --git-dir && real_directory private "$private" \
     || { echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }

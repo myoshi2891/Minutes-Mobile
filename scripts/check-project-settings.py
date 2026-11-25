@@ -140,13 +140,53 @@ class Variant(NamedTuple):
         return self.sdk if self.arch is None else f"{self.sdk}・{self.arch}"
 
 
-# arch の条件を判定する代表の値。書き方に現れる値と、どの名前とも一致しない値（条件の外のビルド）を build_variants が足す
+# arch の条件を判定する代表の値。書き方に現れる値と、どの名前とも一致しない値（条件の外のビルド）を possible_variants が足す
 ARCHS = ("arm64", "arm64e", "x86_64")
 OTHER_ARCH = "その他の arch"
 
 
-def build_variants(own: dict, shared: dict) -> List[Variant]:
-    """判定する SDK と arch の組。arch の条件の書き方がなければ SDK だけの組を返す（arch で結果が変わらない）。"""
+# ARCHS の指定がないときに Xcode が使う値（ARCHS_STANDARD。2026-11-25 に Xcode 27.2 の xcodebuild -showBuildSettings で確かめた）
+STANDARD_ARCHS = {"iphoneos": "arm64", "iphonesimulator": "arm64 x86_64"}
+
+
+def built_archs(own: dict, shared: dict, configuration: str, sdk: str) -> Optional[List[str]]:
+    """その構成・SDK で実際にビルドする arch（ARCHS から EXCLUDED_ARCHS を除いたもの）。決められなければ None。"""
+    # Xcode の既定を、プロジェクトの段より弱い値として置く（ONLY_ACTIVE_ARCH は、ARCHS のどれにもなりうるので見ない）
+    defaults = {"ARCHS": STANDARD_ARCHS[sdk], "ARCHS_STANDARD": STANDARD_ARCHS[sdk], "EXCLUDED_ARCHS": ""}
+    base = {**defaults, **shared}
+    values: Dict[str, List[str]] = {}
+    for name in ("ARCHS", "EXCLUDED_ARCHS"):
+        found = setting_value(own, base, name, configuration, Variant(sdk))
+        if found is None:
+            return None
+        expanded = expand_value(found[0], own, base, configuration, Variant(sdk), setting=name, from_target=found[1])
+        if expanded is None:
+            return None
+        values[name] = expanded.split()
+    archs = [arch for arch in dict.fromkeys(values["ARCHS"]) if arch not in values["EXCLUDED_ARCHS"]]
+    return archs or None
+
+
+def build_variants(own: dict, shared: dict, configuration: str) -> List[Variant]:
+    """その構成で実際にビルドする SDK と arch の組。必要な値の欠落の判定と、変数の展開に使う。
+
+    ビルドする arch を決められない SDK は、possible_variants の組をすべて使う（判定を弱めない）。
+    """
+    chosen: List[Variant] = []
+    for variant in possible_variants(own, shared):
+        archs = built_archs(own, shared, configuration, variant.sdk) if variant.arch is not None else None
+        if archs is None:
+            chosen.append(variant)
+        else:
+            chosen.extend(found for found in (Variant(variant.sdk, arch) for arch in archs) if found not in chosen)
+    return chosen
+
+
+def possible_variants(own: dict, shared: dict) -> List[Variant]:
+    """条件の書き方が当たりうる SDK と arch の組（ビルドしない arch を含む）。禁止する値を探す参照先の列挙に使う。
+
+    arch の条件の書き方がなければ SDK だけの組を返す（arch で結果が変わらない）。
+    """
     patterns = {conditions(key)["arch"] for level in (own, shared) for key in level if "arch" in conditions(key)}
     if not patterns:
         return [Variant(sdk) for sdk in SDKS]
@@ -378,7 +418,7 @@ def check_plist_values(
         empty: Dict[str, List[str]] = {}
         # 効きうる候補のうち展開できないもの。ほかの候補で補えるかによらず違反とする（展開できない値を見逃さない）
         unresolved: Dict[str, List[str]] = {}
-        for configuration, variant in ((c, v) for c in configurations for v in build_variants(own, shared)):
+        for configuration, variant in ((c, v) for c in configurations for v in build_variants(own, shared, c)):
             build = f"{configuration}（{variant.label()}）"
             modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, variant)
             from_files: List[Tuple[str, str]] = []
@@ -464,7 +504,7 @@ def check_plist_orientation(
     """
     missing: List[str] = []
     wrong: Dict[str, List[str]] = {}
-    for configuration, variant in ((c, v) for c in configurations for v in build_variants(own, shared)):
+    for configuration, variant in ((c, v) for c in configurations for v in build_variants(own, shared, c)):
         build = f"{configuration}（{variant.label()}）"
         modes, plists, plists_undecided = infoplist_sources(project_path, target_name, own, shared, configuration, variant)
         covered = bool(plists) and not plists_undecided
@@ -536,13 +576,15 @@ def target_expander(
     def applies(configuration: str, variant: Variant) -> bool:
         if "config" in condition and not fnmatch.fnmatchcase(configuration, condition["config"]):
             return False
-        # arch の条件の書き方があれば build_variants は arch を持つ組を返す（arch が None の組には arch の条件がない）
+        # arch の条件の書き方があれば build_variants・possible_variants は arch を持つ組を返す（arch が None の組には arch の条件がない）
         if "arch" in condition and variant.arch is not None and not fnmatch.fnmatchcase(variant.arch, condition["arch"]):
             return False
         return "sdk" not in condition or sdk_matches(variant.sdk, condition["sdk"], str(key))
 
-    return lambda text: [expand_value(text, own, shared, c, v, setting=setting, from_target=from_target)
-                         for c in configurations for v in build_variants(own, shared) if applies(c, v)]
+    # ビルドする arch に当たる組がない書き方（armv7 だけなど）は、当たりうる組で展開する（展開した値がないものを合格にしない）
+    builds = ([(c, v) for c in configurations for v in build_variants(own, shared, c) if applies(c, v)]
+              or [(c, v) for c in configurations for v in possible_variants(own, shared) if applies(c, v)])
+    return lambda text: [expand_value(text, own, shared, c, v, setting=setting, from_target=from_target) for c, v in builds]
 
 
 def combined_expander(expanders: List[Expander]) -> Expander:
@@ -760,6 +802,7 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
     # INFOPLIST_FILE の参照先 → それを参照する構成・SDK の展開（参照するターゲットの、その構成・SDK のビルド設定だけで
     # 値の変数を展開する。参照しない構成の値で判定しない）
     referenced: Dict[Path, List[Expander]] = {}
+    unbuilt: Dict[Path, List[Expander]] = {}  # ビルドしない arch の参照先（上と同じ形）
     entitlements: List[Path] = []
     tracked = tracked_files(root) if tracked_only else None
     for target in targets:
@@ -767,10 +810,12 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         own = target["build-settings"]
         target_name = str(target.get("name", ""))
         for configuration in configurations:
-            for variant in build_variants(own, shared):
+            built = build_variants(own, shared, configuration)
+            for variant in [*built, *(found for found in possible_variants(own, shared) if found not in built)]:
                 for path in referenced_files(project_path, target_name, own, shared, configuration, "INFOPLIST_FILE", variant,
                                              root, tracked)[0]:
-                    referenced.setdefault(path, []).append(
+                    # 値の変数は、ビルドする組で展開する（ビルドしない arch だけの参照先は、その当たりうる組で展開する）
+                    (referenced if variant in built else unbuilt).setdefault(path, []).append(
                         # ビルドが plist の変数を展開しない・展開するかを決められない構成では、展開後の値で判定しない
                         # （None = 判定できない。check_plist_values・check_plist_orientation と同じ）
                         lambda text, own=own, c=configuration, v=variant: [
@@ -787,6 +832,8 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")
+    for path, expanders in unbuilt.items():
+        referenced.setdefault(path, expanders)
     found = discovered_files(root, ("Info.plist",), tracked)
     # INFOPLIST_FILE が指すファイルも読む。ないファイル・読めないファイルは load_plist が Unreadable にする
     for path in found + [path for path in referenced if path not in found]:

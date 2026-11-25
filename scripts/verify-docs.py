@@ -477,8 +477,8 @@ def link_destinations(line: str, openers: Optional[List[Opener]] = None,
         if not opener.active or not text.startswith("(", position):
             continue
         at = position + 1
-        # 「(」の直後の空白は読み飛ばす（CommonMark。「[設計]( missing.md)」もリンクとして確かめる）
-        while at < len(text) and text[at] in " \t":
+        # 「(」の直後の空白と改行は読み飛ばす（CommonMark。「[設計]( missing.md)」もリンクとして確かめる。text は同じ段落の中だけ）
+        while at < len(text) and text[at] in " \t\n":
             at += 1
         if text.startswith("<", at):
             close = text.find(">", at)
@@ -810,10 +810,12 @@ class Checker:
             section_of = section_numbers(text)
             for header, rows in tables(text):
                 phase_column = header.index("フェーズ") if "フェーズ" in header else -1
+                masvs_column = header.index("MASVS") if "MASVS" in header else -1
                 for number, line in rows:
-                    self.collect_definition(name, number, line, phase_column, section_of.get(number, ""))
+                    self.collect_definition(name, number, line, phase_column, masvs_column, section_of.get(number, ""))
 
-    def collect_definition(self, name: str, number: int, line: str, phase_column: int, section: str) -> None:
+    def collect_definition(self, name: str, number: int, line: str, phase_column: int, masvs_column: int,
+                           section: str) -> None:
         """表のデータ行 1 行から ID の定義を集める（collect_definitions から呼ぶ）。section は行を含む節（「## 」）の番号。"""
         cells = table_cells(line)
         # 先頭の列の空白の有無（|FR-AAA-01| と | FR-AAA-01 |）によらず、正規化した値で判定する
@@ -840,7 +842,12 @@ class Checker:
                 self.error(name, f"{identifier} の{what}", number)
             elif phase.startswith("MVP"):
                 self.mvp.add(identifier)
-
+        if prefix == "SEC":
+            # SEC は MASVS 分類も必ず持つ（docs/README.md §3）。表示されないコメントだけの値は空とする
+            masvs = cells[masvs_column] if 0 <= masvs_column < len(cells) else ""
+            if not INLINE_COMMENT.sub("", masvs).strip():
+                what = "の列がない" if masvs_column < 0 else "が空"
+                self.error(name, f"{identifier} の MASVS 分類{what}", number)
 
     def oversized_range(self, match: "re.Match[str]") -> bool:
         """範囲（〜）の要素数が、同じ接頭辞の定義済み ID の数を超えるか（巨大な範囲を展開しないため）。"""

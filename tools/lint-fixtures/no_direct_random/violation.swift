@@ -27,3 +27,16 @@ let inDoubleRaw = Int.random(in: 0..<##"a"#, using: &generator"##.count) // expe
 let inNestedRaw = Int.random(in: 0..<length(of: #"a"), using: &generator"#)) // expect: no_direct_random
 // 「.」と名前の間の空白があっても検出する
 let spaced = Int . random(in: 0...1) // expect: no_direct_random
+// ふつうの複数行の文字列の中の「"」「,」「using:」は、文字列の終わりや最上位の引数ではない
+let inMultiline = Int.random( // expect: no_direct_random
+    in: 0..<"""
+    a ", using: &generator) (
+    """.count)
+let inNestedMultiline = Int.random( // expect: no_direct_random
+    in: 0..<length(of: """
+    a "quoted" ), using: &generator
+    """))
+let multilineWithout = Int.random( // expect: no_direct_random
+    in: 0..<length(of: """
+    a "quoted" ) (
+    """))
