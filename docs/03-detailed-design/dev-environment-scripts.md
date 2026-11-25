@@ -147,9 +147,23 @@ verify_tool() {
   echo "OK: $name $version"
 }
 
+# 展開した配布ファイル（$1/extract）の通常のファイルを、残りの引数の条件で探し、件数を FOUND_COUNT、最後のパスを FOUND_PATH に
+# 入れる。NUL で区切って読む（パスの改行で件数を数え違えない）。find の失敗は、見つからないことと区別して非 0 を返す
+find_paths() {
+  local work=$1 path
+  shift
+  FOUND_COUNT=0
+  FOUND_PATH=""
+  find "$work/extract" "$@" -type f -print0 > "$work/found" || return 1
+  while IFS= read -r -d '' path; do
+    FOUND_COUNT=$((FOUND_COUNT + 1))
+    FOUND_PATH=$path
+  done < "$work/found"
+}
+
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
-  local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
+  local target="$DEST/$name/$version" work="$WORK/$name" actual found cached=""
   # ツールのディレクトリがリンクなら、リンクの先の共有の場所を書き換えずに止める
   [ ! -L "$DEST/$name" ] || fail "${DEST}/${name} がシンボリックリンク。削除してから実行し直す"
   # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
@@ -188,14 +202,15 @@ install_tool() {
     # 実行ファイルは最上位か、配布ファイルの中のどこか 1 か所（gh は gh_{版}_macOS_{arch}/bin/gh）
     found="$work/extract/$binary"
     if [ ! -f "$found" ]; then
-      found=$(find "$work/extract" -type f -name "$binary")
-      [ -n "$found" ] || fail "$name の配布ファイルに実行ファイル $binary がない"
-      [ "$(printf '%s\n' "$found" | wc -l | tr -d ' ')" = 1 ] || fail "$name の配布ファイルに $binary が複数ある"
+      find_paths "$work" -name "$binary" || fail "$name の配布ファイルを調べられない"
+      [ "$FOUND_COUNT" -gt 0 ] || fail "$name の配布ファイルに実行ファイル $binary がない"
+      [ "$FOUND_COUNT" = 1 ] || fail "$name の配布ファイルに $binary が複数ある"
+      found=$FOUND_PATH
     fi
     cp "$found" "$work/out/$binary"
     chmod 755 "$work/out/$binary"
-    license=$(find "$work/extract" -maxdepth 2 -type f -name LICENSE)
-    if [ -n "$license" ] && [ "$(printf '%s\n' "$license" | wc -l | tr -d ' ')" = 1 ]; then cp "$license" "$work/out/LICENSE"; fi
+    find_paths "$work" -maxdepth 2 -name LICENSE || fail "$name の配布ファイルを調べられない"
+    if [ "$FOUND_COUNT" = 1 ]; then cp "$FOUND_PATH" "$work/out/LICENSE"; fi
     printf '%s\n' "$sha" > "$work/out/.archive-sha256"
     # 既存の導入を消す前に、取得したものが記録した版を名乗ることを確かめる（違えば既存の導入を残して失敗する）
     actual=$(runtime_version "$name" "$work/out/$binary") || fail "取得した $name の版を表示できない。既存の導入は残す"
@@ -795,7 +810,7 @@ write_index_entries() {
 
 # 規則の試験に使うもの（規則・試験用のファイル・試験のスクリプト）をインデックスから同じ一時ディレクトリへ書き出す。
 # 試験のスクリプトは自身の位置をリポジトリ直下とみなすので、一時ディレクトリの中のスクリプトを実行する。
-# 開発ツールは作業ツリーの .tools を指す（ツールは Git の管理外）
+# 開発ツールは照合した写し（$STAGED_TOOLS/.tools）を指す（ツールは Git の管理外）
 prepare_rules_tree() {
   local directory entries
   [ -n "$STAGED_TREE" ] || make_staged_tree
@@ -953,7 +968,7 @@ step_5() {
 # カバレッジを測った入力の識別子。未コミットの変更がなければ HEAD のコミット、あれば作業ツリー全体（追跡していない
 # ファイルを含む。無視するファイルは除く）のツリーのハッシュ。作業ツリーの記録はコミットの合格の記録と区別する
 coverage_input() {
-  local changes index tree
+  local changes index staged tree
   # git status の失敗を「変更なし」と取り違えない（$(…) を条件の中に書くと失敗が見えないので、先に取得して確かめる）
   changes=$(git status --porcelain --untracked-files=normal) || return 1
   if [ -z "$changes" ]; then
@@ -966,7 +981,9 @@ coverage_input() {
   # 届かないまま残る。これらは手元のリポジトリの中だけにあり、git gc が gc.pruneExpire（既定 2 週間）を過ぎたものを消す
   index=$(mktemp)
   rm -f -- "$index"
-  if ! GIT_INDEX_FILE="$index" git read-tree HEAD || ! GIT_INDEX_FILE="$index" git add -A \
+  # 起点は HEAD ではなく現在のインデックス（git add -f でステージした無視するファイルも測る入力に含める。追跡していない
+  # 無視するファイルは git add -A が除く）。未解決の衝突があればツリーを作れず、識別できないものとして失敗する
+  if ! staged=$(git write-tree) || ! GIT_INDEX_FILE="$index" git read-tree "$staged" || ! GIT_INDEX_FILE="$index" git add -A \
     || ! tree=$(GIT_INDEX_FILE="$index" git write-tree); then
     rm -f -- "$index"
     return 1
@@ -1270,6 +1287,7 @@ step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest
+  local resolution=()
   mkdir -p "$PACKAGE/.build"
   take_coverage_lock
   rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
@@ -1283,11 +1301,14 @@ step_7() {
   # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
   # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
   COVERAGE_SCRATCH=$(mktemp -d)
-  swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --enable-code-coverage
+  # 確定版の記録（Package.resolved）があれば、その版だけを使わせる（古い記録を swift test に書き直させて測らない。合わなければ
+  # 記録を書く前に失敗する）。依存がなく記録もない場合は、これまでどおりの指定で実行する
+  if [ -e "$COVERAGE_INPUT/$PACKAGE/Package.resolved" ]; then resolution=(--force-resolved-versions); fi
+  swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" ${resolution[@]+"${resolution[@]}"} --enable-code-coverage
   # 追加の安全策: 測った前後で作業ツリーが変わっていれば記録しない（写しを測るので結果は識別子と一致するが、
   # 測定中に変わった作業ツリーの合格として扱われるのを避ける）
   [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
-  report=$(swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --show-codecov-path)
+  report=$(swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" ${resolution[@]+"${resolution[@]}"} --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない（swift test の結果を確かめる）"
   # この測定の JSON を記録の場所へ写す。同じディレクトリの一時ファイルに写してから rename で置き換え、
   # 写したものからハッシュを計算する。JSON を置いてから入力とハッシュの記録を置く（記録があれば JSON もある）
