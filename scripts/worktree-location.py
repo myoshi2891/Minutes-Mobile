@@ -57,13 +57,19 @@ def registered_worktrees(source: str) -> List[bytes]:
     return paths
 
 
-def identity(path: str) -> Optional[Tuple[int, int]]:
-    """デバイスと inode。ないパスは None。それ以外の失敗（権限など）は判定できないとして終了コード 2。"""
+def identity(path: str, registered: bool = False) -> Optional[Tuple[int, int]]:
+    """デバイスと inode。ないパスは None。それ以外の失敗（権限など）は判定できないとして終了コード 2。
+
+    registered（登録された作業ツリーのパスとその祖先）では、途中の要素がディレクトリでない（登録だけが残り、親のディレクトリが
+    ファイルに置き換わったなど）場合も、ないパスとする。置き場所のパスでは、作れない場所なので判定できないものとする。
+    """
     try:
         info = os.stat(path)
     except FileNotFoundError:
         return None
     except OSError as error:
+        if registered and isinstance(error, NotADirectoryError):
+            return None
         print(f"{path}: {error}", file=sys.stderr)
         sys.exit(2)
     return (info.st_dev, info.st_ino)
@@ -98,7 +104,7 @@ def check(requested: str, source: str) -> int:
     # 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）
     roots: Dict[Tuple[int, int], str] = {}
     for path in [source] + [os.fsdecode(listed) for listed in registered_worktrees(source)]:
-        found_identity = identity(path)
+        found_identity = identity(path, registered=True)
         if found_identity is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
             roots[found_identity] = path
     current = base
@@ -129,7 +135,7 @@ def nested(source: str, parent_path: str) -> int:
         # 祖先（自身は含まない）のどれかが同じディレクトリなら、その下にある（check と同じく文字列では比べない）
         current = os.path.dirname(path)
         while True:
-            if identity(current) == parent_identity:
+            if identity(current, registered=True) == parent_identity:
                 print(f"NG: 専用の作業ツリー（{parent_path}）の下に別の作業ツリー（{path}）が登録されている。"
                       "git worktree move か remove で外してからやり直す", file=sys.stderr)
                 found = True

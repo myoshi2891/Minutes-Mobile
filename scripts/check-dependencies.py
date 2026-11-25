@@ -843,8 +843,69 @@ def package_declarations(manifest: str, directory: str, root: Path) -> Tuple[Lis
             if url is not None:
                 remote.append((normalize(url), arguments, masked_arguments, summary))
         elif path is not None and path == path.strip() and not local_package_errors(directory, path, summary, root):
-            local.append((root / posixpath.join(directory, path)).resolve())
+            # SwiftPM と同じく「..」を字面で取り除いてから解決する（local_package_errors が確かめたパスと同じものをたどる）
+            local.append((root / posixpath.normpath(posixpath.join(directory, path))).resolve())
     return remote, local
+
+
+Edition = Tuple[Tuple[int, ...], Path]  # 版別の manifest の（接尾辞の版, パス）
+VARIANT_NAME = re.compile(r"Package@swift-(\d+(?:\.\d+){0,2})\.swift")
+TOOLS_VERSION = re.compile(r"\s*//\s*swift-tools-version\s*:\s*(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+
+
+def padded(version: Tuple[int, ...]) -> Version:
+    values = (*version, 0, 0)
+    return values[0], values[1], values[2]
+
+
+def tools_version(text: str) -> Optional[Version]:
+    """manifest の先頭の swift-tools-version。読み取れなければ None。"""
+    found = TOOLS_VERSION.match(text)
+    return (int(found.group(1)), int(found.group(2)), int(found.group(3) or 0)) if found else None
+
+
+def selected_manifests(texts: Dict[Path, str], directory: Path, editions: List[Edition], toolchain: Version) -> List[Path]:
+    """そのツールの版で SwiftPM が読む manifest。tools-version を読み取れず 1 つに決まらなければ、ありうるものをすべて返す。
+
+    選び方（2026-11-25 に Swift 6.4.2 の swift package dump-package で確かめた）: 接尾辞が major.minor.patch・major.minor・major と
+    一致するものをこの順に選ぶ。なければ、接尾辞がツールの版以下で最も新しいものを、その tools-version が Package.swift の
+    tools-version より新しい場合だけ選び、それ以外は Package.swift を選ぶ。ツールより新しい tools-version の manifest は
+    そのツールでは読めないので、たどらない。
+    """
+    regular = directory / "Package.swift"
+    by_suffix = dict(editions)
+    chosen: List[Path] = []
+    for length in (3, 2, 1):
+        if toolchain[:length] in by_suffix:
+            chosen = [by_suffix[toolchain[:length]]]
+            break
+    else:
+        lower = [edition for edition in editions if padded(edition[0]) <= toolchain]
+        highest = max((padded(suffix) for suffix, _ in lower), default=None)
+        base = tools_version(texts[regular]) if regular in texts else None
+        # 同じ版を表す接尾辞（6 と 6.0）が並ぶときの優先は確かめていないので、どちらもありうるものとする
+        for newest in [path for suffix, path in lower if padded(suffix) == highest]:
+            ours = tools_version(texts[newest])
+            if regular not in texts or ours is None or base is None or ours > base:
+                chosen.append(newest)
+            if regular in texts and (ours is None or base is None or ours <= base):
+                chosen.append(regular)
+        if not lower and regular in texts:
+            chosen = [regular]
+    return [path for path in chosen if (tools_version(texts[path]) or toolchain) <= toolchain]
+
+
+def toolchains(texts: Dict[Path, str]) -> List[Version]:
+    """manifest の選び方が変わりうる境目の版（接尾辞と tools-version の版と、その次の patch・minor・major）。"""
+    versions: Set[Version] = {(0, 0, 0)}
+    for path, text in texts.items():
+        found = VARIANT_NAME.fullmatch(path.name)
+        suffix = padded(tuple(int(part) for part in found.group(1).split("."))) if found else None
+        for version in (suffix, tools_version(text)):
+            if version is not None:
+                major, minor, patch = version
+                versions |= {version, (major, minor, patch + 1), (major, minor + 1, 0), (major + 1, 0, 0)}
+    return sorted(versions)
 
 
 def transitive_errors(root: Path, texts: Dict[Path, str], by_url: Dict[str, dict], approved: Dict[str, Set[str]],
@@ -853,28 +914,35 @@ def transitive_errors(root: Path, texts: Dict[Path, str], by_url: Dict[str, dict
 
     SwiftPM は起点の Package.resolved だけを使い、ローカルの Package 自身のものは読まない（自身のものは単独の起点として照合する）。
     """
-    remote: Dict[Path, List[Tuple[Path, Tuple[str, str, str, str]]]] = {}
+    # 宣言は manifest ごとに持つ（同じディレクトリの版別の manifest の宣言を混ぜると、同時には読まれない辺がつながる）
+    remote: Dict[Path, List[Tuple[str, str, str, str]]] = {}
     local: Dict[Path, List[Path]] = {}
+    editions: Dict[Path, List[Edition]] = {}
     for path, text in texts.items():
-        declared, locations = package_declarations(text, path.parent.relative_to(root).as_posix(), root)
-        remote.setdefault(path.parent, []).extend((path, declaration) for declaration in declared)
-        local.setdefault(path.parent, []).extend(locations)
-    errors: List[str] = []
-    for start in sorted(local):
-        visited = {start}
-        waiting = list(local[start])
-        while waiting:
-            directory = waiting.pop()
-            if directory in visited:
-                continue
-            visited.add(directory)
-            waiting.extend(local.get(directory, []))
-            for path, (url, arguments, masked, summary) in remote.get(directory, []):
-                if url not in by_url:
-                    continue  # 許可リストにないことは、その manifest の検査が報告する
-                found = version_errors(arguments, masked, summary, approved.get(url, set()), pins.get(start, {}).get(url))
-                errors.extend(f"{start.relative_to(root).as_posix()} を起点とする {path.relative_to(root)}: {message}" for message in found)
-    return errors
+        remote[path], local[path] = package_declarations(text, path.parent.relative_to(root).as_posix(), root)
+        editions.setdefault(path.parent, [])
+        found = VARIANT_NAME.fullmatch(path.name)
+        if found:
+            editions[path.parent].append((tuple(int(part) for part in found.group(1).split(".")), path))
+    errors: Dict[str, None] = {}  # 同じ報告を、ツールの版ごとに繰り返さない
+    for toolchain in toolchains(texts):
+        selected = {directory: selected_manifests(texts, directory, items, toolchain) for directory, items in editions.items()}
+        for start in sorted(selected):
+            visited = {start}
+            waiting = [target for path in selected[start] for target in local[path]]
+            while waiting:
+                directory = waiting.pop()
+                if directory in visited:
+                    continue
+                visited.add(directory)
+                for path in selected.get(directory, []):
+                    waiting.extend(local[path])
+                    for url, arguments, masked, summary in remote[path]:
+                        if url not in by_url:
+                            continue  # 許可リストにないことは、その manifest の検査が報告する
+                        for message in version_errors(arguments, masked, summary, approved.get(url, set()), pins.get(start, {}).get(url)):
+                            errors[f"{start.relative_to(root).as_posix()} を起点とする {path.relative_to(root)}: {message}"] = None
+    return list(errors)
 
 
 def manifests(root: Path) -> Iterator[Path]:

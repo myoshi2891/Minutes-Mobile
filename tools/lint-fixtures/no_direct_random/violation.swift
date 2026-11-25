@@ -21,3 +21,7 @@ let inClosure = Int.random(in: 0..<items.map { pick(using: $0) }.count) // expec
 // 3 段の入れ子でも using: がなければ検出する。4 段以上の入れ子は読めないので、最上位の using: があっても検出する側に倒れる
 let deepWithout = Int.random(in: 0..<f(g(h(1)))) // expect: no_direct_random
 let deeper = Int.random(in: 0..<f(g(h(i(1)))), using: &generator) // expect: no_direct_random
+// 拡張区切りの文字列の中の「"」「,」「using:」は、文字列の終わりや最上位の引数ではない
+let inRawString = Int.random(in: 0..<#"a", using: &generator"#.count) // expect: no_direct_random
+let inDoubleRaw = Int.random(in: 0..<##"a"#, using: &generator"##.count) // expect: no_direct_random
+let inNestedRaw = Int.random(in: 0..<length(of: #"a"), using: &generator"#)) // expect: no_direct_random

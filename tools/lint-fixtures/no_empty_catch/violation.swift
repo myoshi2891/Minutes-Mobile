@@ -31,4 +31,7 @@ func sample() {
     // 条件の括弧の中のコメントの「"」「)」で読み違えず、後ろの空の本体を検出する
     do { try work() } catch let error where check(/* " ) */ error) {} // expect: no_empty_catch
     do { try work() } catch let error where check(f(/* ) " */ error)) { } // expect: no_empty_catch
+    // 条件に拡張区切りの文字列がある空の本体を検出する
+    do { try work() } catch let error where error.message == #"a" { x }"# {} // expect: no_empty_catch
+    do { try work() } catch let error where check(##"a"# ) {"##, error) { } // expect: no_empty_catch
 }

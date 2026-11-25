@@ -35,4 +35,10 @@ func sample() throws {
     // 条件の括弧の中のコメントの「)」で括弧が閉じたと見なさない（コメントの中の「{ }」を空の本体と取り違えない）
     do { try work() } catch let error where check(/* ) { } */ error) { recorder.record(.failed) }
     do { try work() } catch let error where check(error, [/* ] { } */ 5]) { recorder.record(.failed) }
+    // 条件の拡張区切りの文字列の中の「"」「{}」を、文字列の終わりや空の本体と取り違えない
+    do { try work() } catch let error where error.message == #"a" {}"# { recorder.record(.failed) }
+    do { try work() } catch let error where check(##"a"# ) {}"##, error) { recorder.record(.failed) }
+    do { try work() } catch let error where error.message == #"""
+        a" {}
+        """# { recorder.record(.failed) }
 }

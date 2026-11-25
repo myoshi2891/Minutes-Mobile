@@ -65,7 +65,8 @@ def main() -> int:
         # Package の起点を実体のパスに解決し、起点の中のパスはそのまま書く（2026-11-22 に一時的に置いた Package で、/tmp を
         # 経由して指定しても /private/tmp の起点になり、Sources の中のシンボリックリンクのファイルはリンクのパスのまま記録される
         # ことを確かめた）。そこで起点の側だけを実体のパスにし、記録したパスは字面のまま正規化して比べる
-        prefix = os.path.realpath(arguments.sources) + os.sep
+        # 区切りは末尾に 1 つだけ付ける（起点が「/」のときに「//」にしない。名前の似た隣のディレクトリは含めない）
+        prefix = os.path.realpath(arguments.sources).rstrip(os.sep) + os.sep
         lines = []
         for item in files:
             filename = item["filename"]

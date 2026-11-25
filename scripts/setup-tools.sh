@@ -125,9 +125,23 @@ verify_tool() {
   echo "OK: $name $version"
 }
 
+# 展開した配布ファイル（$1/extract）の通常のファイルを、残りの引数の条件で探し、件数を FOUND_COUNT、最後のパスを FOUND_PATH に
+# 入れる。NUL で区切って読む（パスの改行で件数を数え違えない）。find の失敗は、見つからないことと区別して非 0 を返す
+find_paths() {
+  local work=$1 path
+  shift
+  FOUND_COUNT=0
+  FOUND_PATH=""
+  find "$work/extract" "$@" -type f -print0 > "$work/found" || return 1
+  while IFS= read -r -d '' path; do
+    FOUND_COUNT=$((FOUND_COUNT + 1))
+    FOUND_PATH=$path
+  done < "$work/found"
+}
+
 install_tool() {
   local name=$1 version=$2 repo=$3 tag=$4 asset=$5 binary=$6 sha=$7
-  local target="$DEST/$name/$version" work="$WORK/$name" actual found license cached=""
+  local target="$DEST/$name/$version" work="$WORK/$name" actual found cached=""
   # ツールのディレクトリがリンクなら、リンクの先の共有の場所を書き換えずに止める
   [ ! -L "$DEST/$name" ] || fail "${DEST}/${name} がシンボリックリンク。削除してから実行し直す"
   # 導入記録の SHA-256 に加え、実行時の版も照合する（verify_tool と同じ確認方法。違えば取得し直す）。
@@ -166,14 +180,15 @@ install_tool() {
     # 実行ファイルは最上位か、配布ファイルの中のどこか 1 か所（gh は gh_{版}_macOS_{arch}/bin/gh）
     found="$work/extract/$binary"
     if [ ! -f "$found" ]; then
-      found=$(find "$work/extract" -type f -name "$binary")
-      [ -n "$found" ] || fail "$name の配布ファイルに実行ファイル $binary がない"
-      [ "$(printf '%s\n' "$found" | wc -l | tr -d ' ')" = 1 ] || fail "$name の配布ファイルに $binary が複数ある"
+      find_paths "$work" -name "$binary" || fail "$name の配布ファイルを調べられない"
+      [ "$FOUND_COUNT" -gt 0 ] || fail "$name の配布ファイルに実行ファイル $binary がない"
+      [ "$FOUND_COUNT" = 1 ] || fail "$name の配布ファイルに $binary が複数ある"
+      found=$FOUND_PATH
     fi
     cp "$found" "$work/out/$binary"
     chmod 755 "$work/out/$binary"
-    license=$(find "$work/extract" -maxdepth 2 -type f -name LICENSE)
-    if [ -n "$license" ] && [ "$(printf '%s\n' "$license" | wc -l | tr -d ' ')" = 1 ]; then cp "$license" "$work/out/LICENSE"; fi
+    find_paths "$work" -maxdepth 2 -name LICENSE || fail "$name の配布ファイルを調べられない"
+    if [ "$FOUND_COUNT" = 1 ]; then cp "$FOUND_PATH" "$work/out/LICENSE"; fi
     printf '%s\n' "$sha" > "$work/out/.archive-sha256"
     # 既存の導入を消す前に、取得したものが記録した版を名乗ることを確かめる（違えば既存の導入を残して失敗する）
     actual=$(runtime_version "$name" "$work/out/$binary") || fail "取得した $name の版を表示できない。既存の導入は残す"

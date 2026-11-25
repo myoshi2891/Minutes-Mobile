@@ -22,3 +22,6 @@ let withLiteral = Int.random(in: 0..<[1, 2].count, using: &generator)
 let withClosure = Int.random(in: 0..<items.map { $0 }.count, using: &generator)
 // 前の引数の括弧が 3 段の入れ子でも、最上位の using: を認める
 let deepNested = Int.random(in: 0..<f(g(h(1))), using: &generator)
+// 拡張区切りの文字列（「"」と括弧を含む）があっても、後ろの using: を認める
+let rawQuoted = Int.random(in: 0..<length(of: #"a" ) ("#), using: &generator)
+let rawTopLevel = Int.random(in: 0..<##"a"# ( "##.count, using: &generator)

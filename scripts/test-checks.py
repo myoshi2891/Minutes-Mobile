@@ -501,6 +501,28 @@ def test_settings() -> None:
                 subprocess.run(["git", "-C", str(root), "add", "-A"], env=env, check=True, capture_output=True)
             expect(f"settings: 参照先: {label}", [str(SCRIPTS / "check-project-settings.py"), "--project", str(root / "project.xcproj"),
                                                   "--root", str(root), *options], want_code, want_text, env=env)
+    # 名前で見つけたファイルも、実体が起点の中の追跡したファイルであること（通常の実行では求めない）
+    for name in ("Info.plist", "App.entitlements"):
+        for label, options, want_code, want_text in (
+            ("追跡したファイル", ["--tracked-only"], 0, "OK"), ("追跡したファイルを指すリンク", ["--tracked-only"], 0, "OK"),
+            ("起点の外を指すリンク", ["--tracked-only"], 2, "起点の外"), ("無視するファイルを指すリンク", ["--tracked-only"], 2, "追跡していない"),
+            ("無視するファイル", ["--tracked-only"], 2, "追跡していない"), ("起点の外を指すリンク", [], 0, "OK"),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root, env = Path(directory) / "root", isolated_git_env()
+                found = root / "Other" / name
+                found.parent.mkdir(parents=True)
+                (root / "project.xcproj").write_text(OK_PROJECT, encoding="utf-8")
+                (root / ".gitignore").write_text("ignored.data\n" + (f"{name}\n" if label == "無視するファイル" else ""), encoding="utf-8")
+                real = {"追跡したファイルを指すリンク": found.parent / "real.data", "起点の外を指すリンク": Path(directory) / "outside.data",
+                        "無視するファイルを指すリンク": found.parent / "ignored.data"}.get(label, found)
+                real.write_bytes(plistlib.dumps({}))
+                if real != found:
+                    found.symlink_to(real)
+                commit_all(root, env)
+                expect(f"settings: 見つけた {name}: {label}（{options}）", [
+                    str(SCRIPTS / "check-project-settings.py"), "--project", str(root / "project.xcproj"), "--root", str(root), *options],
+                    want_code, want_text, env=env)
     settings_case("どのターゲットも参照しない plist の変数は判定できない", 1, "UIFileSharingEnabled の値を展開できない",
                   plists={"Other/Info.plist": {"UIFileSharingEnabled": "$(SHARING)"}})
 
@@ -702,6 +724,58 @@ def test_dependencies() -> None:
     dependencies_case("ローカルの Package 自身の確定版がない", 1, "Packages/Local/Package.swift: 確定版がない",
                       {**{name: text for name, text in nested_files.items() if name != "Packages/Local/Package.resolved"},
                        "Packages/A/Package.resolved": resolved}, [approved])
+    # 版別の manifest の宣言は混ぜない（同時には読まれない辺をつながない）。選ばれた組がリモートの依存に届けば、起点の確定版を求める
+    tools = "// swift-tools-version: {}\n"
+    to = lambda name: local.replace('"Local"', f'"../{name}"')  # noqa: E731
+    plain = 'let package = Package(name: "P")\n'
+    for label, b_plain, b_variant, want in (
+        ("別の版の辺は組み合わさらない", to("Local"), plain, 0),
+        ("同じ版の辺は組み合わさる", plain, to("Local"), 1),
+    ):
+        dependencies_case(f"版別の manifest: {label}", want, "Packages/A を起点とする Packages/Local/Package.swift: 確定版がない" if want else "OK", {
+            "Packages/A/Package.swift": tools.format("5.5") + plain, "Packages/A/Package@swift-6.swift": tools.format("6.0") + to("B"),
+            "Packages/B/Package.swift": tools.format("5.5") + b_plain, "Packages/B/Package@swift-6.swift": tools.format("6.0") + b_variant,
+            "Packages/B/Package.resolved": resolved,
+            "Packages/Local/Package.swift": tools.format("5.5") + manifest, "Packages/Local/Package.resolved": resolved}, [approved])
+    # 一致する接尾辞がなければ、tools-version が Package.swift より新しい最大の下位の版を選ぶ（等しければ Package.swift）
+    for label, suffix, variant_tools, regular, variant, want in (
+        ("下位の版を選ぶ", "5.9", "5.9", plain, to("Local"), 1),
+        ("下位の版を選べば Package.swift の辺はたどらない", "5.9", "5.9", to("Local"), plain, 0),
+        ("tools-version が新しくなければ選ばない", "5.9", "5.5", to("Local"), plain, 1),
+        ("tools-version が新しくない版別の辺はたどらない", "5.9", "5.5", plain, to("Local"), 0),
+    ):
+        # 起点は 6.0 以上でだけ読める（接尾辞 5.9 とは一致しない）
+        dependencies_case(f"版別の manifest の選び方: {label}", want, "Packages/A を起点とする Packages/Local/Package.swift: 確定版がない" if want else "OK", {
+            "Packages/A/Package.swift": tools.format("6.0") + to("B"), "Packages/B/Package.swift": tools.format("5.5") + regular,
+            f"Packages/B/Package@swift-{suffix}.swift": tools.format(variant_tools) + variant, "Packages/B/Package.resolved": resolved,
+            "Packages/Local/Package.swift": tools.format("5.5") + manifest, "Packages/Local/Package.resolved": resolved}, [approved])
+    dependencies_case("一致する接尾辞の manifest は tools-version によらず選ぶ", 1, "Packages/A を起点とする Packages/Local/Package.swift: 確定版がない", {
+        "Packages/A/Package.swift": tools.format("6.0") + to("B"), "Packages/B/Package.swift": tools.format("6.0") + plain,
+        "Packages/B/Package@swift-6.swift": tools.format("6.0") + to("Local"), "Packages/B/Package.resolved": resolved,
+        "Packages/Local/Package.swift": tools.format("5.5") + manifest, "Packages/Local/Package.resolved": resolved}, [approved])
+    dependencies_case("起点を読めないツールでだけ選ばれる manifest はたどらない", 0, "OK", {
+        "Packages/A/Package.swift": tools.format("6.0") + to("B"), "Packages/B/Package.swift": tools.format("6.0") + plain,
+        "Packages/B/Package@swift-5.9.swift": tools.format("5.9") + to("Local"), "Packages/B/Package.resolved": resolved,
+        "Packages/Local/Package.swift": tools.format("5.5") + manifest, "Packages/Local/Package.resolved": resolved}, [approved])
+    dependencies_case("tools-version を読み取れない版別の manifest は、ありうるものをすべてたどる", 1,
+                      "Packages/A を起点とする Packages/Local/Package.swift: 確定版がない", {
+                          "Packages/A/Package.swift": tools.format("6.0") + to("B"), "Packages/B/Package.swift": plain,
+                          "Packages/B/Package@swift-5.9.swift": to("Local"), "Packages/B/Package.resolved": resolved,
+                          "Packages/Local/Package.swift": manifest, "Packages/Local/Package.resolved": resolved}, [approved])
+    # 間接の依存も「..」を字面で取り除いた場所をたどる（リンクの先の親ではない）
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name, content in {"Packages/A/Package.swift": local.replace('"Local"', '"../Link/../Local"'),
+                              "Packages/Local/Package.swift": manifest, "Packages/Local/Package.resolved": resolved,
+                              "Packages/Deep/Local/Package.swift": local_manifest, "Packages/Deep/Inner/keep.txt": ""}.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text(content, encoding="utf-8")
+        (root / "Packages" / "Link").symlink_to("Deep/Inner")
+        (root / "allowlist.json").write_text(json.dumps({"formatVersion": 1, "allowedLicenses": ["MIT"], "approvedPackages": [approved]}),
+                                             encoding="utf-8")
+        expect("dependencies: リンクの後の「..」を字面で取り除く",
+               [str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(root / "allowlist.json")], 1,
+               "Packages/A を起点とする Packages/Local/Package.swift: 確定版がない")
     dependencies_case("循環するローカルの Package", 0, "OK",
                       {"Packages/A/Package.swift": local.replace('"Local"', '"../B"'), "Packages/B/Package.swift": local.replace('"Local"', '"../A"')})
     dependencies_case("Packages/ の外のローカルの Package", 1, "Packages/ の外",
@@ -1586,13 +1660,34 @@ def worktree_location_case() -> None:
         closed.mkdir()
         command = ["/usr/bin/python3", str(SCRIPTS / "worktree-location.py"), "check"]
         expect("worktree-location: 壊れたリンクの設定", [*command, str(dangling / "base"), str(repository)], 1, ".swift-version", env=env)
+        real_closed = closed.resolve()  # 判定は実体のパスで報告する（TMPDIR がリンクを含むとき）
         closed.chmod(0)
         try:
             expect("worktree-location: 調べられない設定", [*command, str(closed), str(repository)], 2,
-                   str(closed / ".swiftformat"), env=env)
+                   str(real_closed / ".swiftformat"), env=env)
         finally:
             closed.chmod(0o755)
         expect("worktree-location: 設定のない場所", [*command, str(closed / "base"), str(repository)], 0, env=env)
+        # 登録だけが残り、親がファイルに置き換わった作業ツリーはないものとする。置き場所の途中がファイルなら判定できない
+        subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "base"], env=env, check=True, capture_output=True)
+        parent = Path(directory) / "gone"
+        subprocess.run(["git", "-C", str(repository), "worktree", "add", "-q", "--detach", str(parent / "deep" / "tree")], env=env,
+                       check=True, capture_output=True)
+        shutil.rmtree(parent)
+        parent.write_text("", encoding="utf-8")
+        expect("worktree-location: 親がファイルになった登録", [*command, str(closed / "base"), str(repository)], 0, env=env)
+        expect("worktree-location: 親がファイルになった登録（nested）", [*command[:-1], "nested", str(repository), str(closed)], 0, env=env)
+        expect("worktree-location: 途中がファイルの置き場所", [*command, str(parent / "base"), str(repository)], 2, env=env)
+        # 権限で調べられない登録は、ないものとしない
+        locked = Path(directory) / "locked"
+        subprocess.run(["git", "-C", str(repository), "worktree", "add", "-q", "--detach", str(locked / "tree")], env=env, check=True,
+                       capture_output=True)
+        locked.chmod(0)
+        try:
+            expect("worktree-location: 調べられない登録", [*command, str(closed / "base"), str(repository)], 2, "locked", env=env)
+        finally:
+            locked.chmod(0o755)
 
 
 def pre_push_lock_case() -> None:
@@ -1751,7 +1846,8 @@ def require_clean_case(inherited: bool = False) -> None:
         (repository / "scripts" / "verify-docs.py").write_text(
             '#!/bin/sh\nprintf changed > "$MINUTES_TEST_ORIGINAL/marker.txt"\n'
             '{ pwd -P; cat marker.txt; echo; if [ -L .tools ]; then echo link; elif [ -f .tools/marker ]; then echo copy; '
-            'else echo missing; fi; } > "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+            'else echo missing; fi; echo "isolated=${MINUTES_CHECK_ISOLATED:-}"; git worktree list --porcelain | grep -c "^worktree "; } '
+            '> "$MINUTES_TEST_OUT"\n', encoding="utf-8")
         for name in ("check.sh", "test-checks.py", "verify-docs.py"):
             (repository / "scripts" / name).chmod(0o755)
         (repository / ".gitignore").write_text((ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
@@ -1767,13 +1863,23 @@ def require_clean_case(inherited: bool = False) -> None:
         (repository / ".git" / "hooks").mkdir(exist_ok=True)
         (repository / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         (repository / ".git" / "hooks" / "post-checkout").chmod(0o755)
+        # git の代わり: 作業ツリーの作成を数え、2 回目は失敗させる（起動した入れ子の実行に印が届かず、展開を繰り返す場合に止める）
+        shims, added = Path(directory) / "shims", Path(directory) / "added"
+        shims.mkdir()
+        (shims / "git").write_text('#!/bin/bash\ncase " $* " in *" worktree add "*) echo add >> "$MINUTES_TEST_ADDED"\n'
+                                   '  if [ "$(wc -l < "$MINUTES_TEST_ADDED")" -gt 1 ]; then exit 1; fi ;; esac\n'
+                                   'exec "$MINUTES_TEST_GIT" "$@"\n', encoding="utf-8")
+        (shims / "git").chmod(0o755)
         # 代わりのスクリプトが書き換えた marker.txt を、終了の前に戻すことはしない（元の作業ツリーの変更は検査に影響しない）
         result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "10", "--require-clean"], capture_output=True,
-                                text=True, env=dict(env, MINUTES_TEST_OUT=str(out), MINUTES_TEST_ORIGINAL=str(repository)))
+                                text=True, timeout=60,
+                                env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_OUT=str(out), MINUTES_TEST_ADDED=str(added),
+                                         MINUTES_TEST_GIT=str(shutil.which("git")), MINUTES_TEST_ORIGINAL=str(repository)))
         recorded = out.read_text(encoding="utf-8").splitlines() if out.is_file() else []
         worktrees = subprocess.run(["git", "-C", str(repository), "worktree", "list", "--porcelain"], env=env, capture_output=True,
                                    text=True).stdout
-        isolated = (len(recorded) == 3 and recorded[1] == "committed" and recorded[2] == "copy"
+        # 起動した入れ子の実行に専用の作業ツリーの印（MINUTES_CHECK_ISOLATED=1）が届き、さらに専用の作業ツリーを作らないこと
+        isolated = (len(recorded) == 5 and recorded[1:] == ["committed", "copy", "isolated=1", "2"]
                     and not recorded[0].startswith(os.path.realpath(repository)))
         if result.returncode != 0 or not isolated or "専用の作業ツリーで検査" not in result.stdout:
             failures.append(f"check: --require-clean が専用の作業ツリーで検査しない（引き継いだ変数 {inherited}・"
@@ -2759,17 +2865,23 @@ def snapshot_timeout_case() -> None:
     global count
     count += 1
     with tempfile.TemporaryDirectory() as directory:
-        source, dest = Path(directory) / "source", Path(directory) / "dest"
+        source, dest, shims = Path(directory) / "source", Path(directory) / "dest", Path(directory) / "shims"
+        worker = Path(directory) / "worker"  # ロックの待機の sleep の PID（待機の分岐に達した印を兼ねる）
         (source / "bin").mkdir(parents=True)
         (source / ".install.lock").mkdir()
+        shims.mkdir()
+        (shims / "sleep").write_text('#!/bin/bash\necho "$$" > "$MINUTES_TEST_WORKER"\nexec /bin/sleep 60\n', encoding="utf-8")
+        (shims / "sleep").chmod(0o755)
         try:
-            snapshot_tools(source, dest, timeout=0.5)
+            snapshot_tools(source, dest, timeout=3, env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}",
+                                                             MINUTES_TEST_WORKER=str(worker)))
             stopped = False
         except subprocess.TimeoutExpired:
             stopped = True
-        left = subprocess.run(["pgrep", "-f", str(source)], capture_output=True, text=True).stdout.split()
+        recorded = worker.read_text(encoding="utf-8").strip() if worker.is_file() else ""
+        left = not re.fullmatch(r"[1-9]\d*", recorded) or not process_gone(int(recorded))
         if not stopped or left or dest.exists() or not (source / ".install.lock").is_dir():
-            failures.append(f"versions: 上限を過ぎた写しを止めない（止めた {stopped}・残ったプロセス {left}）")
+            failures.append(f"versions: 上限を過ぎた写しを止めない（止めた {stopped}・待機の PID {recorded!r}・残った・記録がない {left}）")
     # ロックを取った後（写しの途中）に上限を過ぎた場合は、写しが自分のロックを外して終わること
     count += 1
     with tempfile.TemporaryDirectory() as directory:
@@ -2932,7 +3044,9 @@ def pre_push_newline_case() -> None:
         for path in (bare, Path(directory) / "bare"):
             path.mkdir()
             git(path, "init", "-q", "--bare", "--template=", "-b", "main")
-        git(bare, "worktree", "add", "-q", "--orphan", "-b", "main", str(work))
+        # 古い git でも動くよう --orphan（2.42 以降）を使わず、空のコミットを作って切り離した HEAD の作業ツリーを登録する
+        tree = git(bare, "hash-object", "-w", "-t", "tree", os.devnull)
+        git(bare, "worktree", "add", "-q", "--detach", str(work), git(bare, "commit-tree", "-m", "seed", tree))
         (work / "scripts").mkdir()
         (work / ".tools" / "bin").mkdir(parents=True)
         copy_location_script(work)
@@ -2946,12 +3060,23 @@ def pre_push_newline_case() -> None:
         (bare / "hooks").mkdir(exist_ok=True)
         (bare / "hooks" / "post-checkout").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         (bare / "hooks" / "post-checkout").chmod(0o755)
-        results = [subprocess.run([str(hook)], cwd=work, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
+
+        def push() -> "subprocess.CompletedProcess[str]":
+            return subprocess.run([str(hook)], cwd=work, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
                                   capture_output=True, text=True, timeout=60, env=dict(env, MINUTES_PRE_PUSH_DIR=str(base)))
-                   for _ in range(2)]
-        if [result.returncode for result in results] != [0, 0]:
-            failures.append(f"pre-push: 改行で終わる共通のディレクトリで再利用できない（{[result.returncode for result in results]}）\n"
-                            f"{results[-1].stderr.strip()}")
+
+        first = push()
+        if first.returncode != 0:
+            failures.append(f"pre-push: 改行で終わる共通のディレクトリで検査できない（終了コード {first.returncode}）\n{first.stderr.strip()}")
+            return
+        # 再利用なら残すビルドの成果物の印。作り直した場合の成功と区別する
+        sentinel = next(path for path in base.iterdir() if path.is_dir()) / ".build" / "sentinel"
+        sentinel.parent.mkdir()
+        sentinel.write_text("kept", encoding="utf-8")
+        second = push()
+        if second.returncode != 0 or not sentinel.is_file():
+            failures.append(f"pre-push: 改行で終わる共通のディレクトリで再利用できない（終了コード {second.returncode}・"
+                            f"ビルドの成果物が残った {sentinel.is_file()}）\n{second.stderr.strip()}")
             return
         count += 1
         text = (SCRIPTS / "check.sh").read_text(encoding="utf-8")
@@ -3064,18 +3189,28 @@ def snapshot_tools_case() -> None:
         lock = source / ".install.lock"
         lock.mkdir()
         errors: List[BaseException] = []
+        # mkdir の代わり: 導入のロックの取得を試みた後（失敗した後）に印を置く。結果は実際の mkdir のまま
+        shims, attempted = Path(directory) / "shims", Path(directory) / "attempted"
+        shims.mkdir()
+        (shims / "mkdir").write_text('#!/bin/bash\n/bin/mkdir "$@"; result=$?\n'
+                                     'case "$1" in *.install.lock) touch "$MINUTES_TEST_ATTEMPTED" ;; esac\nexit "$result"\n', encoding="utf-8")
+        (shims / "mkdir").chmod(0o755)
 
         def snapshot() -> None:
             # スレッドの例外は呼び出し側に伝わらないので、控えて下で確かめる
             try:
-                snapshot_tools(source, dest)
+                snapshot_tools(source, dest, env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}",
+                                                      MINUTES_TEST_ATTEMPTED=str(attempted)))
             except BaseException as error:
                 errors.append(error)
 
         thread = threading.Thread(target=snapshot)
         thread.start()
-        thread.join(0.5)
-        waited = thread.is_alive() and not dest.exists()
+        # 写しが実際にロックの取得を試みるまで待つ（試みる前に外すと、競合を確かめたことにならない）
+        deadline = time.monotonic() + 15
+        while not attempted.exists() and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        waited = attempted.exists() and thread.is_alive() and not dest.exists()
         (source / "bin" / "tool").write_text("installed", encoding="utf-8")  # ロックを持つ導入が書き終える
         lock.rmdir()
         thread.join(60)
@@ -3088,6 +3223,46 @@ def snapshot_tools_case() -> None:
         if not waited or not copied or lock.exists():
             failures.append(f"versions: 開発ツールの写しが導入のロックに従わない（待った {waited}・写した {copied}・"
                             f"ロックが残った {lock.exists()}）")
+
+
+def archive_newline_paths_case() -> None:
+    """setup-tools.sh が、改行を含むパスの実行ファイルと LICENSE を 1 件として数え、複数・なし・find の失敗を区別すること。"""
+    global count
+    import hashlib
+    import tarfile
+    for label, names, broken, want_code, want_text in (
+        ("改行を含むパス", ("odd\ndir/gh", "odd\ndir/LICENSE"), "", 0, ""),
+        ("複数", ("a/gh", "odd\ndir/gh"), "", 1, "が複数ある"),
+        ("なし", ("odd\ndir/other",), "", 1, "実行ファイル gh がない"),
+        ("実行ファイルの find の失敗", ("a/gh",), "gh", 1, "調べられない"),
+        ("LICENSE の find の失敗", ("a/gh", "a/LICENSE"), "LICENSE", 1, "調べられない"),
+    ):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            binary, archive, shims, dest = base / "gh", base / "gh.tar.gz", base / "shims", base / "tools"
+            binary.write_text("#!/bin/sh\necho 'gh version 9.9.9 (2000-01-01)'\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with tarfile.open(archive, "w:gz") as stream:
+                for name in names:
+                    stream.add(binary, arcname=name)
+            versions = base / "versions"
+            versions.write_text(f"gh 9.9.9 any cli/cli v9.9.9 gh.tar.gz gh {hashlib.sha256(archive.read_bytes()).hexdigest()}\n", encoding="utf-8")
+            shims.mkdir()
+            (shims / "curl").write_text('#!/bin/bash\nwhile [ "$1" != -o ]; do shift; done\ncp "$MINUTES_TEST_ARCHIVE" "$2"\n', encoding="utf-8")
+            # find の代わり: 名前が MINUTES_TEST_BROKEN の検索だけ、途中まで出力してから失敗する
+            (shims / "find").write_text('#!/bin/bash\n/usr/bin/find "$@" || exit\nfor word in "$@"; do [ "$word" != "$MINUTES_TEST_BROKEN" ] || exit 1; done\n',
+                                        encoding="utf-8")
+            for path in shims.iterdir():
+                path.chmod(0o755)
+            result = subprocess.run([str(SCRIPTS / "setup-tools.sh"), "--versions", str(versions), "--dest", str(dest), "--require", "gh"],
+                                    capture_output=True, text=True, timeout=60,
+                                    env=dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}", MINUTES_TEST_ARCHIVE=str(archive),
+                                             MINUTES_TEST_BROKEN=broken))
+            licensed = (dest / "gh" / "9.9.9" / "LICENSE").is_file()
+            if result.returncode != want_code or want_text not in result.stderr or licensed != (want_code == 0):
+                failures.append(f"versions: 配布ファイルの中の検索（{label}）の扱いが違う（終了コード {result.returncode}・LICENSE {licensed}）\n"
+                                f"{(result.stdout + result.stderr).strip()}")
 
 
 def retired_backup_case() -> None:
@@ -3490,6 +3665,45 @@ def coverage_links_case() -> None:
                 failures.append(f"check: 手順 7 の入力の{label}の扱いが違う（swift の呼び出し {out.exists()}）\n{result.stderr.strip()}")
 
 
+def coverage_resolution_case() -> None:
+    """check.sh の手順 7 が、確定版の記録があるときだけ --force-resolved-versions を渡し、失敗したら記録を残さないこと。
+    git add -f でステージした無視するファイルを測る入力に含め、追跡していない無視するファイルは含めないこと。"""
+    global count
+    for label, pinned in (("確定版の記録がある", True), ("確定版の記録がない", False)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository, shims, out = Path(directory) / "repository", Path(directory) / "shims", Path(directory) / "out"
+            package = repository / "Packages" / "MinutesKit"
+            (repository / "scripts").mkdir(parents=True)
+            (package / "Sources").mkdir(parents=True)
+            shims.mkdir()
+            (package / "Package.swift").write_text("", encoding="utf-8")
+            if pinned:
+                (package / "Package.resolved").write_text("{}", encoding="utf-8")
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "check.sh").chmod(0o755)
+            (repository / ".gitignore").write_text(".build/\n*.generated.swift\n", encoding="utf-8")
+            # 引数と写しの中のファイルを記録する。古い確定版の代わりに、指定があれば失敗し、なければ次の呼び出し（JSON の場所）で失敗する
+            (shims / "swift").write_text('#!/bin/bash\necho "$*" >> "$MINUTES_TEST_OUT"\n(cd "$3/Sources" && ls) >> "$MINUTES_TEST_OUT"\n'
+                                         'case "$*" in *--force-resolved-versions*|*--show-codecov-path*) exit 1 ;; esac\n', encoding="utf-8")
+            (shims / "swift").chmod(0o755)
+            commit_all(repository, env)
+            for name in ("Forced", "Ignored"):
+                (package / "Sources" / f"{name}.generated.swift").write_text("staged\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "-f", "Packages/MinutesKit/Sources/Forced.generated.swift"], env=env,
+                           check=True, capture_output=True)
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "7"], capture_output=True, text=True, timeout=60,
+                                    env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_OUT=str(out)))
+            called = out.read_text(encoding="utf-8") if out.is_file() else ""
+            if (result.returncode != 1 or called.count("test --package-path") != (1 if pinned else 2)
+                    or ("--force-resolved-versions" in called) != pinned or "Forced.generated.swift" not in called
+                    or "Ignored.generated.swift" in called or (package / ".build" / "minutes-coverage-head").exists()):
+                failures.append(f"check: 手順 7 の入力・確定版の扱いが違う（{label}。終了コード {result.returncode}・呼び出し {called!r}）\n"
+                                f"{result.stderr.strip()}")
+
+
 def coverage_replace_case() -> None:
     """check.sh の手順 7・8 が、--require-clean がなくても置き換えのオブジェクト（git replace）を使わず、元のコミットの内容を
     測る入力として書き出し、同じ入力として照合すること（swift の代わりが写しの内容を記録する）。"""
@@ -3624,6 +3838,8 @@ def staged_index_newline_case() -> None:
 def test_versions() -> None:
     snapshot_tools_case()
     coverage_replace_case()
+    coverage_resolution_case()
+    archive_newline_paths_case()
     stalled_download_case()
     newline_archive_case()
     staged_index_newline_case()
@@ -3954,6 +4170,7 @@ def test_gitleaks() -> None:
     gitleaks_rename_case()
     gitleaks_notes_case()
     gitleaks_relative_case()
+    gitleaks_prefix_case()
     gitleaks_format_case()
     gitleaks_suppression_cases()
     # 浅いクローンは、省いた履歴を検査しないまま通過させない
@@ -4542,6 +4759,25 @@ def gitleaks_relative_case() -> None:
             expect(f"gitleaks: diff.relative の{label}", [str(SCRIPTS / "gitleaks-history.sh"), str(target)], 1, "leaks found: 1", env=env)
 
 
+def gitleaks_prefix_case() -> None:
+    """差分の見出しの接頭辞を変える設定があっても、鍵を検出し、報告のファイルの名前が正しいこと。"""
+    global count
+    for key, value in (("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true"), ("diff.srcPrefix", "x/y/"), ("diff.dstPrefix", "x/y/")):
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            repository, report = Path(directory) / "repository", Path(directory) / "report.json"
+            (repository / "sub").mkdir(parents=True)
+            (repository / "sub" / "config.txt").write_text('token = "' + "ghp_" + "x8Kd2mP9qL4vR7tY1w" + "Z5nB3cF6hJ0sGaUeXi" + '"\n', encoding="utf-8")
+            commit_all(repository, env)
+            subprocess.run(["git", "-C", str(repository), "config", key, value], env=env, check=True, capture_output=True)
+            expect(f"gitleaks: {key}", [str(SCRIPTS / "gitleaks-history.sh"), str(repository), "--report-format", "json",
+                                        "--report-path", str(report)], 1, "leaks found: 1", env=env)
+            count += 1
+            names = [item["File"] for item in json.loads(report.read_text(encoding="utf-8"))] if report.is_file() else None
+            if names != ["sub/config.txt"]:
+                failures.append(f"gitleaks: {key} で報告のファイルの名前が違う（{names}）")
+
+
 def gitleaks_format_case() -> None:
     """設定 format.pretty・log.abbrevCommit によらず、検出した鍵を完全なコミットの ID で報告すること。"""
     global count
@@ -4687,6 +4923,21 @@ def test_coverage() -> None:
     # 矛盾する重複した鍵の記録は、後の値を採用せずに読めないものとする
     coverage_case("重複した鍵の記録", 2, "重複した鍵", 20, 5, duplicate=True)
     coverage_symlink_case()
+    coverage_root_case()
+
+
+def coverage_root_case() -> None:
+    """起点が「/」でも配下のファイルを数え、名前の似た隣のディレクトリは数えないこと。"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(os.path.realpath(directory))
+        (root / "Sources").mkdir()
+        report = root / "report.json"
+        report.write_text(json.dumps({"data": [{"files": [
+            {"filename": str(root / name / "A.swift"), "summary": {"lines": {"count": 10, "covered": covered}}}
+            for name, covered in (("Sources", 10), ("Sources-old", 0))]}]}), encoding="utf-8")
+        for label, sources, want in (("「/」", "/", "行 50.0%（2 ファイル"), ("似た名前の隣", f"{root}/Sources", "行 100.0%（1 ファイル"),
+                                     ("末尾の区切り", f"{root}/Sources//", "行 100.0%（1 ファイル")):
+            expect(f"coverage: 起点が{label}", [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", sources, "--target", "90"], 0, want)
 
 
 def coverage_symlink_case() -> None:
@@ -4887,6 +5138,22 @@ def untracked_snippet_case() -> None:
         run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory), "--update-snippets"])
         if path.read_text(encoding="utf-8") != stale:
             failures.append(f"docs: 追跡しない元のファイル（{label}）でコード片を書き直した")
+
+
+def absolute_snippet_case() -> None:
+    """コード片の元のファイルの絶対パスの「..」を字面で取り除かず、要素を順に確かめること。起点の中の通常の絶対パスは認めること。"""
+    global count
+    for label, place, want in (("通常", "scripts/sample.sh", 0), ("追跡しない場所を経由する「..」", ".tools/bin/../../scripts/sample.sh", 1),
+                               ("ファイルの「..」", "README.md/../scripts/sample.sh", 1)):
+        directory = docs_case(f"絶対パスの元のファイル（{label}）の準備", 0, "OK").resolve()
+        (directory / ".tools" / "bin").mkdir(parents=True)
+        path = directory / "docs/03-detailed-design/sample.md"
+        path.write_text(replaced(path.read_text(encoding="utf-8"), "<!-- file: scripts/sample.sh -->", f"<!-- file: {directory}/{place} -->"),
+                        encoding="utf-8")
+        count += 1
+        code, output = run([str(SCRIPTS / "verify-docs.py"), "--root", str(directory)])
+        if code != want:
+            failures.append(f"docs: 絶対パスの元のファイル（{label}）の扱いが違う（終了コード {code}）\n{output.strip()}")
 
 
 def alias_rewrite_case() -> None:
@@ -5655,6 +5922,20 @@ def run_docs_cases() -> None:
               extra={"docs/02-basic-design/design(v2).txt": "v2\n", "docs/02-basic-design/design(v2.txt": "v2\n"})
     docs_case("エスケープした括弧を含むリンク先がない", 1, "リンクの先がない: missing(v2.txt", basic,
               "[要件](../01-requirements/requirements.md)", "[要件](../01-requirements/requirements.md) [片](missing\\(v2.txt)")
+    # 文字参照も 1 回の走査で戻す。節の区切りは文字参照を戻した後・パーセント符号化を戻す前に分ける
+    for label, target, want in (
+        ("名前の文字参照", "a&amp;b.txt", ""), ("10 進の文字参照", "a&#38;b.txt", ""), ("16 進の文字参照", "a&#x26;b.txt", ""),
+        ("「#」の文字参照は節の区切り", "a&amp;b.txt&#35;節", ""), ("符号化した「#」はファイルの名前", "c%23d.txt", ""),
+        ("エスケープした「&」は文字参照にしない", "x\\&amp;y.txt", ""), ("「;」のない文字参照は戻さない", "x&ampy.txt", "x&ampy.txt"),
+        ("知らない名前の文字参照は戻さない", "x&notit;y.txt", "x&notit;y.txt"), ("戻した名前のファイルがない", "missing&amp;.txt", "missing&.txt"),
+    ):
+        docs_case(f"リンク先の{label}", 1 if want else 0, f"リンクの先がない: {want}" if want else "OK", basic,
+                  "[要件](../01-requirements/requirements.md)", f"[要件](../01-requirements/requirements.md) [例]({target})",
+                  extra={"docs/02-basic-design/a&b.txt": "", "docs/02-basic-design/c#d.txt": "", "docs/02-basic-design/x&amp;y.txt": "",
+                         "docs/02-basic-design/x¬it;y.txt": ""})
+    docs_case("コメントの中の語だけの必須の節", 1, "「セキュリティ」の節がない", detailed, "## 2. セキュリティ", "## 2. その他 <!-- セキュリティ -->")
+    docs_case("コメントのある必須の節", 0, "OK", detailed, "## 2. セキュリティ", "## 16. セキュリティ <!-- 補足 -->")
+    absolute_snippet_case()
     # 対になるエスケープされていない「[」のない「](」はリンクにしない。ふつうのリンク・エスケープした「\\」の後のリンク・
     # 画像を含むリンク・行をまたぐリンクの文は、これまでどおり確かめる
     for label, text, want in (

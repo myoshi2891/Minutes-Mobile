@@ -5,7 +5,7 @@
 「設定しないもの」が入っていないことを確かめる。
 
 使い方: scripts/check-project-settings.py [--project <project.xcproj>] [--root <探す起点>] [--tracked-only]
-  --tracked-only  ビルド設定が指すファイル（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）の実体が、起点の中の、HEAD のコミットで
+  --tracked-only  ビルド設定が指すファイル（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）と、名前で見つけたファイルの実体が、起点の中の、HEAD のコミットで
                   追跡したファイルであることを求める（check.sh が専用の作業ツリーの検査で渡す）。満たさなければ終了コード 2
 終了コード: 0 = 問題なし / 1 = 違反あり / 2 = 読めない（読めないものを合格にしない）
 """
@@ -644,6 +644,16 @@ def tracked_files(root: Path) -> Set[Path]:
     return {root / os.fsdecode(path) for attributes, path in entries if attributes.startswith(b"100")}
 
 
+def require_tracked(source: str, path: Path, root: Path, tracked: Optional[Set[Path]]) -> None:
+    """tracked を渡した場合（--tracked-only）に、リンクを解決した path が root の中の追跡したファイルでなければ Unreadable とする。"""
+    if tracked is None:
+        return
+    if not path.is_relative_to(root):
+        raise Unreadable(f"{source}（{path}）が起点の外にある")
+    if path not in tracked:
+        raise Unreadable(f"{source}（{path}）を検査するコミットで追跡していない")
+
+
 def referenced_files(
     project_path: Path, target: str, own: dict, shared: dict, configuration: str, setting: str,
     sdk: Optional[str] = None, root: Optional[Path] = None, tracked: Optional[Set[Path]] = None
@@ -681,13 +691,20 @@ def referenced_files(
         expanded = re.sub(r"\$\((\w+)\)|\$\{(\w+)\}", expand, text)
         path = Path(expanded)
         target_path = resolved(path if path.is_absolute() else source_root / path)
-        if tracked is not None and root is not None:
-            if not target_path.is_relative_to(root):
-                raise Unreadable(f"{project_path}: {key} = {value} の参照先（{target_path}）が起点の外にある")
-            if target_path not in tracked:
-                raise Unreadable(f"{project_path}: {key} = {value} の参照先（{target_path}）を検査するコミットで追跡していない")
+        if root is not None:
+            require_tracked(f"{project_path}: {key} = {value} の参照先", target_path, root, tracked)
         paths.append(target_path)
     return paths, bool(undecided) or explicit_empty
+
+
+def discovered_files(root: Path, suffixes: Tuple[str, ...], tracked: Optional[Set[Path]]) -> List[Path]:
+    """名前で見つけたファイルの、リンクを解決したパス。tracked を渡した場合は、参照先と同じく追跡したファイルに限る。"""
+    paths: List[Path] = []
+    for path in find_files(root, suffixes):
+        target = resolved(path)
+        require_tracked(f"{path} の実体", target, root, tracked)
+        paths.append(target)
+    return paths
 
 
 def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[List[str], List[str]]:
@@ -737,7 +754,7 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
             if "devplaceholder" in value:
                 warnings.append(f"[CON-09] {name}: {key} が仮の値のまま。最初の実録音の前に確定する")
-    found = [resolved(path) for path in find_files(root, ("Info.plist",))]
+    found = discovered_files(root, ("Info.plist",), tracked)
     # INFOPLIST_FILE が指すファイルも読む。ないファイル・読めないファイルは load_plist が Unreadable にする
     for path in found + [path for path in referenced if path not in found]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
@@ -746,7 +763,7 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         for key, value in load_plist(path).items():
             check_plist_entry(source, str(key), value, errors, expand)
     # CODE_SIGN_ENTITLEMENTS が指すファイルも、拡張子にかかわらず読む。ないファイル・読めないファイルは Unreadable
-    scanned = [resolved(path) for path in find_files(root, (".entitlements",))]
+    scanned = discovered_files(root, (".entitlements",), tracked)
     for path in scanned + [path for path in dict.fromkeys(entitlements) if path not in scanned]:
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         for key in load_plist(path):

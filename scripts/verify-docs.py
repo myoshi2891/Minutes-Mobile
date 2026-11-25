@@ -18,6 +18,8 @@ import argparse
 import calendar
 import contextlib
 import datetime
+import html
+import html.entities
 import os
 import re
 import stat
@@ -385,7 +387,21 @@ def expand(match: "re.Match[str]") -> List[str]:
 
 # バックスラッシュでエスケープできる文字（CommonMark の ASCII の句読点）と、リンク先のエスケープ
 ASCII_PUNCTUATION = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-LINK_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+# 文字参照（&amp;・&#35;・&#x23;。終わりの「;」が要る）も、エスケープと同じ 1 回の走査で戻す（「\\&amp;」は「&amp;」のまま残す）
+LINK_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])|&(#[0-9]{1,7};|#[xX][0-9A-Fa-f]{1,6};|[A-Za-z][A-Za-z0-9]*;)")
+
+
+def unescape_link(target: str) -> str:
+    """リンク先の Markdown のエスケープと文字参照を戻す。定義のない名前の文字参照はそのまま残す（CommonMark）。"""
+    def decode(found: "re.Match[str]") -> str:
+        if found.group(1) is not None:
+            return found.group(1)
+        reference = found.group(2)
+        if reference.startswith("#"):
+            return html.unescape("&" + reference)
+        return html.entities.html5.get(reference, found.group(0))
+
+    return LINK_ESCAPE.sub(decode, target)
 
 
 # コード片の印の行（<!-- file: パス --> と <!-- excerpt: パス -->）。パスは区切りの間の全体で、空白を含んでよい。
@@ -1000,7 +1016,8 @@ class Checker:
             target = target[1:-1]
         # Markdown のエスケープ（「\(」など）を戻してから解決する（エスケープした括弧と、しない括弧を同じファイル名として扱う）。
         # パーセント符号化は、その後でこれまでどおり戻す
-        target = LINK_ESCAPE.sub(r"\1", target)
+        # 文字参照も同時に戻す
+        target = unescape_link(target)
         if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
             return
         # パーセント符号化（%20 など）は、節へのリンクを分けた後に戻してから解決する（GitHub の表示と同じく、符号化した
@@ -1050,7 +1067,8 @@ class Checker:
                 if directory == DETAILED:
                     self.check_snippets(name, text)
                 continue
-            headings = [heading for _, heading, _ in sections]
+            # コメントの中の語は表示されないので、必須の節の見出しと見なさない
+            headings = [visible(heading) for _, heading, _ in sections]
             required = ["セキュリティ", "テスト観点"]
             if directory == DETAILED:
                 required += ["申し送り", "要件 ID ↔ テスト"]
@@ -1224,8 +1242,13 @@ class Checker:
             return path
         # 文書と同じく、解決の経路が追跡しない場所（専用の作業ツリーに残す .tools など）を通るものは、検査する入力の内容では
         # ないので使わない（照合と書き直しの両方）。読むのは経路を確かめた実体
-        problem, real = self.resolve_document(self.root / os.path.relpath(root / relative, root)
-                                              if os.path.isabs(relative) else self.root / relative)
+        # 絶対パスも「..」を字面で取り除かず、起点の下の要素をそのまま渡す（resolve_document が 1 つずつ確かめる）
+        parts = Path(relative)
+        if parts.is_absolute():
+            if not parts.is_relative_to(root):
+                raise Unresolvable(f"{relative}: 起点の外を経由する絶対パス")
+            parts = parts.relative_to(root)
+        problem, real = self.resolve_document(self.root / parts)
         if problem or real is None:
             raise Unresolvable(f"{relative}: {problem}")
         return real

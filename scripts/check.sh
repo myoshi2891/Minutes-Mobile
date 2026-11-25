@@ -380,7 +380,7 @@ write_index_entries() {
 
 # 規則の試験に使うもの（規則・試験用のファイル・試験のスクリプト）をインデックスから同じ一時ディレクトリへ書き出す。
 # 試験のスクリプトは自身の位置をリポジトリ直下とみなすので、一時ディレクトリの中のスクリプトを実行する。
-# 開発ツールは作業ツリーの .tools を指す（ツールは Git の管理外）
+# 開発ツールは照合した写し（$STAGED_TOOLS/.tools）を指す（ツールは Git の管理外）
 prepare_rules_tree() {
   local directory entries
   [ -n "$STAGED_TREE" ] || make_staged_tree
@@ -538,7 +538,7 @@ step_5() {
 # カバレッジを測った入力の識別子。未コミットの変更がなければ HEAD のコミット、あれば作業ツリー全体（追跡していない
 # ファイルを含む。無視するファイルは除く）のツリーのハッシュ。作業ツリーの記録はコミットの合格の記録と区別する
 coverage_input() {
-  local changes index tree
+  local changes index staged tree
   # git status の失敗を「変更なし」と取り違えない（$(…) を条件の中に書くと失敗が見えないので、先に取得して確かめる）
   changes=$(git status --porcelain --untracked-files=normal) || return 1
   if [ -z "$changes" ]; then
@@ -551,7 +551,9 @@ coverage_input() {
   # 届かないまま残る。これらは手元のリポジトリの中だけにあり、git gc が gc.pruneExpire（既定 2 週間）を過ぎたものを消す
   index=$(mktemp)
   rm -f -- "$index"
-  if ! GIT_INDEX_FILE="$index" git read-tree HEAD || ! GIT_INDEX_FILE="$index" git add -A \
+  # 起点は HEAD ではなく現在のインデックス（git add -f でステージした無視するファイルも測る入力に含める。追跡していない
+  # 無視するファイルは git add -A が除く）。未解決の衝突があればツリーを作れず、識別できないものとして失敗する
+  if ! staged=$(git write-tree) || ! GIT_INDEX_FILE="$index" git read-tree "$staged" || ! GIT_INDEX_FILE="$index" git add -A \
     || ! tree=$(GIT_INDEX_FILE="$index" git write-tree); then
     rm -f -- "$index"
     return 1
@@ -855,6 +857,7 @@ step_7() {
   local destination
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest
+  local resolution=()
   mkdir -p "$PACKAGE/.build"
   take_coverage_lock
   rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
@@ -868,11 +871,14 @@ step_7() {
   # 測定ごとに専用の出力先を使う（同じ Package を対象にした別の swift test が、この測定の JSON を上書きできない）。
   # 毎回ビルドし直すので時間はかかるが、共有の出力先に残った別の測定の結果を記録しない
   COVERAGE_SCRATCH=$(mktemp -d)
-  swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --enable-code-coverage
+  # 確定版の記録（Package.resolved）があれば、その版だけを使わせる（古い記録を swift test に書き直させて測らない。合わなければ
+  # 記録を書く前に失敗する）。依存がなく記録もない場合は、これまでどおりの指定で実行する
+  if [ -e "$COVERAGE_INPUT/$PACKAGE/Package.resolved" ]; then resolution=(--force-resolved-versions); fi
+  swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" ${resolution[@]+"${resolution[@]}"} --enable-code-coverage
   # 追加の安全策: 測った前後で作業ツリーが変わっていれば記録しない（写しを測るので結果は識別子と一致するが、
   # 測定中に変わった作業ツリーの合格として扱われるのを避ける）
   [ "$(coverage_input)" = "$measured" ] || fail "カバレッジの測定中に作業ツリーが変わった。手順 7 を実行し直す"
-  report=$(swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" --show-codecov-path)
+  report=$(swift test --package-path "$COVERAGE_INPUT/$PACKAGE" --scratch-path "$COVERAGE_SCRATCH" ${resolution[@]+"${resolution[@]}"} --show-codecov-path)
   [ -f "$report" ] || fail "カバレッジの記録がない（swift test の結果を確かめる）"
   # この測定の JSON を記録の場所へ写す。同じディレクトリの一時ファイルに写してから rename で置き換え、
   # 写したものからハッシュを計算する。JSON を置いてから入力とハッシュの記録を置く（記録があれば JSON もある）
