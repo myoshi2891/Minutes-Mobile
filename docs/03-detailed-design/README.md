@@ -40,3 +40,14 @@
 | コード片の直前に `<!-- file: パス -->` | コード片がそのファイルの全文と一致する。`scripts/verify-docs.py --update-snippets` で実ファイルから書き直せる |
 | コード片の直前に `<!-- excerpt: パス -->` | コード片がそのファイルの連続した一部と一致する |
 | まだ作っていないファイルのコード片 | 印を付けない。ファイルを作る作業で印を付ける |
+
+## 4. 要件 ID ↔ テスト
+
+満たす要件: NFR-MNT-04、TST-GEN-03
+
+本書（索引と方針・文書の検査）が挙げる要件だけを示す。各単位の要件は、各文書の対応表に書く。要件とテスト要件の対応の正は [../01-requirements/test-requirements.md](../01-requirements/test-requirements.md)。
+
+| 要件 | テスト要件 | 検査・試験 |
+| --- | --- | --- |
+| NFR-MNT-04 | TST-GEN-03 | `scripts/check.sh` の手順 10（`scripts/verify-docs.py`）、自己試験 `scripts/test-checks.py docs` |
+| TST-GEN-03 | TST-GEN-03 | 各文書の「要件 ID ↔ テスト」の対応表を `scripts/verify-docs.py` が検査する。テスト名・タグの要件 ID はレビューで確かめる |
