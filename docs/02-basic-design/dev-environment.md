@@ -204,7 +204,8 @@ SwiftLint の組み込みの規則と独自ルールで検出する。例外を�
 | 空の `catch` | なし | SEC-LOG-04 |
 | `UserDefaults` の直接の利用 | 設定の型 | SEC-DAT-07 |
 | `.documentDirectory`・`NSTemporaryDirectory`・ディレクトリの直接の作成 | 保存ルートの型（`NSTemporaryDirectory` とディレクトリの作成だけ。`.documentDirectory` はどこでも認めない） | SEC-DAT-03・04 |
-| `UIPasteboard` の直接の利用、`.textSelection(` | コピーの型 | SEC-PLT-01 |
+| `UIPasteboard` の直接の利用 | コピーの型 | SEC-PLT-01 |
+| `.textSelection(` | なし | SEC-PLT-01 |
 | `ShareLink` | なし | SEC-DAT-06 |
 | `WKWebView`・`import WebKit` | なし | SEC-PLT-05 |
 | `CoreSpotlight`・`NSUserActivity` | なし | SEC-PLT-02 |

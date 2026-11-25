@@ -28,6 +28,7 @@
 #   scripts/setup-tools.sh --verify   取得せず、導入済みの版が tools/versions と一致するかだけ確かめる（check.sh の手順 0）
 # 試験用の指定（検査の自己試験が使う）: --versions <ファイル>  --dest <ディレクトリ>
 #   --download-limit <秒>  gh での取得の上限（1〜300。既定は 300）
+#   --probe-limit <秒>  版の表示のコマンドの上限（1〜300。既定は 30）
 #   --require "<名前 …>"  台帳に行が要るツールの集合（既定は検査が使う 4 種。一部だけの台帳で試験するときに明示する）
 #
 # 終了コード: 0 = 一致 / 1 = 不一致・取得や照合の失敗 / 2 = 使い方の誤り
@@ -46,6 +47,8 @@ DEST="$ROOT/.tools"
 MODE=install
 # gh での取得の全体の上限（秒）。止まった取得でロックを持ち続けない（ロックを待つ上限の 600 秒より短くする）
 DOWNLOAD_LIMIT=300
+# 版の表示のコマンドの上限（秒）。止まった実行ファイルで、ロックを持ったまま待ち続けない
+PROBE_LIMIT=30
 # 検査（check.sh）が使うツール。台帳から行が消えても見落とさないよう、台帳の内容ではなくこの集合で必須を決める
 REQUIRED="gh swiftlint swiftformat gitleaks"
 
@@ -60,6 +63,7 @@ while [ $# -gt 0 ]; do
     --versions) [ $# -ge 2 ] || usage; VERSIONS=$2; shift 2 ;;
     --dest) [ $# -ge 2 ] || usage; DEST=$2; shift 2 ;;
     --download-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; DOWNLOAD_LIMIT=$2; shift 2 ;;
+    --probe-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; PROBE_LIMIT=$2; shift 2 ;;
     --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; REQUIRED=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -72,16 +76,53 @@ fail() {
 
 [ -f "$VERSIONS" ] || fail "版の写しがない: $VERSIONS"
 
+# コマンドを時間の上限（秒。$1）つきで実行する。上限を過ぎたら止め、終わるのを待ってから 124 を返す（中断でも止めて待つ）。
+# 起動したコマンドの子孫も止められるよう別のプロセスグループで実行し、終わったらグループごと止める（残った子孫が標準出力を
+# 持ち続けると、呼び出し側の $(…) が上限を過ぎても戻らない）。bash 3.2 は前面のコマンドを待つ間に trap を動かさないので python3 で待つ
+run_limited() {
+  /usr/bin/python3 -I -c '
+import os
+import signal
+import subprocess
+import sys
+
+def stop(number, frame):
+    sys.exit(128 + number)
+
+# 無視する指定（trap の空の指定）を引き継いだ中断は、無視のままにする
+for number in (signal.SIGTERM, signal.SIGHUP):
+    if signal.getsignal(number) != signal.SIG_IGN:
+        signal.signal(number, stop)
+try:
+    child = subprocess.Popen(sys.argv[2:], start_new_session=True)
+except OSError as error:
+    print(f"NG: 起動できない: {error}", file=sys.stderr)
+    sys.exit(127)
+try:
+    code = child.wait(timeout=int(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    print(f"NG: {sys.argv[1]} 秒を過ぎても終わらないので止めた", file=sys.stderr)
+    code = 124
+finally:
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass  # グループに何も残っていない（macOS は、終了を待たれていないものだけのグループに PermissionError を返す）
+    child.wait()
+sys.exit(code if code >= 0 else 128 - code)' "$@"
+}
+
 # 実行時の版を表示するコマンド。ツールを足すときはここにも足す（未定義のツールは失敗させる）。
-# 呼び出し側は $(…) の中で実行するので set -e が効かない。表示のコマンドの失敗は非 0 で返し、版を出力しない
+# 呼び出し側は $(…) の中で実行するので set -e が効かない。表示のコマンドの失敗（PROBE_LIMIT を過ぎた場合を含む）は非 0 で返し、版を
+# 出力しない（導入では導入済みと見なさず、照合では失敗になる）
 runtime_version() {
   local name=$1 binary=$2 out
   case "$name" in
     # 標準入力は /dev/null にする（呼び出し側は版の写しを読んでいる途中で、版のコマンドに後続の行を読ませない）
-    swiftlint) out=$("$binary" version </dev/null) || return 1 ;;
-    swiftformat) out=$("$binary" --version </dev/null) || return 1 ;;
-    gitleaks) out=$("$binary" version </dev/null) || return 1 ;;
-    gh) out=$("$binary" --version </dev/null) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
+    swiftlint) out=$(run_limited "$PROBE_LIMIT" "$binary" version </dev/null) || return 1 ;;
+    swiftformat) out=$(run_limited "$PROBE_LIMIT" "$binary" --version </dev/null) || return 1 ;;
+    gitleaks) out=$(run_limited "$PROBE_LIMIT" "$binary" version </dev/null) || return 1 ;;
+    gh) out=$(run_limited "$PROBE_LIMIT" "$binary" --version </dev/null) || return 1; out=${out#gh version }; out=${out%% *} ;;  # 1 行目「gh version 2.104.0 (日付)」
     *) echo "NG: 版の確認方法が未定義のツール: $name" >&2; return 1 ;;
   esac
   printf '%s\n' "${out#v}"
@@ -163,22 +204,6 @@ find_paths() {
     FOUND_COUNT=$((FOUND_COUNT + 1))
     FOUND_PATH=$path
   done < "$work/found"
-}
-
-# コマンドを時間の上限（秒。$1）つきで実行する。上限を過ぎたら止め、終わるのを待ってから 124 を返す（中断でも止めて待つ）
-run_limited() {
-  /usr/bin/python3 -I -c '
-import subprocess
-import sys
-try:
-    code = subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode
-except subprocess.TimeoutExpired:
-    print(f"NG: {sys.argv[1]} 秒を過ぎても終わらないので止めた", file=sys.stderr)
-    code = 124
-except OSError as error:
-    print(f"NG: 起動できない: {error}", file=sys.stderr)
-    code = 127
-sys.exit(code if code >= 0 else 128 - code)' "$@"
 }
 
 install_tool() {
@@ -1484,11 +1509,19 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   # 検査に別の設定が混ざる。作業ツリーの外で、設定を継がない一時ディレクトリは認める
   # 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
   location_status=0
+  # 判定に使うスクリプトは開始時のコミットから書き出して実行する（元の作業ツリーが sparse checkout で scripts/ の一部が
+  # なくても判定でき、途中の書き換えで判定が変わらない）
+  location_script=$(mktemp)
+  if ! git cat-file blob "$START_HEAD:scripts/worktree-location.py" > "$location_script"; then
+    rm -f -- "$location_script"
+    fail "開始時のコミットの scripts/worktree-location.py を読めない"
+  fi
   location_out=$(mktemp)
-  "$ROOT/scripts/worktree-location.py" check "$ISOLATED_BASE" "$ROOT" > "$location_out" || location_status=$?
+  # -I: 書き出した場所（一時ディレクトリ）に置かれた同名のモジュール（subprocess.py など）を読み込ませない
+  /usr/bin/python3 -I "$location_script" check "$ISOLATED_BASE" "$ROOT" > "$location_out" || location_status=$?
   checked_base=""
   if [ "$location_status" = 0 ] && ! IFS= read -r -d '' checked_base < "$location_out"; then location_status=2; fi
-  rm -f -- "$location_out"
+  rm -f -- "$location_out" "$location_script"
   case $location_status in
     0) ISOLATED_BASE=$checked_base ;;
     1) fail "専用の作業ツリーの一時の置き場所（${ISOLATED_BASE}）を使えない。TMPDIR で作業ツリーの外の、SwiftFormat の設定のない場所を指定する" ;;
