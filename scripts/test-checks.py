@@ -295,6 +295,11 @@ def test_settings() -> None:
                                         ("2026-11-25T00:00:00Z", 0, "OK")):
         settings_case(f"Info.plist の日付が {value}", want_code, want_text, raw={
             "App/Dated/Info.plist": f'<?xml version="1.0"?><plist version="1.0"><dict><key>K</key><date>{value}</date></dict></plist>'.encode()})
+    # 辞書の外の <key>（最上位の <key>）は plistlib が IndexError を送出する。読めないものとする（辞書の中の鍵は認める）
+    settings_case("Info.plist の最上位の <key>", 2, "設定を読めない", raw={
+        "App/Keyed/Info.plist": b'<?xml version="1.0"?><plist version="1.0"><key>K</key></plist>'})
+    settings_case("Info.plist の辞書の中の <key>", 0, "OK", raw={
+        "App/Keyed/Info.plist": b'<?xml version="1.0"?><plist version="1.0"><dict><key>K</key><string>v</string></dict></plist>'})
     settings_case("iCloud の entitlement", 1, "icloud",
                   plists={"App/App.entitlements": {"com.apple.developer.icloud-services": ["CloudKit"]}})
     settings_case("仮の Bundle Identifier は警告にとどめる", 0, "CON-09",
@@ -1468,6 +1473,17 @@ def test_dependencies() -> None:
                 failures.append(f"dependencies: 循環するリンクの報告にリンクのパスがない: {error}")
         except RuntimeError as error:
             failures.append(f"dependencies: 循環するリンクで例外が送出された: {error!r}")
+        # 先が存在しないリンクは、成果物の中のパスを指していても読めないものとする（リンクのパスを示す）
+        (framework / "Loop1").unlink()
+        (framework / "Loop2").unlink()
+        (framework / "Missing").symlink_to("ios/none")
+        count += 1
+        try:
+            module.content_digest(framework)
+            failures.append("dependencies: 先が存在しないリンクでハッシュを作った")
+        except module.Unreadable as error:
+            if not str(error).startswith(f"{framework / 'Missing'}:"):
+                failures.append(f"dependencies: 先が存在しないリンクの報告にリンクのパスがない: {error}")
     # ローカルの Package の参照先が循環するリンクなら、終了コード 2（読めない）にする
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -1562,6 +1578,12 @@ def test_dependencies() -> None:
                              encoding="utf-8")
         expect("dependencies: 重複した鍵の許可リスト",
                [str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 2, "重複した鍵")
+    # formatVersion の true は Python では 1 と等しいが、形式の版として認めない（整数の 1 だけを認める）
+    with tempfile.TemporaryDirectory() as directory:
+        allowlist = Path(directory) / "allowlist.json"
+        allowlist.write_text('{"formatVersion": true, "allowedLicenses": ["MIT"], "approvedPackages": []}', encoding="utf-8")
+        expect("dependencies: formatVersion が true の許可リスト",
+               [str(SCRIPTS / "check-dependencies.py"), "--root", directory, "--allowlist", str(allowlist)], 2, "formatVersion")
     # checksum を持つ承認はリモートのバイナリの配布物だけを承認する。同じ識別子・版・取得元の Package の確定版と
     # .package(url:) の宣言は承認しない
     binary_pin = {"identity": "b-binary", "kind": "remoteSourceControl", "location": remote,
@@ -1611,7 +1633,10 @@ def isolated_git_env() -> Dict[str, str]:
     """開発者のグローバル・システムの設定と属性、リポジトリを指す変数（GIT_DIR など）の影響を受けない git の環境。
     リポジトリの中の .gitattributes はそのまま効く。"""
     local_vars = subprocess.run(["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True).stdout.split()
-    isolated = {key: value for key, value in os.environ.items() if key not in local_vars and key != "GIT_CONFIG"}
+    # 作者・コミッターの名前とメールの変数は、試験のリポジトリで設定した値（-c user.name など）より優先されるので外す
+    identity = {"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+    isolated = {key: value for key, value in os.environ.items()
+                if key not in local_vars and key != "GIT_CONFIG" and key not in identity}
     # 利用者の属性・無視のファイル（$XDG_CONFIG_HOME/git/attributes、なければ ~/.config/git/attributes など）は、グローバルの設定を
     # 外しても読まれるので、置き場所を空の一時ディレクトリにする（自己試験の終了時に消える）
     isolated.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_ATTR_NOSYSTEM="1", XDG_CONFIG_HOME=EMPTY_CONFIG_HOME.name)
@@ -1730,6 +1755,29 @@ def setup_repository(directory: str, env: Dict[str, str]) -> Path:
                         "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env, check=True,
                        capture_output=True)
     return repository
+
+
+def setup_repeated_hooks_path_case() -> None:
+    """setup.sh --hooks が、共有の設定に core.hooksPath の行が複数あっても（1 つの値の書き込みは失敗する）すべてを .githooks の
+    1 件に置き換え、既に .githooks の 1 件だけなら設定のファイルを書き換えないこと。"""
+    global count
+    env = isolated_git_env()
+    for label, values in (("複数の行", ["elsewhere", "other"]), ("既に .githooks の 1 件", [".githooks"])):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            repository = setup_repository(directory, env)
+            for value in values:
+                subprocess.run(["git", "-C", str(repository), "config", "--local", "--add", "core.hooksPath", value], env=env,
+                               check=True, capture_output=True)
+            config = repository / ".git" / "config"
+            before = config.stat().st_mtime_ns, config.read_bytes()
+            result = subprocess.run([str(repository / "scripts" / "setup.sh"), "--hooks"], env=env, capture_output=True, text=True)
+            stored = subprocess.run(["git", "-C", str(repository), "config", "--local", "--get-all", "core.hooksPath"], env=env,
+                                    capture_output=True, text=True).stdout.splitlines()
+            unchanged = (config.stat().st_mtime_ns, config.read_bytes()) == before
+            if result.returncode != 0 or stored != [".githooks"] or (len(values) == 1 and not unchanged):
+                failures.append(f"setup: core.hooksPath が{label}の --hooks の結果が違う（終了コード {result.returncode}・"
+                                f"設定 {stored}・書き換え {not unchanged}）\n{result.stderr.strip()}")
 
 
 def setup_guard_cases() -> None:
@@ -2945,6 +2993,21 @@ def simulator_stderr_case() -> None:
                     or lines[1:] != ([detail] if detail else [])):
                 failures.append(f"simulator: xcrun の失敗（標準エラー {detail!r}）の報告が違う（終了コード {result.returncode}・"
                                 f"{result.stdout!r}）\n{result.stderr.strip()}")
+
+
+def simulator_timeout_case() -> None:
+    """find-simulator.py が、上限（--timeout）を過ぎても終わらない一覧の取得を止め、取得の失敗（2）とし、標準出力に何も出さないこと。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        stub = Path(directory) / "xcrun"
+        stub.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+        stub.chmod(0o755)
+        result = subprocess.run([str(SCRIPTS / "find-simulator.py"), "--timeout", "1"], capture_output=True, text=True, timeout=20,
+                                env=dict(os.environ, PATH=f"{directory}:{os.environ.get('PATH', '')}"))
+        if result.returncode != 2 or result.stdout or "シミュレータの一覧を取得できない" not in result.stderr:
+            failures.append(f"simulator: 上限を過ぎた一覧の取得を失敗にしない（終了コード {result.returncode}・{result.stdout!r}）\n"
+                            f"{result.stderr.strip()}")
 
 
 def simulator_developer_dir_case() -> None:
@@ -4658,6 +4721,8 @@ def stalled_gh_download_case() -> None:
                                 f"{result.stderr.strip()}")
     for value in ("0", "301", "x", "-1", "1.5"):
         expect(f"versions: gh での取得の上限が {value}", [str(SCRIPTS / "setup-tools.sh"), "--download-limit", value], 2, "使い方")
+    # 空の導入先は ./ に変えて今の場所を導入先にせず、使い方の誤りにする
+    expect("versions: 空の --dest", [str(SCRIPTS / "setup-tools.sh"), "--verify", "--dest", ""], 2, "使い方")
 
 
 def stalled_probe_case() -> None:
@@ -4858,6 +4923,7 @@ def test_versions() -> None:
     expect("setup: 知らない引数", [str(SCRIPTS / "setup.sh"), "--hook"], 2, "使い方")
     setup_hooks_case()
     setup_guard_cases()
+    setup_repeated_hooks_path_case()
     setup_relative_case()
     setup_missing_hook_case()
     require_clean_case()
@@ -4898,6 +4964,7 @@ def test_versions() -> None:
             expect(f"check: 正しい --steps（{value!r}）", [str(copy), "--steps", value], 1, "", timeout=30, env=isolated_git_env())
     simulator_cases()
     simulator_stderr_case()
+    simulator_timeout_case()
     simulator_developer_dir_case()
     lint_rules_config_cases()
     setup = str(SCRIPTS / "setup-tools.sh")
@@ -5378,11 +5445,21 @@ def gitleaks_suppression_cases() -> None:
         （空の一覧や成功の実行を、抑止を試す根拠にしない）。"""
         result = launched(f"gitleaks: 抑止の前の実行（{label}）", command + ["--report-format", "json", "--report-path", str(report)],
                           cwd=cwd, env=env)
+        # 報告は、空でない配列で、各項目が空でない文字列の Fingerprint を持つ辞書であること（null の報告や null の指紋を
+        # str で "None" にして、抑止の試験の入力にしない）。形が違えば読めないものとして失敗を記録し、指紋を使わない
         try:
-            found = [str(item.get("Fingerprint", "")) for item in json.loads(report.read_text(encoding="utf-8"))]
-        except (OSError, json.JSONDecodeError, AttributeError) as error:
-            found = []
+            decoded = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            decoded = None
             failures.append(f"gitleaks: 抑止の前の実行（{label}）の報告を読めない: {error!r}")
+        else:
+            if not (isinstance(decoded, list) and decoded and all(
+                    isinstance(item, dict) and isinstance(item.get("Fingerprint"), str) and item["Fingerprint"]
+                    for item in decoded)):
+                failures.append(f"gitleaks: 抑止の前の実行（{label}）の報告の形が違う（空でない配列の各項目に空でない文字列の"
+                                f" Fingerprint が要る）: {decoded!r}")
+                decoded = None
+        found = [item["Fingerprint"] for item in decoded] if decoded is not None else []
         if result.returncode != 1 or not found or not all(found):
             failures.append(f"gitleaks: 抑止の前の実行（{label}）が鍵を検出しない（終了コード {result.returncode}・指紋 {found}）。"
                             "抑止の試験にならない")
@@ -7289,6 +7366,26 @@ def run_docs_cases() -> None:
         docs_case(f"リンク先の後に文字が続く行は定義にしない（{rest.strip()}）", 0, "OK", basic, link, f"[要件]\n\n[要件]: missing.md{rest}")
     for rest in ("", "  ", ' "題"', " '題'", " (題)", ' "題 \\"引用\\""'):
         docs_case(f"完全なタイトルの定義（{rest.strip()}）", 1, "リンクの先がない: missing.md", basic, link, f"[要件]\n\n[要件]: missing.md{rest}")
+    # タイトルは同じ段落の続きの行にまたがってよい（閉じる区切りの行まで読む）。閉じる前に段落が切れる・閉じた後に文字が続く場合は
+    # 定義にならない（タイトルのない定義の次の行で始めたタイトルなら、定義はタイトルなしのまま残る）
+    requirement = "../01-requirements/requirements.md"
+    for label, body, want in (
+        ("行をまたぐタイトルの定義", '[要件]\n\n[要件]: missing.md "題\n続き\n終わり"', 1),
+        ("次の行で始めて行をまたぐタイトル", "[要件]\n\n[要件]: missing.md\n(題\n続き)", 1),
+        ("ラベルの次の行のリンク先と行をまたぐタイトル", "[要件]\n\n[要件]:\n  missing.md '題\n続き'", 1),
+        ("閉じる前に空行で切れたタイトル", '[要件]\n\n[要件]: missing.md "題\n続き\n\n本文', 0),
+        ("閉じる前に見出しで切れたタイトル", '[要件]\n\n[要件]: missing.md "題\n### 小節', 0),
+        ("閉じた後に文字が続くタイトル", '[要件]\n\n[要件]: missing.md "題\n続き" 文', 0),
+        ("タイトルのない定義の後の閉じないタイトル", '[要件]\n\n[要件]: missing.md\n"題\n続き\n\n本文', 1),
+        # 定義が使った行（タイトルの続きの行を含む）の中のリンクの形は、インラインのリンクとしても読まない
+        ("定義の行のタイトルの中のインラインのリンクの形", f'[一][a]\n\n[a]: {requirement} "[中](missing.md)"', 0),
+        ("行をまたぐタイトルの中のインラインのリンクの形", f'[一][a]\n\n[a]: {requirement} "題\n[中](missing.md)"', 0),
+        ("次の行のタイトルの中のインラインのリンクの形", f'[一][a]\n\n[a]: {requirement}\n"題\n[中](missing.md) 続き"', 0),
+        # 定義の行は段落を切る。後の行の本文のリンクはこれまでどおり確かめ、閉じないタイトルの行も本文として確かめる
+        ("定義の後の本文のインラインのリンク", f"[一][a]\n\n[a]: {requirement}\n本文 [文](missing.md)", 1),
+        ("閉じないタイトルの行の本文のリンク", f'[一][a]\n\n[a]: {requirement} "題\n[文](missing.md)\n\n後', 1),
+    ):
+        docs_case(f"参照の定義の{label}", want, "リンクの先がない: missing.md" if want else "OK", basic, link, body)
     # 字下げしたコードの中の印は説明用の例で、照合も書き直しもしない。箇条書きの中の印はこれまでどおり読む
     marker = "<!-- file: scripts/sample.sh -->"
     sample = f"{marker}\n\n```bash\n"

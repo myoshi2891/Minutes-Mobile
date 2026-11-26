@@ -893,10 +893,11 @@ step_6() {
   xcodebuild -quiet -project "$PROJECT" -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator' build
 }
 
-# カバレッジの JSON の SHA-256。読めなければ失敗を返す
+# カバレッジの JSON の SHA-256。読めなければ失敗を返す。標準入力から読む（パスを渡すと、改行や「\」を含むパスで shasum が
+# 行頭に「\」を付け、値の取り出しを誤る。setup-tools.sh と同じ）
 coverage_digest() {
   local digest
-  digest=$(shasum -a 256 "$1") || return 1
+  digest=$(shasum -a 256 < "$1") || return 1
   printf '%s\n' "${digest%% *}"
 }
 

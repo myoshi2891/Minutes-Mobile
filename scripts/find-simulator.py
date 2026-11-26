@@ -6,7 +6,8 @@
 最低 OS（CON-01）以上のランタイムにある iPhone のうち、ランタイムの版が最も低いもの、
 同じ版の中では名前の順で最初のものを選ぶ（同じ環境では毎回同じ結果になる）。
 
-使い方: scripts/find-simulator.py [--minimum-os 27.2]
+使い方: scripts/find-simulator.py [--minimum-os 27.2] [--timeout <秒>]
+  --timeout  一覧の取得（xcrun simctl list）の上限（1〜600 秒。既定は 120）。過ぎたら取得の失敗（終了コード 2）
 終了コード: 0 = 見つかった / 1 = 条件を満たすシミュレータがない / 2 = 一覧を取得できない
 """
 import argparse
@@ -19,6 +20,8 @@ from typing import Dict, List, Tuple
 
 from xcproj import reject_duplicate_keys
 
+# 一覧の取得の上限（秒）。止まった simctl で検査を待たせ続けない（上限を過ぎたら取得の失敗とする）
+LIST_TIMEOUT = 120
 # シミュレータの UDID は UUID（8-4-4-4-12 桁の 16 進数）。simctl は大文字で出すが、大文字小文字は区別しない
 UDID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 
@@ -40,13 +43,15 @@ def version_key(text: str) -> Tuple[int, ...]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="テストに使うシミュレータの UDID を出力する")
     parser.add_argument("--minimum-os", default="27.2")
+    parser.add_argument("--timeout", type=int, choices=range(1, 601), default=LIST_TIMEOUT, metavar="<秒>")
     arguments = parser.parse_args()
     # 単独で実行しても check.sh と同じ Xcode を使う（DEVELOPER_DIR がない・空のときだけ既定にし、利用者の指定は変えない）
     env = dict(os.environ)
     env["DEVELOPER_DIR"] = env.get("DEVELOPER_DIR") or "/Applications/Xcode.app/Contents/Developer"
     try:
         minimum = version_key(arguments.minimum_os)
-        listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True, check=True, env=env)
+        listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True, check=True, env=env,
+                                 timeout=arguments.timeout)
         # 重複した鍵は後の値で前の値を隠すので、形の違う一覧とする（ValueError で送出される）
         data = json.loads(listing.stdout, object_pairs_hook=reject_duplicate_keys)
         devices_by_runtime = data["devices"]
@@ -109,7 +114,8 @@ def main() -> int:
             if not isinstance(name, str) or not isinstance(udid, str) or not UDID.fullmatch(udid):
                 raise TypeError(f"シミュレータの name・udid の形が違う: {name!r}, {udid!r}")
     # 深い入れ子の一覧は json の読み込みが RecursionError になる（形の違う一覧と同じく取得の失敗として扱う）
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, RecursionError, KeyError, TypeError, ValueError) as error:
+    # 上限を過ぎた取得（TimeoutExpired）も取得の失敗とする（標準出力には何も書かない）
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, RecursionError, KeyError, TypeError, ValueError) as error:
         print(f"NG: シミュレータの一覧を取得できない: {error!r}", file=sys.stderr)
         # xcrun が失敗の理由を標準エラーに出していれば示す（例外の表示には含まれない）
         if isinstance(error, subprocess.CalledProcessError) and error.stderr and error.stderr.strip():

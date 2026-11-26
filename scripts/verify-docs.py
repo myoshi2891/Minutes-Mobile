@@ -73,6 +73,14 @@ PHASES = re.compile(r"^(MVP|P2|P3)\b")
 FENCE_LINE = "\0fence"
 # リンク先の後に続けて書けるタイトル（"…"・'…'・(…)）
 LINK_TITLE = re.compile(r"""\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\))""")
+# 定義のタイトルの、閉じていない始まり（行末まで閉じる区切りがない。行末の「\」は文字としてそのまま）。閉じる区切り → 続きの行の形
+TITLE_OPEN = re.compile(r"""\s+(?:"(?:[^"\\]|\\.)*\\?|'(?:[^'\\]|\\.)*\\?|\((?:[^()\\]|\\.)*\\?)""")
+TITLE_CONTINUED = {'"': re.compile(r"""(?:[^"\\]|\\.)*\\?"""), "'": re.compile(r"""(?:[^'\\]|\\.)*\\?"""),
+                   ")": re.compile(r"""(?:[^()\\]|\\.)*\\?""")}
+# 定義のタイトルを閉じる行（閉じる区切りの後は空白だけ。ほかの文字が続く行は定義ではない）
+TITLE_CLOSED = {'"': re.compile(r"""(?:[^"\\]|\\.)*"[ \t]*"""), "'": re.compile(r"""(?:[^'\\]|\\.)*'[ \t]*"""),
+                ")": re.compile(r"""(?:[^()\\]|\\.)*\)[ \t]*""")}
+TITLE_CLOSERS = {'"': '"', "'": "'", "(": ")"}
 # 参照形式のリンクの定義（[ラベル]: リンク先）。字下げは空白 0〜3 個まで（CommonMark）
 REFERENCE_DEFINITION = re.compile(r"""^ {0,3}\[([^\]]+)\]:\s*(<[^<>\n]+>|\S+)""")
 # 定義のラベルだけの行と、次の行に書いたリンク先（CommonMark。リンク先の後はタイトルだけを書ける）
@@ -349,18 +357,47 @@ def reference_definitions(text: str, skipped: Set[int], consumed: Optional[Set[i
     次の行に書いたタイトルの直後の行は、続けて定義を書ける。リンク先はラベルの次の行にも書ける（行番号はラベルの行）。
     consumed を渡すと、定義が使った行（ラベルの行・次の行のリンク先の行・次の行のタイトルの行）の行番号をすべて加える
     （それらの行は段落ではないので、リンクの使用として読まない）。
+    タイトルは同じ段落の続きの行にまたがってよい（閉じる区切りの行まで読み、またいだ行も定義が使った行に加える）。閉じる前に
+    段落が切れた（空行・新しいブロックの始まりなど）、または閉じる区切りの後に文字が続く場合、リンク先と同じ行で始めたタイトルの
+    定義は定義にならず、タイトルのない定義の次の行で始めたタイトルは、定義のタイトルにならない（どちらも行は段落の本文）。
     """
     used = consumed if consumed is not None else set()
     code = IndentedCode()
     previous = 0
     untitled = False  # 直前の行が、タイトルのない定義
     pending: Optional[Tuple[int, str]] = None  # 直前の行が、リンク先をまだ書いていない定義のラベル（行番号, ラベル）
+    # 閉じていないタイトル（閉じる区切り, タイトルまでの定義が使った行, 閉じたら返す定義。タイトルのない定義の後のタイトルは None）
+    opened: Optional[Tuple[str, List[int], Optional[Tuple[int, str, str]]]] = None
+
+    def opening(rest: str) -> Optional[str]:
+        """rest（空白で始まる）が閉じていないタイトルの始まりなら、閉じる区切りを返す。"""
+        return TITLE_CLOSERS[rest.lstrip()[0]] if rest.strip() and TITLE_OPEN.fullmatch(rest) else None
+
     for number, line in prose_lines(text):
         if number != previous + 1:
             code.interrupt()
             untitled = False
             pending = None
+            opened = None
         previous = number
+        if opened is not None:
+            closer, lines, definition = opened
+            opened = None
+            if (number not in skipped and not COMMENT_OPEN.match(line) and line.strip() and not BLOCK_START.match(line)
+                    and not PARAGRAPH_END.match(line)):
+                if TITLE_CLOSED[closer].fullmatch(line.rstrip()):
+                    used.update(lines + [number])
+                    if definition is not None:
+                        yield definition
+                    code.interrupt()
+                    untitled = False
+                    continue
+                if TITLE_CONTINUED[closer].fullmatch(line.rstrip()):
+                    opened = (closer, lines + [number], definition)
+                    continue
+            # 閉じないタイトルの行は段落の本文なので、この行はその段落の続きとして読む（空行などは下でこれまでどおり扱う）
+            code.paragraph = True
+            untitled = False
         label, pending = pending, None
         if number in skipped or COMMENT_OPEN.match(line):
             code.interrupt()
@@ -374,6 +411,10 @@ def reference_definitions(text: str, skipped: Set[int], consumed: Optional[Set[i
                 yield label[0], label[1], destination.group(1)
                 code.interrupt()
                 untitled = not rest
+                continue
+            closer = opening(rest) if destination else None
+            if closer is not None:
+                opened = (closer, [label[0], number], (label[0], label[1], destination.group(1)))
                 continue
         starts = not code.paragraph
         found = REFERENCE_DEFINITION.match(line)
@@ -394,10 +435,16 @@ def reference_definitions(text: str, skipped: Set[int], consumed: Optional[Set[i
                 code.interrupt()
                 untitled = not rest
                 continue
+            closer = opening(rest)
+            if closer is not None:
+                opened = (closer, [number], (number, found.group(1), found.group(2)))
+                continue
         title = LINK_TITLE.match(" " + line) if untitled else None
         if title and title.end() == len(line.rstrip()) + 1:
             used.add(number)  # 前の行の定義のタイトル
             code.interrupt()
+        elif untitled and opening(" " + line) is not None:
+            opened = (str(opening(" " + line)), [number], None)  # 前の行の定義の、行をまたぐタイトル
         untitled = False
 
 
@@ -1096,6 +1143,11 @@ class Checker:
                 if COMMENT_OPEN.match(line):
                     code.interrupt()
                     continue
+                # 定義が使った行（ラベル・リンク先・タイトル）は段落ではない。インラインのリンクとしても参照の使用としても読まず、
+                # 前後の行の段落を切る（定義の検査は reference_definitions の結果のリンク先で行う）
+                if number in definition_lines:
+                    code.interrupt()
+                    continue
                 # 見出し・区切りの線・表の行は 1 行で終わり、次の行に続かない
                 alone = PARAGRAPH_END.match(line) is not None or number in rows or is_separator(line) or not line.strip()
                 continued = not alone
@@ -1115,13 +1167,13 @@ class Checker:
                             break
                         pending.append(later)
                 targets, openers, (line, *pending) = link_destinations(line, openers, pending)
-                for text_part, label in [] if number in definition_lines else REFERENCE_LINK.findall(line):
+                for text_part, label in REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
                     if target is not None:
                         targets.append(target)
-                # 定義の行の [ラベル] は使用ではない。定義のないラベルはリンクにならない
-                for label in [] if number in definition_lines else SHORTCUT_LINK.findall(line):
+                # 定義のないラベルはリンクにならない（定義の行は上で読み飛ばした）
+                for label in SHORTCUT_LINK.findall(line):
                     target = definitions.get(reference_label(label))
                     if target is not None:
                         targets.append(target)

@@ -42,7 +42,8 @@ while [ $# -gt 0 ]; do
     --verify) MODE=verify; shift ;;
     --versions) [ $# -ge 2 ] || usage; VERSIONS=$2; shift 2 ;;
     # 相対パスは ./ を付ける（「-」などを cd が直前の場所（OLDPWD）やオプションとして解釈しないように。絶対パスはそのまま）
-    --dest) [ $# -ge 2 ] || usage; case "$2" in /*) DEST=$2 ;; *) DEST=./$2 ;; esac; shift 2 ;;
+    # 空の値は ./ に変わって今の場所を導入先にしてしまうので拒否する（「.」の明示は今の場所として認める）
+    --dest) [ $# -ge 2 ] && [ -n "$2" ] || usage; case "$2" in /*) DEST=$2 ;; *) DEST=./$2 ;; esac; shift 2 ;;
     --download-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; DOWNLOAD_LIMIT=$2; shift 2 ;;
     --probe-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; PROBE_LIMIT=$2; shift 2 ;;
     --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; REQUIRED=$2; shift 2 ;;

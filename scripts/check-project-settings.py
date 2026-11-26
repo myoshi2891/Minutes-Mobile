@@ -736,7 +736,8 @@ def load_plist(path: Path) -> dict:
     # 壊れた XML は ExpatError、形の違う日付（<date>）は AttributeError になる（plistlib が照合の失敗を確かめない）
     # 重複した鍵は ValueError（UniqueKeys）
     # バイナリ形式の深い入れ子は、plistlib の読み込みが RecursionError になる
-    except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, AttributeError, RecursionError) as error:
+    # 辞書の外の <key>（最上位の <key> など）は、plistlib が空の入れ子を参照して IndexError になる
+    except (OSError, plistlib.InvalidFileException, ValueError, ExpatError, AttributeError, RecursionError, IndexError) as error:
         raise Unreadable(f"{path}: {error!r}") from error
     if not isinstance(data, dict):
         raise Unreadable(f"{path}: 最上位が辞書でない")

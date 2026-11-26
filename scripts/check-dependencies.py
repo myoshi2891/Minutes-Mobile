@@ -69,7 +69,8 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[s
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:  # 深い入れ子は RecursionError
         raise Unreadable(f"{path}: {error!r}") from error
-    if not isinstance(data, dict) or data.get("formatVersion") != 1:
+    # 真偽値の true は 1 と等しいので、型も確かめる（resolved_pins の version と同じ）
+    if not isinstance(data, dict) or type(data.get("formatVersion")) is not int or data.get("formatVersion") != 1:
         raise Unreadable(f"{path}: formatVersion が 1 でない")
     licenses = data.get("allowedLicenses")
     packages = data.get("approvedPackages")
@@ -597,11 +598,14 @@ def content_digest(path: Path) -> str:
         raise Unreadable(f"{error.filename}: {error}")
 
     def resolved(item: Path) -> Path:
-        """リンクを解決した実体のパス。循環するリンクは解決できないので、読めないものとして扱う。"""
+        """リンクを解決した実体のパス。循環するリンクと、先が存在しないリンクは解決できないので、読めないものとして扱う
+        （strict でない解決は、存在しない先を成果物の中のパスとして返し、壊れたリンクを中を指すリンクと取り違える）。"""
         try:
-            return item.resolve()
+            return item.resolve(strict=True)
         except RuntimeError as error:  # Python 3.9〜3.12 は循環するリンクで RuntimeError を送出する
             raise Unreadable(f"{item}: リンクを解決できない（循環している）: {error}") from error
+        except OSError as error:  # 先が存在しない（strict の解決は FileNotFoundError を送出する）
+            raise Unreadable(f"{item}: リンクを解決できない（先が存在しない）: {error}") from error
 
     def entries(base: Path) -> List[Path]:
         """配下のすべての項目を返す。読めないディレクトリは読めないものとして扱う

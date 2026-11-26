@@ -94,7 +94,11 @@ if [ "$HOOKS" = 1 ]; then
       exit 1
     fi
   done <<< "$included"
-  env -u GIT_CONFIG git -C "$ROOT" config --local core.hooksPath .githooks
+  # 共有の設定のファイル自身の値（取り込みを除く）が既に .githooks の 1 件だけなら書かない。複数の行がある場合、git config の
+  # 1 つの値の書き込みは「複数の値を 1 つの値で上書きできない」で失敗するので、--replace-all ですべての行を明示的に置き換える
+  if [ "$own" != =.githooks ]; then
+    env -u GIT_CONFIG git -C "$ROOT" config --local --replace-all core.hooksPath .githooks
+  fi
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる
   effective=$(read_config --get core.hooksPath) || exit 1
