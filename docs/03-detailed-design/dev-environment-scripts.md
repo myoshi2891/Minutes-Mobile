@@ -51,6 +51,8 @@ DOWNLOAD_LIMIT=300
 PROBE_LIMIT=30
 # 検査（check.sh）が使うツール。台帳から行が消えても見落とさないよう、台帳の内容ではなくこの集合で必須を決める
 REQUIRED="gh swiftlint swiftformat gitleaks"
+# 版の確認方法（runtime_version）を持つツール。台帳に現れてよいのはこれだけ（試験は --require で一部だけを求めてよい）
+SUPPORTED="gh swiftlint swiftformat gitleaks"
 
 usage() {
   echo "使い方: $0 [--verify] [--versions <ファイル>] [--dest <ディレクトリ>]" >&2
@@ -61,7 +63,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --verify) MODE=verify; shift ;;
     --versions) [ $# -ge 2 ] || usage; VERSIONS=$2; shift 2 ;;
-    --dest) [ $# -ge 2 ] || usage; DEST=$2; shift 2 ;;
+    # 相対パスは ./ を付ける（「-」などを cd が直前の場所（OLDPWD）やオプションとして解釈しないように。絶対パスはそのまま）
+    --dest) [ $# -ge 2 ] || usage; case "$2" in /*) DEST=$2 ;; *) DEST=./$2 ;; esac; shift 2 ;;
     --download-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; DOWNLOAD_LIMIT=$2; shift 2 ;;
     --probe-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; PROBE_LIMIT=$2; shift 2 ;;
     --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; REQUIRED=$2; shift 2 ;;
@@ -418,6 +421,8 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
   case "$name" in '' | '#'*) continue ;; esac
   [ -z "${extra:-}" ] || fail "tools/versions の列が多い: $name"
   check_field "名前" "$name" '^[a-z][a-z0-9-]*$'
+  # 版の確認方法のないツールは、導入・公開するリンクの更新を始める前（台帳の検証の中）で止める
+  case " $SUPPORTED " in *" $name "*) ;; *) fail "tools/versions のツール $name は版の確認方法が定義されていない（対応: ${SUPPORTED}）" ;; esac
   check_field "版" "${version:-}" '^[0-9]+(\.[0-9]+)*$'
   check_field "アーキテクチャ" "${arch:-}" '^(any|arm64|x86_64)$'
   check_field "リポジトリ" "${repo:-}" '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
@@ -1054,8 +1059,40 @@ coverage_input() {
   printf 'worktree %s\n' "$tree"
 }
 
+# 手順 7・8 が書く・消すカバレッジの場所（記録・JSON・測る入力の写し・ロック）と、その祖先（起点まで）のそれぞれが、リンクを
+# 解決しても現在の作業ツリーの中にあることを確かめる。.build・$PACKAGE/.build がシンボリックリンクで外を指すと、ロックの作成・
+# 写しの rm -rf・記録の置き換えがリンクの先（作業ツリーの外）に及ぶ。満たさない・調べられない場合は非 0 を返す
+verify_coverage_paths() {
+  /usr/bin/python3 -I - "$ROOT" "$COVERAGE_HEAD" "$COVERAGE_JSON" "$COVERAGE_INPUT" "$COVERAGE_LOCK" <<'PYTHON'
+import os
+import sys
+
+try:
+    root = os.path.realpath(sys.argv[1])
+    bad = []
+    for relative in sys.argv[2:]:
+        path = os.path.join(root, relative)
+        # 対象そのものと、起点までの祖先のそれぞれ（ないものは、あるところまでを解決した値）
+        while path != root:
+            real = os.path.realpath(path)
+            if real != root and not real.startswith(root + os.sep):
+                bad.append(f"{os.path.relpath(path, root)} → {real}")
+                break
+            path = os.path.dirname(path)
+except (OSError, RuntimeError, ValueError) as error:  # 循環するリンクは RuntimeError（Python 3.12 まで）
+    print(f"NG: カバレッジの場所を解決できない: {error!r}", file=sys.stderr)
+    sys.exit(2)
+for item in bad:
+    print(f"NG: カバレッジの場所が作業ツリーの外を指す: {item}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PYTHON
+}
+
 # カバレッジのロックを取る。待たずに失敗する（別の測定が実行中。残骸なら削除して実行し直す）。取得の途中の中断は take_lock が控える
+# 手順 7・8 の共通の入口なので、ロックを取る前（ファイルを作る・消す前）にカバレッジの場所を確かめる
 take_coverage_lock() {
+  verify_coverage_paths \
+    || fail "カバレッジの場所（.build・${PACKAGE}/.build）がシンボリックリンクなどで作業ツリーの外を指す・確かめられない。中身を確かめて直してから実行し直す"
   mkdir -p .build
   take_lock "$COVERAGE_LOCK" COVERAGE_LOCK_HELD \
     || fail "別のカバレッジの測定・集計が実行中（${COVERAGE_LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
@@ -1350,8 +1387,8 @@ step_7() {
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest sources
   local resolution=()
-  mkdir -p "$PACKAGE/.build"
   take_coverage_lock
+  mkdir -p "$PACKAGE/.build"
   rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
   rm -rf -- "$COVERAGE_INPUT"
   # 測る入力を固定する。入力の識別子（コミット、または作業ツリーを写したツリー）が指すツリーから Packages/ を展開し、
