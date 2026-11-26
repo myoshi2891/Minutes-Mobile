@@ -176,14 +176,13 @@ owned_tree() {
     && [ "$(cat "$private/$owner_mark")" = "$owner_text" ]
 }
 # 前の検査が、専用の作業ツリーを移したまま終わった（強制終了・元の場所に別のものができた）場合は、先に元の場所へ戻す。元の場所に
-# 残ったのが空のディレクトリだけなら除く（空でないものには触れない）
+# 何かがあれば（空のディレクトリを含む）、このフックのものと確かめられないので消さず、restore_staging が戻さずに止める
 for held in "$snapshot".work.*; do
   if [ ! -d "$held" ] || [ -L "$held" ]; then continue; fi
   if [ -e "$held/tree" ] && ! owned_tree "$held/tree"; then
     echo "NG: ${held}/tree がこの検査の作業ツリーと確かめられない。中身を確かめて外してから push し直す" >&2
     exit 1
   fi
-  if [ -e "$held/tree" ] && [ -d "$snapshot" ] && [ ! -L "$snapshot" ]; then find "$snapshot" -type d -empty -delete; fi
   staging=$held
   restore_staging
 done

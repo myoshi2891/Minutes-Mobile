@@ -52,7 +52,7 @@ custom_rules:
 
   no_network_api:
     name: "通信 API の禁止"
-    regex: '\b(URLSession\w*|URLRequest|NSURLConnection|NW(Connection|Listener|Browser|PathMonitor|ProtocolWebSocket)\w*|CFStreamCreatePairWith\w+|CFSocket\w*)\b'
+    regex: '\b(URLSession\w*|URLRequest|NSURLConnection|NW(Connection|Listener|Browser|PathMonitor|ProtocolWebSocket)\w*|CFStreamCreatePairWith\w+|CFSocket\w*|getStreamsToHost\w*)\b'
     match_kinds: *code
     message: "アプリのコードは通信 API を持たない（SEC-NET-01、BD-ARC-05）"
     severity: error

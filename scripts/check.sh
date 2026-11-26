@@ -577,8 +577,40 @@ coverage_input() {
   printf 'worktree %s\n' "$tree"
 }
 
+# 手順 7・8 が書く・消すカバレッジの場所（記録・JSON・測る入力の写し・ロック）と、その祖先（起点まで）のそれぞれが、リンクを
+# 解決しても現在の作業ツリーの中にあることを確かめる。.build・$PACKAGE/.build がシンボリックリンクで外を指すと、ロックの作成・
+# 写しの rm -rf・記録の置き換えがリンクの先（作業ツリーの外）に及ぶ。満たさない・調べられない場合は非 0 を返す
+verify_coverage_paths() {
+  /usr/bin/python3 -I - "$ROOT" "$COVERAGE_HEAD" "$COVERAGE_JSON" "$COVERAGE_INPUT" "$COVERAGE_LOCK" <<'PYTHON'
+import os
+import sys
+
+try:
+    root = os.path.realpath(sys.argv[1])
+    bad = []
+    for relative in sys.argv[2:]:
+        path = os.path.join(root, relative)
+        # 対象そのものと、起点までの祖先のそれぞれ（ないものは、あるところまでを解決した値）
+        while path != root:
+            real = os.path.realpath(path)
+            if real != root and not real.startswith(root + os.sep):
+                bad.append(f"{os.path.relpath(path, root)} → {real}")
+                break
+            path = os.path.dirname(path)
+except (OSError, RuntimeError, ValueError) as error:  # 循環するリンクは RuntimeError（Python 3.12 まで）
+    print(f"NG: カバレッジの場所を解決できない: {error!r}", file=sys.stderr)
+    sys.exit(2)
+for item in bad:
+    print(f"NG: カバレッジの場所が作業ツリーの外を指す: {item}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PYTHON
+}
+
 # カバレッジのロックを取る。待たずに失敗する（別の測定が実行中。残骸なら削除して実行し直す）。取得の途中の中断は take_lock が控える
+# 手順 7・8 の共通の入口なので、ロックを取る前（ファイルを作る・消す前）にカバレッジの場所を確かめる
 take_coverage_lock() {
+  verify_coverage_paths \
+    || fail "カバレッジの場所（.build・${PACKAGE}/.build）がシンボリックリンクなどで作業ツリーの外を指す・確かめられない。中身を確かめて直してから実行し直す"
   mkdir -p .build
   take_lock "$COVERAGE_LOCK" COVERAGE_LOCK_HELD \
     || fail "別のカバレッジの測定・集計が実行中（${COVERAGE_LOCK}）。実行中でなければ、そのディレクトリを削除してから実行し直す"
@@ -873,8 +905,8 @@ step_7() {
   [ -f "$PACKAGE/Package.swift" ] || fail "$PACKAGE がない（中核ロジックの Package を作ってから実行する）"
   local measured report digest sources
   local resolution=()
-  mkdir -p "$PACKAGE/.build"
   take_coverage_lock
+  mkdir -p "$PACKAGE/.build"
   rm -f -- "$COVERAGE_HEAD" "$COVERAGE_JSON"
   rm -rf -- "$COVERAGE_INPUT"
   # 測る入力を固定する。入力の識別子（コミット、または作業ツリーを写したツリー）が指すツリーから Packages/ を展開し、

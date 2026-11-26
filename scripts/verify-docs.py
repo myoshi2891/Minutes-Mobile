@@ -161,14 +161,15 @@ def visible(line: str) -> str:
     return INLINE_COMMENT.sub("", line)
 # 節（「## 」）と小節（「### 」）の見出し。字下げは空白 0〜3 個まで（CommonMark。4 個以上は字下げしたコードブロック）。
 # 印と見出しの文の間は空白かタブ（CommonMark。「##\t節」も節として数え、「満たす要件:」の検査から漏らさない）。
+# 印だけの行（「##」。見出しの文が空の見出し。CommonMark）も節として数え、その節の「満たす要件:」を確かめる。
 # sections() と requirement_fields() が同じ判定を使う
-HEADING = re.compile(r"^ {0,3}(#{2,3})[ \t](.*)$")
+HEADING = re.compile(r"^ {0,3}(#{2,3})(?:[ \t](.*))?$")
 
 
 def heading(line: str) -> Optional[Tuple[int, str]]:
     """節・小節の見出しの行なら（段の深さ 2 か 3, 見出しの文）を返す。"""
     found = HEADING.match(line)
-    return (len(found.group(1)), found.group(2).strip()) if found else None
+    return (len(found.group(1)), (found.group(2) or "").strip()) if found else None
 
 
 # HTML のコードブロック（<pre>…</pre>）の始まりと終わり。中の行は表示どおりの文字で、Markdown（フェンス・表・リンク）にならない
@@ -341,12 +342,15 @@ class IndentedCode:
         return False
 
 
-def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, str, str]]:
+def reference_definitions(text: str, skipped: Set[int], consumed: Optional[Set[int]] = None) -> Iterator[Tuple[int, str, str]]:
     """参照形式のリンクの定義（[ラベル]: リンク先）を（行番号, ラベル, リンク先）で返す。skipped の行（引用の中のフェンス）は本文として見ない。
 
     定義は段落の始まりにだけ書ける（段落の文の続きの、定義の形の行は定義にならない。CommonMark）。定義の直後の行と、定義の
     次の行に書いたタイトルの直後の行は、続けて定義を書ける。リンク先はラベルの次の行にも書ける（行番号はラベルの行）。
+    consumed を渡すと、定義が使った行（ラベルの行・次の行のリンク先の行・次の行のタイトルの行）の行番号をすべて加える
+    （それらの行は段落ではないので、リンクの使用として読まない）。
     """
+    used = consumed if consumed is not None else set()
     code = IndentedCode()
     previous = 0
     untitled = False  # 直前の行が、タイトルのない定義
@@ -366,6 +370,7 @@ def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, s
             destination = REFERENCE_DESTINATION.match(line)
             rest = line[destination.end():].rstrip() if destination else ""
             if destination and (not rest or LINK_TITLE.fullmatch(rest)):
+                used.update((label[0], number))
                 yield label[0], label[1], destination.group(1)
                 code.interrupt()
                 untitled = not rest
@@ -384,12 +389,14 @@ def reference_definitions(text: str, skipped: Set[int]) -> Iterator[Tuple[int, s
             # リンク先の後には完全なタイトルだけを書ける。ほかの文字が続く行は定義ではなく段落（CommonMark）
             rest = line[found.end():].rstrip()
             if not rest or LINK_TITLE.fullmatch(rest):
+                used.add(number)
                 yield number, found.group(1), found.group(2)
                 code.interrupt()
                 untitled = not rest
                 continue
         title = LINK_TITLE.match(" " + line) if untitled else None
         if title and title.end() == len(line.rstrip()) + 1:
+            used.add(number)  # 前の行の定義のタイトル
             code.interrupt()
         untitled = False
 
@@ -709,15 +716,33 @@ def section_lead(body: List[str]) -> str:
     return next((line for line in body if visible(line).strip()), "")
 
 
+def leading_whitespace(line: str) -> str:
+    """行の先頭の字下げ（空白とタブ）の文字列。"""
+    return line[:len(line) - len(line.lstrip(" \t"))]
+
+
 def fence_indent(line: str) -> int:
-    """フェンスの開始行の字下げ（空白 0〜3 個）。"""
-    return len(line) - len(line.lstrip(" "))
+    """フェンスの開始行の字下げの桁数（CommonMark の桁。タブは 4 桁ごとのタブ位置まで進める）。
+    箇条書きの項目の中のフェンスは、項目の本文の位置までの字下げを含めて数える。"""
+    column = 0
+    for char in leading_whitespace(line):
+        column += 1 if char == " " else 4 - column % 4
+    return column
 
 
 def dedent(line: str, indent: int) -> str:
-    """CommonMark と同じく、フェンスの本文の行から開始行の字下げの分だけ（あるだけ）先頭の空白を除く。"""
-    spaces = len(line) - len(line.lstrip(" "))
-    return line[min(spaces, indent):]
+    """CommonMark と同じく、フェンスの本文の行から開始行の字下げの桁数（indent）の分だけ（あるだけ）先頭の字下げを除く。
+    タブは 4 桁ごとのタブ位置まで進めて数え、途中までしか除かないタブは残りの桁を空白にする。先頭の字下げの後の
+    タブ（本文の中のタブ）は変えない。"""
+    column = 0
+    for position, char in enumerate(line):
+        if column >= indent or char not in " \t":
+            return line[position:]
+        width = 1 if char == " " else 4 - column % 4
+        if column + width > indent:
+            return " " * (column + width - indent) + line[position + 1:]
+        column += width
+    return ""
 
 
 def stale(confirmed: datetime.date, today: datetime.date) -> bool:
@@ -1043,8 +1068,8 @@ class Checker:
             # 参照形式のリンクは、定義（[ラベル]: リンク先）を通してリンク先を求め、インラインのリンクと同じく確かめる
             definitions: Dict[str, str] = {}
             definition_lines: Set[int] = set()
-            for number, label, destination in reference_definitions(text, set(quoted)):
-                definition_lines.add(number)
+            # 定義が使った行（ラベル・次の行のリンク先・次の行のタイトル）は段落ではないので、リンクの使用として読まない
+            for number, label, destination in reference_definitions(text, set(quoted), definition_lines):
                 definitions.setdefault(reference_label(label), destination)
             rows = {number for _, block in tables(text) for number, _ in block}
             # 確かめる行（行番号, 本文, 前の行と同じ段落の続きか）。先に集め、リンクのタイトルを同じ段落の続きの行から読めるようにする
@@ -1090,7 +1115,7 @@ class Checker:
                             break
                         pending.append(later)
                 targets, openers, (line, *pending) = link_destinations(line, openers, pending)
-                for text_part, label in REFERENCE_LINK.findall(line):
+                for text_part, label in [] if number in definition_lines else REFERENCE_LINK.findall(line):
                     # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
                     target = definitions.get(reference_label(label or text_part))
                     if target is not None:
@@ -1450,14 +1475,15 @@ class Checker:
                 if path is None or not path.is_file():
                     continue  # 不備（root の外の参照先を含む）は検査の側で報告する
                 end = fence_end(lines, start, opened[0])
-                # 字下げしたフェンスには、開始行と同じ字下げを付けて書く（空行には付けない）
-                indent = " " * fence_indent(lines[start])
+                # 字下げしたフェンスには、開始行と同じ字下げ（タブを含めて同じ文字）を付けて書く（空行には付けない）。
+                # 照合は開始行の字下げの桁数で除いて行う（タブと空白の字下げで同じ桁なら同じに読む）
+                indent = leading_whitespace(lines[start])
                 try:
                     source = split_lines(path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError):
                     continue  # このコード片は書き直さない。検査の側（check_snippets）が印の行とともに報告する
                 # 字下げを除いた本文が元のファイルと一致するコード片は、行も改行も変えない
-                if end < len(lines) and [dedent(line, len(indent)) for line in lines[start + 1:end]] == source:
+                if end < len(lines) and [dedent(line, fence_indent(lines[start])) for line in lines[start + 1:end]] == source:
                     continue
                 content = [indent + line if line else line for line in source]
                 # このフェンスを閉じてしまう行を含む内容は書き込まない（長いフェンスに手で直す）

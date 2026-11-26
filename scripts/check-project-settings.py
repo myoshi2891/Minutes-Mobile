@@ -630,10 +630,14 @@ def check_enabled(source: str, key: str, value: object, errors: List[str], expan
         errors.append(f"[{reason}] {source}: {key} を有効にしない（{value} が有効な値に展開される）")
 
 
-def check_plist_entry(source: str, key: str, value: object, errors: List[str], expand: Optional[Expander] = None) -> None:
+def check_plist_entry(source: str, key: str, value: object, errors: List[str], expand: Optional[Expander] = None,
+                      visited: Optional[Set[int]] = None) -> None:
     """Info.plist の 1 項目を調べる。入れ子の辞書と配列もたどる。
 
     expand は値の変数を展開する関数（その plist・ビルド設定を使うターゲットのもの）。None なら変数は判定できないものとする。
+    visited は、1 つの plist（同じ展開の文脈）のたどりの中で中を調べた辞書・配列の id。バイナリ形式の plist は同じ辞書・配列を
+    複数の場所から参照でき、参照のたびに下りると段数に対して指数の手間になるので、同じものの中は 1 回だけ調べる。
+    None なら、この呼び出しから新しいたどりを始める（展開の文脈が違う検査の間で使い回さない）。
     """
     # iPhone の修飾子（~iphone・-iphoneos・-iphoneos~iphone）を除いた鍵で規則を判定する（修飾子つきの鍵で規則を迂回させない）。
     # 報告には元の鍵を使う。接頭辞の規則（FORBIDDEN_PLIST_KEY_PREFIXES）は元の鍵のままで当たる
@@ -654,14 +658,24 @@ def check_plist_entry(source: str, key: str, value: object, errors: List[str], e
                 errors.append(f"[FR-REC-05] {source}: UIBackgroundModes に {mode} を入れない")
     if base == "NSExtensionPointIdentifier" and str(value) not in ALLOWED_EXTENSION_POINTS:
         errors.append(f"[SEC-PLT-04] {source}: 拡張 {value} を置かない")
+    if visited is None:
+        visited = set()
+    # 鍵ごとの規則（上）は参照のたびに判定し、中の項目は同じ辞書・配列について 1 回だけ調べる
     if isinstance(value, dict):
-        for child_key, child_value in value.items():
-            check_plist_entry(source, str(child_key), child_value, errors, expand)
+        containers = [value]
     elif isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict):
-                for child_key, child_value in item.items():
-                    check_plist_entry(source, str(child_key), child_value, errors, expand)
+        if id(value) in visited:
+            return
+        visited.add(id(value))
+        containers = [item for item in value if isinstance(item, dict)]
+    else:
+        return
+    for container in containers:
+        if id(container) in visited:
+            continue
+        visited.add(id(container))
+        for child_key, child_value in container.items():
+            check_plist_entry(source, str(child_key), child_value, errors, expand, visited)
 
 
 def check_build_settings(
@@ -871,8 +885,9 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         # どのターゲットも参照しない plist の値の変数は、展開するビルド設定が決まらないので判定できないものとする
         expand = combined_expander(referenced[path]) if path in referenced else None
+        visited: Set[int] = set()  # この plist のたどりだけで使う（ほかの plist・ビルド設定の検査とは分ける）
         for key, value in load_plist(path).items():
-            check_plist_entry(source, str(key), value, errors, expand)
+            check_plist_entry(source, str(key), value, errors, expand, visited)
     # CODE_SIGN_ENTITLEMENTS が指すファイルも、拡張子にかかわらず読む。ないファイル・読めないファイルは Unreadable
     scanned = discovered_files(root, (".entitlements",), tracked)
     for path in scanned + [path for path in dict.fromkeys(entitlements) if path not in scanned]:

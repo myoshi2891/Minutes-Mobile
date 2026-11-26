@@ -170,6 +170,10 @@ def pin_identity(pin: dict, legacy: bool) -> str:
     return value.lower()
 
 
+# Package.resolved の版 2・3 の pin の kind が取りうる値（SwiftPM の PinsStore の取得元の種類）
+PIN_KINDS = {"remoteSourceControl", "localSourceControl", "registry"}
+
+
 def resolved_pins(path: Path) -> List[Tuple[str, dict]]:
     """Package.resolved の依存を（名前, 記録）で返す。名前は pin_identity の値（重複の判定と承認の照合に同じ値を使う）。"""
     try:
@@ -188,6 +192,13 @@ def resolved_pins(path: Path) -> List[Tuple[str, dict]]:
     pins = holder.get("pins") if isinstance(holder, dict) else None
     if not isinstance(pins, list) or not all(isinstance(pin, dict) for pin in pins):
         raise Unreadable(f"{path}: pins の形式が違う")
+    # 版 2・3 の pin は取得元の種類（kind）を必ず持つ。ない・知らない値の pin は、取得元の判定の前提が崩れるので読まない
+    # （版 1 は kind を持たない）
+    if not legacy:
+        for pin in pins:
+            kind = pin.get("kind")
+            if not isinstance(kind, str) or kind not in PIN_KINDS:
+                raise Unreadable(f"{path}: pin の kind がない・知らない値（{kind!r}）")
     # 同じ名前の依存が重なると、どの確定版が使われるか決まらない（SwiftPM も壊れたファイルとして拒否する）
     seen: Set[str] = set()
     named = [(pin_identity(pin, legacy), pin) for pin in pins]

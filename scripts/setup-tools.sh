@@ -29,6 +29,8 @@ DOWNLOAD_LIMIT=300
 PROBE_LIMIT=30
 # 検査（check.sh）が使うツール。台帳から行が消えても見落とさないよう、台帳の内容ではなくこの集合で必須を決める
 REQUIRED="gh swiftlint swiftformat gitleaks"
+# 版の確認方法（runtime_version）を持つツール。台帳に現れてよいのはこれだけ（試験は --require で一部だけを求めてよい）
+SUPPORTED="gh swiftlint swiftformat gitleaks"
 
 usage() {
   echo "使い方: $0 [--verify] [--versions <ファイル>] [--dest <ディレクトリ>]" >&2
@@ -39,7 +41,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --verify) MODE=verify; shift ;;
     --versions) [ $# -ge 2 ] || usage; VERSIONS=$2; shift 2 ;;
-    --dest) [ $# -ge 2 ] || usage; DEST=$2; shift 2 ;;
+    # 相対パスは ./ を付ける（「-」などを cd が直前の場所（OLDPWD）やオプションとして解釈しないように。絶対パスはそのまま）
+    --dest) [ $# -ge 2 ] || usage; case "$2" in /*) DEST=$2 ;; *) DEST=./$2 ;; esac; shift 2 ;;
     --download-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; DOWNLOAD_LIMIT=$2; shift 2 ;;
     --probe-limit) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,2}$ ]] && [ "$2" -le 300 ] || usage; PROBE_LIMIT=$2; shift 2 ;;
     --require) [ $# -ge 2 ] && [ -n "$2" ] || usage; REQUIRED=$2; shift 2 ;;
@@ -396,6 +399,8 @@ while read -r name version arch repo tag asset binary sha extra || [ -n "${name:
   case "$name" in '' | '#'*) continue ;; esac
   [ -z "${extra:-}" ] || fail "tools/versions の列が多い: $name"
   check_field "名前" "$name" '^[a-z][a-z0-9-]*$'
+  # 版の確認方法のないツールは、導入・公開するリンクの更新を始める前（台帳の検証の中）で止める
+  case " $SUPPORTED " in *" $name "*) ;; *) fail "tools/versions のツール $name は版の確認方法が定義されていない（対応: ${SUPPORTED}）" ;; esac
   check_field "版" "${version:-}" '^[0-9]+(\.[0-9]+)*$'
   check_field "アーキテクチャ" "${arch:-}" '^(any|arm64|x86_64)$'
   check_field "リポジトリ" "${repo:-}" '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
