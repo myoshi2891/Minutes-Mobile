@@ -862,7 +862,11 @@ if [ "$HOOKS" = 1 ]; then
       exit 1
     fi
   done <<< "$included"
-  env -u GIT_CONFIG git -C "$ROOT" config --local core.hooksPath .githooks
+  # 共有の設定のファイル自身の値（取り込みを除く）が既に .githooks の 1 件だけなら書かない。複数の行がある場合、git config の
+  # 1 つの値の書き込みは「複数の値を 1 つの値で上書きできない」で失敗するので、--replace-all ですべての行を明示的に置き換える
+  if [ "$own" != =.githooks ]; then
+    env -u GIT_CONFIG git -C "$ROOT" config --local --replace-all core.hooksPath .githooks
+  fi
   # 実際に効く値を読み直す（より優先される設定（-c・GIT_CONFIG_* の環境変数・worktree の設定など）が
   # 別の値を指していれば、書き込んでもフックは有効にならない）。--local を付けず、worktree の設定も反映させる
   effective=$(read_config --get core.hooksPath) || exit 1
@@ -1156,9 +1160,10 @@ custom_rules:
 
   # 裸の sleep( はメソッドの宣言（func sleep(）を除く（no_bsd_socket と同じ後読み）
   # Task.sleep は型引数つきの呼び出し（Task<Never, Never>.sleep）も検出する（型引数は 1 段の入れ子まで読む）
+  # Thread.sleep・Timer.scheduledTimer・Timer.publish も「.」の前後の空白（Thread . sleep）を Swift と同じく許して検出する
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\.\s*sleep\b|\bThread\.sleep\b|(?<![.\w])(?<!\.\s{1,16})(?<!func\s)u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\.(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\.\s*sleep\b|\bThread\s*\.\s*sleep\b|(?<![.\w])(?<!\.\s{1,16})(?<!func\s)u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\s*\.\s*(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
