@@ -1,0 +1,4 @@
+# SwiftFormat の設定（TST-CI-03）。検査は --lint で行い、ファイルを書き換えない。
+--swift-version 6.4
+--language-mode 6
+--exclude .tools,.build,build,DerivedData,tools/lint-fixtures

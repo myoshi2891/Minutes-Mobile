@@ -1,0 +1,475 @@
+#!/bin/bash
+# プッシュ前の検査: 手順 0〜8 と 10（基本設計 dev-environment.md §6.2）。UI テスト（手順 9）は PR の作成前に手動で行う。
+# 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+# 送信するコミットが HEAD と同じで、未コミットの変更がないことを求める。
+# 検査は、送信するコミットだけをチェックアウトした専用の作業ツリーで行う。元の作業ツリーで検査中にブランチを
+# 切り替えても（切り替えて戻しても）、すべての手順が同じスナップショットを読む。専用の作業ツリーはリポジトリの外
+# （<ホーム>/Library/Caches/MinutesMobile/pre-push/<リポジトリごとの値>。MINUTES_PRE_PUSH_DIR で変えられる）に置く
+# （リポジトリの中に置くと、SwiftFormat などが親のディレクトリの設定ファイルも読み、元の作業ツリーの設定が混ざる）
+set -euo pipefail
+# 置き換えのオブジェクト（git replace の refs/replace/）を使わず、元のコミットのオブジェクトで照合・展開・検査する
+# （参照の照合・HEAD の確認から専用の作業ツリーの展開、check.sh の各手順まで。子のプロセスにも引き継ぐ）
+export GIT_NO_REPLACE_OBJECTS=1
+# HEAD は削除以外の参照の行を受け取ってから解決する（削除だけの送信では解決しない。HEAD がまだない場合にも失敗させない）。
+# 最初に解決した値を、後続の照合・専用の作業ツリーのチェックアウト・--expect-head に使う
+head=""
+updates=0  # 削除以外の参照の送信の数
+# 標準入力: 送信する参照ごとに「<ローカルの参照> <ローカルの SHA> <リモートの参照> <リモートの SHA>」
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # 削除の送信（ローカルの SHA がすべて 0）は検査するコミットがない
+  if [ -z "${local_sha//0/}" ]; then continue; fi
+  updates=$((updates + 1))
+  if [ -z "$head" ]; then head=$(git rev-parse --verify HEAD); fi
+  # 注釈付きのタグはタグのオブジェクトを指すので、コミットまでたどってから比べる
+  commit=$(git rev-parse --verify -q "${local_sha}^{commit}") || {
+    echo "NG: 送信する ${local_ref} (${local_sha}) がコミットを指していない" >&2
+    exit 1
+  }
+  if [ "$commit" != "$head" ]; then
+    echo "NG: 送信する ${local_ref} (${commit}) が HEAD (${head}) と違う。そのコミットをチェックアウトしてから push する" >&2
+    exit 1
+  fi
+done
+# 削除だけの送信は、検査するコミットがないので検査を起動しない
+if [ "$updates" -eq 0 ]; then exit 0; fi
+# 元の作業ツリーに未コミットの変更（追跡していないファイルを含む）があれば、送信するコミットと手元が食い違うので止める
+# 状態を取得できない場合（git status の失敗）は、変更がないと見なさずに止める
+status_output=$(git status --porcelain --untracked-files=normal) || {
+  echo "NG: 作業ツリーの状態を取得できない（git status が失敗した）" >&2
+  exit 1
+}
+if [ -n "$status_output" ]; then
+  echo "NG: 未コミットの変更がある（追跡していないファイルを含む）。コミットするか退避してから push する" >&2
+  exit 1
+fi
+
+# ディレクトリ $2 の実体のパスを変数 $1 に入れる。$(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が
+# 付けた区切りの改行 1 つだけを外す（名前が改行で終わるディレクトリを取り違えない）
+real_directory() {
+  local resolved_path
+  resolved_path=$(cd -P -- "$2" 2>/dev/null && pwd && printf x) || return 1
+  resolved_path=${resolved_path%x}
+  printf -v "$1" '%s' "${resolved_path%$'\n'}"
+}
+# 作業ツリー $2 の git rev-parse --path-format=absolute $3 のパスを変数 $1 に入れる（末尾の改行の扱いは real_directory と同じ）
+git_path() {
+  local printed_path
+  printed_path=$(git -C "$2" rev-parse --path-format=absolute "$3" 2>/dev/null && printf x) || return 1
+  printed_path=${printed_path%x}
+  printf -v "$1" '%s' "${printed_path%$'\n'}"
+}
+# 実体のパス（シンボリックリンクを解決したもの）と共通のディレクトリ。&& の並びの途中の失敗では set -e が働かないので、明示的に止める
+git_path toplevel . --show-toplevel && real_directory source_root "$toplevel" && git_path common_dir . --git-common-dir \
+  || { echo "NG: 作業ツリーの起点・共通のディレクトリを特定できない" >&2; exit 1; }
+base=${MINUTES_PRE_PUSH_DIR:-${HOME}/Library/Caches/MinutesMobile/pre-push}
+# 置き場所の判定（実体のパスへの解決・SwiftFormat の設定のある祖先の拒否・元のリポジトリと登録されたすべての作業ツリーの
+# 中の拒否）は scripts/worktree-location.py が行う（check.sh --require-clean と共用する）。中に置くと、SwiftFormat などが
+# 親のディレクトリの設定ファイルも読み、その作業ツリーの設定が混ざるため。拒否してから作る（中にディレクトリを残さない）。
+# 判定できない場合（作業ツリーの一覧の行を読めないなど）は認めずに止める。
+# スクリプトは、送信するコミット（最初に解決した HEAD）から 1 回だけ書き出し、3 つの操作（check・registered・nested）に同じものを使う
+# （元の作業ツリーが sparse checkout で scripts/ がなくても判定でき、途中の書き換えで判定が変わらない）
+location_script=$(mktemp)
+trap 'status=$?; rm -f -- "$location_script"; exit "$status"' EXIT
+git cat-file blob "$head:scripts/worktree-location.py" > "$location_script" \
+  || { echo "NG: 送信するコミットの scripts/worktree-location.py を読めない" >&2; exit 1; }
+# -I: 書き出した場所（一時ディレクトリ）に置かれた同名のモジュール（subprocess.py など）を読み込ませない
+worktree_location() { /usr/bin/python3 -I "$location_script" "$@"; }
+# 判定の結果のパスは NUL で終わる記録で受け取り、変数 resolved_base に入れる（$(…) はパスの末尾の改行を落とすので使わない）
+check_location() {
+  local location_status=0 location_out
+  location_out=$(mktemp)
+  worktree_location check "$1" "$source_root" > "$location_out" || location_status=$?
+  resolved_base=""
+  if [ "$location_status" = 0 ] && ! IFS= read -r -d '' resolved_base < "$location_out"; then location_status=2; fi
+  rm -f -- "$location_out"
+  case $location_status in
+    0) ;;
+    1) exit 1 ;;  # 理由は worktree-location.py が標準エラーに書いた
+    *)
+      echo "NG: 専用の作業ツリーの置き場所を判定できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
+      exit 1
+      ;;
+  esac
+}
+check_location "$base"
+base=$resolved_base
+mkdir -p "$base"
+# 作った後にも判定し直す（最初の判定と作るまでの間に、置き場所を含む作業ツリーが登録された・置き場所の途中がリンクに
+# 変わった場合に、そのまま使わない）。同じ実体のパスに解決されることも求める
+check_location "$base"
+if [ "$resolved_base" != "$base" ]; then
+  echo "NG: 専用の作業ツリーの置き場所（${base}）が、作った後に別の場所（${resolved_base}）に解決される。やり直す" >&2
+  exit 1
+fi
+key=$(printf '%s' "$common_dir" | shasum -a 256)
+snapshot="$base/${key%% *}"
+lock="$snapshot.lock"
+# フックの実行中に Git が設定する変数を外す（残すと、専用の作業ツリーでの git が元のリポジトリの作業ツリーを操作する）
+# オブジェクトの置き場所・共通のディレクトリの変数も外す（別の場所のオブジェクトを、送信するコミットとして検査しない）
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+
+lock_held=""   # 作業ツリーのロックを自分が取った（後始末は自分のロックだけを消す）
+tools_lock=""  # 元の .tools の導入のロック（写している間だけ持つ）
+# 後始末。持ち主の印を先に外してからロックを外す（間で中断されても、別の実行の取り直したロックを消さない）
+release_locks() {
+  local held_tools=$tools_lock held=$lock_held
+  tools_lock=""
+  lock_held=""
+  if [ -n "$held_tools" ]; then rmdir "$held_tools" 2>/dev/null || true; fi
+  if [ -n "$held" ]; then rmdir "$held" 2>/dev/null || true; fi
+}
+# 専用の作業ツリーを合わせる間だけ移しておく場所（推測できない名前の一時のディレクトリ。中の tree が専用の作業ツリー）
+staging=""
+# 戻す途中で元の場所にほかのものができると、専用の作業ツリーがその中（${snapshot}/tree）に移っていることがある。そこに作業ツリーらしき
+# ものがあるときだけ、可能性として知らせる（この専用の作業ツリーだとは確かめていないので、動かさず、消さない）
+nested_hint() {
+  if [ -e "$snapshot/tree/.git" ]; then printf '%s' "（専用の作業ツリーが ${snapshot}/tree に移っている可能性がある。そこも確かめる）"; fi
+}
+# 移しておいた専用の作業ツリーを元の場所に戻す。元の場所に別のもの（移している間に登録された作業ツリーなど）があれば、どちらも
+# 変えずに失敗する（次の検査が、元の場所が空いていれば戻す）
+restore_staging() {
+  local held=$staging
+  if [ -z "$held" ]; then return 0; fi
+  staging=""
+  if [ ! -e "$held/tree" ]; then rmdir "$held" 2>/dev/null || true; return 0; fi
+  if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、検査の間に別のものができた。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す（元の専用の作業ツリーは ${held}/tree に残した）: $(ls -A -- "$snapshot" 2>/dev/null | sed 's|$|/|' | tr '\n' ' ')" >&2
+    return 1
+  fi
+  # 移す途中の強制終了で、登録されたパスと実際の場所が食い違っている場合だけ、登録を直してから戻す。移動は中断を無視して実行する
+  if ! worktree_location registered "$source_root" "$held/tree"; then git -C "$held/tree" worktree repair > /dev/null || true; fi
+  (trap '' INT TERM; exec git -C "$source_root" worktree move "$held/tree" "$snapshot") \
+    || { echo "NG: 専用の作業ツリー（${held}/tree）を元の場所（${snapshot}）に戻せない$(nested_hint)" >&2; return 1; }
+  rmdir "$held" 2>/dev/null || true
+  # 確かめてから移すまでの間に元の場所ができると、git worktree move はその中に移す（上書きはしない）。検査せずに止める
+  if [ ! -e "$snapshot/.git" ] || [ -e "$snapshot/tree/.git" ]; then
+    echo "NG: 専用の作業ツリーを元の場所（${snapshot}）に戻す間に、そこに別のものができた。中身を確かめて外してから push し直す$(nested_hint)" >&2
+    return 1
+  fi
+}
+# 終了の状態を入口で控え、後始末の後に明示的に返す（後始末のコマンドの状態で検査の失敗を上書きしない）
+trap 'status=$?; restore_staging || true; release_locks; rm -f -- "$location_script"; exit "$status"' EXIT
+# ロック（ディレクトリ $1）を取り、取れたら変数 $2 に場所を記録して 0 を返す。結果を記録するまで、中断は控えるだけにする
+# （取った直後・記録の前に終了してロックを残さない。取れなかった場合に、ほかの実行のロックを消さない）。mkdir は中断を無視して
+# 実行し、作った直後に止められて失敗と取り違えられないようにする。控えた中断には、記録の後で従う
+take_lock() {
+  local taken=""
+  interrupted=""
+  trap 'interrupted=1' INT TERM
+  if (trap '' INT TERM; exec mkdir "$1") 2>/dev/null; then
+    printf -v "$2" '%s' "$1"
+    taken=1
+  fi
+  trap 'exit 130' INT TERM
+  if [ -n "$interrupted" ]; then exit 130; fi
+  [ -n "$taken" ]
+}
+# 同時に 2 つの push が同じ作業ツリーを使わないようにする
+if ! take_lock "$lock" lock_held; then
+  echo "NG: 別の push の検査が実行中（${lock}）。実行中でなければ、そのディレクトリを削除してから push し直す" >&2
+  exit 1
+fi
+
+# このフックが作った印。作業ツリーの専用の管理ディレクトリ（<共通のディレクトリ>/worktrees/<名前>。作業ツリーの中ではないので
+# checkout・clean で消えない）に、このフックの名前と作業ツリーの実体のパスを書く。置き場所と共通のディレクトリが合うだけでは、
+# このフックが作った作業ツリーであることの証拠にならない（利用者が同じ場所に git worktree add した作業ツリーなど）
+owner_mark="minutes-pre-push-owner"
+owner_text="MinutesMobile pre-push ${snapshot}"
+# $1 が、起点がその場所で、共通のディレクトリが元のリポジトリのもので、専用の管理ディレクトリにこのフックの印がある作業ツリーか
+owned_tree() {
+  local top common source_common private
+  git_path top "$1" --show-toplevel && real_directory top "$top" \
+    && git_path common "$1" --git-common-dir && real_directory common "$common" \
+    && real_directory source_common "$common_dir" \
+    && [ "$top" = "$1" ] && [ "$common" = "$source_common" ] \
+    && git_path private "$1" --git-dir && real_directory private "$private" && [ "$(dirname "$private")" = "$source_common/worktrees" ] \
+    && [ -f "$private/$owner_mark" ] && [ ! -L "$private/$owner_mark" ] \
+    && [ "$(cat "$private/$owner_mark")" = "$owner_text" ]
+}
+# 前の検査が、専用の作業ツリーを移したまま終わった（強制終了・元の場所に別のものができた）場合は、先に元の場所へ戻す。元の場所に
+# 何かがあれば（空のディレクトリを含む）、このフックのものと確かめられないので消さず、restore_staging が戻さずに止める
+for held in "$snapshot".work.*; do
+  if [ ! -d "$held" ] || [ -L "$held" ]; then continue; fi
+  if [ -e "$held/tree" ] && ! owned_tree "$held/tree"; then
+    echo "NG: ${held}/tree がこの検査の作業ツリーと確かめられない。中身を確かめて外してから push し直す" >&2
+    exit 1
+  fi
+  staging=$held
+  restore_staging
+done
+
+# 専用の作業ツリーを送信するコミットに合わせる。作業ツリーは残し、無視するファイル（ビルドの成果物）を次の検査で再利用する
+# 一覧の取得と照合を分ける（取得に失敗したまま「登録がない」と見なし、専用の作業ツリーを消して作り直さない）。
+# 照合は記録の worktree の項目（パスの全体）との完全な一致。終了コード: 0 = 登録あり / 1 = 登録なし / 2 = 取得できない
+registration=0
+worktree_location registered "$source_root" "$snapshot" || registration=$?
+case $registration in
+  0 | 1) ;;
+  *)
+    echo "NG: 作業ツリーの一覧を取得できない（git worktree list が失敗した）" >&2
+    exit 1
+    ;;
+esac
+# 再利用するのは、登録があり、ディレクトリの git が専用の作業ツリーそのもの（作業ツリーの起点がこの場所で、
+# 共通のディレクトリが元のリポジトリのもの）を指し、専用の管理ディレクトリにこのフックの印がある場合だけ。
+# .git のファイルを失ったなどで別のリポジトリや親のディレクトリを指す場合・印がない場合に、そちらを checkout・clean しない
+# （その場合は下で止める）
+owned=0
+if [ "$registration" -eq 0 ] && [ -d "$snapshot" ]; then
+  if owned_tree "$snapshot"; then owned=1; fi
+fi
+# 元の作業ツリーが sparse checkout なら、専用の作業ツリーもその指定を引き継ぎ（git worktree add が写す）、一部のファイル
+# しかない状態で検査することになる。専用の作業ツリーで sparse checkout を有効にしていれば、そこでだけ解除して全体を
+# 展開する（作業ツリーごとの設定に書くので、元の作業ツリーは sparse のまま）。有効でなければ解除しない（解除の操作は
+# sparse でないリポジトリにも作業ツリーごとの設定の拡張を書き足すため）。設定を読めない場合は止める
+full_checkout() {
+  local tree=$1 sparse status=0
+  # GIT_CONFIG を外して読む（設定されていると git config はそのファイルだけを読み、専用の作業ツリーの設定を見ない）
+  sparse=$(env -u GIT_CONFIG git -C "$tree" config --type=bool --get core.sparseCheckout) || status=$?
+  case $status in
+    0) if [ "$sparse" = true ]; then git -C "$tree" -c core.autocrlf=false sparse-checkout disable; fi ;;
+    1) ;;  # 設定がない（sparse でない）
+    *)
+      echo "NG: 専用の作業ツリーの sparse checkout の設定を読めない（${tree}）" >&2
+      exit 1
+      ;;
+  esac
+}
+# 作業ツリー（$1）の追跡しているファイルが、そのインデックス（チェックアウトしたコミット）の blob とバイト単位で一致することを
+# 確かめる。checkout は .gitattributes の smudge のフィルタで内容を変えうる（core.autocrlf=false では filter は止まらない）。
+# 内容を変えたチェックアウトを、コミットの合格として検査しない。通常のファイルは git hash-object --no-filters で、
+# シンボリックリンクはリンク先の文字列で比べる。サブモジュール（160000）は blob がないので比べない。一致しなければ非 0 を返す
+verify_checkout_blobs() {
+  local tree=$1 entries entry mode object path actual expected status=0
+  entries=$(mktemp)
+  if ! git -C "$tree" ls-files -s -z > "$entries"; then rm -f -- "$entries"; return 1; fi
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}
+    object=${entry#* }
+    object=${object%% *}
+    path=${entry#*$'\t'}
+    case "$mode" in
+      160000) continue ;;
+      120000)
+        # リンク先は末尾の改行も含めてバイト単位で比べる（$(…) は末尾の改行を落とすので、印の x を付けてから外す）
+        actual=""
+        expected=""
+        if [ -L "$tree/$path" ]; then
+          actual=$(readlink -n -- "$tree/$path" && printf x) && actual=${actual%x} || actual=""
+          expected=$(git -C "$tree" cat-file blob "$object" && printf x) && expected=${expected%x} || expected=""
+        fi
+        if [ ! -L "$tree/$path" ] || [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（シンボリックリンク）" >&2
+          status=1
+        fi
+        ;;
+      *)
+        actual=""
+        if [ -f "$tree/$path" ] && [ ! -L "$tree/$path" ]; then
+          actual=$(git -C "$tree" hash-object --no-filters -- "$tree/$path") || actual=""
+        fi
+        if [ "$actual" != "$object" ]; then
+          echo "NG: チェックアウトした ${path} がコミットの blob と違う（.gitattributes のフィルタなどで内容が変わった）" >&2
+          status=1
+        fi
+        ;;
+    esac
+  done < "$entries"
+  rm -f -- "$entries"
+  return "$status"
+}
+# 改行の変換（利用者の core.autocrlf の設定）を掛けずに展開する（scripts/check.sh などを LF のまま実行する）
+# 利用者のフック（post-checkout）は、内部の展開では動かさない（失敗・書き換えで検査を左右させない。利用者の git には関わらない）
+if [ "$owned" -eq 1 ]; then
+  # 専用の作業ツリーの下に登録された別の作業ツリーがあれば、checkout・clean で中身を失わせうるので、変更せずに止める
+  nested=0
+  worktree_location nested "$source_root" "$snapshot" || nested=$?
+  case $nested in
+    0) ;;
+    1) exit 1 ;;  # 理由とパスは worktree-location.py が標準エラーに書いた
+    *)
+      echo "NG: 専用の作業ツリー（${snapshot}）の下に別の作業ツリーがあるかを判定できない" >&2
+      exit 1
+      ;;
+  esac
+  # 上の判定の後に利用者が登録した作業ツリー（git worktree add はこのフックのロックを見ないので止められない）を壊さないよう、
+  # 専用の作業ツリーを推測できない名前の場所へ rename で移し、そこで確かめ、合わせてから、元の場所へ戻す。移した後に元の場所の下へ
+  # 登録された作業ツリーは、合わせる作業ツリーとは別の場所になる（checkout・clean・rm が及ばない）。移すまでに登録されたものは
+  # 一緒に移り（中身は変わらない）、下の .git の検査で止めて元の場所へ戻す。検査する場所とビルドの成果物は変わらない
+  staging=$(mktemp -d "$snapshot.work.XXXXXX")
+  (trap '' INT TERM; exec git -C "$source_root" worktree move "$snapshot" "$staging/tree") \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）を移せない" >&2; exit 1; }
+  # 中に別の作業ツリー・リポジトリ（.git を持つもの）があれば、何も変えずに止める。残すビルドの成果物（.build）の中の .git の
+  # ディレクトリ（取得した依存の複製）は認めるが、ディレクトリでない .git（登録された作業ツリーが持つファイル）は認めない
+  inner=$(cd "$staging/tree" && find . -name .git ! -path ./.git \
+    \( ! -type d -o ! -path './.build/*' ! -path './Packages/MinutesKit/.build/*' \) -print) \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）の中に別の作業ツリーがあるかを調べられない" >&2; exit 1; }
+  if [ -n "$inner" ]; then
+    echo "NG: 専用の作業ツリー（${snapshot}）に、別の作業ツリーかリポジトリがある。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す: ${inner}" >&2
+    exit 1
+  fi
+  git -C "$staging/tree" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
+  full_checkout "$staging/tree"
+  # 追跡していないファイルを、無視するもの（docs/ の下書きなど）も含めて消し、送信するコミットと一致させる
+  # （無視するファイルが残ると、文書の整合の検査などが送信しないファイルを読む）。残すのは check.sh が使うビルドの成果物の場所
+  # （直下の /.build と Package の /Packages/MinutesKit/.build）だけ。ほかの階層の .build（docs/.build など）は消す
+  # -f は 1 回だけ付け、.git を持つディレクトリを消さない
+  kept=(-e /.build -e /Packages/MinutesKit/.build)
+  git -C "$staging/tree" clean -q -f -d -x "${kept[@]}"
+  # -n: 消さずに、残っているもの（-f を 2 回付けると消えるもの）を調べる
+  remaining=$(git -C "$staging/tree" clean -n -f -f -d -x "${kept[@]}") \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）に追跡していないものが残っているかを調べられない" >&2; exit 1; }
+  if [ -n "$remaining" ]; then
+    echo "NG: 専用の作業ツリー（${snapshot}）に、別の作業ツリーかリポジトリがある。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す: ${remaining}" >&2
+    exit 1
+  fi
+  # 残したビルドの成果物の場所には、中断した前回の検査のカバレッジのロック（check.sh の手順 7・8 が直下の .build に作る）が
+  # 残りうる（強制終了では check.sh の後始末が動かない）。この専用の作業ツリーで検査するのは作業ツリーのロック（$lock）を
+  # 持つ実行だけなので、ロックを取った今、残っているものは持ち主のいない残骸として消す（ビルドの成果物は消さない）
+  # .build がシンボリックリンクなら、リンクの先（作業ツリーの外の場所）の中を消しうるので、消さずに止める
+  # Package の .build も、リンクなら check.sh がカバレッジの記録をリンクの先に書くので、同じく止める
+  for build in "$staging/tree/.build" "$staging/tree/Packages/MinutesKit/.build"; do
+    if [ -L "$build" ]; then
+      echo "NG: 専用の作業ツリーの ${build#"$staging/tree/"} がシンボリックリンク。中身を確かめて削除してから push し直す" >&2
+      exit 1
+    fi
+  done
+  rm -rf -- "$staging/tree/.build/minutes-coverage.lock"
+  restore_staging
+else
+  # 専用の作業ツリーとして確かめられなかったもの（登録のないディレクトリ・別のリポジトリを指すもの・このフックの印のない
+  # 作業ツリーなど）が置き場所にあれば、変更せずに止める（中身が何かを確かめられないものを checkout・clean・rm -rf しない）。
+  # 登録も置き場所もないとき（初回）だけ作る
+  if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、この検査の作業ツリーと確かめられないもの（このフックの印のない作業ツリーを含む）がある。中身を確かめて削除する（作業ツリーなら git worktree remove）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す$(nested_hint)" >&2
+    exit 1
+  fi
+  # 登録だけが残っている場合は、上書きせずに止める（作業ツリーを別の場所へ移した・外した場所に置いた場合に、その登録を奪わない）
+  if [ "$registration" -eq 0 ]; then
+    echo "NG: 専用の作業ツリーの置き場所（${snapshot}）は、ディレクトリがないのに作業ツリーとして登録されている。移したものなら git worktree repair で登録を直し、不要なら git worktree remove で登録を外してから push し直す" >&2
+    exit 1
+  fi
+  # --force は付けない（上の照合の後に登録された場合も、git が拒否する）
+  # --no-checkout: 先に登録だけを行い、印を書いてから展開する（時間のかかる展開の途中で中断・失敗しても印が残り、次の検査が
+  # このフックの作業ツリーとして展開し直せる）
+  # 登録してから、作った作業ツリーの専用の管理ディレクトリにこのフックの印を書く（次の検査で再利用してよいかの判定に使う）まで、
+  # 中断を無視する（間で終わって、印のない作業ツリーを残さない。このシェルの trap は、サブシェルの終了を待ってから動くので、
+  # 控えた中断にはその後で従う）。登録に失敗したら、既存のものに印を書かずに止める
+  # 印を書けなかった場合は、この実行が作った登録だと確かめられたときだけ外す（印のない作業ツリーを残すと、次の検査は持ち主を
+  # 確かめられずに止まる）。確かめる: 管理ディレクトリが登録の置き場所の直下にあり、add の前にはなかった名前で、その gitdir の
+  # 記録が置き場所の .git を指すこと。確かめられない・外せない場合は外さずに、場所と直し方を示して止める
+  created=0
+  (
+    trap '' INT TERM
+    real_directory source_common "$common_dir" || exit 2
+    before=" "
+    for entry in "$source_common/worktrees"/*; do
+      if [ -e "$entry" ] || [ -L "$entry" ]; then before="$before${entry##*/} "; fi
+    done
+    git -C "$source_root" worktree add -q --no-checkout --detach "$snapshot" "$head" || exit 1
+    git_path private "$snapshot" --git-dir && real_directory private "$private" || exit 2
+    if printf '%s\n' "$owner_text" > "$private/$owner_mark"; then exit 0; fi
+    name=${private##*/}
+    if [ "${private%/*}" != "$source_common/worktrees" ] || case "$before" in *" $name "*) true ;; *) false ;; esac \
+      || [ ! -f "$private/gitdir" ] || [ -L "$private/gitdir" ]; then
+      exit 5
+    fi
+    # gitdir の記録は相対パスのこともある（worktree.useRelativePaths）。相対なら記録のあるディレクトリ（管理ディレクトリ）から
+    # 解決し、実体のパスにしてから置き場所の .git と比べる
+    record=$(cat "$private/gitdir") || exit 5
+    case $record in
+      /*) ;;
+      *) record=$private/$record ;;
+    esac
+    if [ "${record##*/}" != .git ] || ! real_directory recorded_tree "${record%/*}" \
+      || [ "$recorded_tree/.git" != "$snapshot/.git" ]; then
+      exit 5
+    fi
+    git -C "$source_root" worktree remove --force "$snapshot" || exit 4
+    exit 3
+  ) || created=$?
+  recovery="中身を確かめてから git worktree remove --force で外す（ディレクトリだけがなければ git worktree prune）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す"
+  case $created in
+    0) ;;
+    1) echo "NG: 専用の作業ツリー（${snapshot}）を作れない" >&2; exit 1 ;;
+    2) echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない。印のない作業ツリーが残った可能性がある。${recovery}" >&2; exit 1 ;;
+    3) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けない（作った登録は外した）。管理ディレクトリ（${common_dir}/worktrees）に書き込めるかを確かめてから push し直す" >&2; exit 1 ;;
+    4) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けず、登録も外せない。${recovery}" >&2; exit 1 ;;
+    *) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けず、この検査が作った登録だと確かめられないので外さない。${recovery}" >&2; exit 1 ;;
+  esac
+  git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
+  full_checkout "$snapshot"
+fi
+# 再利用・作り直しのどちらでも、展開した内容が送信するコミットの blob と同じであること（core.autocrlf=false では
+# smudge のフィルタは止まらない。変わった内容を送信するコミットの合格として検査しない）
+if ! verify_checkout_blobs "$snapshot"; then
+  echo "NG: 専用の作業ツリーの内容が送信するコミット（${head}）の blob と違う（.gitattributes の smudge のフィルタなど）。検査しない" >&2
+  exit 1
+fi
+# 開発ツールは Git の管理外（.gitignore の /.tools で無視される）。元の作業ツリーの .tools を共有のリンクで指すと、検査の途中に
+# 別の setup.sh が bin のリンクや版のディレクトリを差し替え、手順 0 で照合した導入と後の手順が使う導入が食い違いうる。
+# そこで、導入のロック（setup-tools.sh と同じ .install.lock）を取ってから元の .tools を専用の作業ツリーへ写し、ロックを外す。
+# 写しは APFS では複製の領域を使わない clone（cp -c）、対応しないファイルシステムでは通常の複写で作る。bin のリンクは
+# 相対パスなので写しの中を指す。以後の手順（手順 0 の照合を含む）はすべてこの写しを使い、元の .tools の変更の影響を受けない
+tools_source="$source_root/.tools"
+tools_copy="$snapshot/.tools"
+if [ ! -d "$tools_source" ]; then
+  echo "NG: 開発ツールが導入されていない（${tools_source}）。scripts/setup-tools.sh を実行してから push し直す" >&2
+  exit 1
+fi
+waited=0
+retried=0  # ロックが消えていたときに、直ちに取り直した（1 回だけ）
+until take_lock "$tools_source/.install.lock" tools_lock; do
+  # mkdir の失敗の後にロックが外れた（別の導入が終わった）場合は、待たずに 1 回だけ取り直す。
+  # 取り直しても失敗し、ロックもない場合は、ロック以外の理由（書き込めないなど）として止める
+  if [ ! -d "$tools_source/.install.lock" ] && [ "$retried" -eq 0 ]; then
+    retried=1
+    continue
+  fi
+  if [ -d "$tools_source/.install.lock" ]; then retried=0; fi
+  if [ ! -d "$tools_source/.install.lock" ] || [ "$waited" -ge 600 ]; then
+    echo "NG: 開発ツールの導入のロック（${tools_source}/.install.lock）を取れない。導入の実行中でなければ削除してから push し直す" >&2
+    exit 1
+  fi
+  if [ "$waited" -eq 0 ]; then echo "待機: 開発ツールの導入・照合が実行中。終わるのを待つ" >&2; fi
+  sleep 1
+  waited=$((waited + 1))
+done
+# 写した bin のリンクが写しの中を指すのは、リンクが相対パスの場合だけ。絶対パスのリンクは写しても元の導入を指し、手順 0 の
+# 照合が写しの導入先と合わずに失敗する（検査は弱まらないが原因が分からない）。写す前に、理由を示して止める（リンクは書き換えない）
+for link in "$tools_source"/bin/*; do
+  if [ -L "$link" ] && case "$(readlink -- "$link")" in /*) true ;; *) false ;; esac; then
+    echo "NG: 開発ツールのリンク（${link}）が絶対パスを指している。scripts/setup-tools.sh で導入し直してから push し直す" >&2
+    exit 1
+  fi
+done
+# 前の写しは、上で専用の作業ツリーを合わせるときに消してある（ここで消すと、後から登録された作業ツリーを消しうる）
+mkdir "$tools_copy"
+for entry in "$tools_source"/* "$tools_source"/.[!.]*; do
+  if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi  # 一致するものがないときの glob の文字列
+  case "${entry##*/}" in .install.lock | .work.*) continue ;; esac  # ロックと導入の途中の作業場所は写さない
+  # -P: シンボリックリンクはたどらずにリンクとして写す
+  if ! cp -c -R -P -- "$entry" "$tools_copy/" 2>/dev/null; then
+    rm -rf -- "${tools_copy:?}/${entry##*/}"
+    cp -R -P -- "$entry" "$tools_copy/" || { echo "NG: 開発ツールを写せない（${entry}）" >&2; exit 1; }
+  fi
+done
+# ロックを外して持ち主の印（tools_lock）を外すまで、中断は控えるだけにする（take_lock と同じ。間で終了してロックを残さず、
+# 終了の trap が別の導入の取り直したロックを消さない）。外せなければ印を残して失敗し、控えた中断には印を外した後で従う
+interrupted=""
+released=1
+trap 'interrupted=1' INT TERM
+if (trap '' INT TERM; exec rmdir "$tools_lock"); then tools_lock=""; else released=""; fi
+trap 'exit 130' INT TERM
+if [ -n "$interrupted" ]; then exit 130; fi
+if [ -z "$released" ]; then echo "NG: 開発ツールの導入のロック（${tools_lock}）を外せない" >&2; exit 1; fi
+
+# 起動する check.sh は、専用の作業ツリーの中の通常の実行できるファイルであること（check.sh の手順 10 の verify-docs.py と同じ）。
+# scripts かその中の check.sh がシンボリックリンクなら、verify_checkout_blobs（リンク先の文字列の照合）は通っても、作業ツリーの外を実行しうる
+if [ -L "$snapshot/scripts" ] || [ ! -d "$snapshot/scripts" ] || [ -L "$snapshot/scripts/check.sh" ] \
+  || [ ! -f "$snapshot/scripts/check.sh" ] || [ ! -x "$snapshot/scripts/check.sh" ]; then
+  echo "NG: 送信するコミットの scripts/check.sh が通常の実行できるファイルでない（シンボリックリンク・実行権限なしなど）" >&2
+  exit 1
+fi
+# 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
+MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

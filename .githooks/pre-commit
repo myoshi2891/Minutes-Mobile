@@ -1,0 +1,50 @@
+#!/bin/bash
+# コミット前の検査: ステージしたファイルに対する手順 1〜3 と 10（基本設計 dev-environment.md §6.2）。
+# 有効にする: scripts/setup.sh --hooks（git config core.hooksPath .githooks）。--no-verify で飛ばさない。
+set -euo pipefail
+# 置き換えのオブジェクト（git replace の refs/replace/）を使わず、ステージした blob そのものを読む（台帳の書き出しと、
+# check.sh --staged の各手順の書き出し。子のプロセスにも引き継ぐ）
+export GIT_NO_REPLACE_OBJECTS=1
+# $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と git が付けた区切りの改行 1 つだけを外す（pre-push と同じ）
+root=$(git rev-parse --show-toplevel && printf x) && root=${root%x} && root=${root%$'\n'} || exit 1
+# 導入済みの開発ツールが、ステージした tools/versions（コミットする台帳）と一致することを先に確かめる。作業ツリーの台帳や
+# 古い導入のまま、コミットする台帳と違う版のツールで整形・静的解析・秘密情報を検査しない
+versions=$(mktemp)
+# 終了の状態を入口で控え、一時ファイルの削除の後に明示的に返す（削除の失敗で検査の結果を上書きしない）
+trap 'status=$?; rm -f -- "$versions" || true; exit "$status"' EXIT
+# 読むのは、このフックが見ているインデックス（部分的なコミット git commit <パス> では一時のもの）の blob。ID を控え、案内する
+# 導入し直す手順でも同じ ID を使う（一時のインデックスはフックの後に消え、通常のインデックスのパスは別の内容を指しうる）
+if ! versions_blob=$(git rev-parse --verify -q :tools/versions) || ! git cat-file blob "$versions_blob" > "$versions"; then
+  echo "NG: ステージした tools/versions を読めない" >&2
+  exit 1
+fi
+# 照合に使う setup-tools.sh も、作業ツリーではなくステージしたもの（コミットする内容）を一時ファイルに書き出して実行する
+# （ステージしていない作業ツリーの変更で照合の結果を変えない）。--versions・--dest を渡すので、置き場所に依存しない
+setup=$(mktemp)
+trap 'status=$?; rm -f -- "$versions" "$setup" || true; exit "$status"' EXIT
+if ! setup_blob=$(git rev-parse --verify -q :scripts/setup-tools.sh) || ! git cat-file blob "$setup_blob" > "$setup"; then
+  echo "NG: ステージした scripts/setup-tools.sh を読めない" >&2
+  exit 1
+fi
+# 導入し直す手順は、ステージした台帳と setup-tools.sh の両方を一時ファイルに書き出し、書き出したものを --versions・--dest を
+# 付けて実行する（作業ツリーのものは使わず、作業ツリーとステージした内容は変えない）。一時ファイルを消した後も、導入（または
+# 書き出し）の終了コードを返す（削除の成否で導入の結果を変えない。利用者のシェルが set -e を引き継いでいても後始末まで進むよう、
+# 導入は if の条件で実行する）。zsh では status が読み取り専用なので result に控える。
+# 起点のパスは上と同じく末尾の改行を保つ（%?x は、印の x とその前の区切りの改行 1 文字を外す。引用符の中に書けるのでこの形にする）
+reinstall='(export GIT_NO_REPLACE_OBJECTS=1; root=$(git rev-parse --show-toplevel && printf x) || exit 1; root=${root%?x}; versions=$(mktemp) || exit 1; setup=$(mktemp) || { rm -f -- "$versions"; exit 1; }; if git cat-file blob '"$versions_blob"' > "$versions" && git cat-file blob '"$setup_blob"' > "$setup" && /bin/bash "$setup" --versions "$versions" --dest "$root/.tools"; then result=0; else result=$?; fi; rm -f -- "$versions" "$setup" || true; exit "$result")'
+if ! /bin/bash "$setup" --verify --versions "$versions" --dest "$root/.tools"; then
+  echo "NG: 導入済みの開発ツールがステージした tools/versions と違う。ステージした台帳で導入し直してからコミットする: ${reinstall}" >&2
+  exit 1
+fi
+# check.sh --staged は、導入のロックを取って開発ツールを写し、写しをステージした台帳と照合してから、検査のすべてを写しで
+# 行う（照合の後に元の導入が差し替えられても、検査に使う導入は変わらない）。上の照合は、導入し直す手順を示すために先に行う
+# check.sh 自身もステージしたものを書き出して実行する（ステージしていない作業ツリーの変更で検査を変えない）。--root で元の
+# リポジトリを示すので、Git の操作・GIT_INDEX_FILE・.tools は元のリポジトリのまま。check.sh が呼ぶほかのスクリプト
+# （worktree-location.py・setup-tools.sh・test-lint-rules.py・verify-docs.py）は、check.sh がステージした内容から書き出して使う
+check=$(mktemp)
+trap 'status=$?; rm -f -- "$versions" "$setup" "$check" || true; exit "$status"' EXIT
+if ! git cat-file blob :scripts/check.sh > "$check"; then
+  echo "NG: ステージした scripts/check.sh を読めない" >&2
+  exit 1
+fi
+/bin/bash "$check" --root "$root" --staged

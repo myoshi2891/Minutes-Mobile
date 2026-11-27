@@ -1,0 +1,6 @@
+# テストコードでだけ外す規則（SEC-INP-03 の例外）。この内容を変えるときは
+# tools/lint-fixtures/_test-code/.swiftlint.yml と各テストのディレクトリの写しを同じ作業で直す。
+disabled_rules:
+  - force_try
+  - force_cast
+  - force_unwrapping

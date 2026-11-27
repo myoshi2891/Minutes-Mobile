@@ -1,0 +1,17 @@
+let now = Date() // expect: no_direct_clock
+let today = Date.now // expect: no_direct_clock
+let clock = ContinuousClock() // expect: no_direct_clock
+let spacedToday = Date . now // expect: no_direct_clock
+let spacedDispatch = DispatchTime . now() // expect: no_direct_clock
+let seconds = CFAbsoluteTimeGetCurrent() // expect: no_direct_clock
+let initialized = Date.init() // expect: no_direct_clock
+let sinceNow = Date(timeIntervalSinceNow: 0) // expect: no_direct_clock
+let remaining = deadline.timeIntervalSinceNow // expect: no_direct_clock
+let spaced = deadline . timeIntervalSinceNow // expect: no_direct_clock
+let uptime = ProcessInfo.processInfo.systemUptime // expect: no_direct_clock
+let spacedUptime = ProcessInfo . processInfo . systemUptime // expect: no_direct_clock
+let recordedAt: Date = .now // expect: no_direct_clock
+let optionalAt: Date? = . now // expect: no_direct_clock
+let typedInit: Foundation.Date = .init() // expect: no_direct_clock
+let reference = Date.timeIntervalSinceReferenceDate // expect: no_direct_clock
+let spacedReference = Foundation.Date . timeIntervalSinceReferenceDate // expect: no_direct_clock

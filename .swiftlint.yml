@@ -1,0 +1,252 @@
+# SwiftLint の設定（security-requirements.md §10.1、基本設計 dev-environment.md §7）。
+# 規則を足す・変えるときは tools/lint-fixtures/<規則名>/ の違反例と正常例も同じ作業で直す（BD-DEV-05）。
+# 検査はリポジトリ直下から --config を付けずに実行する（付けると、テストコード用の入れ子の設定が無効になる）。
+
+# 警告もエラーとして扱う（TST-CI-03）
+strict: true
+
+excluded:
+  - .tools
+  - .build
+  - build
+  - DerivedData
+  - tools/lint-fixtures
+
+opt_in_rules:
+  - force_unwrapping
+
+# SEC-INP-03。テストコードでは入れ子の設定（tools/lint-fixtures/_test-code/.swiftlint.yml の写し）で外す
+force_try: error
+force_cast: error
+# 既定では静的な文字列を渡した URL(string:)・UIImage(named:) などの強制アンラップを見逃すので、例外の一覧を空にする
+force_unwrapping:
+  severity: error
+  ignored_literal_argument_functions: []
+
+# match_kinds はコメントと文字列の中の一致を除くために指定する（コードとして現れた場合だけ検出する）
+custom_rules:
+  no_print_logging:
+    name: "print / NSLog / debugPrint の禁止"
+    regex: '\b(print|debugPrint|NSLog)\s*\('
+    match_kinds: &code
+      - identifier
+      - typeidentifier
+      - keyword
+      - attribute.id
+      - attribute.builtin
+      - argument
+      - parameter
+      - number
+    message: "ログはログの型を経由する（SEC-LOG-01）"
+    severity: error
+
+  no_direct_logger:
+    name: "Logger の直接の利用の禁止"
+    # 型の注釈を付けた省略形（let logger: Logger = .init(subsystem:category:)）も生成として検出する
+    regex: '\bos_log\s*\(|\bLogger\s*(?:\.\s*init\s*)?\(|:\s*(?:os\s*\.\s*)?Logger\s*[?!]?\s*=\s*\.\s*init\s*\('
+    excluded:
+      - '.*/Logging/AppLogger\.swift\z'
+    match_kinds: *code
+    message: "Logger はログの型の中だけで使う（BD-ARC-06、SEC-LOG-03）"
+    severity: error
+
+  no_network_api:
+    name: "通信 API の禁止"
+    regex: '\b(URLSession\w*|URLRequest|NSURLConnection|NW(Connection|Listener|Browser|PathMonitor|ProtocolWebSocket)\w*|CFStreamCreatePairWith\w+|CFSocket\w*|getStreamsToHost\w*)\b'
+    match_kinds: *code
+    message: "アプリのコードは通信 API を持たない（SEC-NET-01、BD-ARC-05）"
+    severity: error
+
+  no_network_import:
+    name: "通信フレームワークの import の禁止"
+    regex: '\bimport\s+(\w+\s+)?(Network|CFNetwork)\b'
+    match_kinds: *code
+    message: "Network / CFNetwork を import しない（SEC-NET-01）"
+    severity: error
+
+  # URL を受け取る読み込みの初期化子は、https:// などのリモートの URL も読めるので使わない（通信の経路になる）。
+  # ローカルのファイルは、パスを受け取る API（contentsOfFile:・FileManager.contents(atPath:)・FileHandle）で読む。
+  # append(contentsOf:) などコレクションの操作は対象外にするため、型の名前を付けた呼び出しと、型の注釈つきの .init だけを検出する
+  # NSAttributedString・NSMutableAttributedString は url: の初期化子もリモートの URL を読める（string: などは認める）
+  no_url_content_loading:
+    name: "URL を受け取る読み込みの禁止"
+    regex: '\b(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*(?:\.\s*init\s*)?\(\s*contentsOf\s*:|:\s*(?:Foundation\s*\.\s*)?(?:NS(?:Mutable)?(?:Data|String|AttributedString|Dictionary|Array)|Data|String|AttributedString|XMLParser|NSXMLParser)\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*contentsOf\s*:|\bNS(?:Mutable)?AttributedString\s*(?:\.\s*init\s*)?\(\s*url\s*:|:\s*(?:Foundation\s*\.\s*)?NS(?:Mutable)?AttributedString\s*[?!]?\s*=\s*(?:try\s*[?!]?\s*)?\.\s*init\s*\(\s*url\s*:'
+    match_kinds: *code
+    message: "URL を受け取る読み込みはリモートの URL も読める。ローカルのファイルはパスを受け取る API で読む（SEC-NET-01）"
+    severity: error
+
+  # 「.」の後に空白を挟むメンバーの呼び出し（store . connect()）は、有界の後読みで除く（ICU は可変長の後読みを持たない）
+  no_bsd_socket:
+    name: "BSD ソケットの禁止"
+    regex: '(?:\bDarwin\s*\.\s*|(?<![.\w])(?<!\.\s{1,16})(?<!func\s))(socket|connect)\s*\('
+    match_kinds: *code
+    message: "ソケットを直接使わない（SEC-NET-01）"
+    severity: error
+
+  no_legacy_speech_recognizer:
+    name: "SFSpeechRecognizer の禁止"
+    regex: '\bSFSpeechRecognizer\b'
+    match_kinds: *code
+    message: "旧来の音声認識は使わない。SpeechAnalyzer を使う（SEC-NET-01、BD-STT-10）"
+    severity: error
+
+  no_private_cloud_model:
+    name: "端末外のモデルの禁止"
+    regex: '\bPrivateCloudComputeLanguageModel\b'
+    match_kinds: *code
+    message: "オンデバイスのモデルだけを使う（SEC-NET-02）"
+    severity: error
+
+  # 条件（where 句など）と本体（コメントと空白だけ）の判定は先読みに置き、一致範囲をキーワードの「catch」に限る。
+  # 一致範囲がキーワードだけになるので、コメントや文字列の中の「catch {}」を検出せず、
+  # 条件に文字列を含む空の catch も見逃さない（一致範囲に文字列の種別が入ると match_kinds で外れるため）。
+  # 条件は複数行にわたってよい。条件の中の文字列リテラル・行コメント・ブロックコメントは読み飛ばす
+  # （中の「{」「{}」を本体の始まりや空の本体と取り違えない）。
+  # ブロックコメントは 1 段の入れ子まで読む（/* 外 /* 内 */ 外 */ を 1 つのコメントとして扱う）。外側を閉じる「*/」の後に
+  # 実行文がある catch を空と見なさない。正規表現では任意の深さの入れ子を数えられないので、2 段以上の入れ子は読み違えうる
+  # 行コメントは条件側・本体側とも行末（CR か LF。CR だけのファイルを含む）まで後戻りせずに読み飛ばす（*+）。コメント内の「{」「}」を本体の始まりや終わりと取り違えない
+  # 条件の中の丸括弧・角括弧の組は 2 段の入れ子まで、中の文字列ごと読み飛ばす（引数のクロージャー「f(where: { … })」の
+  # 「{」「}」を本体と取り違えない。括弧なしの後置クロージャーは Swift が条件の中で認めない）。3 段以上の入れ子は検出しない
+  # 括弧の中のブロックコメント（1 段の入れ子まで）と行コメントは 1 つの単位として読み飛ばす（コメントの中の「)」「"」で
+  # 括弧が早く閉じた・文字列が始まったと取り違えない）
+  # 拡張区切りの文字列（#"…"#・##"…"##・#"""…"""# など。「#」の数は後方参照でそろえる）も 1 つの単位として読み飛ばす。
+  # 文字列を始める「#」は 1 文字として読まない（後戻りで「"」からふつうの文字列と読み直させない）。補間の中の文字列は読まない
+  # ふつうの複数行の文字列（"""…"""）も 1 つの単位として読み飛ばす
+  no_empty_catch:
+    name: "空の catch の禁止"
+    regex: '\bcatch\b(?=(?:[^{"/(\[#]|[(\[](?:[^()\[\]"/#]|/(?![/*])|//[^\r\n]*+|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\1))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\1))*+")\1|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*"|[(\[](?:[^()\[\]"/#]|/(?![/*])|//[^\r\n]*+|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\2))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\2))*+")\2|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*")*[)\]])*[)\]]|/(?![/*])|//[^\r\n]*+|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\3))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\3))*+")\3|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*")*\{\s*(?://[^\r\n]*+\s*|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/\s*)*\})'
+    match_kinds: *code
+    message: "エラーを握りつぶさない（SEC-LOG-04）"
+    severity: error
+
+  no_direct_user_defaults:
+    name: "UserDefaults の直接の利用の禁止"
+    regex: '\b(UserDefaults|NSUserDefaults|AppStorage)\b'
+    excluded:
+      - '.*/Settings/SettingsStore\.swift\z'
+    match_kinds: *code
+    message: "UserDefaults は設定の型の中だけで使う（SEC-DAT-07）"
+    severity: error
+
+  # Documents は保存ルートの型の中でも使わない（保存先は Application Support に限る）。例外の場所を持たない
+  # documentsDirectory は API の参照（URL.documentsDirectory・省略形の .documentsDirectory）だけを検出し、同じ名前の局所変数は認める
+  no_documents_directory:
+    name: "Documents ディレクトリの禁止"
+    regex: '\.\s*documentDirectory\b|\.\s*`?documentsDirectory\b'
+    match_kinds: *code
+    message: "保存先は Application Support に限る（SEC-DAT-04）"
+    severity: error
+
+  # temporaryDirectory は API の参照（FileManager.default.temporaryDirectory・URL.temporaryDirectory・省略形の .temporaryDirectory）
+  # だけを検出し、同じ名前の局所変数は認める
+  no_direct_directory_access:
+    name: "一時ディレクトリの直接の指定とディレクトリの直接の作成の禁止"
+    regex: '\bNSTemporaryDirectory\b|\.\s*`?temporaryDirectory\b|\bcreateDirectory\s*\('
+    excluded:
+      - '.*/Storage/StorageRoot\.swift\z'
+      - '.*/TestSupport/TemporaryDirectory\.swift\z'
+    match_kinds: *code
+    message: "ディレクトリは保存ルートの型を経由して作る（SEC-DAT-01・03）"
+    severity: error
+
+  no_direct_pasteboard:
+    name: "UIPasteboard の直接の利用の禁止"
+    regex: '\bUIPasteboard\b'
+    excluded:
+      - '.*/Clipboard/ClipboardWriter\.swift\z'
+    match_kinds: *code
+    message: "コピーはコピーの型を経由する（SEC-PLT-01）"
+    severity: error
+
+  # コピーの型（ClipboardWriter.swift）でも使わない（no_direct_pasteboard と違い、例外の場所を持たない）
+  no_text_selection:
+    name: "textSelection の禁止"
+    regex: '\.\s*textSelection\s*\('
+    match_kinds: *code
+    message: "文字列の選択からの標準のコピーは使わない。コピーはコピーの型を経由する（SEC-PLT-01）"
+    severity: error
+
+  no_share_link:
+    name: "ShareLink の禁止"
+    regex: '\bShareLink\b'
+    match_kinds: *code
+    message: "共有は完了を受け取れる部品で行う（SEC-DAT-06）"
+    severity: error
+
+  no_webkit:
+    name: "WebView の禁止"
+    regex: '\bWKWebView\b|\bimport\s+(\w+\s+)?WebKit\b'
+    match_kinds: *code
+    message: "WebView を使わない（SEC-PLT-05）"
+    severity: error
+
+  no_spotlight_user_activity:
+    name: "Spotlight と NSUserActivity の禁止"
+    regex: '\bimport\s+(\w+\s+)?CoreSpotlight\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
+    match_kinds: *code
+    message: "Spotlight・Siri にデータを渡さない（SEC-PLT-02）"
+    severity: error
+
+  no_direct_clock:
+    name: "時計の直接の利用の禁止"
+    # Date()・Date.init()・Date(timeIntervalSinceNow:) と、プロパティの .timeIntervalSinceNow（deadline.timeIntervalSinceNow）は
+    # 現在時刻を読む。Date(timeIntervalSince1970:)・deadline.timeIntervalSince(now) などは認める
+    # 型のプロパティの Date.timeIntervalSinceReferenceDate も現在時刻を読む（保存した日時のインスタンスのプロパティ
+    # fixedDate.timeIntervalSinceReferenceDate は認める）
+    # 起動からの時間は ProcessInfo.processInfo.systemUptime の呼び出しで検出する（systemUptime という名前の変数・プロパティは認める）
+    # 型の注釈を付けた省略形（let recordedAt: Date = .now・: Date = .init()）も現在時刻の読み取りとして検出する。
+    # 型の注釈のない .now（clock.now など別の型のもの）と、: Date = .init(timeIntervalSince1970:) は認める
+    regex: '\bDate\s*(?:\.\s*init\s*)?\(\s*(?:\)|timeIntervalSinceNow\s*:)|:\s*(?:Foundation\s*\.\s*)?Date\s*[?!]?\s*=\s*\.\s*(?:now\b|init\s*\(\s*(?:\)|timeIntervalSinceNow\s*:))|\.\s*timeIntervalSinceNow\b|\bDate\s*\.\s*now\b|\bDate\s*\.\s*timeIntervalSinceReferenceDate\b|\bCFAbsoluteTimeGetCurrent\b|\b(ContinuousClock|SuspendingClock)\b|\bDispatchTime\s*\.\s*now\b|\bmach_(absolute|continuous)_time\b|\.\s*processInfo\s*\.\s*systemUptime\b'
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+    match_kinds: *code
+    message: "時刻は注入した時計から得る（TST-GEN-01・07）"
+    severity: error
+
+  no_direct_uuid:
+    name: "UUID の直接の生成の禁止"
+    # 型の注釈を付けた省略形（let id: UUID = .init()）も生成として検出する。引数のある .init(uuidString:)・.init(uuid:) は認める
+    regex: '\bUUID\s*\(\s*\)|\bUUID\s*\.\s*init\s*\(\s*\)|:\s*(?:Foundation\s*\.\s*)?UUID\s*[?!]?\s*=\s*\.\s*init\s*\(\s*\)'
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+      - '.*/TestSupport/TemporaryDirectory\.swift\z'
+    match_kinds: *code
+    message: "UUID は注入した生成器から得る（TST-GEN-04・07）"
+    severity: error
+
+  # 裸の sleep( はメソッドの宣言（func sleep(）を除く（no_bsd_socket と同じ後読み）
+  # Task.sleep は型引数つきの呼び出し（Task<Never, Never>.sleep）も検出する（型引数は 1 段の入れ子まで読む）
+  # Thread.sleep・Timer.scheduledTimer・Timer.publish も「.」の前後の空白（Thread . sleep）を Swift と同じく許して検出する
+  # Timer の初期化子（Timer(timeInterval:…)・Timer(fire:…)・Timer.init(…)・型の注釈つきの : Timer = .init(…)）も、作った後に
+  # RunLoop に足すと実時間で動くので検出する。名前の一部が Timer の型（ManualTimer(…)・TimerScheduler(…)）は認める
+  no_direct_sleep_timer:
+    name: "待機とタイマーの直接の利用の禁止"
+    regex: '\bTask\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\.\s*sleep\b|\bThread\s*\.\s*sleep\b|(?<![.\w])(?<!\.\s{1,16})(?<!func\s)u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\s*\.\s*(scheduledTimer|publish)\b|\bTimer\s*(?:\.\s*init\s*)?\(|:\s*(?:Foundation\s*\.\s*)?Timer\s*[?!]?\s*=\s*\.\s*init\s*\(|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+    match_kinds: *code
+    message: "待機とタイマーは注入した型を経由する。実時間を待つテストは書かない（TST-GEN-01）"
+    severity: error
+
+  # 「.」と名前の間の空白（Int . random(in:)）は Swift と同じく許す
+  # random・randomElement・shuffled・shuffle は、注入した生成器を渡す呼び出し（using: の引数）を認め、既定の生成器を使う
+  # 呼び出しだけを検出する。using: は呼び出しの最上位の引数のラベル（「(」の直後か、最上位の「,」の直後）だけを認める。
+  # 引数の中の括弧（丸括弧・角括弧・波括弧）は 3 段の入れ子まで読み、入れ子の中の using:（辞書のリテラル [using: 1] や
+  # 入れ子の呼び出しの引数）は認めない（それより深い入れ子のある呼び出しは、最上位に using: があっても検出する側に倒れる）
+  # 引数の中のブロックコメントと行コメントは 1 つの単位として読み飛ばす（コメントの中の「(」「)」で括弧の対を取り違えて
+  # 後ろの using: を見落とさず、コメントの中の「using:」を引数と見なさない）。文字列リテラル（1 行の "…"）も 1 つの単位として
+  # 読み飛ばす（文字列の中の「(」「)」で括弧の対を取り違えず、文字列の中の「using:」を引数と見なさない）
+  # ブロックコメントは 1 段の入れ子まで読む（/* 外 /* 内 */ 外 */ を 1 つのコメントとして扱う。no_empty_catch と同じ）
+  # 行コメントは行末（CR か LF。CR だけのファイルを含む）で終わる（no_empty_catch と同じ）
+  # 引数のラベル using と「:」の間のコメント（ブロックコメント・行コメント）は空白として扱う
+  # 拡張区切りの文字列（#"…"#・##"…"##・#"""…"""# など。「#」の数は後方参照でそろえる）も 1 つの単位として読み飛ばす。
+  # 文字列を始める「#」は 1 文字として読まない（後戻りで「"」からふつうの文字列と読み直させない）。補間の中の文字列は読まない
+  # ふつうの複数行の文字列（"""…"""）も 1 つの単位として読み飛ばす
+  no_direct_random:
+    name: "乱数の直接の利用の禁止"
+    regex: '\.\s*(?:random|randomElement|shuffled|shuffle)\s*\((?!(?:\s|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+)*\busing(?:\s|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+)*:|(?:/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\1))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\1))*+")\1|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*"|[^()\[\]{}/"#]|/(?![/*])|[(\[{](?:/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\2))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\2))*+")\2|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*"|[^()\[\]{}/"#]|/(?![/*])|[(\[{](?:/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\3))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\3))*+")\3|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*"|[^()\[\]{}/"#]|/(?![/*])|[(\[{](?:/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+|(#+)(?:"""[ \t]*\r?\n(?:[^"]|"(?!""\4))*+"""|"(?!""[ \t]*\r?\n)(?:[^"\r\n]|"(?!\4))*+")\4|#(?!#*")|"""[ \t]*\r?\n(?:[^"\\]|\\[\s\S]|"(?!""))*+"""|"(?:[^"\\\n]|\\.)*"|[^()\[\]{}/"#]|/(?![/*]))*[)\]}])*[)\]}])*[)\]}])*,(?:\s|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+)*\busing(?:\s|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+)*:)|\bSystemRandomNumberGenerator\b|\barc4random\w*\b|\bSecRandomCopyBytes\b'
+    excluded:
+      - '.*/SystemDependencies/.*\.swift'
+    match_kinds: *code
+    message: "乱数は注入した型から得る（TST-GEN-07）"
+    severity: error
