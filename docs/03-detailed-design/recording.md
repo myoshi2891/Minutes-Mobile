@@ -914,7 +914,8 @@ public struct RecordingTransition: Equatable, Sendable {
 | `interrupted_draining` | `drainCompleted`（再開の要求が保留されていない） | `interrupted_waiting` | なし |
 | `interrupted_draining` | `drainCompleted`（再開の要求が保留されている） | `interrupted_resuming`（世代+1） | `restart` |
 | `interrupted_draining` | `resumeRequested` | `interrupted_draining` | なし（再開の要求を保留する） |
-| `interrupted_draining`・`interrupted_waiting` | `resumeDenied` | 変わらない | `report(interruptedNotResumed)` |
+| `interrupted_draining` | `resumeDenied` | `interrupted_draining`（保留した再開の要求を取り消す: `resumeRequested` を偽にする） | `report(interruptedNotResumed)`（取り消した後の `drainCompleted` は、保留のない行で `interrupted_waiting` へ進み、`restart` しない） |
+| `interrupted_waiting` | `resumeDenied` | 変わらない | `report(interruptedNotResumed)` |
 | `interrupted_draining`・`interrupted_waiting` | `configurationChanged`・`mediaServicesReset`・`routeChanged` | 変わらない | なし（再開のときに形式とセッションを読み直す） |
 | `interrupted_draining`・`interrupted_waiting` | `stopRequested(理由)` | `stopping`（世代+1） | 停止の並び |
 | `interrupted_waiting` | `resumeRequested` | `interrupted_resuming`（世代+1） | `restart` |
@@ -1022,7 +1023,7 @@ public struct RecordingTransition: Equatable, Sendable {
 
 | 段 | 手段 |
 | --- | --- |
-| ① 閉鎖済みにする | 録音パイプラインの世代ごとの閉鎖の印（`Synchronization.Atomic` の世代の番号。リングバッファと同じく原子操作）を立てる。tap のブロックは書き込みの前に印を読み、閉鎖済みの世代のバッファをリングバッファに入れずに捨てる。印は呼び出しの戻りを待たずに立てられ、立てた時点からその世代のサンプルは Chunk に入らない |
+| ① 閉鎖済みにする | 録音パイプラインの世代ごとの閉鎖の印（`Synchronization.Atomic` の世代の番号。リングバッファと同じく原子操作）を立てる。tap のブロックは書き込みの前に印を読み、閉鎖済みの世代のバッファをリングバッファに入れずに捨てる（これは量を減らすための早い除外で、保証は次の消費側で行う。印を立てる前に印を読んだ tap は、立てた後にリングバッファへ書きうる）。**保証は消費側の破棄で行う:** リングバッファは世代ごとに作る（§5.3 の `beginCapture`）ので、取り出したサンプルの世代はリングバッファで決まる。取り出し側は、Chunk の組み立てに渡す直前に、そのリングバッファの世代の印を確かめ、閉鎖済みなら渡さずに捨てる。この「印の確認 → Chunk の組み立てへの追加」と①の印の設定は、同じ排他（`Synchronization.Mutex`。取り出し側と①だけが取り、tap の音声コールバックは取らない）の中で行う。①は、取り出し側が 1 回分の追加（メモリ上の操作だけ）を終えるのを待つことはあるが、戻っていない入力の呼び出しは待たない。①が戻った後は、その世代のサンプルは、tap がいつ書いたものでも Chunk に入らない。閉鎖済みの世代のリングバッファに残ったサンプルも同じく捨てる |
 | ② 停止の指示 | `AudioInput.close(generation:)` が、入力の制御の直列キュー（入力を開く呼び出しと同じキュー）の外から、その世代の tap の取り外しと入力の停止を指示する。開く呼び出しが戻っていなければ、戻った直後に同じキューで停止と取り外しを行う予約になる |
 | ③ 閉じたことの確認 | `AudioInput.isClosed(generation:)` が、その世代の入力が止まり（`isRunning` が偽）、tap が外れていることを返す。入力の制御のキューで確かめるので、開く呼び出しが戻っていなければ確かめられない |
 | ④ セッションの無効化 | ③を確かめた後にだけ行う |
@@ -1178,8 +1179,8 @@ public struct RecordingTransition: Equatable, Sendable {
 | 6 | 記録列の満杯 | 記録列が満杯の間、空きがあっても受け付けずに数え続けること | NFR-PRF-01 |
 | 7 | 折り返しと通過帯域 | 48 kHz・44.1 kHz の 12 kHz 正弦波で、4 kHz の成分が −40 dB 以下。1 kHz・3 kHz の振幅が ±0.5 dB 以内。取り出しの大きさを変えても結果が同じ | TST-AUD-02 |
 | 8 | 遷移の表の網羅 | 9 つの段 × 15 種類の事象。表の 45 通りだけが許されること | TST-INT-01〜05、TST-GEN-06 |
-| 9 | 古い世代 | 世代の合わない完了が、どの段でも拒否されること | TST-GEN-05 |
-| 10 | 割り込みの開始の並び | 通知の予約が先頭、空白区間の開設が短い Chunk の確定の後にあること。排出の途中で届いた再開の要求が保留され、排出の完了で再開が始まること | TST-INT-01 |
+| 9 | 古い世代 | 世代の合わない完了が、どの段でも拒否されること。入力の閉鎖の手続きの①の後に、閉鎖した世代のリングバッファへ書いたサンプル（印を立てる前に印を読んだ tap の書き込みを模す）が、Chunk に入らずに捨てられること | TST-GEN-05 |
+| 10 | 割り込みの開始の並び | 通知の予約が先頭、空白区間の開設が短い Chunk の確定の後にあること。排出の途中で届いた再開の要求が保留され、排出の完了で再開が始まること。保留の後に `resumeDenied` が届くと保留が取り消され、`interruptedNotResumed` が報告され、排出の完了で `restart` せずに `interrupted_waiting` へ進むこと | TST-INT-01 |
 | 11 | 再開の失敗 | 4 つの段のそれぞれで失敗させ、入力の停止・保持分の破棄・無効化が指示されること。通知の予約し直しが `close_gap` のときだけであること | TST-INT-02 |
 | 12 | 停止の並びと理由 | `capturing`・`interrupted_waiting`・`rebuilding_draining`・`rebuilding_restarting` のそれぞれから、同じ並びで停止すること。`terminated` を受け付けないこと | TST-INT-07 |
 | 13 | 入力の喪失 | 再構築で使える入力がなければ、停止理由 `no_input` で停止の並びが指示されること | TST-INT-04 |
@@ -1285,7 +1286,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | 空白区間の理由の一覧（割り込みの理由、`overrun`、`route_change`、`media_reset`） | 6 つ（`interruption`・`built_in_mic_muted`・`route_disconnected`・`overrun`・`route_change`・`media_reset`） | §6 |
 | 中断通知の文言と予約までの時間 | 題名「録音が中断しています」、本文「アプリを開くと再開を試みます。」、60 秒。差し込む値は持たない | §7 |
 | 割り込みの開始の処理（停止要求がない場合を含む）・再構築の④（作り直しと入力の開始の呼び出し）・再構築の途中に届いた停止の待機・割り込みの終了の①〜④の呼び出しの待機・停止の経路で空白区間を閉じる処理の待機・割り込みの終了の②の後で④の前に届いた停止での末尾の Chunk の確定の待機の時間の上限（§5.1） | 順に 5 秒・3 秒・5 秒・3 秒（1 つごと）・5 秒・5 秒。`RecordingTuning` の値で、注入した `Scheduler` で測る | §2・§5.4 |
-| 入力の閉鎖の手続き（§5.1）の手段（戻っていない呼び出しを待たずに入力を閉じ、閉じたことを確かめる方法）と時間の上限 | 世代ごとの閉鎖の印（原子操作）で tap がサンプルを捨て、`AudioInput.close(generation:)` で停止と取り外しを指示し、`isClosed(generation:)` で入力の停止と tap の取り外しを確かめてからセッションを無効化する。上限 2 秒。確かめられなければ `microphone_close_unconfirmed` を表示して確認を続ける | §5.4 |
+| 入力の閉鎖の手続き（§5.1）の手段（戻っていない呼び出しを待たずに入力を閉じ、閉じたことを確かめる方法）と時間の上限 | 世代ごとの閉鎖の印（原子操作）で tap がサンプルを捨て、取り出し側が印の設定と同じ排他の中で閉鎖済みの世代のサンプルを Chunk に渡さずに捨て（印を読んだ後の tap の書き込みも Chunk に入らない）、`AudioInput.close(generation:)` で停止と取り外しを指示し、`isClosed(generation:)` で入力の停止と tap の取り外しを確かめてからセッションを無効化する。上限 2 秒。確かめられなければ `microphone_close_unconfirmed` を表示して確認を続ける | §5.4 |
 | 割り込みの記録（事象時刻・理由・未確定の開始位置）の形式と置き場所（§5.1。起動時の復旧が読む。[storage.md](storage.md) §8）。永続化できなかった割り込みの記録のメモリ上の保持と再試行、空白区間の記録で置き換える取引の形（§5.1） | `meeting.json` の `pendingInterruption`（識別子・事象時刻・理由）。保存の actor のメモリ上に持ち、再試行は `meeting.json` の新しい世代の書き込み。置き換えは、メモリ上で記録を除いて同じ識別子の空白区間を足し、DB の取引 → `meeting.json` の 1 回の置き換えで行う | §5.4、[storage.md](storage.md) §3.1・§5.1 |
 
 ---

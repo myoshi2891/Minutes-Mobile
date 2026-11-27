@@ -1209,9 +1209,11 @@ public enum SealDecision: Equatable, Sendable {
 Chunk の登録（1 取引）:
 
 ```swift
-    /// Chunk の登録・総サンプル数の更新・未保存の記録の削除を 1 取引で行う。何度呼んでも結果は同じ
+    /// Chunk の登録・総サンプル数の更新・未保存の記録の削除を 1 取引で行う。何度呼んでも結果は同じ。
+    /// 起動時の書きかけの救済（§9）は retainingUnsavedRecord に true を渡し、未保存の記録を消さない
+    /// （救済したサンプル数を記録の元の範囲と比べる前に消すと、失われた末尾を求められなくなる）
     static func register(
-        _ row: ChunkRow, at now: Timestamp, in connection: SQLiteConnection,
+        _ row: ChunkRow, at now: Timestamp, retainingUnsavedRecord: Bool = false, in connection: SQLiteConnection,
     ) throws(StorageFailure) -> ChunkRegistration {
         let key: [SQLValue] = [.text(row.meeting.description), .integer(Int64(row.sequence.value))]
         let incoming: SQLValue = row.digest.map { .text($0.description) } ?? .null
@@ -1244,10 +1246,13 @@ Chunk の登録（1 取引）:
                 "UPDATE meetings SET total_samples = MAX(total_samples, ?2), updated_at = ?3 WHERE meeting_id = ?1",
                 [key[0], .integer(row.startSample + sampleCount), .integer(now.milliseconds)], stage: .register,
             )
-            // 保存できたので、同じ連番の未保存の記録を消す（基本設計 §5.1）
-            try connection.execute(
-                "DELETE FROM unsaved_chunks WHERE meeting_id = ?1 AND sequence_no = ?2", key, stage: .register,
-            )
+            // 保存できたので、同じ連番の未保存の記録を消す（基本設計 §5.1）。
+            // 救済の経路では消さない（§9 の照合 f が、元の範囲と比べてから消す）
+            if !retainingUnsavedRecord {
+                try connection.execute(
+                    "DELETE FROM unsaved_chunks WHERE meeting_id = ?1 AND sequence_no = ?2", key, stage: .register,
+                )
+            }
             return .inserted
         }
     }
@@ -1261,7 +1266,7 @@ Chunk の登録（1 取引）:
 | 4 | 同じ連番のハッシュの記録・正式名の WAV・DB の行を調べ、`SealDecision.decide` で扱いを決める | `read_back`・`register` | 同上 |
 | 5 | （記録を作る場合）一時ファイルに書いて同期し、置換しない rename で公開、ディレクトリを同期。記録には連番・開始サンプル・サンプル数・SHA-256 を書く（§3.2） | `write_hash_record`・`sync`・`rename`・`sync_directory` | `.part` と記録が残る。再試行では「記録あり・一致」になる |
 | 6 | `.part` を正式名へ置換しない rename、ディレクトリを同期 | `rename`・`sync_directory` | rename の前なら 5 と同じ。後なら正式名の WAV と記録がある → 再試行では「WAV あり・同じ内容」になる |
-| 7 | Chunk の登録・総サンプル数の更新・未保存の記録の削除（1 取引） | `register` | 正式名の WAV と記録がある。再試行、または起動時の照合（§9）で登録される |
+| 7 | Chunk の登録・総サンプル数の更新・未保存の記録の削除（1 取引）。起動時の書きかけの救済（§9）では未保存の記録を消さない（`retainingUnsavedRecord: true`） | `register` | 正式名の WAV と記録がある。再試行、または起動時の照合（§9）で登録される |
 
 - **正式名のファイルは、常に完全な Chunk である**（FR-SAV-01）。書きかけは `.part` の名前でしか存在しない。手順 1〜7 のどこで失敗しても、正式名のファイルは「ない」か「完全」のどちらかになる（各段で失敗を注入して確かめた。§12.3）。
 - 同じ Chunk を何度確定しても、ファイルは 1 つ、行は 1 つである（FR-SAV-03、INV-05）。
@@ -1554,14 +1559,23 @@ public enum ProtectionAction: Equatable, Sendable {
 
 public enum ProtectionPolicy {
     /// hasUnfinishedWork: 録音中・確定待ち・未完了のジョブ・書き出し中・未保存の Chunk のどれかがある
+    /// restoredInThisProcess: このプロセスで、会議ディレクトリの下を処理中の保護クラスに戻し終えた
+    /// （保管への切り替えを始めると偽に戻る。再起動の後は偽）
+    /// next は、action が全部成功した後に記録する状態（unseal が途中で失敗したら、記録は変えない）
     public static func review(
         current: ProtectionState,
         hasUnfinishedWork: Bool,
         isProtectedDataAvailable: Bool,
+        restoredInThisProcess: Bool,
     ) -> (next: ProtectionState, action: ProtectionAction) {
         if hasUnfinishedWork {
-            // 保管中の会議を再処理するのは利用者の操作からだけで、そのとき端末はロック解除されている
-            return current == .sealed ? (.open, .unseal) : (.open, .none)
+            // 保管中の会議を再処理するのは利用者の操作からだけで、そのとき端末はロック解除されている。
+            // open・seal_pending でも、保管への切り替えの途中の失敗で一部が complete のことがあり、
+            // 記録だけでは見分けられないので、戻し終えたと分かるまで戻す
+            if current == .sealed || !restoredInThisProcess {
+                return (.open, .unseal)
+            }
+            return (.open, .none)
         }
         switch current {
         case .sealed: return (.sealed, .none)
@@ -1576,7 +1590,7 @@ public enum ProtectionPolicy {
 | 未完了の作業（`hasUnfinishedWork`） | 次のどれかがある: 会議の状態が `recording`・`stop_requested`・`finalizing`・`transcribing`、`pending`・`processing` のジョブ、メモリ上の未保存の Chunk、未保存の記録、進行中の書き出し、進行中の削除 |
 | 見直す時点 | すべて `ProtectionCoordinator.review` を通す（下の「持ち主の型」）。副作用 `reviewProtection`（確定・文字起こしの完了。[architecture.md](architecture.md) §5）、書き出しの完了、再文字起こし・失敗区間の再試行・書き出しの開始（処理中へ戻す）、および下の「保留の解消」 |
 | 保管への切り替え（`seal`） | 会議ディレクトリの下のファイルを 1 つずつ `complete` にし、最後に各ディレクトリを `complete` にする。全部が成功してから、`protection_state` を `sealed` にする。途中で失敗したら `open` のままにして、次の見直しでやり直す（属性の設定は、何度行っても同じ結果になる） |
-| 処理中へ戻す（`unseal`） | 先に `protection_state` を `open` にし、各ディレクトリ、ファイルの順に「最初のロック解除まで」へ戻す。全部が成功してから、ジョブの作成・書き出しを始める |
+| 処理中へ戻す（`unseal`） | 各ディレクトリ、ファイルの順に「最初のロック解除まで」へ戻し、**全部が成功してから** `protection_state` を `open` にする（`seal` と同じく、記録を最後に書く）。途中で失敗・終了したら `sealed` のままにして、次の受け付けで最初から戻し直す（属性の設定は、何度行っても同じ結果になる）。ジョブの作成・書き出しは、戻し終えて受け付けた後にだけ始める。戻せないまま作業を受け付けなかった会議は、一部のファイルが「最初のロック解除まで」のまま `sealed` として残りうる（処理中の会議と同じ保護クラス。次の受け付けで戻し直し、作業の後の見直しで保管に上げる） |
 | 新しく作るファイル | 常に「最初のロック解除まで」で作る（§4.1）。保管中の会議にはファイルを作らない（作る前に必ず処理中へ戻す） |
 | SQLite | 常に「最初のロック解除まで」（開くときのフラグ。§3.4）。`-wal`・`-shm` と、移行の前の複製も同じ |
 | 対象の外 | `db/`・`tombstones/`・`tmp/`・保存ルートの直下の `quarantine/` は、常に「最初のロック解除まで」のままにする |
@@ -1600,10 +1614,10 @@ public protocol ProtectionCoordinating: Sendable {
 | --- | --- |
 | 会議ごとの状態 | 受け付けた作業の集合（`WorkLease`。受け付けから後始末の終わりまで）と、進行中の操作（なし・保管への切り替え・処理中への戻し。どちらも 1 つの `Task`） |
 | 1 つの操作 | 保管の条件の判定（`ProtectionPolicy.review`）から、会議ディレクトリ全体の保護クラスの書き込みと `protection_state` の記録の完了までを 1 つの `Task` にする。**`await` の前に進行中の操作を状態に入れる**ので、待つ間の再入で `accept` が割り込んでも、その操作の完了を待ってから判断する |
-| 受け付け（`accept`） | 進行中の操作があればその完了を待つ。会議が `sealed` なら処理中への戻しを同じく 1 つの操作で行い、成功を確かめてから受け付ける（失敗したら受け付けず `ProtectionFailure` を返す。一部のファイルだけが `complete` の場合も、戻し終えるまで受け付けない）。`seal_pending` なら取り消して `open` にする。受け付けた作業がある間は保管しない |
+| 受け付け（`accept`） | 進行中の操作があればその完了を待つ。会議が `sealed` なら処理中への戻しを同じく 1 つの操作で行い、成功を確かめてから受け付ける（失敗したら受け付けず `ProtectionFailure` を返す）。**`open`・`seal_pending` の会議でも、このプロセスで戻し終えたと分かっている場合（下）を除き、受け付けの前に同じ戻しを行う**: 保管への切り替えが途中で失敗・終了すると、記録は `open`（または、その後の見直しで `seal_pending`）のまま一部のファイルだけが `complete` になり、記録だけでは見分けられないため。戻しが全部成功するまで受け付けない。`seal_pending` は取り消して `open` にする。戻し終えた会議は、保管への切り替えを始めるまでメモリ上で「戻し済み」として持ち、次の受け付けで戻しを省く（再起動の後は持たないので、もう一度戻す）。この判断は `ProtectionPolicy.review` の `restoredInThisProcess` で行う（`ProtectionCoordinator` は「戻し済み」の値を渡し、返った `action` に従うだけで、自分では判断しない）。受け付けた作業がある間は保管しない |
 | 呼ぶ側 | `TranscriptionService`（開始・再試行・再文字起こし・不足分の作成・起動時の回収）と `ExportService`（開始）は、`accept` が返してから、ジョブを作る・ファイルを開くなどの作業を始める。`seal_pending` の解消と起動時の復旧の手順 9 も `review` を通す |
 | 通さないもの | 録音の継続と Chunk の書き込み（録音中・確定前の会議は保管の対象にならない）。`ProtectionCoordinator` は `MeetingStore` を待たせない: 保護クラスの書き込みは `FileSystem` で自分で行い、`protection_state` の記録だけを `MeetingStore` に依頼する |
-| 試験 | 差し替えの `FileSystem` で保護クラスの書き込みを止め、その間に `accept` を呼ぶ。書き込みの完了まで受け付けが返らず、返った後は会議が `open` で、作業が `complete` の会議で動かないこと |
+| 試験 | `ProtectionPolicy.review` を、`current`（3 つ）× `hasUnfinishedWork` × `isProtectedDataAvailable` × `restoredInThisProcess` の 24 通りの表で網羅する（未完了の作業があり、`sealed`、または戻し済みでない `open`・`sealPending` なら `(.open, .unseal)`、戻し済みの `open`・`sealPending` なら `(.open, .none)`。未完了の作業がなければ、`restoredInThisProcess` によらずこれまでの結果）。差し替えの `FileSystem` で保護クラスの書き込みを止め、その間に `accept` を呼ぶ。書き込みの完了まで受け付けが返らず、返った後は会議が `open` で、作業が `complete` の会議で動かないこと。戻しの途中のファイルで失敗させると、`protection_state` が `sealed` のまま受け付けず、次の `accept` で最初から戻し直して全部を戻してから受け付けること。保管への切り替えの途中で失敗させた（`open` のまま一部が `complete`）会議と、再起動を模して `ProtectionCoordinator` を作り直した後の同じ会議で、`accept` が戻しを全部終えてから受け付けること |
 
 **保留（`seal_pending`）を解消するきっかけ**（基本設計の申し送り）は、次の 3 つである。どれも、`ProtectionPolicy.review` を `sealPending` の会議に対して呼び直す。
 
@@ -1640,7 +1654,7 @@ public protocol ProtectionCoordinating: Sendable {
 
 - 何度実行しても同じ結果になり、途中で落ちても次の起動で続きを行える（各手順が、状態を読んでから必要な分だけを行う）。
 - 手順 2 の印（`db/rebuild-pending`）を消す条件は、基本設計 §8 のとおりである: 全会議の照合が完了し、かつ保護データを読めずに照合できなかった会議が残っていないこと。壊れていて読めない `meeting.json` は、「読めない会議」として一覧に出した時点で照合の済んだ会議として数える。
-- 復旧の結果（`stop_requested` にした会議の数、救済した Chunk の数、隔離した数、DB を作り直したか）を値として返し、起動後に 1 回表示する（[ui.md](ui.md) §4.7）。ログは `recovery_completed`・`part_file_salvaged`・`part_file_quarantined`・`database_quarantined` を出す。
+- 復旧の結果（`stop_requested` にした会議の数、救済した Chunk の数、隔離した数、DB を作り直したか、DB を作り直した場合は照合（c・d）でハッシュが合わなかった Chunk の数（`hash_mismatch`）と、ハッシュの記録がない・読めないために照合できなかった Chunk の数（`invalid`））を値として返し、起動後に 1 回表示する（[ui.md](ui.md) §4.7）。ログは `recovery_completed`・`part_file_salvaged`・`part_file_quarantined`・`database_quarantined` を出す。
 
 **照合**（会議 1 件について、会議ディレクトリと DB を突き合わせる。BD-STO-08）:
 
@@ -1677,7 +1691,7 @@ public enum PartSalvage: Equatable, Sendable {
 
 | 計画 | 処理 |
 | --- | --- |
-| `salvage` | ①ファイルを `truncatedSize`（44 + サンプル数 × 2）まで切り詰める（奇数バイトの端数を捨てる）→ ②ヘッダを書き直す → ③媒体まで同期する → ④全体を読み直して SHA-256 を計算する → ⑤§4.4 の判定（`SealDecision`）で公開・登録する。記録を作る場合の開始サンプルは、その連番自身の未保存の記録の開始サンプルを先に使い、なければ直前の連番の終わり（直前の連番のハッシュの記録の `startSample` + サンプル数）とする（基本設計 §8）。メモリ上の PCM はないので、照合の相手は読み直したファイル自身である。VAD は読み直した PCM から計算し直す |
+| `salvage` | ①ファイルを `truncatedSize`（44 + サンプル数 × 2）まで切り詰める（奇数バイトの端数を捨てる）→ ②ヘッダを書き直す → ③媒体まで同期する → ④全体を読み直して SHA-256 を計算する → ⑤§4.4 の判定（`SealDecision`）で公開・登録する。**この登録では、どの判定の分岐でも未保存の記録を消さない**（`ChunkTable.register` に `retainingUnsavedRecord: true` を渡す）。記録は、救済したサンプル数をその元の範囲と比べる照合（下の「未保存の記録」の手順 2・3。照合の f）まで残し、比べて `fullySalvaged` のときにだけ消す（短い `.part` の救済で失われた末尾を、元の範囲から求めてから消すかを決める）。記録を作る場合の開始サンプルは、その連番自身の未保存の記録の開始サンプルを先に使い、なければ直前の連番の終わり（直前の連番のハッシュの記録の `startSample` + サンプル数）とする（基本設計 §8）。メモリ上の PCM はないので、照合の相手は読み直したファイル自身である。VAD は読み直した PCM から計算し直す |
 | `quarantine` | 0 サンプル・44 バイト以下・Chunk の上限（480,000 サンプル）を超える・読めない場合。削除せず、会議の `quarantine/part-{連番}.wav.part` へ置換しない rename で移す。連番を `audio_chunks` に `quarantined` として登録し、`meeting.json` の `quarantinedSequences` にも書く。隔離した連番は Barrier の不成立の理由になる（§6.1） |
 
 **未保存の記録**（FR-SAV-05）は、毎回もとの範囲から欠落を求める。
@@ -1707,7 +1721,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | --- | --- |
 | 1 | DB の `unsaved_chunks` と `meeting.json` の `unsavedChunks` を、連番ごとに和集合にする。同じ連番で元の範囲が食い違う場合は、両方を含む範囲を元の範囲とする（欠落を小さく見積もらない） |
 | 2 | 同じ連番の登録済みの WAV（上の c・d で救済・登録したものを含む）があれば、そのサンプル数を「救済済みのサンプル数」として、両方の記録に書く（既にあれば同じ値で上書きする） |
-| 3 | `UnsavedReconcile.compare` で比べる。`fullySalvaged` なら記録を消す。`lost` なら記録を残し、その範囲を「失われた未保存」として Barrier へ渡す。`inconsistent`（救済した WAV の方が長い）なら、Chunk を `invalid` にする |
+| 3 | `UnsavedReconcile.compare` で比べる（c の救済の登録は記録を消さないので、比べる元の範囲が残っている）。`fullySalvaged` なら記録を消す。`lost` なら記録を残し、その範囲を「失われた未保存」として Barrier へ渡す。`inconsistent`（救済した WAV の方が長い）なら、Chunk を `invalid` にする |
 
 - 欠落は「元の範囲 − 救済済みの範囲」として毎回求め、前回求めた欠落から差し引かない。同じ WAV を再起動のたびに照合しても、欠落は縮まない（基本設計 §8）。
 - MVP の照合の対象は、`recording`・`stop_requested`・`finalizing` の会議である。DB を作り直した場合と印が残っている場合だけ、全会議に広げる。利用者が全件を再構築する機能（FR-RCV-03）は P2 とする。
@@ -1803,7 +1817,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 14 | 確定の手順（結合） | 停止 → Barrier → `finalized`。不成立 → 再試行 → 通過。例外確定で `lossRecord` が保存される | TST-FIN-01〜03 |
 | 15 | 強制終了からの復旧（結合） | 録音の途中でパイプラインを捨て、復旧する。会議が `stop_requested`（理由 `terminated`）になり、書きかけが救済され、失ったサンプル数が追記していない分だけであること | TST-RCV-01 |
 | 16 | 書きかけの救済（結合） | 途中まで・奇数バイト・0 バイト・ヘッダだけの `.part`。切り詰めと隔離。末尾の Chunk を隔離した会議が `finalized` にならないこと | TST-RCV-02 |
-| 17 | 未保存の末尾の Chunk の喪失（結合） | 基本設計 §13 の同名の行（記録から失われた連番が検出される、短い `.part` の救済、0 サンプルの会議が残る、DB を作り直しても同じ結果） | FR-SAV-05 |
+| 17 | 未保存の末尾の Chunk の喪失（結合） | 基本設計 §13 の同名の行（記録から失われた連番が検出される、短い `.part` の救済、0 サンプルの会議が残る、DB を作り直しても同じ結果）。短い `.part` の救済の登録の後も未保存の記録が残り、照合で失われた末尾が元の範囲から求まること（救済の登録が記録を消さない） | FR-SAV-05 |
 | 18 | DB の作り直し（結合） | 壊れた DB を置いて起動する。退避され、全会議が `meeting.json` とファイルから戻る。印の作成の後・退避の後・照合の途中で落としても、次の起動で全会議の照合が行われる | TST-RCV-04、INV-10 |
 | 19 | 復旧の冪等性（結合） | 復旧を 2 回実行して、DB とファイルが変わらないこと | FR-RCV-01 |
 | 20 | 削除（結合） | 各段で落として復旧し、会議 ID に関わるファイル・行・一時ファイルが 0 件。墓標の後に DB を作り直しても会議が復活しない。DB ファイルにタイトルのバイト列が残らない | TST-SEC-05 |

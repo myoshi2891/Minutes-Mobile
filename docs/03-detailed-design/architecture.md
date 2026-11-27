@@ -261,6 +261,20 @@ public struct ChunkSequence: Hashable, Comparable, Sendable, Codable {
         self.value = value
     }
 
+    /// 永続データは整数 1 つで表す。init(_:) と同じ範囲で検証し、範囲外の値から作らない（fileStem に届かせない）
+    public init(from decoder: any Decoder) throws {
+        let number = try decoder.singleValueContainer().decode(Int.self)
+        guard let value = ChunkSequence(number) else {
+            throw PersistedDataError.invalidValue(field: .sequenceNo)
+        }
+        self = value
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(value)
+    }
+
     public static func < (lhs: ChunkSequence, rhs: ChunkSequence) -> Bool {
         lhs.value < rhs.value
     }
@@ -273,7 +287,7 @@ public struct ChunkSequence: Hashable, Comparable, Sendable, Codable {
 }
 ```
 
-- `ChunkSequence` の `Codable` も `MeetingID` と同じ形で、範囲外の値を `PersistedDataError.invalidValue(field: .sequenceNo)` で拒否する。
+- `ChunkSequence` の `Codable` も `MeetingID` と同じ形で、範囲外の値を `PersistedDataError.invalidValue(field: .sequenceNo)` で拒否する（自動の合成の `init(from:)` は検証を通らずに値を作るので、使わない）。
 - 大文字の UUID は拒否する。同じ会議が大文字と小文字の 2 つのディレクトリに分かれるのを防ぐ（大文字と小文字を区別するファイルシステムを前提にする）。
 - 連番の上限 999,999 は約 347 日分に当たり、実用上は届かない。届いた場合は録音を停止する（ファイル名の桁を超えるため）。
 
@@ -908,7 +922,8 @@ public enum RecordingIssue: Equatable, Sendable {
 | `PersistedDataError`（会議の読み込み） | `unreadable_meeting` | 録音のファイルは残っている |
 | 復旧で `recording` の会議を検出 | `recovered_after_termination` | 保存済みの分は無事。直近の未保存分は失われた可能性がある |
 | 書きかけを隔離 | `part_files_quarantined` | 隔離した分は文字起こしに使えない |
-| DB を退避して作り直した | `database_rebuilt` | 録音は無事（ファイルから作り直した） |
+| DB を退避して作り直し、照合でハッシュの合わない Chunk とハッシュの記録を読めない Chunk がどちらも 0 件 | `database_rebuilt` | 録音は無事（ファイルから作り直した） |
+| DB を退避して作り直し、照合でハッシュの合わない Chunk かハッシュの記録を読めない Chunk が 1 件以上（件数は復旧の結果。[storage.md](storage.md) §9） | `database_rebuilt_damaged` | 「録音は無事」と言わない。傷んだ Chunk（件数を示す）が見つかった。残りは無事 |
 | エンジンの可否が `available` 以外 | `engine_unavailable` | 録音は無事 |
 | 文字起こしの延期（高温・低電力・録音中） | `transcription_deferred` | 録音は無事 |
 | `transcribe_chunk` が `failed` | `transcription_segment_failed` | 録音は無事。その区間は再試行できる |
@@ -1363,7 +1378,7 @@ struct MeetingStateMachineTests {
 | --- | --- | --- |
 | 型・protocol の名称と、Package のターゲット分割を確定する | ターゲットを 7 つに分けた。注入点の protocol・本番の実装・差し替えの名前を確定した | §2・§6 |
 | 録音パイプラインを起こす合図の方式を確定する（§4） | 周期的な合図（100 ms）を非同期の列で受け取る。停止・割り込みの排出は合図を待たない | §7.2 |
-| エラー分類の列挙と、利用者向けの文言への写像を確定する（§8） | 7 つの型に分類し、27 種の問題の種類へ網羅的に写す。文言は ui.md §6 | §8 |
+| エラー分類の列挙と、利用者向けの文言への写像を確定する（§8） | 7 つの型に分類し、28 種の問題の種類へ網羅的に写す。文言は ui.md §6 | §8 |
 | 型付きログのイベント一覧と、各値の privacy 指定を確定する（BD-ARC-06） | 41 イベント。名前と欄は public、会議 ID はハッシュで伏せる | §9 |
 | 要件 ID ↔ テストの対応表を文書ごとに作る | 本書の対応表を作った。ほかの 5 文書もそれぞれ持つ | §14 |
 

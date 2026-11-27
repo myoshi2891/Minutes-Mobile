@@ -56,9 +56,12 @@ public enum ExportKind: String, Sendable, CaseIterable, Codable, LogSymbolSource
     /// 緊急書き出し（メモリ上の未保存の Chunk）
     case emergency
 
-    public var fileExtension: String {
+    /// 書き出すファイルの拡張子。緊急書き出しは、作る中身と同じく Chunk の数で決まる（1 件なら WAV、複数なら ZIP。§7 の手順 3）。
+    /// ほかの種類は chunkCount を見ない
+    public func fileExtension(chunkCount: Int) -> String {
         switch self {
-        case .archive, .emergency: "zip"
+        case .archive: "zip"
+        case .emergency: chunkCount == 1 ? "wav" : "zip"
         case .concatenatedAudio: "wav"
         case .transcriptText: "txt"
         case .transcriptMarkdown: "md"
@@ -707,8 +710,9 @@ public enum ExportFileName {
 
 - 結果は、必ず 1 つのファイル名になる（区切りを含まない）。`../` を含むタイトルでも、ディレクトリをまたがない（TST-SEC-06）。
 - 日時は、端末の時間帯で `yyyyMMdd-HHmm` にする（数字とハイフンだけ）。時間帯は引数で渡す（試験で固定できる）。
-- 拡張子は `ExportKind.fileExtension`（`zip`・`wav`・`txt`・`md`）で、利用者の入力から作らない。
-- 緊急書き出しの名前は、タイトルの後ろに `_未保存` を付ける（例: `定例_未保存_20261116-1430.zip`）。
+- 拡張子は `ExportKind.fileExtension(chunkCount:)`（`zip`・`wav`・`txt`・`md`）で、利用者の入力から作らない。`ExportFileName.make` の `fileExtension` には、この関数が返した値を渡す。
+- 緊急書き出しの拡張子は、書き出す未保存の Chunk の数（§7 の手順 1 で受け取った写しの件数）を `chunkCount` に渡して決める。1 件なら `wav`、複数なら `zip` で、§7 の手順 3 で作る中身（1 件なら WAV、複数なら ZIP）と一致させる（`NSItemProvider` のデータの種類も同じ件数で選ぶ）。
+- 緊急書き出しの名前は、タイトルの後ろに `_未保存` を付ける（例: 複数なら `定例_未保存_20261116-1430.zip`、1 件なら `定例_未保存_20261116-1430.wav`）。
 
 ---
 

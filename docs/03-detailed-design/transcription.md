@@ -68,6 +68,8 @@ public struct TranscriptionTuning: Equatable, Sendable {
     public var retryJitter = 0.2
     /// 1 件のジョブの上限時間（音声の長さの倍数）
     public var timeoutFactor = 10
+    /// 1 件のジョブの上限時間の下限（ms）。空でない入力は、倍数で求めた値が短くてもこの値を下回らない
+    public var minimumTimeoutMs: Int64 = 30000
     /// 打ち切ったエンジンの実行の停止（cancel() の戻り）を待つ上限（ms）
     public var stopConfirmTimeoutMs: Int64 = 5000
 
@@ -83,7 +85,7 @@ public struct TranscriptionTuning: Equatable, Sendable {
 | 低信頼度のしきい値 | 0.4 | 基本設計 §5.3。実測して見直す |
 | 試行回数の上限 | 5 | 基本設計 §4.2 |
 | 再実行までの間隔 | 2・5・10・30・60 秒に ±20% のゆらぎ | 基本設計 §4.2 |
-| 1 件のジョブの上限時間 | 入力の長さの 10 倍（30 秒の Chunk + 3 秒の Overlap なら 330 秒） | 基本設計 §4.2 |
+| 1 件のジョブの上限時間 | 入力の長さの 10 倍（30 秒の Chunk + 3 秒の Overlap なら 330 秒）。空でない入力は 30 秒（`minimumTimeoutMs`）を下回らない | 基本設計 §4.2。下限は本書で決めた初期値で、エンジンの起動から結果までの固定の時間を実測して見直す（§14） |
 | 打ち切った実行の停止を待つ上限 | 5 秒（上限を過ぎても待ち続け、その間は次の試行を始めない。§5.2） | 基本設計 §4.2 の「止まっていない実行」。実エンジンで止まるまでの時間を実測して見直す（§14） |
 
 値はすべて差し替えられる（試験では小さい値を使う）。境界での取りこぼし・重複を記録して見直す（§14）。
@@ -710,9 +712,14 @@ public enum RetryPolicy {
         return Int64((Double(base) * 1000 * factor).rounded())
     }
 
-    /// 1 件のジョブの上限時間（ミリ秒）。音声の長さの timeoutFactor 倍
+    /// 1 件のジョブの上限時間（ミリ秒）。音声の長さの timeoutFactor 倍を、ミリ秒に切り上げて求める。
+    /// 空でない入力は minimumTimeoutMs を下回らない。空の入力は、これまでどおり 0
     public static func timeoutMs(inputSamples: Int, tuning: TranscriptionTuning = TranscriptionTuning()) -> Int64 {
-        Int64(inputSamples) * 1000 / Int64(AudioConstants.sampleRate) * Int64(tuning.timeoutFactor)
+        guard inputSamples > 0 else { return 0 }
+        let rate = Int64(AudioConstants.sampleRate)
+        // 倍数を掛けてから割る（先に割ると、1 ミリ秒に満たない入力が 0 になる）。端数は切り上げる
+        let scaled = (Int64(inputSamples) * 1000 * Int64(tuning.timeoutFactor) + rate - 1) / rate
+        return max(scaled, tuning.minimumTimeoutMs)
     }
 }
 
@@ -760,6 +767,7 @@ public enum JobSelector {
 
 - 再実行までの待ち時間は、`RetryPolicy.delayMs` で求め、注入した `Scheduler` で待つ（[architecture.md](architecture.md) §6.2）。乱数は `RandomSource` から取る。**待ち時間は DB に保存しない。** 再起動の後は、待たずに実行できる（[storage.md](storage.md) §3.3）。
 - 上限時間は、手順が `Scheduler` で待ち、過ぎたら `engine.cancel()` を呼んで、分類を `TIMEOUT` にする（エンジンが返す `cancelled` を、`TIMEOUT` に読み替える）。
+- **上限時間の下限:** 上限時間は入力の長さの `timeoutFactor` 倍を、倍数を掛けてから割ってミリ秒に切り上げて求め（短い入力を切り捨てで 0 にしない）、空でない入力では `minimumTimeoutMs`（初期値 30,000 ms = 30 秒）を下回らないようにする。末尾の短い Chunk（数サンプル〜数秒）でも、エンジンの起動から結果までの固定の時間を待たずに `TIMEOUT` にしない。空の入力（0 サンプル）は 0 のまま（認識に渡す入力がない）。下限の値はエンジンの実測で見直す（§14）。
 - 上限時間による中止と、録音の開始などによる中止が重なった場合は、**回数に数えない方（`SYSTEM_EXPIRED`）を優先する**（利用者の操作で止めた実行を、失敗の回数に数えない）。
 - **止まっていない実行（停止の確かめ方と待機の上限。基本設計 §4.2）:** `TIMEOUT` と中止（`SYSTEM_EXPIRED`）で実行を打ち切ったときは、`engine.cancel()` が戻ったことを停止の確認とする（§3.1・§3.3。戻った時点で、認識の操作全体が終わり、解析は止まっていて、これから始まることもない）。手順は `engine.cancel()` の戻りを注入した `Scheduler` で上限（`stopConfirmTimeoutMs`。5 秒）まで待つ。
   - 上限までに戻れば、ジョブの完了の処理（`pending` への戻し・再試行の予定）を行い、次の試行を許す。
@@ -997,8 +1005,12 @@ public enum TranscriptMerger {
             return Verdict(rule: .contained, keepsFirst: keepsFirst, timeOverlap: overlap, similarity: score)
         }
         guard score >= tuning.similarityThreshold else { return nil }
-        // 信頼度の高い方を残す。同点・取得できない場合は前の Chunk 側を残す
-        let keepsFirst = (first.confidence ?? 0) >= (second.confidence ?? 0)
+        // 信頼度の高い方を残す。同点・どちらかが取得できない場合は前の Chunk 側を残す
+        // （取得できない値を 0 と見なして比べない。前の側だけが取得できないと、後ろの側を残してしまう）
+        guard let firstConfidence = first.confidence, let secondConfidence = second.confidence else {
+            return Verdict(rule: .similar, keepsFirst: true, timeOverlap: overlap, similarity: score)
+        }
+        let keepsFirst = firstConfidence >= secondConfidence
         return Verdict(rule: .similar, keepsFirst: keepsFirst, timeOverlap: overlap, similarity: score)
     }
 
@@ -1071,7 +1083,7 @@ public enum TranscriptMerger {
 | 4 | **時間の重なり**（重なる長さ ÷ 短い方の長さ。どちらかの長さが 0 なら 0）が 0.5 未満なら、重複ではない |
 | 5 | 本文を正規化する: NFKC、小文字化、句読点・記号・空白の除去（比較にだけ使う。表示は元の本文）。長音・促音のゆれは同一視しない |
 | 6 | **包含**: 一方が他方の連続した一部で、長さの比（短い方 ÷ 長い方）が 0.3〜0.95 なら、重複とみなして**長い方を残す**（根拠 `contained`） |
-| 7 | 包含でなければ、**類似**（1 − 編集距離 ÷ 長い方の長さ。どちらかが空なら 0）が 0.8 以上なら重複とみなして、**信頼度の高い方を残す**。同点・取得できない場合は前の Chunk 側を残す（根拠 `similar`） |
+| 7 | 包含でなければ、**類似**（1 − 編集距離 ÷ 長い方の長さ。どちらかが空なら 0）が 0.8 以上なら重複とみなして、**信頼度の高い方を残す**。同点の場合と、どちらか一方でも信頼度を取得できない場合は前の Chunk 側を残す（取得できない値を 0 として比べない。数値で比べるのは両方が取得できたときだけ。根拠 `similar`） |
 | 8 | しきい値に届かない組は、別の発話として両方残す（取りこぼしより、二重に残す方を選ぶ） |
 | 9 | 採用したセグメントを、開始サンプル・連番・番号の順に並べる |
 | 10 | 境界ごとに記録を作る（後ろ側の Chunk の連番、Overlap を行ったか、行わなかった理由、除外した件数）。Overlap を行わなかった境界は、理由を記録して除外 0 件にする（FR-STT-03 ③） |
@@ -1313,9 +1325,12 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     private let ids: any IDGenerator
     private let expirationStream: AsyncStream<Void>
     private let expirationContinuation: AsyncStream<Void>.Continuation
+    /// いまの投入のタスク（currentIdentifier と同じ識別子のものだけを持つ）
     private var task: BGContinuedProcessingTask?
-    /// task が届く前に end(success:) が呼ばれた場合の結果。届いたらすぐにその結果で完了させる
-    private var recordedOutcome: Bool?
+    /// いまの投入の識別子。end(success:) はこの投入にだけ当てる。拒否された・終わった投入では nil
+    private var currentIdentifier: String?
+    /// タスクが届く前に終わった投入の結果（投入の識別子ごと）。届いたタスクには、同じ識別子の結果だけを当てる
+    private var recordedOutcomes: [String: Bool] = [:]
     private var completedUnits: Int64 = 0
     private var totalUnits: Int64 = 0
 
@@ -1348,9 +1363,12 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     func begin(totalUnits: Int) async -> BackgroundGrant {
         self.totalUnits = Int64(totalUnits)
         completedUnits = 0
-        // 前の投入の結果を、この投入のタスクに当てない
-        recordedOutcome = nil
+        // 前の投入のタスクが残っていれば完了させる（この投入の end(success:) で前の投入のタスクを完了させない）
+        task?.setTaskCompleted(success: false)
+        task = nil
         let identifier = "\(identifierPrefix).\(ids.makeUUID().uuidString.lowercased())"
+        // 投入の await の間に届くタスクを照らせるよう、await の前にこの投入の識別子にする
+        currentIdentifier = identifier
         let request = BGContinuedProcessingTaskRequest(
             identifier: identifier, title: Self.title, subtitle: Self.subtitle,
         )
@@ -1360,7 +1378,10 @@ actor ContinuedProcessingExecution: BackgroundExecution {
             try await BGTaskScheduler.shared.submitTaskRequest(request)
             return .granted
         } catch {
-            // 拒否・未対応。前面にいる間だけ進める
+            // 拒否・未対応。この投入のタスクは届かないので、結果を記録する先にしない。前面にいる間だけ進める
+            if currentIdentifier == identifier {
+                currentIdentifier = nil
+            }
             return .refused
         }
     }
@@ -1373,9 +1394,14 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     }
 
     func end(success: Bool) async {
+        guard let identifier = currentIdentifier else {
+            // いまの投入がない（拒否された・もう終わった）。前の投入のタスクに結果を当てない
+            return
+        }
+        currentIdentifier = nil
         guard let attached = task else {
-            // タスクがまだ届いていない（投入の直後に終わった）。届いたら、この結果ですぐに完了させる
-            recordedOutcome = success
+            // タスクがまだ届いていない（投入の直後に終わった）。届いたら、この投入の結果ですぐに完了させる
+            recordedOutcomes[identifier] = success
             return
         }
         attached.setTaskCompleted(success: success)
@@ -1387,10 +1413,14 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     }
 
     private func attach(_ continued: BGContinuedProcessingTask) {
-        if let outcome = recordedOutcome {
-            // 実行はもう終わっている。進行表示を残さないよう、受け取ったタスクをすぐに完了させる
-            recordedOutcome = nil
+        if let outcome = recordedOutcomes.removeValue(forKey: continued.identifier) {
+            // その投入の実行はもう終わっている。進行表示を残さないよう、受け取ったタスクをその投入の結果ですぐに完了させる
             continued.setTaskCompleted(success: outcome)
+            return
+        }
+        guard continued.identifier == currentIdentifier, task == nil else {
+            // いまの投入のものでないタスク（前の投入のもので結果の記録もない）。いまのタスクとして扱わず、すぐに完了させる
+            continued.setTaskCompleted(success: false)
             return
         }
         task = continued
@@ -1420,7 +1450,7 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | システムが打ち切る（`expirations()`） | 実行中のジョブを中止し（`engine.cancel()`。分類 `SYSTEM_EXPIRED`）、完了の処理を待ってから `end(success: false)` を呼ぶ |
 | 前面に戻る | 開始条件を評価し直し、`pending` のジョブがあれば `begin` からやり直す |
 | 実行番号が終わる | `end(success: true)` |
-| タスクが届く前に終わる（投入の直後に実行番号が終わる・打ち切る） | `end(success:)` が結果を記録し、後から届いたタスク（`attach`）をその結果ですぐに完了させる。`begin` のたびに記録を消す（前の投入の結果を次のタスクに当てない） |
+| タスクが届く前に終わる（投入の直後に実行番号が終わる・打ち切る） | `end(success:)` が結果を**投入の識別子ごとに**記録し、後から届いたタスク（`attach`）を、タスクの識別子（`identifier`。投入の要求と同じ値）と同じ投入の結果ですぐに完了させる。いまの投入（`currentIdentifier`）のタスクだけを `task` として持ち、`end(success:)` はいまの投入にだけ当てる。前の投入のタスクが次の投入（B）の `begin` の後に届いても、B のタスクとして扱わず、B の `end` で完了させない（記録があればその結果で、なければ失敗として、届いた時点で完了させる）。拒否された投入は、タスクが届かないので記録しない。届かないまま残る記録は、許可されて届かなかった投入の数だけで、プロセスの終了で消える |
 | アプリが終了した | 次の起動で回収して再開する（§5.4） |
 
 - どの局面でも、Chunk 単位で状態が永続化されているので、失うのは処理中の 1 Chunk 分の計算だけである。
@@ -1473,11 +1503,11 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | 2 | 時刻の変換 | 既知の値で、会議全体のサンプル番号になること。Overlap の中で終わる結果が捨てられること | FR-STT-03 |
 | 3 | ジョブの状態遷移の網羅 | 全状態 × 全事象。§5.1 の表だけが許されること | TST-GEN-06 |
 | 4 | 失敗の分類と回数 | 回数に数えない分類で回数が戻ること。数える分類が上限で `failed` になること | FR-STT-02 |
-| 5 | 再実行の間隔と上限時間 | 2・5・10・30・60 秒と ±20%。入力の 10 倍 | NFR-REL-03 |
+| 5 | 再実行の間隔と上限時間 | 2・5・10・30・60 秒と ±20%。入力の 10 倍。空でない短い入力（1 サンプル・1 秒）が下限の 30 秒になり、0 にならないこと。330 秒の入力の値が変わらないこと。空の入力が 0 | NFR-REL-03 |
 | 6 | 次のジョブの選び方 | 連番の小さい `pending` から。全 Chunk が終わったら統合。実行中があれば待つ | FR-STT-02 |
 | 7 | 開始条件 | §8.1 の表の全行と、上書き。自動開始が無効で始まっていない会議が、`finalized`・`conditionsChanged` のどちらでも `auto_start_disabled` になり、`userRequested` と、始まっている会議の `conditionsChanged` では止まらないこと。停止を確かめていない実行があると、上書きでも `engine_not_stopped` になること | TST-STT-05・06、FR-STT-12 |
 | 8 | 統合（重複の除外） | 境界で 2 回出た発話が 1 回になること。判定の記録。渡す順序を変えても同じ結果 | TST-STT-04 |
-| 9 | 統合の境界値 | 重なり 0.5、類似 0.8、包含の比 0.3 と 0.95、空文字列、正規化 | FR-STT-03 |
+| 9 | 統合の境界値 | 重なり 0.5、類似 0.8、包含の比 0.3 と 0.95、空文字列、正規化。類似の判定で、前の側だけ・後ろの側だけ・両方の信頼度が `nil` のどれでも前の側を残すこと（前の側が `nil` で後ろの側が 0.9 でも前を残す） | FR-STT-03 |
 | 10 | 結果ファイル・失敗の記録・版のファイルの検証 | 番号の不一致・範囲の外・制御文字・形式の版の違いが拒否されること。読めない失敗の記録が `failed` の側で扱われること（基本設計 §4.3 の 2 つの例外を含む） | SEC-INP-03 |
 | 11 | 実行世代の照合（DB） | 古い世代の完了の通知が、試行回数が同じでも捨てられ、行が変わらないこと。2 重の実行開始が 1 つだけ成功すること | TST-GEN-05 |
 | 12 | 二重実行（結合） | 同じジョブを 2 回実行する・結果ファイルの保存の直後に落として再実行する。結果ファイルとセグメントが重複しないこと | TST-STT-03 |
@@ -1490,7 +1520,7 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | 19 | 版の保存（結合） | §6.3 の各段で落として再実行する。公開済みの版が変わらず、記録だけの番号が欠番になること | FR-STT-05 |
 | 20 | 再文字起こしと失敗区間の再試行（結合） | 以前の版が残ること。完成まで以前の版が読めること。失敗区間の再試行で、成功済みの区間の本文が新しい版に残ること。基本設計 §13 の「失敗区間の再試行（ジョブ行がない）」「再試行の実行番号の記録」「統合の失敗」の各行 | TST-STT-09 |
 | 21 | 版のファイルの破損（結合） | 1 バイト書き換える・切り詰める。読み込み時に検出され、その版が使われず、ファイルと記録が変わらないこと。DB を作り直した後も検出されること。記録のない版が `invalid` になること | TST-SEC-11 |
-| 22 | バックグラウンド（結合） | 投入の成功・拒否・打ち切りを差し替えて、ジョブの状態が正しく戻ること。進捗がジョブごとに報告されること。タスクが届く前に `end(success:)` を呼ぶと、後から届いたタスクがその結果ですぐに完了し、次の `begin` の後に届いたタスクには前の結果が当たらないこと | NFR-PWR-03 |
+| 22 | バックグラウンド（結合） | 投入の成功・拒否・打ち切りを差し替えて、ジョブの状態が正しく戻ること。進捗がジョブごとに報告されること。タスクが届く前に `end(success:)` を呼ぶと、後から届いたタスクがその結果ですぐに完了し、次の `begin` の後に届いたタスクには前の結果が当たらないこと。投入 A を終えて投入 B を始めた後に A のタスクが届くと、A の結果で完了し、B のタスクとして持たれず、B の `end` が B のタスクだけを完了させること（A のタスクを二重に完了させない） | NFR-PWR-03 |
 | 23 | エンジンの中止の契約 | `AnalyzerSpeechEngine` の準備の 2 つの `await`（ロケールの問い合わせ・入力の変換）と解析の作成・開始を、試験用の初期化子で差し替えられる関数にする（本番は §3.3 の SDK の呼び出し）。それぞれの `await` で止め、そこで `cancel()` を呼ぶ。`cancel()` が操作の終了の後に戻り、解析が作られず・始まらず（作成と開始の回数が 0）、その後に何も始まらないこと。解析の実行中の `cancel()` では、`cancelAndFinishNow()` の後に戻ること。実行中でなければ直ちに戻ること。前の操作の終了前の `transcribe` が始まらないこと | NFR-PWR-02、TST-STT-06 |
 | 24 | 止まっていない実行（結合） | 差し替えのエンジンの `cancel()` を戻さず、上限（`stopConfirmTimeoutMs`）を時計の注入で過ぎさせる。次の試行も別のジョブも `processing` に入らず、理由が `engine_not_stopped` で、ログ `engine_stop_unconfirmed` が出ること。`cancel()` を戻すと `engine_stop_confirmed` が出て、再開すること | NFR-PWR-02 |
 
@@ -1605,6 +1635,7 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | --- | --- | --- |
 | `AnalyzerSpeechEngine` で、実際に日本語を認識できる | ビルドできることと、可否の判定が動くことだけを Mac 上で確かめた。認識は実行していない（言語アセットの取得は OS の通信を伴うため） | TST-STT-07（実機）。文字起こしの実装の最初に、Mac 上でも確かめる |
 | `SpeechAnalyzer` の利用に、音声認識の利用目的の文言（`NSSpeechRecognitionUsageDescription`）が要るか | SDK の宣言からは判断できない（基本設計 §11 の宿題のまま）。[dev-environment.md](dev-environment.md) §14 は「置かない」としている | TST-STT-07。要る場合は、文言を足して dev-environment.md を同じ作業で直す |
+| 1 件のジョブの上限時間の下限 30 秒（`minimumTimeoutMs`。§5.2）で、短い入力の認識が上限までに終わる | 初期値。エンジンの起動から結果までの固定の時間を測っていない | 文字起こしの実装の最初（Mac・実機）に、1 秒以下の入力で認識の時間を測って見直す |
 | 確定した結果の時刻範囲（`range`）が、入力の先頭から数えた値で返る | SDK の宣言による。確かめていない | TST-STT-07（時刻が音声の範囲の中にあること） |
 | 信頼度の属性が取れる。しきい値 0.4 が妥当 | 取れない場合は `nil` として保存する設計にした | TST-STT-07。実測して見直す |
 | `modelRetention` の `lingering` で、Chunk ごとのモデルの読み込み直しが避けられる | SDK の列挙の名前による。効果は測っていない | 計測値（実時間比）で見る。効果がなければ、解析を会議の実行の間だけ使い回す形に改める |

@@ -167,11 +167,11 @@
 | 順 | 要素 | 内容 |
 | --- | --- | --- |
 | 1 | タイトル | 表示と「編集」。編集は入力欄のシートで行い、`MeetingTitle.sanitized` で検証する。タイトルの表示には、標準のテキスト選択を付けない（§7.3） |
-| 2 | 状態の帯 | 会議の状態と、待っている理由（`TranscriptionWaitReason` の文言。下の表）。文字起こし中は「30 件中 12 件」と進み具合の棒 |
+| 2 | 状態の帯 | 会議の状態と、待っている理由（`TranscriptionWaitReason` の文言。下の表）。文字起こし中は「30 件中 12 件」と進み具合の棒。DB の作り直しで付けた保留（`rebuild_hold`。基本設計 [transcription.md](../02-basic-design/transcription.md) §4.3・§8）のある `transcribing` の会議では、待っている理由より先に、保留の理由「会議の一覧を作り直したため、文字起こしを止めています。続けるには『文字起こしを再開する』を押してください」を出す |
 | 3 | 問題（あれば） | `merge_failed`・`transcript_version_rejected`・`finalization_blocked` などを 3 点で出す |
 | 4 | 文字起こし | セグメントを、会議時刻（`AudioTimeline`）つきで並べる。`LazyVStack`（NFR-PRF-04）。空白区間・利用できなかった区間・文字起こしできなかった区間を、その位置に挟む |
 | 5 | エンジンの情報 | 「音声認識: OS 標準 ／ ja_JP ／ iOS 27.2（27C100）」を常に出す（FR-STT-09） |
-| 6 | 操作 | 「文字起こしを始める」「再文字起こし」「書き出す」「重なりの整理を見る」「削除」 |
+| 6 | 操作 | 「文字起こしを始める」「文字起こしを再開する」「再文字起こし」「書き出す」「重なりの整理を見る」「削除」。3 つの文字起こしの操作は別の操作として示す（下の「文字起こしの操作の区別」） |
 
 | 待っている理由 | 文言 | 添える操作 |
 | --- | --- | --- |
@@ -192,6 +192,7 @@
 | 空白区間（`gaps`） | 「録音が中断していました（約 2 分）」と理由（「着信などの割り込み」「マイクの切り替え」「処理が追いつかなかった」）。長さが分からない場合は「長さは不明」（FR-TRV-03） |
 | 利用できなかった区間（`unavailableChunks`） | 「この区間の録音は使えません（保存時と内容が一致しません）」など、ファイルの状態ごとの文 |
 
+- **文字起こしの操作の区別**（基本設計 §4.4 の SC-05 の操作）: 「文字起こしを始める」は、一度も文字起こししていない `finalized` の会議から最初の実行を始める。「文字起こしを再開する」は、作り直しの保留（`rebuild_hold`）のある `transcribing` の会議**だけ**に出し、押すと保留を外し、同じ実行番号の不足したジョブを作ってから（基本設計 [transcription.md](../02-basic-design/transcription.md) §4.3）、開始条件（[transcription.md](transcription.md) §8.1）を評価して続きを実行する。新しい実行番号を作らず、新しい版も作らない。「再文字起こし」は、既存の版から新しい実行を作り、新しい版を作る。保留のない会議には「文字起こしを再開する」を出さない
 - **再生**（FR-TRV-01）: セグメントの開始サンプル s から、`開始サンプル ≤ s < 開始サンプル + サンプル数` を満たす Chunk を選び、その中の `(s − 開始サンプル) ÷ 16,000` 秒の位置から再生する。Chunk の終わりで、次の連番の Chunk を続けて再生する（欠けていれば止める）。再生の前に、Chunk を検証つきで読む（[storage.md](storage.md) §6.1）。録音中は再生できない（ボタンを無効にする）。
 - **言語アセットの取得**（FR-STT-07）: 「モデルを取得する」を押すと、「OS が音声認識モデルをダウンロードします。会議データは送信されません」と「ダウンロードする」「やめる」を出す。「ダウンロードする」でだけ `SpeechEngine.installAssets` を呼び、進み具合を出す（[transcription.md](transcription.md) §3.2）。
 - **重なりの整理を見る**（FR-STT-03）: 版のファイルの `boundaries` と `excluded` を一覧にする。境界ごとに「重なりの整理: 1 件を除外」「重なりなし（前の録音データが欠けているため）」などと出し、除外したセグメントの本文と、残したセグメントを並べる。
@@ -283,7 +284,7 @@ public protocol SummaryModelAvailabilityProviding: Sendable {
 | 書きかけを救済した | 「保存の途中だった録音 N 件を復元しました」 |
 | 書きかけを隔離した | 問題 `part_files_quarantined` の 3 点 |
 | 位置の分からない録音を登録した（ハッシュの記録がない・読めない WAV。[storage.md](storage.md) §9 の照合 d） | 「位置の分からない録音 N 件があります。この会議は欠けた部分を承知のうえで確定できます」と「確認する」 |
-| DB を作り直した | 問題 `database_rebuilt` の 3 点 |
+| DB を作り直した | 復旧の結果の、作り直しの照合でハッシュが合わなかった Chunk の数と、ハッシュの記録を読めなかった Chunk の数（[storage.md](storage.md) §9）が**どちらも 0 のときだけ**、問題 `database_rebuilt`（「録音は無事です」）の 3 点。どちらかが 1 以上なら、「録音は無事」を出さず、問題 `database_rebuilt_damaged` の 3 点（N は 2 つの数の和） |
 | 削除の続きを行った | 表示しない（利用者が求めた削除の完了である） |
 
 「確認する」は確定待ち（SC-06）へ、「閉じる」は一覧へ進む。
@@ -463,10 +464,11 @@ public struct ProblemPresentation: Equatable, Sendable {
     public static func severity(of kind: ProblemKind) -> ProblemSeverity {
         switch kind {
         case .recordingInterrupted, .inputLost, .chunkUnsaved, .storageExhausted, .storageCritical: .critical
+        case .microphoneCloseUnconfirmed: .critical
         case .microphoneDenied, .recordingStartFailed, .audioDropped, .storageLow, .finalizationBlocked: .warning
         case .unreadableMeeting, .partFilesQuarantined, .transcriptionSegmentFailed, .mergeFailed: .warning
         case .transcriptVersionRejected, .exportInsufficientSpace, .exportIntegrityWarning: .warning
-        case .exportFailed, .deletionIncomplete, .engineUnavailable: .warning
+        case .exportFailed, .deletionIncomplete, .engineUnavailable, .databaseRebuiltDamaged: .warning
         case .alreadyRecording, .recoveredAfterTermination, .databaseRebuilt, .transcriptionDeferred: .notice
         case .exportUnavailable, .notificationsDenied: .notice
         }
@@ -474,9 +476,9 @@ public struct ProblemPresentation: Equatable, Sendable {
 }
 ```
 
-- 問題は、種類（`ProblemKind`。27 種。[architecture.md](architecture.md) §8.2）と、差し込む数（あれば）だけで表す。**文字列を差し込めない**ので、エラーの説明文・パス・本文が画面に出る経路がない。
+- 問題は、種類（`ProblemKind`。28 種。[architecture.md](architecture.md) §8.2）と、差し込む数（あれば）だけで表す。**文字列を差し込めない**ので、エラーの説明文・パス・本文が画面に出る経路がない。
 - 3 点の文言は、種類ごとに String Catalog に 1 組だけ置く（鍵は `problem.{種類}.what`・`.safety`・`.action`）。画面ごとに文を組み立てない。
-- 重大度は 3 段階で、色・アイコン・文字（「お知らせ」「警告」「重要」）の 3 つで示す。録音が止まっている・失われうる状態（5 種）は最上位にする。
+- 重大度は 3 段階で、色・アイコン・文字（「お知らせ」「警告」「重要」）の 3 つで示す。録音が止まっている・失われうる状態（6 種）は最上位にする。
 - `severity(of:)` は `default` を書かない。問題の種類を足すと、重大度を決めるまでビルドが通らない。String Catalog に 3 つの鍵が揃っていることは、単体テストで確かめる（§11.1）。
 
 文言（初版。N は差し込む数）:
@@ -498,7 +500,8 @@ public struct ProblemPresentation: Equatable, Sendable {
 | `unreadable_meeting` | 警告 | この会議の情報を読み込めません | 録音のファイルは、削除されずに残っています | 操作は不要です。不要であれば、この会議を削除できます |
 | `recovered_after_termination` | お知らせ | 前回、録音の途中でアプリが終了しました | 保存済みの録音は無事です。終了の直前の録音は、失われた可能性があります | 会議を開いて、内容を確かめてください |
 | `part_files_quarantined` | 警告 | 録音の一部（N 件）を復元できませんでした | 復元できなかった分は、文字起こしに使えません。ファイルは削除せずに残しています | 会議を開いて、欠けた部分を確かめてください |
-| `database_rebuilt` | お知らせ | 会議の一覧を作り直しました | 録音は無事です。録音のファイルから一覧を復元しました | 操作は不要です。文字起こしの途中だった会議は、もう一度始めてください |
+| `database_rebuilt` | お知らせ | 会議の一覧を作り直しました | 録音は無事です。録音のファイルから一覧を復元しました | 操作は不要です。文字起こしの途中だった会議は、会議を開いて「文字起こしを再開する」を押してください |
+| `database_rebuilt_damaged` | 警告 | 会議の一覧を作り直しました | 作り直しで、保存時と内容が一致しない録音か、確かめられない録音（合わせて N 件）が見つかりました。残りの録音は無事です | 会議を開いて、使えない部分を確かめてください。文字起こしの途中だった会議は、「文字起こしを再開する」を押してください |
 | `engine_unavailable` | 警告 | いま、文字起こしを使えません | 録音は無事です。録音と書き出しは使えます | 「設定」で対応状況を確かめてください |
 | `transcription_deferred` | お知らせ | 文字起こしを一時的に見合わせています | 録音は無事です | 条件が戻ると自動で再開します。すぐに実行することもできます |
 | `transcription_segment_failed` | 警告 | 一部の区間（N か所）を文字起こしできませんでした | 録音は無事です。ほかの区間の文字起こしは表示しています | その区間の「再試行」を押してください |
@@ -852,7 +855,7 @@ nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
 
 | 順 | テスト | 確かめること | 要件 |
 | --- | --- | --- | --- |
-| 1 | 問題の網羅 | 27 種のすべてが、重大度と 3 つの鍵を持つ。String Catalog に 81 の鍵がすべてあり、空でない | NFR-UX-04 |
+| 1 | 問題の網羅 | 28 種のすべてが、重大度と 3 つの鍵を持つ。String Catalog に 84 の鍵がすべてあり、空でない。`microphone_close_unconfirmed` が最上位になる | NFR-UX-04 |
 | 2 | 経過時間 | スナップショットの値から式どおりになる。中断中に変わらない。書式（`0:05`・`1:02:03`） | FR-REC-06 |
 | 3 | ロック画面の値 | 状態の写像。録音していない状態では `nil`。値の型に文字列がない | SEC-PLT-07 |
 | 4 | タイトルの検証 | 改行・制御文字の除去、100 文字、空白だけ | TST-SEC-06 |
@@ -862,7 +865,7 @@ nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
 | 8 | 録音中の Store | 値を流して表示の値を確かめる。古い世代の値が捨てられる。最上位の問題が、重大度の高い順で選ばれる | TST-GEN-05 |
 | 9 | 同意確認の Store | 主ボタンの処理でだけ、同意確認の値が作られる。段階 2 では、承知のスイッチがないと開始できない | FR-CNS-01 |
 | 10 | 確定待ちの Store | 理由の一覧と、失われる範囲の表示。例外確定は、確認の後にだけ要求される | FR-FIN-02 |
-| 11 | 詳細の Store | 版の内容から、セグメント・空白区間・失敗区間・利用できなかった区間が、時刻順に並ぶ。使えない版では、以前の版が出る | FR-TRV-02・03 |
+| 11 | 詳細の Store | 版の内容から、セグメント・空白区間・失敗区間・利用できなかった区間が、時刻順に並ぶ。使えない版では、以前の版が出る。作り直しの保留のある `transcribing` の会議だけに「文字起こしを再開する」が出て、状態の帯が保留の理由を示す（保留のない `transcribing`・`finalized` の会議には出ない） | FR-TRV-02・03 |
 | 12 | 再生の位置 | セグメントの開始サンプルから、Chunk と位置が求まる。Chunk をまたぐ場合 | FR-TRV-01 |
 | 13 | UI テスト: 同意と開始 | 確認しないと録音が始まらない。設定に省略の項目がない | FR-CNS-01 |
 | 14 | UI テスト: 権限 | 権限が拒否のとき、案内と「設定を開く」が出る | TST-INT-06 |
@@ -963,7 +966,7 @@ UI テストは、差し替えた構成でアプリを起動する（[architectu
 | --- | --- | --- |
 | 各画面の配置・文言・用語の言い換え表 | SC-01〜SC-06・SC-08〜SC-11 の配置と文言を定めた（SC-07 は export.md）。内部の用語 16 個の言い換えを定めた | §3・§4 |
 | Store ごとの状態の型と、サービスから受け取る値の型 | 9 つの Store と状態の型。録音中は `RecordingSnapshot` と `RecordingStore`。古い応答は世代番号で捨てる | §5 |
-| 問題の種類の一覧と 3 点の文言 | 27 種の重大度と、3 点の文言（初版）。鍵は `problem.{種類}.{what・safety・action}` | §6 |
+| 問題の種類の一覧と 3 点の文言 | 28 種の重大度と、3 点の文言（初版）。鍵は `problem.{種類}.{what・safety・action}` | §6 |
 | 覆いを出す条件（アプリの状態のどの変化で出すか）と、キーボードの拒否の実装 | 覆いは、シーンが前面で操作中でなくなる通知で、専用のウィンドウを出す。キーボードは、アプリのデリゲートが `.keyboard` の拡張機能だけを拒否する | §7.1・§7.2 |
 | Live Activity の状態の型と更新の頻度。停止の確認の方法（確認か長押しか） | 型は `LockScreenContent`（状態と経過時間）。更新は、状態の変化では直ちに、録音中は累積サンプル数が 30 秒分進むたび（Chunk の確定・保存の成否によらない）、中断中は注入した `Scheduler` で 30 秒ごと。古くなる時刻は最後の更新の 90 秒後。停止は確認のダイアログ | §4.3・§8 |
 | Apple Intelligence の可否を OS に問い合わせる手段（SDK で確かめ、確認日と出典を添える）と、可否の 3 状態への対応づけ | FoundationModels の `SystemLanguageModel.default.availability` を `SummaryModelAvailabilityProviding` の背後で読む（iOS 27.2 SDK の宣言で確認。2026-11-27）。`.available` → 対応、`.unavailable(.deviceNotEligible)` → 非対応、`.unavailable(.appleIntelligenceNotEnabled)`・`.unavailable(.modelNotReady)`・未知の理由 → 無効 | §4.6 |
