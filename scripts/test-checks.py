@@ -6878,8 +6878,13 @@ OK_GITIGNORE = "\n".join([
 
 
 def tracked_case(label: str, want_code: int, want_text: str, ignore: Optional[str] = OK_GITIGNORE,
-                 files: Optional[Dict[str, str]] = None, repository: bool = True) -> None:
-    """一時ディレクトリに Git のリポジトリを作り、.gitignore を越えて（--force）ファイルをインデックスに入れてから検査する。"""
+                 files: Optional[Dict[str, str]] = None, repository: bool = True,
+                 after_add: Optional[Callable[[Path], None]] = None,
+                 extra_env: Optional[Callable[[Path], Dict[str, str]]] = None) -> None:
+    """一時ディレクトリに Git のリポジトリを作り、.gitignore を越えて（--force）ファイルをインデックスに入れてから検査する。
+    after_add はインデックスに入れた後に作業ツリー・インデックスを変える。extra_env は検査の実行にだけ足す変数を返す。
+    準備と検査は、開発者の設定とリポジトリを指す変数を引き継がない 1 つの環境（isolated_git_env）で行う。"""
+    env = isolated_git_env()
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         contents = {"Sources/App.swift": "let a = 1\n"}
@@ -6890,9 +6895,44 @@ def tracked_case(label: str, want_code: int, want_text: str, ignore: Optional[st
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_text(content, encoding="utf-8")
         if repository:
-            subprocess.run(["git", "init", "--quiet", directory], check=True, capture_output=True)
-            subprocess.run(["git", "-C", directory, "add", "--force", "--all"], check=True, capture_output=True)
-        expect(f"tracked: {label}", [str(SCRIPTS / "check-tracked-files.py"), "--root", directory], want_code, want_text)
+            subprocess.run(["git", "init", "--quiet", directory], check=True, capture_output=True, env=env)
+            subprocess.run(["git", "-C", directory, "add", "--force", "--all"], check=True, capture_output=True, env=env)
+        if after_add is not None:
+            after_add(root)
+        run_env = dict(env)
+        if extra_env is not None:
+            run_env.update(extra_env(root))
+        expect(f"tracked: {label}", [str(SCRIPTS / "check-tracked-files.py"), "--root", directory], want_code, want_text,
+               env=run_env)
+
+
+def tracked_git(root: Path, *arguments: str) -> None:
+    """tracked_case の after_add の中で、同じ隔離した環境で git を実行する。"""
+    subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, env=isolated_git_env())
+
+
+def tracked_other_repository(root: Path) -> Dict[str, str]:
+    """検査するリポジトリと別の、違反を持つリポジトリを GIT_DIR・GIT_WORK_TREE で指す（検査はこれを読まずに --root を読む）。"""
+    other = root.parent / f"{root.name}-other"
+    other.mkdir()
+    (other / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    (other / "leak.wav").write_text("RIFF", encoding="utf-8")
+    env = isolated_git_env()
+    subprocess.run(["git", "init", "--quiet", str(other)], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(other), "add", "--force", "--all"], check=True, capture_output=True, env=env)
+    return {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other), "GIT_COMMON_DIR": str(other / ".git"),
+            "GIT_OBJECT_DIRECTORY": str(other / ".git" / "objects")}
+
+
+def tracked_alternate_index(root: Path) -> Dict[str, str]:
+    """別のインデックス（録音データを入れたもの）を GIT_INDEX_FILE で渡す。検査はこの変数を外さずに使う。"""
+    index = root / ".git" / "alternate-index"
+    env = isolated_git_env()
+    env["GIT_INDEX_FILE"] = str(index)
+    (root / "staged.wav").write_text("RIFF", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "read-tree", "--empty"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(root), "add", "--force", "--all"], check=True, capture_output=True, env=env)
+    return {"GIT_INDEX_FILE": str(index)}
 
 
 def test_tracked() -> None:
@@ -6920,6 +6960,24 @@ def test_tracked() -> None:
     tracked_case("追跡されている .env.local", 1, ".env.local", files={".env.local": "TOKEN=x\n"})
     tracked_case("追跡されている個人の設定", 1, "xcuserdata", files={"App.xcodeproj/xcuserdata/me/state.plist": "x"})
     tracked_case("Git の管理下でない場所は合格にしない", 2, "読めない", repository=False)
+    # .gitignore の規則は、インデックスの内容で判定する（作業ツリーだけの変更で合否を変えない）
+    tracked_case("作業ツリーだけで必須の行を消しても、インデックスの内容で通る", 0, "OK",
+                 after_add=lambda root: (root / ".gitignore").write_text(replaced(OK_GITIGNORE, "*.wav\n", ""), encoding="utf-8"))
+    tracked_case("インデックスに必須の行がなければ、作業ツリーで直しても失敗する", 1, "*.wav の行がない",
+                 ignore=replaced(OK_GITIGNORE, "*.wav\n", ""),
+                 after_add=lambda root: (root / ".gitignore").write_text(OK_GITIGNORE, encoding="utf-8"))
+    tracked_case("ステージした入れ子の取り消しは、作業ツリーで直しても失敗する", 1, "Tests/.gitignore",
+                 files={"Tests/.gitignore": "!*.wav\n"},
+                 after_add=lambda root: (root / "Tests/.gitignore").write_text("*.tmp\n", encoding="utf-8"))
+    tracked_case("作業ツリーから消した入れ子の .gitignore も、インデックスの内容で判定する", 1, "Tests/.gitignore",
+                 files={"Tests/.gitignore": "!*.wav\n"}, after_add=lambda root: (root / "Tests/.gitignore").unlink())
+    tracked_case("追跡していない入れ子の .gitignore の取り消しは、作業ツリーの内容で判定する", 1, "Docs/.gitignore",
+                 after_add=lambda root: ((root / "Docs").mkdir(), (root / "Docs/.gitignore").write_text("!*.zip\n", encoding="utf-8")))
+    tracked_case("インデックスにない .gitignore は合格にしない", 1, "インデックスにない",
+                 after_add=lambda root: tracked_git(root, "rm", "--cached", "--quiet", ".gitignore"))
+    # リポジトリの場所を指す変数は外し、GIT_INDEX_FILE は残す
+    tracked_case("外から引き継いだ GIT_DIR などで別のリポジトリを読まない", 0, "OK", extra_env=tracked_other_repository)
+    tracked_case("GIT_INDEX_FILE で渡したインデックスを検査する", 1, "staged.wav", extra_env=tracked_alternate_index)
 
 
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）
@@ -8088,7 +8146,8 @@ def run_docs_cases() -> None:
         ("エスケープした括弧を文に含むリンク", "[例\\]続き](missing.md)", "missing.md"),
         ("画像を含むリンク", "[![図](../README.md)](missing.md)", "missing.md"),
         ("行をまたぐリンクの文", "[例\n続き](missing.md)", "missing.md"),
-        # 引用の中でも、印を除いた本文で段落の続きを読む。空の引用の行・引用の終わり・深さの変化では段落を切る
+        # 引用の中でも、印を除いた本文で段落の続きを読む。空の引用の行・空行での引用の終わり・深くなる変化では段落を切る。
+        # 浅くなる行（「>」が減る・なくなる）は、段落の途中なら怠惰な続きの行（CommonMark）で、段落を切らない
         ("引用の行をまたぐリンクの文", "> [例\n> 続き](missing.md)", "missing.md"),
         ("入れ子の引用の行をまたぐリンクの文", "> > [例\n> > 続き](missing.md)", "missing.md"),
         ("引用の行をまたぐ、あるリンク先", "> [例\n> 続き](../README.md)", ""),
@@ -8096,6 +8155,9 @@ def run_docs_cases() -> None:
         ("引用の終わりをまたぐ括弧", "> [例\n\n続き](missing.md)", ""),
         ("引用の深さが変わる括弧", "> [例\n> > 続き](missing.md)", ""),
         ("引用の中の 1 行のリンク", "> 前の行\n> [例](missing.md)", "missing.md"),
+        ("引用の怠惰な続きの行をまたぐリンクの文", "> [例\n続き](missing.md)", "missing.md"),
+        ("入れ子の引用の浅くなる続きの行をまたぐリンクの文", "> > [例\n> 続き](missing.md)", "missing.md"),
+        ("怠惰な続きの行をまたぐ、あるリンク先", "> [例\n続き](../README.md)", ""),
         # リンクの中にリンクは入らない。内側がリンクになれば、外側の「[」は文字のまま表示される。画像の外側は無効にしない
         ("入れ子のリンクの外側", "[外 [内](../README.md)](missing.md)", ""),
         ("入れ子のリンクの内側", "[外 [内](missing.md)](../README.md)", "missing.md"),

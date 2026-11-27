@@ -1196,13 +1196,14 @@ class Checker:
             code = IndentedCode()
             for number, line in prose_lines(text):
                 # 引用の行は、印を除いた本文で段落の続きを判定する（「> [例」「> 続き](x.md)」を 1 つの段落として読む）。
-                # 印だけの行（空の引用の行）は段落を切り、引用の深さが変わる（引用が終わる・入れ子に入る）と段落を切る
+                # 印だけの行（空の引用の行）は段落を切り、引用が深くなる（入れ子に入る）と段落を切る。浅くなる行（「>」が減る・
+                # なくなる）は、段落の途中なら怠惰な続きの行で、同じ段落の続きとして読む（CommonMark。「> [例」「続き](x.md)」）
                 quote = QUOTE_PREFIX.match(line)
                 depth = quote.group(0).count(">") if quote else 0
                 body = line[quote.end():] if quote else line
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
                 starts = (number != previous + 1 or not body.strip() or BLOCK_START.match(body) is not None or not continued
-                          or depth != previous_depth)
+                          or depth > previous_depth)
                 previous_depth = depth
                 if number != previous + 1:
                     code.interrupt()

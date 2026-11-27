@@ -6,11 +6,18 @@
 3. インデックス（追跡しているファイルと、ステージしたファイル）に、必須の行が除外する対象のファイルがない
    （git add --force は .gitignore を越えるので、インデックスの側も調べる）
 
+1・2 は、インデックスにある .gitignore の内容で判定する（作業ツリーの内容ではない。コミット前の検査で、ステージしていない
+.gitignore の変更に合格を左右させない）。追跡していない入れ子の .gitignore は、インデックスに内容がないが git add の対象を
+変えうるので、2 だけを作業ツリーの内容で判定する。
+git の環境のうち、別のリポジトリを指しうる変数（GIT_DIR など）は外す。GIT_INDEX_FILE は残す（部分的なコミットのフックと
+check.sh --staged が、検査するインデックスをこの変数で渡すため）。
+
 使い方: scripts/check-tracked-files.py [--root <リポジトリ>]
 終了コード: 0 = 問題なし / 1 = 違反あり / 2 = 読めない（読めないものを合格にしない）
 """
 import argparse
 import fnmatch
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,26 +44,57 @@ REQUIRED_IGNORE_LINES: Dict[str, str] = {
 }
 
 
+# 外から引き継いだ場合に、--root と別のリポジトリ・オブジェクトの置き場所を git に選ばせる変数（setup.sh と同じ考え方）。
+# GIT_INDEX_FILE は外さない（検査するインデックスを呼び出し側が渡すため）
+REPOSITORY_LOCATION_VARIABLES = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+
+
 class Unreadable(Exception):
     """Git の管理下でない・コマンドが失敗したなど、検査そのものができない。"""
 
 
-def git_paths(root: Path, *arguments: str) -> List[str]:
-    """git ls-files の結果を返す。区切りは NUL（空白・日本語を含む名前をそのまま受け取るため）。"""
-    result = subprocess.run(["git", "-C", str(root), "ls-files", "-z", *arguments], capture_output=True)
+def git_env() -> Dict[str, str]:
+    """リポジトリの場所を指す変数を除いた環境。git には --root からリポジトリを探させる。"""
+    return {key: value for key, value in os.environ.items() if key not in REPOSITORY_LOCATION_VARIABLES}
+
+
+def git(root: Path, *arguments: str) -> bytes:
+    result = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, env=git_env())
     if result.returncode != 0:
         raise Unreadable(result.stderr.decode("utf-8", "replace").strip())
-    return [name for name in result.stdout.decode("utf-8", "surrogateescape").split("\0") if name]
+    return result.stdout
 
 
-def ignore_lines(path: Path) -> List[str]:
+def git_paths(root: Path, *arguments: str) -> List[str]:
+    """git ls-files の結果を返す。区切りは NUL（空白・日本語を含む名前をそのまま受け取るため）。"""
+    output = git(root, "ls-files", "-z", *arguments)
+    return [name for name in output.decode("utf-8", "surrogateescape").split("\0") if name]
+
+
+def meaningful_lines(text: str) -> List[str]:
     """コメントと空行を除いた行を返す。"""
+    lines = [line.rstrip() for line in text.splitlines()]
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def indexed_lines(root: Path, name: str) -> List[str]:
+    """インデックスにある内容（ステージした内容）の行。cat-file はフィルタ（textconv など）を通さない blob のバイト列を返す。"""
+    try:
+        text = git(root, "cat-file", "blob", f":{name}").decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Unreadable(f"{name}（インデックス）: {error}") from error
+    return meaningful_lines(text)
+
+
+def working_lines(path: Path) -> List[str]:
+    """作業ツリーのファイルの行（追跡していない .gitignore だけに使う）。"""
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
         raise Unreadable(f"{path}: {error}") from error
-    lines = [line.rstrip() for line in text.splitlines()]
-    return [line for line in lines if line and not line.startswith("#")]
+    return meaningful_lines(text)
 
 
 def excluded_by(name: str) -> str:
@@ -77,19 +115,25 @@ def excluded_by(name: str) -> str:
 def check(root: Path) -> List[str]:
     errors: List[str] = []
     tracked = git_paths(root, "--cached")
-    top = root / ".gitignore"
-    if not top.is_file():
-        errors.append("[SEC-SUP-04] .gitignore がない")
+    patterns = ("--", ".gitignore", ":(glob)**/.gitignore")
+    indexed = sorted(set(git_paths(root, "--cached", *patterns)))
+    if ".gitignore" not in indexed:
+        if (root / ".gitignore").is_file():
+            errors.append("[SEC-SUP-04] .gitignore がインデックスにない（追跡していない .gitignore はコミットに入らない。git add .gitignore）")
+        else:
+            errors.append("[SEC-SUP-04] .gitignore がない")
     else:
-        present = set(ignore_lines(top))
+        present = set(indexed_lines(root, ".gitignore"))
         for pattern, reason in REQUIRED_IGNORE_LINES.items():
             if pattern not in present:
-                errors.append(f"[SEC-SUP-04] .gitignore に {pattern} の行がない（{reason}）")
-    nested = git_paths(root, "--cached", "--others", "--exclude-standard", "--", ".gitignore", ":(glob)**/.gitignore")
-    for name in sorted(set(nested)):
-        if not (root / name).is_file():
-            continue  # インデックスにだけあり、作業ツリーから消したもの
-        for line in ignore_lines(root / name):
+                errors.append(f"[SEC-SUP-04] .gitignore に {pattern} の行がない（{reason}。インデックスの内容で判定）")
+    # 取り消しの行: 追跡している .gitignore はインデックスの内容（作業ツリーから消したものも含む）、
+    # 追跡していない .gitignore は作業ツリーの内容で判定する
+    untracked = sorted(set(git_paths(root, "--others", "--exclude-standard", *patterns)) - set(indexed))
+    sources = [(name, indexed_lines(root, name)) for name in indexed]
+    sources += [(name, working_lines(root / name)) for name in untracked if (root / name).is_file()]
+    for name, lines in sources:
+        for line in lines:
             if line.startswith("!"):
                 errors.append(f"[SEC-SUP-04] {name}: 除外を取り消す行（{line}）を置かない")
     for name in tracked:
