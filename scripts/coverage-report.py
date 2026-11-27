@@ -66,8 +66,11 @@ def main() -> int:
         parser.error(f"--measured-sources が絶対パスでない: {arguments.measured_sources}")
     sources = arguments.measured_sources if arguments.measured_sources is not None else os.path.realpath(arguments.sources)
     try:
-        files = json.loads(arguments.report.read_text(encoding="utf-8"),
-                           object_pairs_hook=reject_duplicate_keys)["data"][0]["files"]
+        data = json.loads(arguments.report.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)["data"]
+        # swift test の記録は 1 つの塊だけを持つ。複数の塊は、どれを集計するか決まらないので読めないものとする（先頭だけを数えない）
+        if not isinstance(data, list) or len(data) != 1:
+            raise ValueError(f"data の塊がちょうど 1 つでない（{len(data) if isinstance(data, list) else type(data).__name__}）")
+        files = data[0]["files"]
         # 数える対象かは、記録したパスで決める（現在のファイルシステムのシンボリックリンクをたどらない）。swift test の記録は
         # Package の起点を実体のパスに解決し、起点の中のパスはそのまま書く（2026-11-22 に一時的に置いた Package で、/tmp を
         # 経由して指定しても /private/tmp の起点になり、Sources の中のシンボリックリンクのファイルはリンクのパスのまま記録される

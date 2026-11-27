@@ -93,6 +93,8 @@ PRIVACY_ACCESSED_API_REASONS: Dict[str, Tuple[str, ...]] = {
 
 # SDK の版つきの名前（iphoneos27.2 など）。条件 [sdk=…] はこの名前と照合する。取得できなければ None
 _SDK_NAMES: Dict[str, Optional[str]] = {}
+# SDK の版の問い合わせ（xcrun）を待つ上限（秒）。応答しない xcrun で検査を止めない。過ぎたら版を取得できないものとする
+SDK_QUERY_TIMEOUT = 30
 
 
 def sdk_name(sdk: str) -> Optional[str]:
@@ -102,10 +104,10 @@ def sdk_name(sdk: str) -> Optional[str]:
         env.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
         try:
             result = subprocess.run(["xcrun", "--sdk", sdk, "--show-sdk-version"], env=env,
-                                    capture_output=True, text=True, check=True)
+                                    capture_output=True, text=True, check=True, timeout=SDK_QUERY_TIMEOUT)
             version = result.stdout.strip()
             _SDK_NAMES[sdk] = f"{sdk}{version}" if re.fullmatch(r"\d+(\.\d+)*", version) else None
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             _SDK_NAMES[sdk] = None
     return _SDK_NAMES[sdk]
 

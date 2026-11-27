@@ -41,6 +41,9 @@ fi
 # check.sh 自身もステージしたものを書き出して実行する（ステージしていない作業ツリーの変更で検査を変えない）。--root で元の
 # リポジトリを示すので、Git の操作・GIT_INDEX_FILE・.tools は元のリポジトリのまま。check.sh が呼ぶほかのスクリプト
 # （worktree-location.py・setup-tools.sh・test-lint-rules.py・verify-docs.py）は、check.sh がステージした内容から書き出して使う
+# この検査が確かめるのは、検査の時点でインデックスから読んだ内容だけである。フックの後に Git が作るコミットのツリーが
+# それと同じ内容であることまでは保証しない（検査中・検査の後にインデックスが変わりうる）。送信するコミットが検査に通るかは、
+# 送信するコミットを固定して検査するプッシュ前のフック（.githooks/pre-push）の結果で判断する（ここで比べ直す処理は足さない）
 check=$(mktemp)
 trap 'status=$?; rm -f -- "$versions" "$setup" "$check" || true; exit "$status"' EXIT
 if ! git cat-file blob :scripts/check.sh > "$check"; then

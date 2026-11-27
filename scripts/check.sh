@@ -500,6 +500,12 @@ step_2() {
     esac
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
+    # 実行する試験のスクリプトは、書き出した場所の中の通常の実行できるファイルであること（手順 10 の verify-docs.py と同じ）。
+    # ステージした scripts かその中の test-lint-rules.py がシンボリックリンクなら、書き出した場所の外を実行しうる
+    if [ -L "$STAGED_TREE/scripts" ] || [ -L "$STAGED_TREE/scripts/test-lint-rules.py" ] \
+      || [ ! -f "$STAGED_TREE/scripts/test-lint-rules.py" ] || [ ! -x "$STAGED_TREE/scripts/test-lint-rules.py" ]; then
+      fail "ステージした scripts/test-lint-rules.py が通常の実行できるファイルでない（シンボリックリンク・実行権限なしなど）"
+    fi
     (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \
       "$STAGED_TREE/scripts/test-lint-rules.py" --staged)
     return 0

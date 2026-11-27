@@ -735,6 +735,8 @@ def is_separator(line: str) -> bool:
 # 新しいブロックの始まりの行（引用・ATX の見出し・箇条書き・番号付きの箇条書き。字下げは空白 0〜3 個）。
 # GFM では表はこれらのブロックの始まりで終わるので、「|」を含んでいても表の行にしない
 BLOCK_START = re.compile(r"^ {0,3}(?:>|#{1,6}(?:\s|$)|[-+*]\s|\d{1,9}[.)]\s)")
+# 引用の印（入れ子を含む）。段落の続きは、印を除いた本文で判定する
+QUOTE_PREFIX = re.compile(r"^(?: {0,3}>[ \t]?)+")
 
 
 # 表を終わらせる行（空行・新しいブロックの始まり・HTML のコメントの始まり・区切りの線）。GFM と同じく、表は
@@ -1190,10 +1192,18 @@ class Checker:
             entries: List[Tuple[int, str, bool]] = []
             previous = 0  # 前の行の番号
             continued = False  # 前の行が段落の途中で、次の行に続きうる
+            previous_depth = 0  # 前の行の引用の深さ（「>」の数）
             code = IndentedCode()
             for number, line in prose_lines(text):
+                # 引用の行は、印を除いた本文で段落の続きを判定する（「> [例」「> 続き](x.md)」を 1 つの段落として読む）。
+                # 印だけの行（空の引用の行）は段落を切り、引用の深さが変わる（引用が終わる・入れ子に入る）と段落を切る
+                quote = QUOTE_PREFIX.match(line)
+                depth = quote.group(0).count(">") if quote else 0
+                body = line[quote.end():] if quote else line
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
-                starts = number != previous + 1 or not line.strip() or BLOCK_START.match(line) is not None or not continued
+                starts = (number != previous + 1 or not body.strip() or BLOCK_START.match(body) is not None or not continued
+                          or depth != previous_depth)
+                previous_depth = depth
                 if number != previous + 1:
                     code.interrupt()
                 previous = number
@@ -1216,8 +1226,9 @@ class Checker:
                     code.interrupt()
                     continue
                 # 見出し・区切りの線・表の行は 1 行で終わり、次の行に続かない
-                alone = PARAGRAPH_END.match(line) is not None or number in rows or is_separator(line) or not line.strip()
+                alone = PARAGRAPH_END.match(body) is not None or number in rows or is_separator(body) or not body.strip()
                 continued = not alone
+                line = body  # 引用の印はリンクの文の一部ではない
                 # インラインのコードの中はリンクとして確かめない。消さずに同じ長さの空白に置き換え、前後の文字がつながって
                 # リンクに見えないようにする（「[a]`x`(b.md)」を「[a](b.md)」にしない）
                 line = CODE_SPAN.sub(lambda span: " " * len(span.group(0)), line)

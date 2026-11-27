@@ -144,11 +144,22 @@ def check(requested: str, source: str) -> int:
     # どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら認めない（大文字小文字を区別しないボリュームで
     # 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）
     roots: Dict[Tuple[int, int], str] = {}
+    missing: List[str] = []  # 登録だけが残り、ディレクトリのない作業ツリー（解決した登録のパス）
     listed_first = registered_worktrees(source)
     for path in [source] + [os.fsdecode(listed) for listed in listed_first]:
         found_identity = identity(path, registered=True)
-        if found_identity is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
+        if found_identity is not None:
             roots[found_identity] = path
+        else:
+            missing.append(path)
+    # ディレクトリのない作業ツリーは同一性で比べられない。置き場所を作るとその登録のパスの中にディレクトリができるので、
+    # 作る前に、解決した登録のパスと置き場所（自身を含む祖先）を文字列で比べて認めない（作った後の判定に任せない）
+    for path in missing:
+        registered_path = os.path.realpath(path)
+        if base == registered_path or base.startswith(registered_path.rstrip(os.sep) + os.sep):
+            print(f"NG: 専用の作業ツリーの置き場所（{base}）が作業ツリー（{path}。ディレクトリがない）の中にある。どの作業ツリーの外も指定する",
+                  file=sys.stderr)
+            return 1
     current = base
     while True:
         info = identity(current)  # None はまだない部分（作る予定の場所）
