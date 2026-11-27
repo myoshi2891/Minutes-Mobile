@@ -328,6 +328,8 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
     public var finalization: FinalizationRecord?
     public var lossRecord: LossRecord?
     public var gaps: [GapRecord]
+    /// 開始位置が未確定の割り込みの記録（空白区間を開いたら、同じ書き換えで gaps の件に置き換える。recording.md §5.4）
+    public var pendingInterruption: PendingInterruptionRecord?
     public var routes: [RouteRecord]
     public var unsavedChunks: [UnsavedChunkRecord]
     public var quarantinedSequences: [ChunkSequence]
@@ -355,6 +357,16 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
         public var endedAt: Timestamp?
         /// 開いている間は null
         public var resumed: Bool?
+        /// 割り込みの記録から置き換えた空白区間なら、その記録の識別子（それ以外は null）
+        public var interruptionId: UUID?
+    }
+
+    /// 割り込みの開始の直後に書く記録（recording.md §5.4）。開始位置は排出が終わるまで決まらないので持たない
+    public struct PendingInterruptionRecord: Equatable, Sendable, Codable {
+        public var interruptionId: UUID
+        /// 割り込みの通知を受け取った時刻（壁時計。事象時刻）
+        public var eventAt: Timestamp
+        public var reason: GapReason
     }
 
     public struct RouteRecord: Equatable, Sendable, Codable {
@@ -444,11 +456,12 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
 
 | ファイル | 型 | 内容（例） |
 | --- | --- | --- |
-| `mic/{連番}.sha256.json` | `ChunkHashRecord` | `{"formatVersion":1,"sampleCount":480000,"sequenceNo":7,"sha256":"（小文字の 16 進 64 桁）"}` |
+| `mic/{連番}.sha256.json` | `ChunkHashRecord` | `{"formatVersion":1,"sampleCount":480000,"sequenceNo":7,"sha256":"（小文字の 16 進 64 桁）","startSample":3360000}` |
 | `tombstones/{meetingId}` | `Tombstone` | `{"formatVersion":1,"meetingId":"（UUID）","requestedAt":1800000000000}` |
 
 - ハッシュは、WAV ファイル全体（44 バイトのヘッダ + PCM）の SHA-256 である。`SHA256Digest` は小文字の 16 進 64 桁だけを受け付ける。
 - ハッシュの記録は、一時ファイル（`{連番}.sha256.json.tmp`）に書いて媒体まで同期し、置換しない rename（§4.1）で公開する。一時ファイルは記録として扱わない。
+- **`startSample` は、その Chunk の開始サンプル（会議全体の位置）である。** 記録は WAV とは別のファイルなので、WAV が失われても残る。DB を作り直すとき・DB に行のない WAV を登録するときは、各 Chunk の開始サンプルをこの値で戻す（前の Chunk のファイルから求めない。割り込みの境界の短い Chunk や欠番があると、前の Chunk の終わりは開始位置と一致しない。§9 の照合 d）。実装前なので、形式の版は 1 のまま項目を足した。
 - 記録を読むときは、形式の版が 1 で、連番がファイル名と一致することを確かめる。合わない・読めない記録は「読めない記録」として扱い、その Chunk を `invalid` にする。**再計算した値で記録を作り直さない**（基本設計 §3.1）。
 - 削除要求は、ファイル名の会議 ID と中身の会議 ID が一致することを確かめる。読めない削除要求は削除せず、ファイル名の会議 ID の削除要求として扱う（消し残しより、削除の続行を優先する。§10）。
 - 文字起こしの版のハッシュの記録（`transcript/v{版}.sha256.json`）は [transcription.md](transcription.md) §6 にある。
@@ -487,7 +500,7 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
         CREATE TABLE audio_chunks (
             meeting_id TEXT NOT NULL REFERENCES meetings (meeting_id) ON DELETE CASCADE,
             sequence_no INTEGER NOT NULL CHECK (sequence_no BETWEEN 0 AND 999999),
-            start_sample INTEGER NOT NULL CHECK (start_sample >= 0),
+            start_sample INTEGER CHECK (start_sample IS NULL OR start_sample >= 0),
             sample_count INTEGER NOT NULL CHECK (sample_count BETWEEN 0 AND 480000),
             byte_count INTEGER NOT NULL CHECK (byte_count >= 0),
             sha256 TEXT CHECK (sha256 IS NULL OR length(sha256) = 64),
@@ -518,6 +531,7 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
             salvaged_count INTEGER CHECK (salvaged_count >= 0),
             held_since INTEGER NOT NULL,
             cause TEXT NOT NULL,
+            attempt_no INTEGER NOT NULL CHECK (attempt_no >= 0),
             PRIMARY KEY (meeting_id, sequence_no)
         ) STRICT, WITHOUT ROWID
         """,
@@ -531,6 +545,7 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
             started_at INTEGER NOT NULL,
             ended_at INTEGER,
             resumed INTEGER CHECK (resumed IN (0, 1)),
+            interruption_id TEXT CHECK (interruption_id IS NULL OR length(interruption_id) = 36),
             PRIMARY KEY (meeting_id, gap_no)
         ) STRICT, WITHOUT ROWID
         """,
@@ -623,9 +638,9 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
 | 表 | 補足 |
 | --- | --- |
 | `meetings` | `waiting_reason` は文字起こしを待っている理由（[transcription.md](transcription.md) §8）。`deletion_requested_at` が DB の中の墓標（§10）。`protection_state` は §8 |
-| `audio_chunks` | `sha256` は保存時の値（ハッシュの記録と同じ値）。隔離した書きかけ（`quarantined`）の行は `sha256` が `NULL`、サンプル数が 0。`vad_permille` は VAD の割合を 1,000 倍した整数 |
-| `chunk_conflicts` | `kind` は `different_content`（同じ連番で内容の異なる Chunk）・`record_mismatch`（既存のハッシュの記録と合わない）・`record_unreadable`（既存の記録が読めない）。主キーにより、同じ競合を何度記録しても 1 行である |
-| `unsaved_chunks` | 書き込めずにメモリへ保持した Chunk（§7）。保存に成功したら、Chunk の登録と同じ取引で消す |
+| `audio_chunks` | `sha256` は保存時の値（ハッシュの記録と同じ値）。隔離した書きかけ（`quarantined`）の行は `sha256` が `NULL`、サンプル数が 0。`vad_permille` は VAD の割合を 1,000 倍した整数。`start_sample` が `NULL` の行は開始位置が不明で、`file_state` は `invalid` である（DB に行のない WAV を、開始サンプルを読めるハッシュの記録なしで復旧が登録した行。§9 の照合 d）。総サンプル数の計算に使わない |
+| `chunk_conflicts` | `kind` は `different_content`（同じ連番で内容の異なる Chunk）・`record_mismatch`（既存のハッシュの記録と合わない）・`record_unreadable`（既存の記録が読めない）・`record_missing`（正式名の WAV があり、記録がない）。主キーにより、同じ競合を何度記録しても 1 行である |
+| `unsaved_chunks` | 書き込めずにメモリへ保持した Chunk（§7）。保存に成功したら、Chunk の登録と同じ取引で消す。`attempt_no` は actor がその記録の書き込みごとに発行する試行の連番で、範囲の更新は `INSERT … ON CONFLICT DO UPDATE … WHERE excluded.attempt_no > unsaved_chunks.attempt_no` で行う（後から完了した古い試行が、新しい範囲を戻さない。§5.1） |
 | `route_events`・`loss_entries` | 番号（`event_no`・`entry_no`）は `meeting.json` の配列の位置。作り直しても同じ行になる |
 | `transcript_versions` | `integrity` は `valid`・`corrupt`・`invalid`（[transcription.md](transcription.md) §6）。`engine` はエンジンの識別名（本文ではない） |
 | `usage_metrics` | 計測値の名前は閉じた列挙型で、値は整数（ミリ秒・件数・割合の 1,000 倍）。会議を消すと一緒に消える |
@@ -995,32 +1010,60 @@ public protocol ChunkStoring: Sendable {
 同じ連番の既存のファイルとの突き合わせは、純粋関数 `SealDecision.decide` で決める。
 
 ```swift
+/// 同じ連番のハッシュの記録の状態
+public enum ExistingHashRecord: Equatable, Sendable {
+    case none
+    case readable(SHA256Digest)
+    /// 形式の検証に通らない・読めない。書き換えない（再計算した値で作り直さない）
+    case unreadable
+
+    public var digest: SHA256Digest? {
+        if case let .readable(digest) = self { digest } else { nil }
+    }
+}
+
 /// 確定しようとする Chunk と、同じ連番の既存のファイルの突き合わせ（FR-SAV-03）。純粋関数で、I/O を持たない
 public enum SealDecision: Equatable, Sendable {
     /// 正式名へ置換しない rename をして登録する。writeHashRecord が真なら、先にハッシュの記録を作る
     case publish(writeHashRecord: Bool)
     /// 既存のハッシュの記録と合わない。記録は書き換えず、rename して hash_mismatch として登録し、競合を記録する
     case publishAsMismatch
-    /// 同じ内容の正式名のファイルがすでにある。DB に行がなければ既存のファイルを登録し、新しい方を破棄する
-    case discardDuplicate(registerExisting: Bool, writeHashRecord: Bool)
-    /// 内容の異なる正式名のファイルがすでにある。既存を残し、新しい方を競合の版として隔離する
+    /// 正式名の WAV がなく、記録が読めない。記録は書き換えず、rename して invalid として登録し、競合を記録する
+    case publishAsUnverifiable
+    /// 同じ内容の正式名の WAV と、読める記録がある。DB に行がなければ既存を登録し、新しい方を破棄する
+    case discardDuplicate(registerExisting: Bool)
+    /// 同じ内容の正式名の WAV があり、記録が読めない。記録も WAV も書き換えない。
+    /// DB に行がなければ既存を invalid で登録し（あれば行を変えない）、競合を記録して新しい方を破棄する
+    case discardDuplicateUnverifiable(registerExisting: Bool)
+    /// 正式名の WAV があり、記録がない。.part から記録を作らない。既存を invalid にし、新しい方を競合の版として隔離する
+    case quarantineWithoutRecord
+    /// 内容の異なる正式名の WAV と、記録（読める・読めない）がある。既存を残し、新しい方を競合の版として隔離する
     case quarantineConflict
 
     /// incoming: 書きかけファイルを読み直して計算した値
-    /// existingRecord: 同じ連番のハッシュの記録の値（なければ nil）
+    /// record: 同じ連番のハッシュの記録の状態
     /// existingChunk: 同じ連番の正式名のファイルを読み直して計算した値（なければ nil）
     public static func decide(
         incoming: SHA256Digest,
-        existingRecord: SHA256Digest?,
+        record: ExistingHashRecord,
         existingChunk: SHA256Digest?,
         hasRow: Bool,
     ) -> SealDecision {
         guard let existingChunk else {
-            guard let existingRecord else { return .publish(writeHashRecord: true) }
-            return existingRecord == incoming ? .publish(writeHashRecord: false) : .publishAsMismatch
+            switch record {
+            case .none: return .publish(writeHashRecord: true)
+            case let .readable(digest): return digest == incoming ? .publish(writeHashRecord: false) : .publishAsMismatch
+            case .unreadable: return .publishAsUnverifiable
+            }
         }
-        guard existingChunk == incoming else { return .quarantineConflict }
-        return .discardDuplicate(registerExisting: !hasRow, writeHashRecord: existingRecord == nil)
+        switch record {
+        case .none:
+            return .quarantineWithoutRecord
+        case .readable:
+            return existingChunk == incoming ? .discardDuplicate(registerExisting: !hasRow) : .quarantineConflict
+        case .unreadable:
+            return existingChunk == incoming ? .discardDuplicateUnverifiable(registerExisting: !hasRow) : .quarantineConflict
+        }
     }
 }
 ```
@@ -1031,9 +1074,10 @@ public enum SealDecision: Equatable, Sendable {
 | ない | ある・一致 | 記録の作成を省く → 公開 → 登録（`present`） | `saved` |
 | ない | ある・不一致 | 記録を書き換えない → 公開 → 登録（`hash_mismatch`）→ 競合 `record_mismatch` を記録 | `saved_with_mismatch` |
 | ない | ある・読めない | 記録を書き換えない → 公開 → 登録（`invalid`）→ 競合 `record_unreadable` を記録 | `saved_with_mismatch` |
-| ある・同じ内容 | ない | 記録を作る → DB に行がなければ既存を登録 → 新しい方を破棄 | `saved` |
-| ある・同じ内容 | ある | DB に行がなければ既存を登録（状態は、既存のハッシュと記録の照合で決める）→ 新しい方を破棄 | `saved` |
-| ある・異なる内容 | 問わない | **記録を作らない。** 既存を残す → 新しい方を `quarantine/conflict-…` へ移す → 競合 `different_content` を記録 | `conflict_quarantined` |
+| ある（内容によらない） | ない | **`.part` から記録を作らない**（作ると、照合できない既存の WAV の連番に `.part` の記録が付く）。既存の WAV を `invalid` にする（DB に行がなければ `invalid` で登録し、あれば `invalid` に更新する）→ 新しい方を `quarantine/conflict-…` へ移す → 競合 `record_missing` を記録（基本設計 §4 の「既存のハッシュの記録」①） | `conflict_quarantined` |
+| ある・同じ内容 | ある・読める | DB に行がなければ既存を登録（状態は、既存のハッシュと記録の照合で決める: 一致なら `present`、不一致なら `hash_mismatch`）→ 新しい方を破棄 | `saved` |
+| ある・同じ内容 | ある・読めない | **記録も既存の WAV も書き換えない**（公開しない）。DB に行がなければ既存を `invalid` で登録し、行があれば変えない（登録した時点で照合済みの行で、記録の破損は読むときの検証と Barrier の検査で検出する）→ 競合 `record_unreadable` を記録 → 新しい方を破棄（同じ内容なので、音声を失わない） | `saved_with_mismatch` |
+| ある・異なる内容 | ある（読める・読めない） | **記録を作らない・書き換えない。** 既存を残す → 新しい方を `quarantine/conflict-…` へ移す → 競合 `different_content` を記録 | `conflict_quarantined` |
 
 `saved_with_mismatch` と `conflict_quarantined` でも、書き込み自体は成功している。メモリ上の PCM は解放し、未保存の件数に数えない（基本設計 §4）。`hash_mismatch`・`invalid` の行は Barrier の不成立の理由になり、確定待ちで利用者に示す（§6）。
 
@@ -1064,15 +1108,10 @@ public enum SealDecision: Equatable, Sendable {
             digest: incoming, voice: voice, fileState: .present,
         )
         let record = try readRecord(meeting, chunk.sequence)
-        guard record != .unreadable else {
-            // 読めない記録は書き換えない。Chunk は公開し、照合できないものとして invalid にする
-            try publish(part, as: published)
-            row.fileState = .invalid
-            return try register(row, conflict: .recordUnreadable, existing: nil)
-        }
+        // 正式名の WAV の有無を、記録の状態によらず先に確かめる（読めない記録でも、既存の WAV を置き換えない）
         let existingChunk = try files.exists(published) ? ChunkHasher.digest(of: files.read(published)) : nil
         let decision = try SealDecision.decide(
-            incoming: incoming, existingRecord: record.digest, existingChunk: existingChunk, hasRow: hasRow(row),
+            incoming: incoming, record: record, existingChunk: existingChunk, hasRow: hasRow(row),
         )
         switch decision {
         case let .publish(writeHashRecord):
@@ -1085,10 +1124,27 @@ public enum SealDecision: Equatable, Sendable {
             try publish(part, as: published)
             row.fileState = .hashMismatch
             return try register(row, conflict: .recordMismatch, existing: record.digest)
-        case let .discardDuplicate(registerExisting, writeHashRecord):
-            if writeHashRecord {
-                try publishRecord(row, digest: incoming)
+        case .publishAsUnverifiable:
+            // 読めない記録は書き換えない。正式名の WAV はないので公開し、照合できないものとして invalid にする
+            try publish(part, as: published)
+            row.fileState = .invalid
+            return try register(row, conflict: .recordUnreadable, existing: nil)
+        case let .discardDuplicateUnverifiable(registerExisting):
+            // 記録も既存の WAV も書き換えない。行がなければ既存を invalid で登録し、行があれば変えない
+            row.fileState = .invalid
+            let now = Timestamp(clock.now())
+            if registerExisting {
+                _ = try ChunkTable.register(row, at: now, in: connection)
             }
+            try ChunkTable.recordConflict(row, kind: .recordUnreadable, existing: nil, at: now, in: connection)
+            try files.remove(part)
+            return .savedWithMismatch
+        case .quarantineWithoutRecord:
+            // .part から記録を作らない。既存の WAV を invalid にして（行がなければ invalid で登録）、新しい方を隔離する
+            row.fileState = .invalid
+            try ChunkTable.registerOrMarkInvalid(row, at: Timestamp(clock.now()), in: connection)
+            return try quarantine(part, row: row, incoming: incoming, existing: existingChunk, kind: .recordMissing)
+        case let .discardDuplicate(registerExisting):
             if registerExisting {
                 // 既存のファイルの状態は、読み直したハッシュと記録の照合で決める
                 row.fileState = record.digest == nil || record.digest == incoming ? .present : .hashMismatch
@@ -1097,13 +1153,13 @@ public enum SealDecision: Equatable, Sendable {
             try files.remove(part)
             return .saved
         case .quarantineConflict:
-            return try quarantine(part, row: row, incoming: incoming, existing: existingChunk)
+            return try quarantine(part, row: row, incoming: incoming, existing: existingChunk, kind: .differentContent)
         }
     }
 
-    /// 内容の異なる Chunk がすでにある。既存を残し、新しい方を競合の版として隔離して記録する
+    /// 既存の正式名の Chunk を残し、新しい方を競合の版として隔離して記録する
     private func quarantine(
-        _ part: URL, row: ChunkRow, incoming: SHA256Digest, existing: SHA256Digest?,
+        _ part: URL, row: ChunkRow, incoming: SHA256Digest, existing: SHA256Digest?, kind: ChunkConflictKind,
     ) throws(StorageFailure) -> SealOutcome {
         let prefix = String(incoming.description.prefix(16))
         guard let destination = layout.conflictingChunk(row.meeting, row.sequence, digestPrefix: prefix) else {
@@ -1116,7 +1172,7 @@ public enum SealDecision: Equatable, Sendable {
             try publish(part, as: destination)
         }
         let now = Timestamp(clock.now())
-        try ChunkTable.recordConflict(row, kind: .differentContent, existing: existing, at: now, in: connection)
+        try ChunkTable.recordConflict(row, kind: kind, existing: existing, at: now, in: connection)
         return .conflictQuarantined
     }
 ```
@@ -1203,7 +1259,7 @@ Chunk の登録（1 取引）:
 | 2 | `.part` を媒体まで同期する | `sync` | 同上 |
 | 3 | `.part` の全体を読み直し、「最終のヘッダ + メモリ上の PCM」と照合する。合わなければ `verification_mismatch` | `read_back` | 同上 |
 | 4 | 同じ連番のハッシュの記録・正式名の WAV・DB の行を調べ、`SealDecision.decide` で扱いを決める | `read_back`・`register` | 同上 |
-| 5 | （記録を作る場合）一時ファイルに書いて同期し、置換しない rename で公開、ディレクトリを同期 | `write_hash_record`・`sync`・`rename`・`sync_directory` | `.part` と記録が残る。再試行では「記録あり・一致」になる |
+| 5 | （記録を作る場合）一時ファイルに書いて同期し、置換しない rename で公開、ディレクトリを同期。記録には連番・開始サンプル・サンプル数・SHA-256 を書く（§3.2） | `write_hash_record`・`sync`・`rename`・`sync_directory` | `.part` と記録が残る。再試行では「記録あり・一致」になる |
 | 6 | `.part` を正式名へ置換しない rename、ディレクトリを同期 | `rename`・`sync_directory` | rename の前なら 5 と同じ。後なら正式名の WAV と記録がある → 再試行では「WAV あり・同じ内容」になる |
 | 7 | Chunk の登録・総サンプル数の更新・未保存の記録の削除（1 取引） | `register` | 正式名の WAV と記録がある。再試行、または起動時の照合（§9）で登録される |
 
@@ -1211,6 +1267,7 @@ Chunk の登録（1 取引）:
 - 同じ Chunk を何度確定しても、ファイルは 1 つ、行は 1 つである（FR-SAV-03、INV-05）。
 - 照合は、ヘッダと PCM を連結した**ファイルの全体**で行う。PCM だけでは照合しない（ヘッダの書き損じを見逃さないため）。
 - `MeetingStore` の `appendPart`・`seal` は、関数の中に `await` を置かない。actor の中で最後まで続けて実行されるので、手順 4 の判定と手順 6 の rename の間に、別の確定が割り込まない。それでも rename が `already_exists` で失敗した場合（アプリの外からファイルが置かれたなど）は、失敗として返し、再試行で手順 4 からやり直す。
+- `ChunkTable.registerOrMarkInvalid` は、1 取引で、行がなければ `invalid` で登録し（総サンプル数・未保存の記録の扱いは `register` と同じ）、行があれば `file_state` を `invalid` に更新する。
 - 失敗した Chunk は、`RecordingService` がメモリに保持し、`recordUnsaved` で未保存の記録を残す（§7）。
 - ログは、成功で `chunk_sealed`、失敗で `chunk_write_failed`（連番・種類・段・コード）、競合で `chunk_conflict` を出す（[architecture.md](architecture.md) §9.2）。
 
@@ -1236,7 +1293,7 @@ Chunk の登録（1 取引）:
 | --- | --- | --- |
 | 会議の作成 | `meetings` の行（状態 `recording`、同意の時刻、開始日時） | 全体を新しく書く |
 | 経路の記録（`recordRoute`） | `route_events` に 1 行 | `routes` に 1 件 |
-| 空白区間を開く・閉じる | `recording_gaps` の行を作る・更新する | `gaps` の該当の件 |
+| 空白区間を開く・閉じる | `recording_gaps` の行を作る・更新する。同じ取引で `meetings.total_samples` を `MAX(total_samples, 空白区間の位置)` に上げる | `gaps` の該当の件と、`totalSamples`（DB と同じ値） |
 | Chunk の確定 | `audio_chunks` の行、`meetings.total_samples`、`unsaved_chunks` の削除（§4.4） | 書かない（未保存の記録を消した場合だけ、`unsavedChunks` を書き直す） |
 | 未保存の記録の追加 | `unsaved_chunks` に 1 行 | `unsavedChunks` に 1 件 |
 | 停止（`recording` → `stop_requested`） | `status`、`stop_reason`、`stop_detected_at`、`total_samples` | `status`、`stop`、`totalSamples` |
@@ -1257,6 +1314,23 @@ Chunk の登録（1 取引）:
 
 - 状態の変更は、`MeetingStateMachine.reduce` が返した遷移だけを保存する。保存の側に、状態を直接書き換える入口（`setStatus` のような関数）を作らない（[architecture.md](architecture.md) §5.3）。`MeetingRecordStoring` の関数は、遷移（`MeetingTransition`）と、その遷移に伴う記録（停止理由・確定方式・欠落の記録）を引数に取る。
 - ジョブの状態だけは SQLite が唯一の記録である（INV-04）。`meeting.json` には書かない。
+- **空白区間と総サンプル数（`meeting.json` の不変条件）:** 空白区間を含む `meeting.json` は、どの世代でも、`totalSamples` が保存したすべての空白区間の位置（開始サンプル）以上である。Chunk の確定は `meeting.json` を書かないので、空白区間を保存する側が総サンプル数を上げる: actor はメモリ上の総サンプル数を `max(現在の値, 空白区間の位置)` に上げてから、①DB の取引（空白区間の行と `total_samples` の更新）→ ②その状態の全体から `meeting.json` を書く（原則の順。§5.1 の世代の規則）。こうして、DB を `meeting.json` から作り直しても、空白区間が総サンプル数の後ろに来ない。総サンプル数は録音した位置の最大値であり、保存した Chunk の合計ではない（足りない範囲は Barrier が欠落として扱う）。
+
+### 5.1 書き込みの I/O と公開の文脈（基本設計 §5.1）
+
+基本設計 §5.1 の「書き込みの I/O の遅れと actor の応答」と「戻らない rename からの回復」の実現方法と値を定める。
+
+| 項目 | 設計 |
+| --- | --- |
+| I/O を行う実行の文脈（申し送り） | `MeetingStore`（actor）は、未保存の記録・保存済みの Chunk の一覧（連番とファイルの状態）・確定中の Chunk・長さが不明な欠落の記録・総サンプル数をメモリ上の状態として持ち、追加・削除・登録の順序と内容をこの状態の上で 1 件ずつ決める。`unsaved_chunks` と `meeting.json` への書き込みの I/O は、会議ごとの公開の文脈 `MeetingDocumentPublisher`（専用の直列キュー `DispatchSerialQueue` を実行器にした actor。会議ごとに 1 つ）が行う。`MeetingStore` は依頼を待たずに投げ（`Task` で呼び、`await` しない）、完了を `MeetingStore.didComplete(_:)` で受け取る。`unsaved_chunks` の書き込みには、公開の文脈が持つ同じ DB の 2 本目の接続（WAL。`busy_timeout` 1 秒）を使う。Barrier の入力の問い合わせと書き出しのスナップショットは、I/O を待たずにメモリ上の状態から答える |
+| 未保存の記録の書き込みの時間の上限（申し送り） | **5 秒**（設計値。`StorageTuning.unsavedWriteTimeoutMs`）。注入した `Scheduler` で測り、過ぎたら I/O の完了を待たずに actor の状態で失敗として扱う（段階 3 の表示と再試行の対象。試行の連番を新しくして再試行する） |
+| 試行の連番 | actor が対象（会議・連番）ごとに発行する。遅れて届いた完了は、その対象の最新の試行でなければ状態に反映しない。DB の範囲の更新は、取引の中で試行の連番を比べる（`unsaved_chunks.attempt_no`。§3.3）ので、古い試行の書き込みが後から完了しても新しい範囲を DB に戻さない |
+| `meeting.json` の世代 | actor が会議ごとに単調に増える世代を発行し、内容はその時点の状態の全体から作る。一時ファイルの名前は**世代ごとに別**で、`meeting.json.g{世代 10 桁}.tmp`（同じディレクトリ）。一時ファイルへの書き込みと同期は公開の文脈の外で並行してよく、公開済みの世代の確認と rename だけを公開の文脈で直列に行う |
+| rename の時間の上限（申し送り） | **5 秒**（設計値。`StorageTuning.documentRenameTimeoutMs`。rename とディレクトリの同期を合わせた時間）。過ぎたら、後の世代を公開する前に取り消す |
+| 取り消し（申し送り） | その世代の一時ファイルを削除する（`unlink`）。上限は **5 秒**（`StorageTuning.documentCancelTimeoutMs`）。①削除が成功: その世代を時間の上限による失敗として actor に通知し、次の世代へ進む。②削除が「ない」（`ENOENT`）で失敗: rename は終わっている。公開の文脈がディレクトリを同期し（上限 5 秒）、成功を確かめてからその世代を公開済み・完了済みに数える。同期が失敗・上限切れなら失敗として通知する。③削除の呼び出しも戻らない: 公開の文脈はそのまま止まる（後の世代を公開しない）。actor は時間の上限による失敗として表示と再試行の対象にする |
+| 起動時の後始末 | 起動時の照合（§9）で、会議ディレクトリに残った `meeting.json.g*.tmp` を削除する（記録として扱わない）。公開済みの世代は再起動で失われるので、起動後の最初の書き込みは、照合で読んだ内容を基に新しい世代として書く |
+
+- 値はすべて差し替えられる（試験では小さい値と、止まる I/O を注入した `FileSystem` を使う）。実機で I/O が止まる場面は作れないので、値は TST-DEV-06 の結果で見直す。
 
 ---
 
@@ -1500,12 +1574,36 @@ public enum ProtectionPolicy {
 | 項目 | 設計 |
 | --- | --- |
 | 未完了の作業（`hasUnfinishedWork`） | 次のどれかがある: 会議の状態が `recording`・`stop_requested`・`finalizing`・`transcribing`、`pending`・`processing` のジョブ、メモリ上の未保存の Chunk、未保存の記録、進行中の書き出し、進行中の削除 |
-| 見直す時点 | 副作用 `reviewProtection`（確定・文字起こしの完了。[architecture.md](architecture.md) §5）、書き出しの完了、再文字起こし・失敗区間の再試行・書き出しの開始（処理中へ戻す）、および下の「保留の解消」 |
+| 見直す時点 | すべて `ProtectionCoordinator.review` を通す（下の「持ち主の型」）。副作用 `reviewProtection`（確定・文字起こしの完了。[architecture.md](architecture.md) §5）、書き出しの完了、再文字起こし・失敗区間の再試行・書き出しの開始（処理中へ戻す）、および下の「保留の解消」 |
 | 保管への切り替え（`seal`） | 会議ディレクトリの下のファイルを 1 つずつ `complete` にし、最後に各ディレクトリを `complete` にする。全部が成功してから、`protection_state` を `sealed` にする。途中で失敗したら `open` のままにして、次の見直しでやり直す（属性の設定は、何度行っても同じ結果になる） |
 | 処理中へ戻す（`unseal`） | 先に `protection_state` を `open` にし、各ディレクトリ、ファイルの順に「最初のロック解除まで」へ戻す。全部が成功してから、ジョブの作成・書き出しを始める |
 | 新しく作るファイル | 常に「最初のロック解除まで」で作る（§4.1）。保管中の会議にはファイルを作らない（作る前に必ず処理中へ戻す） |
 | SQLite | 常に「最初のロック解除まで」（開くときのフラグ。§3.4）。`-wal`・`-shm` と、移行の前の複製も同じ |
 | 対象の外 | `db/`・`tombstones/`・`tmp/`・保存ルートの直下の `quarantine/` は、常に「最初のロック解除まで」のままにする |
+
+**持ち主の型（基本設計 §7.1 の申し送り）:** 保管の判定・保護クラスの書き込み・作業の受け付けの順序は、`ProtectionCoordinator`（保存ルートに 1 つの actor。`MeetingStore` とは別の actor）が決める。
+
+```swift
+/// 保管の判定・保護クラスの書き込み・作業の受け付けを、会議ごとに直列にする持ち主（基本設計 §7.1）
+public protocol ProtectionCoordinating: Sendable {
+    /// 作業（文字起こし・再試行・再文字起こし・不足分の作成・起動時の回収・書き出し）を始める前に呼ぶ。
+    /// 保管への切り替え中ならその完了を待ち、保管中なら処理中に戻したことを確かめてから受け付ける
+    func accept(_ work: ProtectedWork, for meeting: MeetingID) async throws(ProtectionFailure) -> WorkLease
+    /// 作業の後始末（完了・失敗・取り消し）が終わったら呼ぶ。最後の作業なら保管を判定し直す
+    func release(_ lease: WorkLease) async
+    /// 見直しの時点（上の表）・seal_pending の解消・起動時の復旧の手順 9 で呼ぶ
+    func review(_ meeting: MeetingID) async
+}
+```
+
+| 項目 | 設計 |
+| --- | --- |
+| 会議ごとの状態 | 受け付けた作業の集合（`WorkLease`。受け付けから後始末の終わりまで）と、進行中の操作（なし・保管への切り替え・処理中への戻し。どちらも 1 つの `Task`） |
+| 1 つの操作 | 保管の条件の判定（`ProtectionPolicy.review`）から、会議ディレクトリ全体の保護クラスの書き込みと `protection_state` の記録の完了までを 1 つの `Task` にする。**`await` の前に進行中の操作を状態に入れる**ので、待つ間の再入で `accept` が割り込んでも、その操作の完了を待ってから判断する |
+| 受け付け（`accept`） | 進行中の操作があればその完了を待つ。会議が `sealed` なら処理中への戻しを同じく 1 つの操作で行い、成功を確かめてから受け付ける（失敗したら受け付けず `ProtectionFailure` を返す。一部のファイルだけが `complete` の場合も、戻し終えるまで受け付けない）。`seal_pending` なら取り消して `open` にする。受け付けた作業がある間は保管しない |
+| 呼ぶ側 | `TranscriptionService`（開始・再試行・再文字起こし・不足分の作成・起動時の回収）と `ExportService`（開始）は、`accept` が返してから、ジョブを作る・ファイルを開くなどの作業を始める。`seal_pending` の解消と起動時の復旧の手順 9 も `review` を通す |
+| 通さないもの | 録音の継続と Chunk の書き込み（録音中・確定前の会議は保管の対象にならない）。`ProtectionCoordinator` は `MeetingStore` を待たせない: 保護クラスの書き込みは `FileSystem` で自分で行い、`protection_state` の記録だけを `MeetingStore` に依頼する |
+| 試験 | 差し替えの `FileSystem` で保護クラスの書き込みを止め、その間に `accept` を呼ぶ。書き込みの完了まで受け付けが返らず、返った後は会議が `open` で、作業が `complete` の会議で動かないこと |
 
 **保留（`seal_pending`）を解消するきっかけ**（基本設計の申し送り）は、次の 3 つである。どれも、`ProtectionPolicy.review` を `sealPending` の会議に対して呼び直す。
 
@@ -1549,9 +1647,9 @@ public enum ProtectionPolicy {
 | 順 | 処理 |
 | --- | --- |
 | a | `meeting.json` を読んで検証する。読めなければ「読めない会議」として記録し、この会議の残りの手順を行わない（ファイルは変えない）。DB に行がなければ、`meeting.json` から行を作る（`tombstones/` に記録がある会議は作らない） |
-| b | `mic/` を一覧する。`{連番}.sha256.json.tmp` は削除する（記録として扱わない） |
+| b | `mic/` を一覧する。`{連番}.sha256.json.tmp` と、会議ディレクトリの `meeting.json.g*.tmp`（§5.1）は削除する（記録として扱わない） |
 | c | 書きかけ（`{連番}.wav.part`）を、連番の小さい順に救済する（下の「書きかけの救済」） |
-| d | 正式名のファイルがあり DB に行がないものを、検査（§6.1 の順 2〜5）のうえで登録する。開始サンプルは、連番 0 から順に、前の Chunk の終わりの位置とする |
+| d | 正式名のファイルがあり DB に行がないものを、検査（§6.1 の順 2〜5）のうえで登録する。**開始サンプルは、同じ連番のハッシュの記録の `startSample` を使う**（§3.2。前の Chunk のファイルから求めない）。記録がない・読めない・`startSample` を持たない場合は、開始位置を不明（`start_sample` が `NULL`）として `invalid` で登録し（`register` とは別の入口 `ChunkTable.registerWithUnknownStart`: 1 取引で、`start_sample` を `NULL`・`file_state` を `invalid` にして行を作り、`total_samples` を更新しない。`ChunkRow.startSample` は seal の経路では常に分かっているので、`register` は変えない）、その連番を「位置の分からない録音」として復旧の結果に数え（[ui.md](ui.md) §4.7）、Barrier の不成立の理由にする（位置を推定しない）。DB を作り直した場合は、WAV のない連番もハッシュの記録があれば、記録の開始サンプルとサンプル数で行を作って `missing` にする（記録は WAV と別のファイルなので、WAV が失われても失われた音声の位置を示せる） |
 | e | DB に行がありファイルがないものを `missing` にする |
 | f | 未保存の記録を突き合わせる（下の「未保存の記録」） |
 | g | 開いたままの空白区間を閉じる: 長さと終了時刻を「不明」（`null`）、再開を「いいえ」にする（基本設計 §8）。単調時計の値はプロセスをまたいで比べられないので、推定値で埋めない（[architecture.md](architecture.md) §6.2） |
@@ -1579,7 +1677,7 @@ public enum PartSalvage: Equatable, Sendable {
 
 | 計画 | 処理 |
 | --- | --- |
-| `salvage` | ①ファイルを `truncatedSize`（44 + サンプル数 × 2）まで切り詰める（奇数バイトの端数を捨てる）→ ②ヘッダを書き直す → ③媒体まで同期する → ④全体を読み直して SHA-256 を計算する → ⑤§4.4 の判定（`SealDecision`）で公開・登録する。メモリ上の PCM はないので、照合の相手は読み直したファイル自身である。VAD は読み直した PCM から計算し直す |
+| `salvage` | ①ファイルを `truncatedSize`（44 + サンプル数 × 2）まで切り詰める（奇数バイトの端数を捨てる）→ ②ヘッダを書き直す → ③媒体まで同期する → ④全体を読み直して SHA-256 を計算する → ⑤§4.4 の判定（`SealDecision`）で公開・登録する。記録を作る場合の開始サンプルは、その連番自身の未保存の記録の開始サンプルを先に使い、なければ直前の連番の終わり（直前の連番のハッシュの記録の `startSample` + サンプル数）とする（基本設計 §8）。メモリ上の PCM はないので、照合の相手は読み直したファイル自身である。VAD は読み直した PCM から計算し直す |
 | `quarantine` | 0 サンプル・44 バイト以下・Chunk の上限（480,000 サンプル）を超える・読めない場合。削除せず、会議の `quarantine/part-{連番}.wav.part` へ置換しない rename で移す。連番を `audio_chunks` に `quarantined` として登録し、`meeting.json` の `quarantinedSequences` にも書く。隔離した連番は Barrier の不成立の理由になる（§6.1） |
 
 **未保存の記録**（FR-SAV-05）は、毎回もとの範囲から欠落を求める。
@@ -1624,8 +1722,8 @@ public enum UnsavedReconcile: Equatable, Sendable {
 
 | 順 | 処理 | 途中で落ちた場合 |
 | --- | --- | --- |
-| 0 | 録音中の会議なら拒否する。その会議の新しい書き出しの要求を拒否し始める（[export.md](export.md) §3）。文字起こし中・書き出し中なら中止を要求し、中止の完了を待つ（[transcription.md](transcription.md) §8.3 と同じ「中止の完了」） | 何も消えていない |
-| 1 | 削除要求（`tombstones/{meetingId}`）を原子的に作り、続けて `meetings.deletion_requested_at` を記録する。この時点で一覧から消える | 削除要求があれば、次の起動で手順 2 から続ける |
+| 0 | 録音中の会議なら拒否する。その会議の文字起こしの開始・再試行・不足分の作成、新しい書き出しの要求（[export.md](export.md) §3）、録音データと記録の書き込みを拒否し始める（永続化した削除要求がある間は、再起動の後も拒否を続ける） | 何も消えていない |
+| 1 | 削除要求（`tombstones/{meetingId}`）を原子的に作って同期し、続けて `meetings.deletion_requested_at` を記録する。この時点で一覧から消える。削除要求を作れなければ、文字起こし・書き出しを中止せずに削除を中止する。**続けて**、文字起こし中・書き出し中なら中止を要求し、中止の完了（エンジンの停止の確認とジョブの完了の処理の終わり。書き出しの後始末の終わり。[transcription.md](transcription.md) §8.3）を、注入した `Scheduler` で上限 **10 秒**（設計値。`StorageTuning.deletionCancelTimeoutMs`）まで待つ。上限までに完了しなければ、削除要求を残したまま手順 2 以降に進まず、問題 `deletion_incomplete` を表示する | 削除要求があれば、次の起動で手順 2 から続ける（再起動の後には、前の起動のエンジンの実行は残らない） |
 | 2 | `tmp/export/{meetingId}/` を丸ごと消す | 同上 |
 | 3 | 会議ディレクトリを丸ごと消す | 同上 |
 | 4 | DB の行を消し（子の表は連鎖して消える）、`checkpointTruncate()` で WAL を切り詰める | 同上 |
@@ -1700,7 +1798,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 9 | 移行と制約 | 移行が 1 回だけ適用される。録音中の会議 2 件が一意制約の違反になる。`STRICT` が型違いを拒否する。取引が取り消される | NFR-MNT-05 |
 | 10 | Chunk の確定（冪等性） | 追記して確定すると完全な Chunk が 1 つできる。同じ Chunk の再確定で増えない。内容の異なる Chunk は隔離される | TST-SAV-02 |
 | 11 | Chunk の確定（原子性） | 6 つの段のそれぞれで失敗を注入し、正式名のファイルが「ない」か「完全」であること、再試行で保存できること | TST-SAV-01 |
-| 12 | 既存のハッシュの記録 | 記録だけがある状態で確定する。一致なら記録が変わらず登録される。不一致なら記録が変わらず `hash_mismatch` と競合が残る | SEC-INT-01 |
+| 12 | 既存のハッシュの記録 | 記録だけがある状態で確定する。一致なら記録が変わらず登録される。不一致なら記録が変わらず `hash_mismatch` と競合が残る。正式名の WAV と読めない記録がある状態で確定すると、WAV も記録も変わらず（rename しない）、同じ内容なら行のない場合だけ `invalid` で登録されて `record_unreadable` が残り、異なる内容なら隔離されて `different_content` が残ること。正式名の WAV があり記録がない状態では、記録が作られず、既存が `invalid`、`.part` が隔離されて `record_missing` が残ること | SEC-INT-01 |
 | 13 | 未保存の保持と上限（結合） | 書き込みを失敗させ続ける。録音が止まらず件数が増え、20 件で `disk_full` の停止になる。失敗をやめると古い順に保存される | TST-SAV-03 |
 | 14 | 確定の手順（結合） | 停止 → Barrier → `finalized`。不成立 → 再試行 → 通過。例外確定で `lossRecord` が保存される | TST-FIN-01〜03 |
 | 15 | 強制終了からの復旧（結合） | 録音の途中でパイプラインを捨て、復旧する。会議が `stop_requested`（理由 `terminated`）になり、書きかけが救済され、失ったサンプル数が追記していない分だけであること | TST-RCV-01 |
@@ -1710,6 +1808,10 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 19 | 復旧の冪等性（結合） | 復旧を 2 回実行して、DB とファイルが変わらないこと | FR-RCV-01 |
 | 20 | 削除（結合） | 各段で落として復旧し、会議 ID に関わるファイル・行・一時ファイルが 0 件。墓標の後に DB を作り直しても会議が復活しない。DB ファイルにタイトルのバイト列が残らない | TST-SEC-05 |
 | 21 | 保護データを読めない起動（結合） | 保護データを読めない状態で起動し、DB が退避されないこと。読めるようになってから復旧が行われること | SEC-DAT-02 |
+| 22 | 空白区間と総サンプル数 | 確定していない Chunk の後ろの位置で空白区間を保存し、その `meeting.json` の `totalSamples` が空白区間の位置以上であること。DB を `meeting.json` から作り直しても同じであること | INV-10 |
+| 23 | 開始位置の復元（結合） | 割り込みの境界の短い Chunk と欠番を含む会議で DB を作り直す。各 Chunk の開始サンプルがハッシュの記録の値で戻り、WAV のない連番が記録の位置で `missing` になること。記録のない WAV が開始位置不明の `invalid` になり、復旧の結果に数えられること | FR-RCV-01、INV-10 |
+| 24 | 書き込みの I/O の遅れ（結合） | 未保存の記録・`meeting.json` の I/O を止めたまま（時計を注入して上限を過ぎさせる）、Barrier の入力と書き出しのスナップショットが待たずに返ること。古い試行・古い世代の完了が新しい範囲・内容を戻さないこと。戻らない rename の取り消しの 3 通り | NFR-REL-05 |
+| 25 | 持ち主の直列化（結合） | 保護クラスの書き込みを止めている間の `accept` が完了まで返らず、返った後は会議が `open` であること | SEC-DAT-02 |
 
 ### 12.2 失敗の注入と差し替え
 
@@ -1810,16 +1912,20 @@ public enum UnsavedReconcile: Equatable, Sendable {
 
 満たす要件: NFR-MNT-04
 
-基本設計 [storage.md](../02-basic-design/storage.md) §14 の 6 項目。
+基本設計 [storage.md](../02-basic-design/storage.md) §14 の 10 項目。
 
 | 申し送り | 解決 | 節 |
 | --- | --- | --- |
 | 表の列・索引・制約、移行の番号付け | 10 の表と `schema_version` を、移行 1 として定義した。すべて `STRICT`、録音中は 1 件の部分一意索引、子の表は連鎖削除。番号は 1 からの連番で、1 つの移行を 1 取引で適用する | §3.3・§3.4 |
 | `meeting.json`・ハッシュの記録・DB の外の削除要求の項目と形式の版 | 3 つとも形式の版 1。`MeetingDocument`・`ChunkHashRecord`・`Tombstone` として型と検証を定義した。日時は UTC の経過ミリ秒 | §3.1・§3.2 |
-| 置換しない rename の実現方法と、競合の版のファイル名 | `renamex_np` の `RENAME_EXCL`。競合の版は `quarantine/conflict-{連番}-{SHA-256 の先頭 16 桁}.wav` | §2.1・§4.1 |
+| 置換しない rename の実現方法（`FileManager` の移動か `renamex_np` か）と、競合の版のファイル名 | `renamex_np` の `RENAME_EXCL`。競合の版は `quarantine/conflict-{連番}-{SHA-256 の先頭 16 桁}.wav` | §2.1・§4.1 |
 | SQLite ラッパーの API（束縛・取引・エラー） | SQL は `StaticString`、値は 3 種の `SQLValue` の束縛、取引は `transaction`、エラーは拡張コードから `StorageFailure` に分類する | §4.2 |
-| 同期の方式と周期、段階ごとの閾値の最終値 | 追記は取り出しのたび、途中の同期は 80,000 サンプルごとに `fsync`、確定時は `F_FULLFSYNC`。閾値は基本設計の初期値のまま（予備 200 MB、120 分・30 分・10 分、保持 20 Chunk） | §4.3・§7 |
-| `seal_pending` の解消を起こすきっかけ | 保護データを読めるようになった通知、前面への復帰、起動時の復旧の手順 9 の 3 つ | §8 |
+| 同期の方式と周期（§4）、段階ごとの閾値の最終値（§6） | 追記は取り出しのたび、途中の同期は 80,000 サンプルごとに `fsync`、確定時は `F_FULLFSYNC`。閾値は基本設計の初期値のまま（予備 200 MB、120 分・30 分・10 分、保持 20 Chunk） | §4.3・§7 |
+| `seal_pending` の解消を起こすきっかけ（ロック解除の通知・前面復帰） | 保護データを読めるようになった通知、前面への復帰、起動時の復旧の手順 9 の 3 つ。どれも `ProtectionCoordinator.review` を通す | §8 |
+| 保管の判定・保護クラスの書き込み・作業の受け付けの順序を決める持ち主の型（§7.1） | `ProtectionCoordinator`（保存ルートに 1 つの actor。protocol は `ProtectionCoordinating`）。判定から書き込みと記録の完了までを 1 つの `Task` にし、`await` の前に状態に入れて再入の割り込みを防ぐ。作業は `accept` の後に始める | §8 |
+| 会議の削除で文字起こしの中止の完了を待つ時間の上限の値（§9） | 10 秒（`deletionCancelTimeoutMs`）。書き出しの中止の完了も同じ上限。削除要求を永続化した後に待ち、過ぎたら手順 2 に進まず `deletion_incomplete` を表示して、次の起動で手順 2 から続ける | §10 |
+| 未保存の記録の書き込みの時間の上限の値と、I/O を行う実行の文脈（§5.1 の「書き込みの I/O の遅れと actor の応答」） | 5 秒（`unsavedWriteTimeoutMs`）。I/O は会議ごとの公開の文脈 `MeetingDocumentPublisher`（専用の直列キューの actor。DB の 2 本目の接続を持つ）が行い、`MeetingStore` は待たない。範囲の更新は `attempt_no` で古い試行を DB に反映しない | §5.1・§3.3 |
+| `meeting.json` の rename の呼び出しの時間の上限の値と、世代ごとの一時ファイルの名前・取り消し（削除）の時間の上限（§5.1 の「戻らない rename からの回復」） | rename とディレクトリの同期で 5 秒（`documentRenameTimeoutMs`）。一時ファイルは `meeting.json.g{世代 10 桁}.tmp`。取り消しの削除は 5 秒（`documentCancelTimeoutMs`）。結果の 3 通りの扱いは §5.1 | §5.1 |
 
 ---
 
@@ -1841,6 +1947,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 空き容量の値が、実際の書き込みの可否と一致する | OS の推定値である | 書き込みの失敗の捕捉を最後の防衛線にする |
 | `PRAGMA quick_check` で、壊れた DB を検出できる範囲 | 全ページの検査ではない | 壊れた DB の試験（§12.1 の 18）。読み書きの途中で `database_corrupt` が返った場合も、次の起動で退避する |
 | 保護データを読めない状態でアプリが起動される経路があるか | 分からない（録音・継続処理タスクは前面から始める設計） | TST-DEV-03。経路がなくても、退避しない規則（§3.5）は残す |
+| 2026-11-27 に変えた・足したコード片（§4.4 の `ExistingHashRecord`・`SealDecision`・`seal`、§8 の `ProtectionCoordinating`）がビルドできる | ビルドしていない（§12.3 の確認は、それより前の版のもの） | 保存の実装の最初にビルドとテストで確かめ、本書を直す |
 | `MeetingRecordStoring` などの protocol のシグネチャ | `ChunkStoring` だけをビルドして確かめた | 保存の実装で確定し、本書に追記する |
 | 120 分の会議の Barrier（約 220 MiB の読み直し）にかかる時間 | 測っていない | 保存の実装（計測値）。進み具合を表示する |
 
@@ -1857,3 +1964,5 @@ public enum UnsavedReconcile: Equatable, Sendable {
 - iOS 27.2 SDK の `Foundation.swiftinterface`・`NSFileManager.h`・`NSURL.h`（保護クラスの属性、バックアップ除外、重要用途向けの空き容量、属性のキャッシュの破棄）
 - Xcode 27.2（27B52）・Swift 6.4.2 の `swift build`・`swift test`（一時の Package で実行。§12.3 の結果はこの実行による。`STRICT` の表・`secure_delete`・WAL の切り詰め・オンラインバックアップ・属性の挙動は、macOS 同梱の SQLite と macOS のファイルシステムで動かして確かめたもの）
 - Minutes `docs/design-local-phase1.md` §3.4・§11・§13・§16・§21〜§23・§26、`docs/design-local-phase2.md` §8（別リポジトリ・読み取り専用。本作業では参照できず、基本設計の記述に基づいた）
+- [SQLite Release 3.54.0](https://sqlite.org/releaselog/3_54_0.html)（上流の 3.54.0 の公開記録。SDK に同梱された版の根拠は `sqlite3.h` の `SQLITE_VERSION`。確認日 2026-11-18）、[Apple: FileProtectionType](https://developer.apple.com/documentation/foundation/fileprotectiontype)（ページの存在を確認。確認日 2026-11-20）
+- **出典の URL について（確認日 2026-11-27）:** 上の SDK のヘッダ・`.swiftinterface` は、Xcode に同梱されたローカルのファイルで、公開の URL はない。版の根拠は、SDK の版（iOS 27.2）は `xcodebuild -showsdks`、Xcode 27.2（27B52）は `xcodebuild -version`、Swift 6.4.2 は `swift --version`、各 API の対応 OS は SDK の宣言（`@available`・`API_AVAILABLE`）で確かめたものである（[dev-environment.md](dev-environment.md) §2）。Apple の文書のページは、本文が JavaScript で描かれ、対応 OS の記述を取得できないので、版の根拠にしない

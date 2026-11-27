@@ -541,6 +541,7 @@ public enum MeetingStateMachine {
 | 中断の通知 | `InterruptionNoticeScheduling` | `LocalNoticeScheduler`（アプリ） | `NoticeSchedulerSpy` | [recording.md](recording.md) §7 |
 | ログの出力先 | `LogSink` | `AppLogger`（System） | `RecordingLogSink` | §9 |
 | 設定値 | `SettingsStoring` | `SettingsStore`（System） | `InMemorySettings` | [ui.md](ui.md) §4.6 |
+| Apple Intelligence の可否 | `SummaryModelAvailabilityProviding` | `SystemSummaryModelAvailability`（アプリ） | `FixedSummaryModelAvailability` | [ui.md](ui.md) §4.6 |
 | LLM（P2） | —（P2 の基本設計で決める） | — | — | — |
 
 ### 6.2 時計・ID・乱数・端末の状態
@@ -822,7 +823,7 @@ public actor RecordingPipelineSkeleton {
 
 | 領域 | 型 | 内容 | 定義 |
 | --- | --- | --- | --- |
-| 録音の開始 | `RecordingStartFailure` | 録音中・権限なし・文字起こしの中止の時間切れ・会議の作成の失敗・セッションの有効化の失敗・入力の開始の失敗・最初のバッファの時間切れ | 下のコード |
+| 録音の開始 | `RecordingStartFailure` | 録音中・権限なし・会議の作成の失敗・セッションの有効化の失敗・入力の開始の失敗・最初のバッファの時間切れ | 下のコード |
 | 録音中 | `RecordingIssue` | 再開できない・再構築の失敗・入力の喪失・取りこぼし・通知の予約の失敗。**録音を止める理由にしない**（`inputLost` だけは物理的に続けられない） | 下のコード |
 | 保存 | `StorageFailure` | 種類（`StorageFailureKind` 11 種）・段（`StorageStage` 16 種）・OS の結果コード | 下のコード |
 | 確定 | `FinalizationBlocker` | 欠番・ファイル欠損・不正なヘッダ・隔離・ハッシュ不一致・メモリ上の未保存・失われた未保存 | [storage.md](storage.md) §6 |
@@ -863,7 +864,6 @@ public enum StorageFailureKind: String, Sendable, CaseIterable, Codable, LogSymb
 public enum RecordingStartFailure: Error, Equatable, Sendable {
     case alreadyRecording
     case microphoneDenied
-    case transcriptionCancelTimedOut
     case meetingCreationFailed(StorageFailure)
     case sessionActivationFailed(osCode: Int32)
     case inputStartFailed(osCode: Int32)
@@ -877,6 +877,8 @@ public enum RecordingIssue: Equatable, Sendable {
     case inputLost
     case samplesDropped(frames: Int64)
     case noticeSchedulingFailed
+    /// 入力の閉鎖の手続きで、マイクを閉じたことを上限までに確かめられない（recording.md §5.4）
+    case microphoneCloseUnconfirmed
 }
 ```
 
@@ -897,6 +899,7 @@ public enum RecordingIssue: Equatable, Sendable {
 | `RecordingIssue.inputLost` | `input_lost` | 停止した。保存済みの分は無事 |
 | `RecordingIssue.samplesDropped` | `audio_dropped` | 一部（長さを示す）を取りこぼした。録音は続いている |
 | `RecordingIssue.noticeSchedulingFailed` | `notifications_denied` | 録音に影響はない |
+| `RecordingIssue.microphoneCloseUnconfirmed` | `microphone_close_unconfirmed` | 保存済みの分は無事。マイクを閉じたことを確かめられていない（確かめ続ける） |
 | 空き容量の段階 1 | `storage_low` | 録音は続いている |
 | 空き容量の段階 2 | `storage_critical` | 録音は続いている |
 | 空き容量の段階 3（`StorageFailure` で Chunk をメモリに保持） | `chunk_unsaved` | 録音は続いている。保持中の分は終了すると失われる |
@@ -926,7 +929,7 @@ public enum ProblemMapping {
         switch failure {
         case .alreadyRecording: .alreadyRecording
         case .microphoneDenied: .microphoneDenied
-        case .transcriptionCancelTimedOut, .meetingCreationFailed, .sessionActivationFailed: .recordingStartFailed
+        case .meetingCreationFailed, .sessionActivationFailed: .recordingStartFailed
         case .inputStartFailed, .firstBufferTimedOut: .recordingStartFailed
         }
     }
@@ -937,6 +940,7 @@ public enum ProblemMapping {
         case .inputLost: .inputLost
         case .samplesDropped: .audioDropped
         case .noticeSchedulingFailed: .notificationsDenied
+        case .microphoneCloseUnconfirmed: .microphoneCloseUnconfirmed
         }
     }
 }
@@ -1050,6 +1054,8 @@ public protocol LogSink: Sendable {
 | `job_finished` | transcription | info | あり | `sequence`、`state`、`reason`、`attempt`、`duration_ms` |
 | `job_reclaimed` | transcription | notice | あり | `sequence`、`state`、`attempt` |
 | `stale_completion_dropped` | transcription | notice | あり | `sequence`、`kind` |
+| `engine_stop_unconfirmed` | transcription | error | あり | `run`、`sequence`（停止を待つ上限を過ぎた。[transcription.md](transcription.md) §5.2・§8.3） |
+| `engine_stop_confirmed` | transcription | notice | あり | `run`、`sequence`、`duration_ms`（中止の指示から停止の確認まで） |
 | `transcript_merged` | transcription | info | あり | `version`、`run`、`count`（採用した件数） |
 | `transcript_version_rejected` | transcription | error | あり | `version`、`reason` |
 | `background_task_changed` | transcription | info | — | `state` |
@@ -1124,7 +1130,7 @@ public struct AppLogger: LogSink {
 | 1 | 起動の引数から構成を決める（§10.2。純粋関数） |
 | 2 | 注入点の実装を作る（本番、または UI テスト用の差し替え） |
 | 3 | `StorageRoot` を作り、属性を検証する（[storage.md](storage.md) §2） |
-| 4 | `MeetingStore`（SQLite）を開く。開けなければ退避して作り直す |
+| 4 | 保護データを読めることを確かめてから、`MeetingStore`（SQLite）を開く（読めない間は開かず、読めるようになった通知を待つ）。退避して作り直すのは、種類が `database_corrupt` の場合と `PRAGMA quick_check` に通らない場合だけである。容量不足（`disk_full`）・権限（`permission_denied`）・一時的な失敗（`database_busy`・`io_error`）、保護データを読めない間の失敗では、退避も作り直しもしない（[storage.md](storage.md) §3.5） |
 | 5 | サービスを作る |
 | 6 | 起動時の復旧を実行する（[storage.md](storage.md) §9）。**完了するまで、録音の開始を受け付けない** |
 | 7 | ルートの View に Store を渡す |
@@ -1356,9 +1362,9 @@ struct MeetingStateMachineTests {
 | 申し送り | 解決 | 節 |
 | --- | --- | --- |
 | 型・protocol の名称と、Package のターゲット分割を確定する | ターゲットを 7 つに分けた。注入点の protocol・本番の実装・差し替えの名前を確定した | §2・§6 |
-| 録音パイプラインを起こす合図の方式を確定する | 周期的な合図（100 ms）を非同期の列で受け取る。停止・割り込みの排出は合図を待たない | §7.2 |
-| エラー分類の列挙と、利用者向けの文言への写像を確定する | 7 つの型に分類し、26 種の問題の種類へ網羅的に写す。文言は ui.md §6 | §8 |
-| 型付きログのイベント一覧と、各値の privacy 指定を確定する | 39 イベント。名前と欄は public、会議 ID はハッシュで伏せる | §9 |
+| 録音パイプラインを起こす合図の方式を確定する（§4） | 周期的な合図（100 ms）を非同期の列で受け取る。停止・割り込みの排出は合図を待たない | §7.2 |
+| エラー分類の列挙と、利用者向けの文言への写像を確定する（§8） | 7 つの型に分類し、27 種の問題の種類へ網羅的に写す。文言は ui.md §6 | §8 |
+| 型付きログのイベント一覧と、各値の privacy 指定を確定する（BD-ARC-06） | 41 イベント。名前と欄は public、会議 ID はハッシュで伏せる | §9 |
 | 要件 ID ↔ テストの対応表を文書ごとに作る | 本書の対応表を作った。ほかの 5 文書もそれぞれ持つ | §14 |
 
 ---
@@ -1376,6 +1382,7 @@ struct MeetingStateMachineTests {
 | アプリターゲット（既定の分離が MainActor）に置くアダプタの `nonisolated` の書き方 | アプリターゲットではビルドしていない（一時の Package で確かめたのは Package 側だけ） | 共通基盤の実装 |
 | 型付きの `throws` を protocol の要件に使った場合の、差し替えの書きやすさ | `FreeSpaceProviding` の 1 つでだけ確かめた | 共通基盤の実装。書きにくければ `Result` を返す形に改める |
 | Mac 上の `swift test` と、シミュレータ・実機で結果が一致する | Mac でだけ実行した | 作業単位 2（シミュレータでの実行）、各実機試験 |
+| 2026-11-27 に変えたコード片（§8.1 の `RecordingStartFailure`・`RecordingIssue`、§8.2 の写像）がビルドできる | ビルドしていない | 共通基盤の実装 |
 | §11.2 の直し方で、2 つの検査が両立する | 直した設定では確かめていない（SwiftFormat の側は、規則を無効にして整形できることだけを確かめた） | 作業単位 2 の最初 |
 
 ---

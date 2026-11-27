@@ -34,7 +34,7 @@
 | --- | --- | --- |
 | 停止の確認の方法（確認か長押しか） | **確認のダイアログ**にする。長押しは VoiceOver と支援機能で操作しにくく、操作に気付きにくい | §4.3 |
 | 覆いを出す条件 | シーンが「前面で操作中」でなくなる通知で出し、前面で操作中になった通知で外す。**専用のウィンドウ**で覆う（ルートの View への重ね描きでは、シートやアラートを隠せないため） | §7.1 |
-| Live Activity の更新の頻度 | 状態が変わったときと、Chunk の確定のたび（約 30 秒ごと） | §8 |
+| Live Activity の更新の頻度 | 状態が変わったときは直ちに。録音中は、累積サンプル数が前回の更新から 30 秒分（480,000 サンプル）進むたび（Chunk の確定・保存の成否によらない）。取り出しが起きない間（中断中など）は、注入した `Scheduler` で 30 秒ごとに同じ内容を更新して古くなる時刻だけを延ばす。古くなる時刻は最後の更新の 90 秒後 | §8 |
 | 起動の引数 `-uiTestConsent` の意味 | `accepted` は初回説明を読了済みにするだけである。**録音ごとの同意確認は省略しない**（FR-CNS-01） | §11.2 |
 
 ---
@@ -182,6 +182,7 @@
 | `thermal` | 「iPhone が熱くなっているため、文字起こしを見合わせています」 | 「このまま実行する」 |
 | `low_power` | 「低電力モードのため、文字起こしを見合わせています」 | 「このまま実行する」 |
 | `auto_start_disabled` | 「文字起こしはまだ行っていません」 | 「文字起こしを始める」 |
+| `engine_not_stopped` | 「前の文字起こしの処理が止まるのを待っています。録音は無事です」 | —（止まったら自動で再開する。[transcription.md](transcription.md) §5.2） |
 
 | 文字起こしの中の要素 | 表示 |
 | --- | --- |
@@ -225,7 +226,7 @@
 | 端末の対応状況 | 音声認識 | `EngineAvailability` の文言（「使えます」「音声認識モデルが必要です」「この iPhone では使えません」など）。モデルが必要なら「モデルを取得する」（§4.4 と同じ手順） |
 | | 空き容量 | 「あと約 N 分録音できます」 |
 | | 録音データの使用量 | 全体と、会議ごとの一覧（大きい順。NFR-CAP-02。[storage.md](storage.md) §10） |
-| | 要約（Apple Intelligence） | 「要約は今後の版で提供します」（MVP） |
+| | Apple Intelligence | `SummaryModelAvailability` の文言（対応「使えます」・非対応「この iPhone では使えません」・無効「現在は使えません。設定アプリで Apple Intelligence を確認してください」）。どの値でも、別の行に「要約は今後の版で提供します」を出し、要約の操作は出さない（MVP。FR-SET-01） |
 | 文字起こし | 「確定後に自動で文字起こしする」 | スイッチ。`SettingsStoring.autoTranscribe`（FR-SET-02。既定はオン） |
 | データについて | 保存場所 | 「録音と文字起こしは、このアプリの中だけに保存します。『ファイル』アプリやパソコンからは見えません」 |
 | | バックアップ | 「録音はバックアップに含まれません。アプリを削除すると、録音はすべて消えます。残したい録音は書き出してください」 |
@@ -249,6 +250,29 @@ public protocol SettingsStoring: Sendable {
 
 - 本番の実装（`MinutesSystem/Settings/SettingsStore.swift`）だけが `UserDefaults` を使う（`no_direct_user_defaults` の例外。[architecture.md](architecture.md) §2.4）。鍵は `settings.autoTranscribe` と `settings.onboardingCompleted` の 2 つで、どちらも真偽値（D4）である。文字列を保存しない（SEC-DAT-07）。
 
+Apple Intelligence の可否（FR-SET-01。申し送り）:
+
+```swift
+/// 要約に使う端末内モデルの可否（設定画面の 3 状態）
+public enum SummaryModelAvailability: String, Sendable, CaseIterable {
+    case supported
+    case unsupported
+    case disabled
+}
+
+/// 可否の問い合わせ（注入点）。本番は SystemSummaryModelAvailability、テストは FixedSummaryModelAvailability
+public protocol SummaryModelAvailabilityProviding: Sendable {
+    func current() -> SummaryModelAvailability
+}
+```
+
+| 項目 | 設計 |
+| --- | --- |
+| 問い合わせの手段 | 本番の実装（アプリの `Platform/SystemSummaryModelAvailability.swift`）が FoundationModels の `SystemLanguageModel.default.availability` を読む（iOS 26 以降。iOS 27.2 SDK の `FoundationModels.swiftinterface` の宣言で確認。確認日 2026-11-27）。読むだけで、セッションを作らず、モデルを呼ばない（要約は P2）。オンデバイスのモデルだけを使い、`PrivateCloudComputeLanguageModel` は使わない（SEC-NET-02。`no_private_cloud_model`） |
+| 3 状態への対応づけ | `.available` → `supported`。`.unavailable(.deviceNotEligible)` → `unsupported`。`.unavailable(.appleIntelligenceNotEnabled)`・`.unavailable(.modelNotReady)`（モデルの準備中）・未知の理由（`@unknown default`）→ `disabled`（端末は対応しうるが、今は使えない） |
+| 読む時点 | 設定画面を開いたときと、前面に戻ったとき。値を保存しない |
+| 試験 | 差し替え（`FixedSummaryModelAvailability`）に 3 つの値を与え、それぞれの文言になり、どの値でも「要約は今後の版で提供します」が別に出て要約の操作が出ないこと（基本設計 §12）。対応づけは、本番の実装の写像を純粋関数（`SummaryModelAvailability.init(_:)`）に分け、列挙の全件を表で確かめる。実際の端末での表示は実機で確かめる |
+
 ### 4.7 復旧の報告（SC-10）
 
 起動時の復旧（[storage.md](storage.md) §9）の結果に、利用者へ知らせることがあるときだけ、1 回だけ出す。
@@ -258,6 +282,7 @@ public protocol SettingsStoring: Sendable {
 | 録音の途中で終了した会議があった | 問題 `recovered_after_termination` の 3 点と、会議ごとに「保存できた録音 N 件」「確定しました」または「確定できませんでした（確認する）」 |
 | 書きかけを救済した | 「保存の途中だった録音 N 件を復元しました」 |
 | 書きかけを隔離した | 問題 `part_files_quarantined` の 3 点 |
+| 位置の分からない録音を登録した（ハッシュの記録がない・読めない WAV。[storage.md](storage.md) §9 の照合 d） | 「位置の分からない録音 N 件があります。この会議は欠けた部分を承知のうえで確定できます」と「確認する」 |
 | DB を作り直した | 問題 `database_rebuilt` の 3 点 |
 | 削除の続きを行った | 表示しない（利用者が求めた削除の完了である） |
 
@@ -449,7 +474,7 @@ public struct ProblemPresentation: Equatable, Sendable {
 }
 ```
 
-- 問題は、種類（`ProblemKind`。26 種。[architecture.md](architecture.md) §8.2）と、差し込む数（あれば）だけで表す。**文字列を差し込めない**ので、エラーの説明文・パス・本文が画面に出る経路がない。
+- 問題は、種類（`ProblemKind`。27 種。[architecture.md](architecture.md) §8.2）と、差し込む数（あれば）だけで表す。**文字列を差し込めない**ので、エラーの説明文・パス・本文が画面に出る経路がない。
 - 3 点の文言は、種類ごとに String Catalog に 1 組だけ置く（鍵は `problem.{種類}.what`・`.safety`・`.action`）。画面ごとに文を組み立てない。
 - 重大度は 3 段階で、色・アイコン・文字（「お知らせ」「警告」「重要」）の 3 つで示す。録音が止まっている・失われうる状態（5 種）は最上位にする。
 - `severity(of:)` は `default` を書かない。問題の種類を足すと、重大度を決めるまでビルドが通らない。String Catalog に 3 つの鍵が揃っていることは、単体テストで確かめる（§11.1）。
@@ -463,6 +488,7 @@ public struct ProblemPresentation: Equatable, Sendable {
 | `recording_start_failed` | 警告 | 録音を開始できませんでした | 録音は始まっていません。保存済みの会議に影響はありません | もう一度お試しください。繰り返す場合は、iPhone を再起動してください |
 | `recording_interrupted` | 重要 | 録音が止まっています | 中断の前までは保存されています。今は録音できていません | 「再開」を押すか、録音を停止してください |
 | `input_lost` | 重要 | 使えるマイクがなくなったため、録音を停止しました | 停止までの録音は保存されています | マイクの接続を確かめて、新しい録音を始めてください |
+| `microphone_close_unconfirmed` | 重要 | マイクを閉じたことを確認できていません | 保存済みの録音は無事です。新しい音声は録音に入れていません | しばらく待っても消えない場合は、アプリを終了してください（終了するとマイクは閉じます） |
 | `audio_dropped` | 警告 | 録音の一部（約 N 秒）を記録できませんでした | 録音は続いています。記録できなかった部分は、空白として残ります | 操作は不要です。繰り返す場合は、ほかのアプリを閉じてください |
 | `storage_low` | 警告 | 空き容量が少なくなっています | 録音は続いています。あと約 N 分録音できます | 不要なデータを削除してください |
 | `storage_critical` | 重要 | 空き容量がほとんどありません | 録音は続いています。あと約 N 分で保存できなくなります | すぐに不要なデータを削除するか、録音を停止してください |
@@ -685,6 +711,9 @@ nonisolated struct RecordingActivityAttributes: ActivityAttributes {
 /// Live Activity の表示（RecordingStatusPresenting の本番の実装）。
 /// Activity は Sendable ではないので保持しない。更新と終了は、そのつど OS から一覧を取り直して行う
 nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
+    /// 最後の更新から古くなるまでの秒数（初期値。TST-DEV-12 で見直す）
+    static let staleAfterSeconds: TimeInterval = 90
+
     private let clock: any WallClock
 
     init(clock: any WallClock) {
@@ -727,7 +756,8 @@ nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
         let state = RecordingActivityAttributes.ContentState(
             status: content.status, elapsedSeconds: content.elapsedSeconds, timerStart: start,
         )
-        return ActivityContent(state: state, staleDate: nil)
+        // 古くなる時刻: 最後の更新の 90 秒後（通常の更新の間隔 30 秒より長い余裕。基本設計 §8）
+        return ActivityContent(state: state, staleDate: clock.now().addingTimeInterval(Self.staleAfterSeconds))
     }
 }
 ```
@@ -737,9 +767,11 @@ nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
 | 状態の型（申し送り） | `LockScreenContent`: 状態（`recording`・`interrupted`）と経過時間（秒）だけ。**文字列の欄がない**ので、会議タイトル・本文を渡せない（SEC-PLT-07） |
 | Live Activity の値 | `RecordingActivityAttributes.ContentState`: 状態、止まった経過時間、OS の時間表示の起点の時刻（録音中だけ）。固定の属性は持たない |
 | 始める・終える | 録音の状態が `capturing` になったら `start`、`idle`・`stopping` になったら `end`。Push は使わない（`pushType` は `nil`） |
-| 更新の頻度（申し送り） | **状態が変わったとき**（録音中 ↔ 中断中）と、**Chunk の確定のたび**（約 30 秒ごと。時間表示の起点を合わせ直す）。それ以外では更新しない |
+| 更新の頻度（申し送り） | 契機は録音パイプラインが届けるスナップショット（`RecordingSnapshot`。§5.2）である。**状態が変わったとき**（録音中 ↔ 中断中）は直ちに更新する。録音中は、**累積サンプル数が前回の更新から 30 秒分（480,000 サンプル。初期値）進むたび**に更新し、時間表示の起点をスナップショットの値に合わせ直す。**Chunk の確定・保存の成否によらない**（保存が遅れている・失敗している段階 3 でも、録音が続いていれば更新する）。取り出しが起きない状態（中断中など）では、アプリが動ける間、注入した `Scheduler` で 30 秒ごとに同じ内容を更新し、古くなる時刻だけを延ばす（タイマーの値から経過時間を作らない。INV-08）。更新は保存の actor の I/O を待たない |
+| 古くなる時刻 | 開始と更新のたびに、`staleDate` を最後の更新の 90 秒後にする（`staleAfterSeconds`。初期値で、TST-DEV-12 で見直す）。中断中の静止した表示にも付ける。アプリが更新できない場合（サスペンド・終了・クラッシュ）にだけ古くなる |
+| 古くなった表示 | ウィジェットの `isStale` が真のとき、中断中以外の状態（録音中）なら、経過時間を出さず、「状態を更新できていません。アプリを開いて確認してください」の固定の文だけを出す。中断中なら、「中断中」の状態と中断した時点で止めた経過時間を残したまま、同じ文を加える（基本設計 §8、BD-UI-04） |
 | 経過時間の見せ方 | 録音中は、OS の時間表示（起点の時刻からの経過を、OS が自分で進める）を使う。中断したら、直ちに「中断中」と止まった時間の表示に更新する |
-| 起点の時刻 | 「現在の壁時計の時刻 − 経過時間」。表示のためだけに使う（録音の位置には使わない。INV-08）。壁時計が変わっても、次の Chunk の確定で合わせ直される |
+| 起点の時刻 | 「現在の壁時計の時刻 − 経過時間」。表示のためだけに使う（録音の位置には使わない。INV-08）。壁時計が変わっても、次の更新で合わせ直される |
 | 使えない場合 | `start` が `false` を返す（Live Activity が無効・Personal Team で動かないなど）。アプリ内の表示と OS の録音インジケータで代え、設定画面にその旨を出す（§4.6。NFR-UX-03 ②） |
 | 残った表示の片付け | `start` の前と、起動時の復旧の後に `end()` を呼ぶ（前のプロセスが残した表示を消す）。`Activity` は `Sendable` ではないので保持せず、そのつど OS から一覧を取り直す |
 | 停止の操作 | Live Activity からは提供しない（アプリを開いて停止する） |
@@ -749,7 +781,7 @@ nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
 | 項目 | 設計 |
 | --- | --- |
 | ターゲット | `MinutesMobileWidgets`（ウィジェット拡張）。`RecordingActivityAttributes` を、アプリと共有する 1 ファイルに置く |
-| ロック画面 | アイコン、状態（「録音中」「中断中」）、経過時間。中断中は、色とアイコンを変え、「アプリを開くと再開を試みます」を添える |
+| ロック画面 | アイコン、状態（「録音中」「中断中」）、経過時間。中断中は、色とアイコンを変え、「アプリを開くと再開を試みます」を添える。古くなった表示は上の「古くなった表示」の行に従う |
 | ダイナミックアイランド | 小さい表示は、アイコンと経過時間。広げた表示は、ロック画面と同じ内容 |
 | 設定 | アプリの Info.plist に `NSSupportsLiveActivities`（真）。拡張の Bundle Identifier は、アプリの Bundle Identifier に `.widgets` を付けたもの（CON-09 の確定の後に決まる） |
 | 実装の順序 | 画面の実装の最後。Live Activity がなくても、ほかの機能が完結する（`RecordingStatusPresenting` の差し替えで動く） |
@@ -820,7 +852,7 @@ nonisolated struct LiveActivityPresenter: RecordingStatusPresenting {
 
 | 順 | テスト | 確かめること | 要件 |
 | --- | --- | --- | --- |
-| 1 | 問題の網羅 | 26 種のすべてが、重大度と 3 つの鍵を持つ。String Catalog に 78 の鍵がすべてあり、空でない | NFR-UX-04 |
+| 1 | 問題の網羅 | 27 種のすべてが、重大度と 3 つの鍵を持つ。String Catalog に 81 の鍵がすべてあり、空でない | NFR-UX-04 |
 | 2 | 経過時間 | スナップショットの値から式どおりになる。中断中に変わらない。書式（`0:05`・`1:02:03`） | FR-REC-06 |
 | 3 | ロック画面の値 | 状態の写像。録音していない状態では `nil`。値の型に文字列がない | SEC-PLT-07 |
 | 4 | タイトルの検証 | 改行・制御文字の除去、100 文字、空白だけ | TST-SEC-06 |
@@ -925,15 +957,16 @@ UI テストは、差し替えた構成でアプリを起動する（[architectu
 
 満たす要件: NFR-MNT-04
 
-基本設計 [ui.md](../02-basic-design/ui.md) §13 の 5 項目。
+基本設計 [ui.md](../02-basic-design/ui.md) §13 の 6 項目。
 
 | 申し送り | 解決 | 節 |
 | --- | --- | --- |
 | 各画面の配置・文言・用語の言い換え表 | SC-01〜SC-06・SC-08〜SC-11 の配置と文言を定めた（SC-07 は export.md）。内部の用語 16 個の言い換えを定めた | §3・§4 |
 | Store ごとの状態の型と、サービスから受け取る値の型 | 9 つの Store と状態の型。録音中は `RecordingSnapshot` と `RecordingStore`。古い応答は世代番号で捨てる | §5 |
-| 問題の種類の一覧と 3 点の文言 | 26 種の重大度と、3 点の文言（初版）。鍵は `problem.{種類}.{what・safety・action}` | §6 |
-| 覆いを出す条件と、キーボードの拒否の実装 | 覆いは、シーンが前面で操作中でなくなる通知で、専用のウィンドウを出す。キーボードは、アプリのデリゲートが `.keyboard` の拡張機能だけを拒否する | §7.1・§7.2 |
-| Live Activity の状態の型と更新の頻度。停止の確認の方法 | 型は `LockScreenContent`（状態と経過時間）。更新は、状態の変化と Chunk の確定のたび。停止は確認のダイアログ | §4.3・§8 |
+| 問題の種類の一覧と 3 点の文言 | 27 種の重大度と、3 点の文言（初版）。鍵は `problem.{種類}.{what・safety・action}` | §6 |
+| 覆いを出す条件（アプリの状態のどの変化で出すか）と、キーボードの拒否の実装 | 覆いは、シーンが前面で操作中でなくなる通知で、専用のウィンドウを出す。キーボードは、アプリのデリゲートが `.keyboard` の拡張機能だけを拒否する | §7.1・§7.2 |
+| Live Activity の状態の型と更新の頻度。停止の確認の方法（確認か長押しか） | 型は `LockScreenContent`（状態と経過時間）。更新は、状態の変化では直ちに、録音中は累積サンプル数が 30 秒分進むたび（Chunk の確定・保存の成否によらない）、中断中は注入した `Scheduler` で 30 秒ごと。古くなる時刻は最後の更新の 90 秒後。停止は確認のダイアログ | §4.3・§8 |
+| Apple Intelligence の可否を OS に問い合わせる手段（SDK で確かめ、確認日と出典を添える）と、可否の 3 状態への対応づけ | FoundationModels の `SystemLanguageModel.default.availability` を `SummaryModelAvailabilityProviding` の背後で読む（iOS 27.2 SDK の宣言で確認。2026-11-27）。`.available` → 対応、`.unavailable(.deviceNotEligible)` → 非対応、`.unavailable(.appleIntelligenceNotEnabled)`・`.unavailable(.modelNotReady)`・未知の理由 → 無効 | §4.6 |
 
 ---
 
@@ -953,6 +986,7 @@ UI テストは、差し替えた構成でアプリを起動する（[architectu
 | 文言（§4・§6）が利用者に伝わる | 初版 | オーナーの確認。実機試験で読みにくい文を直す |
 | アプリターゲット（既定の分離が MainActor）での Store と View のビルド | 一時の Package（同じ設定）でだけ確かめた | 画面の実装 |
 | ウィジェット拡張の見た目のコード | 書いていない（ビルドしていない） | 画面の実装の最後 |
+| 2026-11-27 に変えた・足したコード片（§4.6 の `SummaryModelAvailability`・`SummaryModelAvailabilityProviding`、§8 の `LiveActivityPresenter` の `staleDate`）がビルドできる | ビルドしていない（§11.3 の確認は、それより前の版のもの） | 画面の実装の最初に確かめる |
 
 ---
 
@@ -964,7 +998,10 @@ UI テストは、差し替えた構成でアプリを起動する（[architectu
 
 - iOS 27.2 SDK の `UIApplication.h`（拡張機能の種類ごとの許可、キーボードの拡張機能の識別子）、`UIPasteboard.h`（端末内限定・有効期限の指定、項目の設定）
 - iOS 27.2 SDK の `ActivityKit.swiftinterface`（`ActivityAttributes`・`Activity.request(attributes:content:pushType:)`・`update`・`end`・`ActivityContent`・`ActivityAuthorizationInfo.areActivitiesEnabled`・古い `request` の非推奨の宣言）
+- iOS 27.2 SDK の `FoundationModels.swiftinterface`（`SystemLanguageModel.default`・`availability`・`Availability.UnavailableReason` の `deviceNotEligible`・`appleIntelligenceNotEnabled`・`modelNotReady`、iOS 26 以降の宣言）（確認日 2026-11-27）
 - Xcode 27.2（27B52）・Swift 6.4.2 の `swift build`・`swift test`・`xcodebuild`（一時の Package で実行。§11.3 の結果はこの実行による）
-- SwiftLint 0.65.1（`no_direct_pasteboard` の検出の確認）
+- SwiftLint 0.65.1（`no_direct_pasteboard` の検出の確認）。版と配布元は [GitHub: realm/SwiftLint releases](https://github.com/realm/SwiftLint/releases)（確認日 2026-11-14。台帳 [dependencies-and-costs.md](../01-requirements/dependencies-and-costs.md) §3）で、実行したのは `tools/versions` の SHA-256 で照合して `.tools/` に入れた版
 - 基本設計 [ui.md](../02-basic-design/ui.md) §14 の出典（Apple の対応 capability の一覧など。本作業では再確認していない）
 - Minutes `docs/design-local-phase1.md` §3.6・§3.9、`docs/design-local-phase2.md` §18（別リポジトリ・読み取り専用。本作業では参照できず、基本設計の記述に基づいた）
+- [Apple: ActivityConfiguration](https://developer.apple.com/documentation/widgetkit/activityconfiguration)（WidgetKit の文書のページ。ページの存在を確認。確認日 2026-11-27。WidgetKit の型で iOS 16.1 以降であることの根拠は、iOS 27.2 SDK の `WidgetKit.swiftinterface` の宣言）
+- **出典の URL について（確認日 2026-11-27）:** 上の SDK のヘッダ・`.swiftinterface` は、Xcode に同梱されたローカルのファイルで、公開の URL はない。版の根拠は、SDK の版（iOS 27.2）は `xcodebuild -showsdks`、Xcode 27.2（27B52）は `xcodebuild -version`、Swift 6.4.2 は `swift --version`、各 API の対応 OS は SDK の宣言（`@available`・`API_AVAILABLE`）で確かめたものである（[dev-environment.md](dev-environment.md) §2）。Apple の文書のページは、本文が JavaScript で描かれ、対応 OS の記述を取得できないので、版の根拠にしない

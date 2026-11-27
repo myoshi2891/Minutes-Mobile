@@ -141,7 +141,7 @@ public enum ConcatenationPlan {
 
 | 規則 | 内容 |
 | --- | --- |
-| 位置 | 各 Chunk の位置は、その開始サンプル（DB の記録）で決める。開始サンプルの順に並べる |
+| 位置 | 各 Chunk の位置は、その開始サンプル（書き出しの開始時のスナップショットの値。§3.4）で決める。開始サンプルの順に並べる |
 | 無音で補う区間 | **保存済みの Chunk で覆われない区間だけ**を、同じサンプル数の無音にする。欠番・ファイル欠損・不正なヘッダ・途中の隔離は、前後の Chunk の終わりと始まりから区間が決まる。一部だけ救済した Chunk は、救済した分をそのまま入れ、残りだけが無音になる |
 | 末尾 | 範囲の分かっている欠落（未保存の記録の元の範囲、失われた未保存）が最後の Chunk より後にあれば、その終わり（`knownEnd`）までを無音にする |
 | 長さの分からない欠落 | 最後の Chunk より後に、範囲を持たない欠落（末尾の隔離など）がある場合は、**作らない**（`unknownLengthLoss`）。推定の長さで無音を補わない。録音一式は作れる |
@@ -149,9 +149,50 @@ public enum ConcatenationPlan {
 | 空白区間 | 無音を入れない（長い中断で巨大になるため）。そのため、連結した録音の中の位置は、会議全体のサンプル番号（音声時刻）と一致する |
 | 大きさ | WAV のヘッダの上限（4 GiB 未満）に収まらない場合は、作らずに理由を表示する（`archiveLimitExceeded`）。16 kHz・16 bit・モノラルでは約 37 時間分に当たる |
 
-- `knownEnd` と `hasUnknownLengthLoss` は、`ExportService` が、DB の Chunk の一覧・未保存の記録・`lossRecord`・`quarantinedSequences` から求める（[storage.md](storage.md) §9）。
+- `knownEnd` と `hasUnknownLengthLoss` は、`ExportService` が、書き出しの開始時のスナップショット（§3.4）の Chunk の一覧・未保存の記録・欠落の記録から求める。DB と `meeting.json` は読まない。
 - 連結した録音での位置（秒）は、`サンプル番号 ÷ 16,000` である。会議時刻（空白区間を含む）との対応は、[architecture.md](architecture.md) §4 の式で求める。文字起こしの書き出し（§8）に、連結した録音での位置を併記する。
-- 書き方は、WAV のヘッダ（全体のサンプル数）を先に書き、区間ごとに追記する。無音は、0 のバイト列を 1 MB ずつ追記する（全体をメモリに載せない）。
+- 書き方は、WAV のヘッダ（全体のサンプル数）を先に書き、区間ごとに追記する。無音は、0 のバイト列を 1 MB ずつ追記する（全体をメモリに載せない）。注記があれば、最後に下の `LIST` チャンクを追記する。
+
+**連結した録音の注記（`LIST`（`INFO`）チャンク。基本設計 §2 の申し送り）:** 補った欠落区間とハッシュの不一致がある場合だけ、`data` チャンクの**後ろ**に 1 つ置く（`data` は常に 44 バイト目から始まる）。
+
+```swift
+/// 連結した録音の注記のチャンク（基本設計 §2）。comment は固定の書式の ASCII だけ（タイトルを入れない）
+public enum WAVAnnotation {
+    /// "LIST" + 大きさ + "INFO" + "ICMT" + 大きさ + 本文 + NUL + 詰め物（必要なら 1 バイト）
+    public static func listChunk(comment: String) -> [UInt8]? {
+        guard comment.utf8.allSatisfy({ (0x20 ... 0x7E).contains($0) }) else { return nil }
+        let text = Array(comment.utf8) + [0]
+        let padding: [UInt8] = text.count.isMultiple(of: 2) ? [] : [0]
+        let subchunk = Array("ICMT".utf8) + littleEndian(UInt32(text.count)) + text + padding
+        let body = Array("INFO".utf8) + subchunk
+        return Array("LIST".utf8) + littleEndian(UInt32(body.count)) + body
+    }
+
+    /// RIFF の大きさの欄に収まるか（ファイル全体 − 8 が 32 bit に収まる）。上限の判定と書き込みで同じ計算を使う
+    public static func fits(totalSamples: Int64, annotationBytes: Int) -> Bool {
+        let fileBytes = Int64(WAVHeader.byteCount) + totalSamples * 2 + Int64(annotationBytes)
+        return fileBytes - 8 <= Int64(UInt32.max)
+    }
+
+    private static func littleEndian(_ value: UInt32) -> [UInt8] {
+        [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF), UInt8((value >> 16) & 0xFF), UInt8(value >> 24)]
+    }
+}
+```
+
+| 位置（`LIST` の先頭から） | 大きさ | 内容 |
+| --- | --- | --- |
+| 0 | 4 | `LIST` |
+| 4 | 4 | 以後の大きさ（リトルエンディアン）= 4 + 8 + `ICMT` の大きさ + 詰め物 |
+| 8 | 4 | `INFO` |
+| 12 | 4 | `ICMT` |
+| 16 | 4 | `ICMT` の大きさ = 本文のバイト数 + 1（終端の NUL を含む。詰め物は含めない） |
+| 20 | 本文 + 1 | 本文（ASCII の 0x20〜0x7E だけ）と終端の NUL |
+| 20 + 本文 + 1 | 0 か 1 | 詰め物（`ICMT` の大きさが奇数のときだけ 0x00 を 1 バイト。チャンクを偶数長にそろえる） |
+
+- RIFF の大きさの欄（4 バイト目）は「ファイル全体 − 8」（`LIST` を含む）にする。ヘッダは先に書くので、注記の本文は書き始める前に、スナップショット（§3.4）から作って長さを決めておく。
+- **上限の判定は、注記を含めた大きさで行う**（`WAVAnnotation.fits`。詰め物の 1 バイトで上限が変わるため、`listChunk` の戻り値の長さをそのまま渡す）。収まらなければ `archiveLimitExceeded`。
+- 本文の書式（`MinutesMobile hash-mismatch: …`・`MinutesMobile loss: …`・`MinutesMobile unverified: …` を `;`（直後に空白 1 つ）で区切って並べる）は基本設計 §2 のとおりである。数値と英字の理由だけで、タイトル・本文を入れない。
 
 ---
 
@@ -165,14 +206,16 @@ public enum ConcatenationPlan {
 | --- | --- | --- |
 | 1 | 画面（SC-07）で種類を選ぶ。警告「書き出したファイルは、このアプリの保護の外に出ます」を出し、「了承して書き出す」を押したときだけ進む（毎回。省く設定は作らない。BD-EXP-04） | — |
 | 2 | `ExportService.begin(meeting:kind:)`。録音中の会議なら拒否する（緊急書き出しを除く）。削除を始めた会議なら拒否する | `recordingInProgress`・`meetingBeingDeleted` |
-| 3 | 書き出し ID を発番する（`IDGenerator`）。`tmp/export/{meetingId}/{exportId}/` を作る（[storage.md](storage.md) §2.2） | `storage` |
-| 4 | 必要な大きさ（下の式）を見積もり、空き容量が「必要な大きさ + 予備（200 MB）」以上であることを確かめる（BD-EXP-07） | `insufficientSpace(requiredBytes:)` |
+| 3 | 書き出し ID を発番する（`IDGenerator`）。`tmp/export/{meetingId}/{exportId}/` を作る（[storage.md](storage.md) §2.2）。**緊急書き出しでは、作れなくても失敗にせず、§7 のメモリ上の経路へ進む** | `storage`（緊急書き出しを除く） |
+| 4 | 必要な大きさ（下の式）を見積もり、空き容量が「必要な大きさ + 予備（200 MB）」以上であることを確かめる（BD-EXP-07）。**緊急書き出しでは行わない**（下の注記） | `insufficientSpace(requiredBytes:)`（緊急書き出しを除く） |
 | 5 | 保管中（`sealed`）の会議なら、処理中の保護クラスへ戻す（BD-EXP-08。[storage.md](storage.md) §8） | `storage` |
 | 6 | 各 Chunk を検証つきで読む（ヘッダとハッシュ。[storage.md](storage.md) §6.1）。文字起こしを含む場合は、版のファイルの完全性を照合する（[transcription.md](transcription.md) §6.3） | `transcriptVersionRejected` |
 | 7 | ハッシュが合わない Chunk があれば、件数を画面に返し、続けるかを利用者が選ぶ（問題 `export_integrity_warning`）。続ける場合は、そのまま入れて目録に印を付ける | `cancelled`（やめた場合） |
 | 8 | 一時ファイルを作る（順に書く。進み具合を「済んだ Chunk の数 ÷ 全体」で流す） | `archiveLimitExceeded`・`unknownLengthLoss`・`inconsistentRanges`・`storage` |
 | 9 | 一時ファイルの場所を画面へ返す。画面が共有シートを出す（§3.3） | — |
 | 10 | 共有シートの完了・取り消しで、`ExportService.finish(exportId:)` を呼ぶ。一時のディレクトリを消し、保護クラスを見直す | — |
+
+- **緊急書き出しは、事前の空き容量の確認（手順 4）をせず、書き込みを試してから戻る**（決定）。緊急書き出しを使うのは容量の枯渇で Chunk を保存できない場面なので、事前の確認は常に通らず、メモリ上の経路に届かなくなるためである。手順 3 の一時のディレクトリの作成、または §7 の一時ファイルの書き込み・同期のどれかに失敗したら（`disk_full` を含む）、作りかけの一時ファイルを消し（消せなくても続ける）、§7 の手順 5 のメモリ上の経路で渡す。
 
 必要な大きさの見積もり: 録音一式は「入れる Chunk のバイト数の合計 + エントリごとに 76 バイトと名前の長さの 2 倍 + 目録」、連結した録音は「44 + 全体のサンプル数 × 2」、文字起こしは「版のファイルの大きさの 2 倍」（上限の目安）。
 
@@ -187,7 +230,7 @@ public enum ConcatenationPlan {
 | --- | --- | --- |
 | `recordingInProgress` | その会議が録音中（緊急書き出しを除く） | `export_unavailable` |
 | `meetingBeingDeleted` | 削除を始めた会議（確認の後から。墓標の後も） | `export_unavailable` |
-| `insufficientSpace(requiredBytes:)` | 空き容量が足りない | `export_insufficient_space` |
+| `insufficientSpace(requiredBytes:)` | 空き容量が足りない（緊急書き出しを除く。緊急書き出しは確認をせず、書けなければ §7 のメモリ上の経路へ移る） | `export_insufficient_space` |
 | `archiveLimitExceeded` | 4 GiB 以上・65,535 件以上（§4.1）、または連結した録音が 4 GiB 以上 | `export_unavailable` |
 | `unknownLengthLoss` | 連結した録音で、長さの分からない欠落がある | `export_unavailable`（「録音一式で書き出してください」を添える） |
 | `inconsistentRanges` | 連結した録音で、Chunk の範囲が重なる | `export_unavailable` |
@@ -200,7 +243,7 @@ public enum ConcatenationPlan {
 | 書き出し ID | 書き出しごとに `IDGenerator.makeUUID()` で作る。一時のディレクトリの名前と、要求と応答の対応付けに使う |
 | 同時の書き出し | 1 つの会議につき、同時に 1 つ。進行中に次の要求が来たら、前の書き出しを中止して片付けてから始める |
 | 古い応答 | 進み具合・完了・失敗には、書き出し ID を添える。`ExportStore` は、現在の書き出し ID と合わない応答を捨てる（TST-GEN-05） |
-| 削除との関係 | `DeletionService` は、確認の後すぐに `ExportService.rejectExports(for:)` を呼ぶ。以後、その会議の `begin` は `meetingBeingDeleted` を返す（書き出し中でなくても）。書き出し中なら中止し、中止の完了（一時ファイルへの書き込みが止まったこと）を返してから、削除が進む（[storage.md](storage.md) §10 の手順 0） |
+| 削除との関係 | `DeletionService` は、確認の後すぐに `ExportService.rejectExports(for:)` を呼ぶ。以後、その会議の `begin` は `meetingBeingDeleted` を返す（書き出し中でなくても）。書き出し中なら、削除要求を永続化した後に中止し、中止の完了（一時ファイルへの書き込みが止まったこと）を返してから、削除が進む（上限 10 秒。[storage.md](storage.md) §10 の手順 1） |
 | 保存の入口 | `ExportService` は、Domain の protocol（`ExportSource`: Chunk の一覧と検証つきの読み出し、版の読み出し、会議のメタデータ。`ExportSink`: 一時ファイルの作成・追記・削除）越しに `MeetingStore` を使う。一時ファイルを作る関数は、会議に削除要求がないことを確かめる |
 
 ### 3.3 書き出しの画面（SC-07）と共有シート
@@ -266,6 +309,40 @@ struct ActivityShareSheet: UIViewControllerRepresentable {
 | 入口 | 共有シートを出すのは、`ExportStore` の 1 か所だけである（警告と後始末を必ず通す） |
 | 完了が届かない場合 | アプリが終了すると届かない。次の起動の復旧で `tmp/export/` を丸ごと消す（§6） |
 | 覆いとの関係 | 共有シートを出している間も、覆い（[ui.md](ui.md) §7.1）は専用のウィンドウで上に出る |
+
+### 3.4 書き出しの開始時のスナップショット（基本設計 §2 の申し送り）
+
+```swift
+/// 書き出しに使う値のすべて（基本設計 §2）。MeetingStore のメモリ上の状態の写しで、DB と meeting.json を読まずに作る
+public struct ExportSnapshot: Equatable, Sendable {
+    public let meeting: MeetingID
+    /// 保存済みの Chunk（連番・開始サンプル・サンプル数・記録したハッシュ・ファイルの状態）。
+    /// 開始位置が不明な Chunk（storage.md §9 の照合 d）は開始サンプルが nil で、連結した録音と目録では欠落として扱う
+    public let chunks: [SavedChunkEntry]
+    /// メモリ上の未保存 Chunk と永続化した未保存の記録（連番・元の範囲）
+    public let unsaved: [UnsavedChunkEntry]
+    public let gaps: [MeetingDocument.GapRecord]
+    /// lossRecord・隔離した連番・長さが不明な欠落
+    public let losses: LossSummary
+    /// タイトル・開始日時・確定方式・入力経路の履歴・会議の状態
+    public let metadata: MeetingMetadata
+}
+
+public protocol ExportSource: Sendable {
+    /// 中断点（await）を含まない 1 つのメソッドで、actor のメモリ上の状態から写しを作る
+    func exportSnapshot(of meeting: MeetingID) async throws(ExportFailure) -> ExportSnapshot
+    // ほかの要件（検証つきの Chunk の読み出し・版の読み出し）は §3.2 の「保存の入口」のとおり
+}
+```
+
+| 項目 | 設計 |
+| --- | --- |
+| 取得の方法 | `MeetingStore.exportSnapshot(of:)`（actor のメソッド）は、中に `await` を持たない。呼び出し側の `await` は actor に入るための待ちで、メソッドの中では別の処理（保存の再試行の成功など）が割り込まない。値はすべて、同じ時点の actor のメモリ上の状態（会議ごとの `MeetingState`。[storage.md](storage.md) §5.1）から取る |
+| メモリ上に持つ形 | `MeetingStore` は会議ごとに `MeetingState`（値型）を持つ: 保存済みの Chunk の一覧（連番 → `SavedChunkEntry`）、未保存（連番 → `UnsavedChunkEntry`。メモリ上の保持と永続化した記録の両方）、空白区間、欠落の記録、会議のメタデータ。起動の後は、起動時の照合（[storage.md](storage.md) §9）の結果から作る |
+| 書き込みの前に状態へ反映する順序 | どの変更も、**同じ同期のメソッドの中で、先に `MeetingState` を更新してから** DB・`meeting.json` の書き込みを発行する（Chunk の登録は、登録の取引と `MeetingState` の更新を同じメソッドの中で続けて行う。未保存の記録の削除も同じ）。書き込みの I/O が終わっていなくても、状態に反映済みの登録・追加・削除・タイトルの変更はスナップショットに入る |
+| 再試行の成功がスナップショットを変えないこと | スナップショットは値型の写しで、`MeetingState` への参照を持たない。書き出しは、手順 2 で取った写しの Chunk の一覧と未保存の記録だけを使い、その後の再試行の成功（未保存から保存済みへの移動）を見ない。1 つの写しの中で、同じ Chunk が保存済みと未保存の両方に現れるのは、一部だけ救済した連番（正しい状態）だけである |
+| 使う手順 | §3.1 の手順 2 の直後に 1 回だけ取り、目録（§4.2）・連結した録音（§2）・文字起こしの書き出し（§8）・ファイル名（§5）・注記（§2）のすべてをこの写しから作る |
+| 試験 | 保存の再試行の成功をスナップショットの取得の直後に起こし（差し替えで順序を決める）、書き出しの中身が取得の時点の写しのままであること。DB の書き込みを止めた状態でも、状態に反映済みの登録がスナップショットに入ること |
 
 ---
 
@@ -645,7 +722,7 @@ public enum ExportFileName {
 | 共有の完了・取り消し | `{exportId}/` を丸ごと消す。`{meetingId}/` が空になったら、それも消す | `ExportService.finish(exportId:)` |
 | 書き出しの失敗・中止 | 同上（失敗を返す前に消す） | `ExportService` |
 | 次の起動 | `tmp/export/` の下をすべて消す | 起動時の復旧の手順 8（[storage.md](storage.md) §9） |
-| 会議の削除 | その会議の新しい書き出しを拒否し、書き出し中なら中止の完了を待ってから、`tmp/export/{meetingId}/` を丸ごと消す | [storage.md](storage.md) §10 の手順 0・2 |
+| 会議の削除 | その会議の新しい書き出しを拒否し、書き出し中なら中止の完了を待ってから、`tmp/export/{meetingId}/` を丸ごと消す | [storage.md](storage.md) §10 の手順 0〜2 |
 
 - 一時ファイルは、保存ルートの下にだけ作る。OS の一時ディレクトリ（`NSTemporaryDirectory`）を使わない（静的解析の `no_direct_directory_access`）。
 - 共有シートに渡すのは、この一時ファイルの URL である。共有先が複製を作った後は、アプリからは消せない（警告で伝える。§3.3）。
@@ -685,8 +762,8 @@ public enum WAVImage {
 | 1 | `RecordingService` から、メモリに保持している未保存の Chunk（連番・開始サンプル・PCM）の写しを受け取る（[storage.md](storage.md) §7）。**保持は解放しない** |
 | 2 | Chunk ごとに `WAVImage.file(of:)` で WAV のバイト列にする（確定のときと同じヘッダ） |
 | 3 | 1 件なら WAV、複数なら ZIP にする。ZIP の中身は、`manifest.json`（未保存の Chunk の連番・開始サンプル・サンプル数。`omissions` ではなく `chunks` に入れ、SHA-256 はこの WAV のもの）と `mic/{連番}.wav` |
-| 4 | 一時ファイルを作れれば、`tmp/export/{meetingId}/{exportId}/` に書いて、URL を共有シートへ渡す |
-| 5 | **一時ファイルを作れない場合**（容量の枯渇で書き込めない）は、メモリ上のバイト列を、`ShareItem.data` として共有シートへ直接渡す（下の表） |
+| 4 | 一時のディレクトリ（§3.1 の手順 3）を作れていれば、`tmp/export/{meetingId}/{exportId}/` に書いて同期し、URL を共有シートへ渡す（事前の空き容量の確認はしない。§3.1） |
+| 5 | **一時のディレクトリを作れない・一時ファイルを書けない・同期できない場合**（容量の枯渇・権限など）は、作りかけの一時ファイルを消し、メモリ上のバイト列を、`ShareItem.data` として共有シートへ直接渡す（下の表） |
 | 6 | 共有の完了・取り消しの後も、メモリ上の保持と未保存の記録は消さない（端末内の保存に成功するまで、Barrier は通らない。[storage.md](storage.md) §6） |
 
 | メモリ上のデータを渡す経路（申し送り） | 内容 |
@@ -812,8 +889,10 @@ public enum TranscriptLine {
 | 13 | 長さの分からない欠落（結合） | 連結した録音が作られず、理由が出ること。録音一式は作れ、目録に長さ `null` で入ること。文字起こしが長さを書かないこと | FR-EXP-01 |
 | 14 | 一時ファイル（結合） | 完了・取り消し・失敗・中止のそれぞれで、`tmp/export/` に何も残らないこと。起動時の復旧で消えること | SEC-DAT-06 |
 | 15 | 削除との関係（結合） | 削除を始めた会議の書き出しが拒否されること。書き出し中の会議を削除すると、中止の完了の後に `tmp/export/{meetingId}/` が消え、ほかの会議の一時ファイルが残ること | TST-SEC-05 |
-| 16 | 容量（結合） | 空き容量が足りないとき、作成を始めずに `insufficientSpace` を返すこと | FR-EXP-01 |
-| 17 | 緊急書き出し（結合） | 書き込みを失敗させてメモリに保持させ、書き出した WAV が再生できること。保持が解放されないこと。一時ファイルを作れないとき、メモリ上のデータの経路になること | TST-SAV-04 |
+| 16 | 容量（結合） | 緊急書き出し以外の種類で、空き容量が足りないとき、作成を始めずに `insufficientSpace` を返すこと | FR-EXP-01 |
+| 17 | 緊急書き出し（結合） | 書き込みを失敗させてメモリに保持させ、書き出した WAV が再生できること。保持が解放されないこと。次の 3 つのそれぞれで `insufficientSpace`・`storage` を返さずにメモリ上のデータの経路になり、一時ファイルが残らないこと: ①一時のディレクトリの作成の失敗、②空き容量が予備（200 MB）より少ない（`FixedFreeSpace`。事前の確認をしない）、③一時ファイルの書き込みの失敗（`FaultInjectingFileSystem`） | TST-SAV-04 |
+| 20 | 連結した録音の注記 | `ICMT` の本文の長さが偶数・奇数のそれぞれで、§2 の表のバイト配置（詰め物の有無）になること。RIFF の大きさがファイル全体 − 8 と一致し、`data` が 44 バイト目から始まること。上限の判定が注記の長さ（詰め物を含む）で変わること。ASCII 以外の本文を拒否すること | FR-EXP-01、SEC-INT-01 |
+| 21 | スナップショット（結合） | §3.4 の試験の行 | FR-EXP-01 |
 | 18 | 古い応答（単体） | 前の書き出し ID の進み具合・完了が、`ExportStore` に捨てられること | TST-GEN-05 |
 | 19 | UI テスト: 警告 | 警告を了承しないと、共有シートが出ないこと | FR-EXP-03 |
 
@@ -883,14 +962,16 @@ public enum TranscriptLine {
 
 満たす要件: NFR-MNT-04
 
-基本設計 [export.md](../02-basic-design/export.md) §12 の 4 項目。
+基本設計 [export.md](../02-basic-design/export.md) §12 の 6 項目。
 
 | 申し送り | 解決 | 節 |
 | --- | --- | --- |
-| ZIP の各ヘッダのバイト配置 | ローカルファイルヘッダ（30 バイト）・中央ディレクトリのヘッダ（46 バイト）・終端（22 バイト）の配置を表にし、`ZIPFormat` として実装した。参照元が手元にないため、公開の仕様から起こし、OS 標準の機能で展開できることを確かめた | §4.1 |
+| ZIP の各ヘッダのバイト配置（Minutes `src/export/zip.ts` を基準にする） | ローカルファイルヘッダ（30 バイト）・中央ディレクトリのヘッダ（46 バイト）・終端（22 バイト）の配置を表にし、`ZIPFormat` として実装した。参照元が手元にないため、公開の仕様から起こし、OS 標準の機能で展開できることを確かめた | §4.1 |
 | 目録の項目と形式の版 | `ExportManifest`（形式の版 1）。入れた Chunk・入れていない区間・空白区間・経路・確定方式 | §4.2 |
+| 書き出しの開始時のスナップショット（保存済みの Chunk の一覧・未保存の記録・空白区間・欠落の記録・会議のメタデータを、保存の actor の中断点を含まない 1 つのメソッドの中で、DB を読まずに actor のメモリ上の状態から取得する問い合わせ）の型と、これらの値を actor のメモリ上に持つ形・書き込みの前に状態へ反映する順序、書き出しの途中の保存の再試行の成功がスナップショットを変えないことの保証の方法（§2・§4.1） | 型は `ExportSnapshot`（`ExportSource.exportSnapshot(of:)`）。`MeetingStore` が会議ごとの `MeetingState`（値型）を持ち、どの変更も同じ同期のメソッドの中で状態を先に更新してから書き込みを発行する。スナップショットは `await` のないメソッドで作る値型の写しで、後の再試行の成功を見ない | §3.4 |
 | 共有シートを包む部品と、完了の受け取り方 | `ActivityShareSheet`。`completionWithItemsHandler` で完了と取り消しを受け取り、後始末へつなぐ | §3.3 |
-| メモリ上のデータを直接渡す経路の実装 | `ShareItem.data`: `NSItemProvider` にデータの種類と中身を登録して、共有シートの項目にする | §7 |
+| メモリ上のデータを直接渡す経路の実装 | `ShareItem.data`: `NSItemProvider` にデータの種類と中身を登録して、共有シートの項目にする。緊急書き出しは事前の空き容量の確認をせず、一時のディレクトリ・ファイルを作れなければこの経路へ移る | §3.1・§7 |
+| 連結した録音の注記（不一致・補った欠落区間）の `LIST`（`INFO`）チャンクのバイト配置（`ICMT` の終端の NUL と、偶数長にするための詰め物を含む。詰め物の 1 バイトで総サンプル数の上限が変わるため、上限の判定と同じ計算にする） | `WAVAnnotation.listChunk(comment:)`。`data` の後ろに `LIST`・大きさ・`INFO`・`ICMT`・大きさ（本文 + NUL）・本文・NUL・詰め物（奇数のときだけ 1 バイト）。上限は `WAVAnnotation.fits` で、注記の長さ（詰め物を含む）を足して判定する | §2 |
 
 ---
 
@@ -909,6 +990,7 @@ public enum TranscriptLine {
 | 120 分の録音一式を作るのにかかる時間 | 測っていない | 書き出しの実装（進み具合を表示する） |
 | Markdown のエスケープの対象の文字が、十分である | 一般的な記法の文字を対象にした。表示するアプリの方言による | 書き出した Markdown を、代表的なアプリで開いて確かめる |
 | 連結した録音の上限（4 GiB 未満。約 37 時間分） | 実用上は届かない | — |
+| 2026-11-27 に足したコード片（§2 の `WAVAnnotation`、§3.4 の `ExportSnapshot`・`ExportSource`）がビルドできる | ビルドしていない（§10.3 の確認は、それより前の版のもの） | 書き出しの実装の最初にビルドとテストで確かめ、本書を直す |
 
 ---
 
@@ -921,5 +1003,6 @@ public enum TranscriptLine {
 - iOS 27.2 SDK の `zlib.h`（zlib 1.2.12 の `crc32`）、`UIActivityViewController.h`（`completionWithItemsHandler`）、`NSItemProvider.h`（データの種類と中身の登録・`suggestedName`）
 - Xcode 27.2（27B52）・Swift 6.4.2 の `swift build`・`swift test`・`xcodebuild`（一時の Package で実行。§10.3 の結果はこの実行による）
 - macOS 27.2 の `/usr/bin/unzip`（作ったアーカイブの展開の確認）
-- ZIP の形式の仕様（PKWARE の「APPNOTE.TXT - .ZIP File Format Specification」）。§4.1 のバイト配置は、この仕様の無圧縮・単一ディスク・ZIP64 なしの形である。本作業では文書そのものを開いておらず、**配置の正しさは、OS 標準の `unzip` で検査・展開できたことで確かめた**
+- ZIP の形式の仕様: [PKWARE: APPNOTE.TXT - .ZIP File Format Specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT)（版 6.3.10、2022-11-01 改訂。確認日 2026-11-27。ローカルファイルヘッダ（4.3.7）・中央ディレクトリ（4.3.12）・終端（4.3.16）の節があることを確かめた）。§4.1 のバイト配置は、この仕様の無圧縮・単一ディスク・ZIP64 なしの形である。§4.1 の表と仕様のバイト単位の照合はしておらず、**配置の正しさは、OS 標準の `unzip` で検査・展開できたことで確かめた**
+- **出典の URL について（確認日 2026-11-27）:** 上の SDK のヘッダ・`.swiftinterface` は、Xcode に同梱されたローカルのファイルで、公開の URL はない。版の根拠は、SDK の版（iOS 27.2）は `xcodebuild -showsdks`、Xcode 27.2（27B52）は `xcodebuild -version`、Swift 6.4.2 は `swift --version`、各 API の対応 OS は SDK の宣言（`@available`・`API_AVAILABLE`）で確かめたものである（[dev-environment.md](dev-environment.md) §2）。Apple の文書のページは、本文が JavaScript で描かれ、対応 OS の記述を取得できないので、版の根拠にしない
 - Minutes `src/export/zip.ts`、`docs/design-local-phase1.md` §3.4・§4.5（別リポジトリ・読み取り専用。本作業では参照できず、基本設計の記述に基づいた）

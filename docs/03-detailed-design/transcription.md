@@ -68,6 +68,8 @@ public struct TranscriptionTuning: Equatable, Sendable {
     public var retryJitter = 0.2
     /// 1 件のジョブの上限時間（音声の長さの倍数）
     public var timeoutFactor = 10
+    /// 打ち切ったエンジンの実行の停止（cancel() の戻り）を待つ上限（ms）
+    public var stopConfirmTimeoutMs: Int64 = 5000
 
     public init() {}
 }
@@ -82,6 +84,7 @@ public struct TranscriptionTuning: Equatable, Sendable {
 | 試行回数の上限 | 5 | 基本設計 §4.2 |
 | 再実行までの間隔 | 2・5・10・30・60 秒に ±20% のゆらぎ | 基本設計 §4.2 |
 | 1 件のジョブの上限時間 | 入力の長さの 10 倍（30 秒の Chunk + 3 秒の Overlap なら 330 秒） | 基本設計 §4.2 |
+| 打ち切った実行の停止を待つ上限 | 5 秒（上限を過ぎても待ち続け、その間は次の試行を始めない。§5.2） | 基本設計 §4.2 の「止まっていない実行」。実エンジンで止まるまでの時間を実測して見直す（§14） |
 
 値はすべて差し替えられる（試験では小さい値を使う）。境界での取りこぼし・重複を記録して見直す（§14）。
 
@@ -169,7 +172,8 @@ public protocol SpeechEngine: Sendable {
     func installAssets(progress: @escaping @Sendable (Double) -> Void) async throws(EngineFailure)
     /// 16 kHz・モノラルの PCM を認識し、確定した結果だけを返す（途中経過は返さない）
     func transcribe(_ samples: [Int16]) async throws(EngineFailure) -> [RecognizedSpan]
-    /// 実行中の認識を中止する。エンジンの実行が止まってから戻る。実行中でなければ何もしない
+    /// 実行中の認識を中止する。認識の操作全体（準備の await を含む）が終わり、解析が止まり、
+    /// これから解析が始まることもない状態になってから戻る。実行中でなければ何もしない
     func cancel() async
 }
 ```
@@ -179,7 +183,7 @@ public protocol SpeechEngine: Sendable {
 | 入力 | 16 kHz・モノラルの `[Int16]`（Overlap の分と当該 Chunk をつないだもの）。エンジンは、どの会議のどの Chunk かを知らない |
 | 出力 | 確定した結果だけ（`RecognizedSpan`）。位置は入力の先頭からのサンプル番号。途中経過は要求しない |
 | 失敗 | `EngineFailure`（7 種）。OS のエラーの説明文は持たない。ジョブの失敗の分類への写像は `failureClass`（§5.2） |
-| 中止 | `cancel()` は、エンジンの実行が止まってから戻る（録音の開始が、これを待つ。§8.3） |
+| 中止 | `cancel()` は、認識の操作全体が終わってから戻る（準備の `await` の途中でも、解析の作成・開始の前でも、解析の実行中でも）。戻った時点で、解析は止まっていて、これから始まることもない。**戻ったことが停止の確認である**（§5.2 の「止まっていない実行」）。録音の開始は、これを待たない（§8.3） |
 | エンジンの情報（`EngineInfo`） | エンジンの種類・ロケール・OS の版・OS のビルド番号の 4 つ。文字列の 3 つは、英数字と `.`・`_`・`-` だけ・32 文字までに限る（永続データから読んだ値をそのまま画面に出すため） |
 | 差し替え（`ScriptedSpeechEngine`） | 入力の長さ・呼ばれた回数に応じて、決めた結果・失敗・遅延を返す。`cancel()` が呼ばれたことを記録する |
 
@@ -205,6 +209,9 @@ public protocol SpeechEngine: Sendable {
 /// 1 回の transcribe が 1 つの解析（開始 → 入力の終わりまで確定 → 終了）で、結果の時刻は入力の先頭から数える
 public actor AnalyzerSpeechEngine: SpeechEngine {
     private let locale: Locale
+    /// 認識の操作全体（ロケールの問い合わせ・入力の変換・解析）。cancel() はこれの終了を待つ
+    private var operation: Task<[RecognizedSpan], any Error>?
+    /// 作成して開始した解析。operation の中でだけ設定する
     private var running: SpeechAnalyzer?
 
     public init(locale: Locale = Locale(identifier: "ja_JP")) {
@@ -227,33 +234,55 @@ public actor AnalyzerSpeechEngine: SpeechEngine {
 
 ```swift
     public func transcribe(_ samples: [Int16]) async throws(EngineFailure) -> [RecognizedSpan] {
-        guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else { throw .unavailable }
-        let transcriber = Self.makeTranscriber(supported)
+        // 前の操作が終わる前には始めない（ジョブの側は、停止を確かめてからしか呼ばない。§5.2）
+        guard operation == nil else { throw .cancelled }
+        let task = Task { try await self.run(samples) }
+        operation = task
+        defer { operation = nil }
         do {
-            let inputs = try await Self.inputs(for: samples, module: transcriber)
-            // モデルは、使い終わってもしばらく保持する（Chunk ごとの読み込み直しを避ける）
-            let options = SpeechAnalyzer.Options(priority: .utility, modelRetention: .lingering)
-            let analyzer = SpeechAnalyzer(modules: [transcriber], options: options)
-            running = analyzer
-            defer { running = nil }
-            async let spans = Self.collect(from: transcriber)
-            let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
-            for input in inputs {
-                continuation.yield(input)
-            }
-            continuation.finish()
-            try await analyzer.start(inputSequence: stream)
-            try await analyzer.finalizeAndFinishThroughEndOfInput()
-            return try await spans
+            return try await task.value
         } catch {
             throw Self.classify(error)
         }
     }
 
+    /// 認識の操作の本体。await の後ごとに中止を確かめ、中止されていれば解析を作らず・始めない
+    private func run(_ samples: [Int16]) async throws -> [RecognizedSpan] {
+        guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: locale) else {
+            throw EngineFailure.unavailable
+        }
+        try Task.checkCancellation()
+        let transcriber = Self.makeTranscriber(supported)
+        let inputs = try await Self.inputs(for: samples, module: transcriber)
+        // ここから解析を start するまで中断点がないので、cancel() は「作る前」か「running が設定された後」にだけ入る
+        try Task.checkCancellation()
+        // モデルは、使い終わってもしばらく保持する（Chunk ごとの読み込み直しを避ける）
+        let options = SpeechAnalyzer.Options(priority: .utility, modelRetention: .lingering)
+        let analyzer = SpeechAnalyzer(modules: [transcriber], options: options)
+        running = analyzer
+        defer { running = nil }
+        async let spans = Self.collect(from: transcriber)
+        let (stream, continuation) = AsyncStream.makeStream(of: AnalyzerInput.self)
+        for input in inputs {
+            continuation.yield(input)
+        }
+        continuation.finish()
+        try await analyzer.start(inputSequence: stream)
+        try await analyzer.finalizeAndFinishThroughEndOfInput()
+        return try await spans
+    }
+
     public func cancel() async {
-        // transcribe が待っている間に呼ばれる（actor の再入）。解析が止まってから戻る
-        guard let analyzer = running else { return }
-        await analyzer.cancelAndFinishNow()
+        // transcribe が待っている間に呼ばれる（actor の再入）
+        guard let task = operation else { return }
+        // 準備の await の途中なら、次の checkCancellation で解析を作らずに終わる
+        task.cancel()
+        // 解析の実行中なら、解析を止める（入力の列は終わっている。エンジンに新しい音声を渡さない）
+        if let analyzer = running {
+            await analyzer.cancelAndFinishNow()
+        }
+        // 操作全体の終了を待つ。戻った時点で解析は止まっていて、これから始まることもない
+        _ = await task.result
     }
 
     /// 途中経過（volatile）は要求しない。時刻範囲と信頼度の属性を要求する
@@ -347,7 +376,7 @@ public actor AnalyzerSpeechEngine: SpeechEngine {
 | 入力の組み立て | `[Int16]` を 16 kHz・Int16・モノラルの `AVAudioPCMBuffer` に写し、`AnalyzerInputConverter.converter(compatibleWith:)`（iOS 27）で、エンジンが受け付ける形式の `AnalyzerInput` の列にする。変換の末尾は `flush()` で吐き出す |
 | 結果の読み出し | `results` の列から、確定した結果（`isFinal`）だけを集める。本文は `AttributedString` の文字列、時刻は `range`（`CMTimeRange`）を 16,000 倍してサンプル番号にする |
 | 信頼度 | 結果の中の区間ごとの値（`transcriptionConfidence`）を、文字数で重み付けして平均する。1 つも取れなければ `nil` |
-| 中止 | `cancel()` が `cancelAndFinishNow()` を呼ぶ。actor の再入により、`transcribe` が待っている間に実行される |
+| 中止 | 認識の操作全体を `operation`（`Task`）として持つ。`cancel()` は、①`operation` を中止する（準備の `await` の後ごとの `checkCancellation()` で、解析を作らず・始めずに終わる）、②解析が実行中なら `cancelAndFinishNow()` を呼ぶ、③`operation` の終了を待つ、の順に行い、③が終わってから戻る。`checkCancellation()` から `running` の設定と `start` の呼び出しまでの間に中断点がないので、中止が「解析を作った後・`running` に入れる前」に入り込むことはない。actor の再入により、`transcribe` が待っている間に実行される。前の操作が終わる前の `transcribe` は始めずに `cancelled` を投げる |
 | エラーの分類 | `SFSpeechError` のコードだけを見る。`noModel`・`assetLocaleNotAllocated` → `assetMissing`、`insufficientResources` → `insufficientResources`、`timeout` → `timedOut`、`CancellationError` → `cancelled`、そのほか → `other(osCode:)`。**説明文（`localizedDescription`）は読まない** |
 | エンジンの情報 | OS の版は `ProcessInfo.operatingSystemVersion`、ビルド番号は `operatingSystemVersionString` の `Build` の後ろから取り出す（取り出せなければ `unknown`） |
 
@@ -500,6 +529,21 @@ public enum OverlapMapping {
 - 読むときは `validated(run:sequence:)` で検証する: 形式の版、番号の一致、範囲（セグメントが「Chunk の開始 − Overlap」から Chunk の終わりまでに収まる）、番号が 0 からの連番、本文（空でない・4,000 文字まで・制御文字を含まない）、信頼度（0〜1）、件数（2,000 件まで）。通らない結果ファイルは使わない（そのジョブを再実行する）。
 - セグメントの ID は「連番-Chunk 内の番号」（`SegmentID`）で、同じ版の中で一意である。版をまたいで参照する場合は、版番号と組にする（FR-STT-04）。
 - 本文（D2）は、会議ディレクトリのファイルにだけ置く。DB・ログ・エラーの値には入れない（BD-STT-03）。
+
+**失敗の記録**（`stt/run-{実行番号 4 桁}/{連番 6 桁}.failed.json`。型は `ChunkFailureRecord`。形式の版 1。基本設計 §4.3）:
+
+| 項目 | 内容 |
+| --- | --- |
+| `formatVersion`・`runNo`・`sequenceNo` | 形式の版、実行番号、連番（読むときに、ファイル名の値と一致することを確かめる） |
+| `failureClass` | 失敗の分類（`TranscriptionFailureClass` の生の値。§5.2） |
+| `reason` | 記録した理由（`retry_not_selected`・`retry_result_unavailable`・`attempts_exhausted` などの英小文字・数字・`_` の 64 文字まで）。なければ `null` |
+| `attemptGeneration` | `failed` にした試行の実行世代（UUID の小文字の文字列。§5.3） |
+| `retryID` | 失敗区間の再試行の中で `failed` にした場合の、その再試行の識別子（UUID の小文字の文字列。§7）。なければ `null` |
+| `recordedAtMs` | 記録した日時（UTC の経過ミリ秒） |
+
+- 書き方は結果ファイルと同じ（`PersistedJSON.encode` と `FileSystem.replaceAtomically`。同じ連番の記録があれば置き換える）。`failed` にする DB の取引より前に公開する。
+- 読むときは `validated(run:sequence:)` で検証する: 形式の版、番号の一致、`failureClass` が既知の値、`reason` の文字の種類と長さ、UUID の形、日時が 0 以上。**通らない記録は、`failed` の記録があるものとして扱う**（結果ファイルを再利用しない側に倒す）。例外は基本設計 §4.3 の 2 つ（失敗区間の再試行で選んだ連番は `pending`、`processing` のジョブの回収では記録がないものとする）。
+- 本文を含めない（D2 を持たない）。
 
 計測値（NFR-PRF-03。`usage_metrics` に記録する。数値は保証せず、合否にも使わない）:
 
@@ -717,6 +761,11 @@ public enum JobSelector {
 - 再実行までの待ち時間は、`RetryPolicy.delayMs` で求め、注入した `Scheduler` で待つ（[architecture.md](architecture.md) §6.2）。乱数は `RandomSource` から取る。**待ち時間は DB に保存しない。** 再起動の後は、待たずに実行できる（[storage.md](storage.md) §3.3）。
 - 上限時間は、手順が `Scheduler` で待ち、過ぎたら `engine.cancel()` を呼んで、分類を `TIMEOUT` にする（エンジンが返す `cancelled` を、`TIMEOUT` に読み替える）。
 - 上限時間による中止と、録音の開始などによる中止が重なった場合は、**回数に数えない方（`SYSTEM_EXPIRED`）を優先する**（利用者の操作で止めた実行を、失敗の回数に数えない）。
+- **止まっていない実行（停止の確かめ方と待機の上限。基本設計 §4.2）:** `TIMEOUT` と中止（`SYSTEM_EXPIRED`）で実行を打ち切ったときは、`engine.cancel()` が戻ったことを停止の確認とする（§3.1・§3.3。戻った時点で、認識の操作全体が終わり、解析は止まっていて、これから始まることもない）。手順は `engine.cancel()` の戻りを注入した `Scheduler` で上限（`stopConfirmTimeoutMs`。5 秒）まで待つ。
+  - 上限までに戻れば、ジョブの完了の処理（`pending` への戻し・再試行の予定）を行い、次の試行を許す。
+  - 上限までに戻らなければ、**同じジョブの次の試行も別のジョブの試行も始めない**（`processing` に入れない。`JobSelector` の結果によらず、手順の側が止める）。会議の待っている理由を `engine_not_stopped` にして表示し、ログ `engine_stop_unconfirmed` を出す。`engine.cancel()` の戻りは上限の後も待ち続け（問い合わせを繰り返す間隔は持たない。戻りを 1 回待つだけである）、戻った時点でログ `engine_stop_confirmed`（打ち切りからの時間）を出し、開始条件を評価し直して再開する。
+  - 照合（§5.3）と `processing` の件数は、停止の確認の代わりにしない。
+  - プロセスが終了すれば実行は止まるので、次の起動では起動時の回収（§5.4）から再開する。
 - `merge_transcript` が `failed` になった場合は、会議を `transcribing` のままにして、問題 `merge_failed` を表示する（基本設計 §4.2。[ui.md](ui.md) §6）。以前の版があれば表示し続ける。
 
 ### 5.3 実行世代による照合と、次のジョブの選び方
@@ -1119,6 +1168,21 @@ public enum TranscriptMerger {
 ### 8.1 開始条件
 
 ```swift
+/// 開始条件の入力（すべて注入点から組み立てる）
+public struct StartConditions: Equatable, Sendable {
+    public var isRecording: Bool
+    public var engine: EngineAvailability
+    public var thermal: ThermalLevel
+    public var isLowPowerMode: Bool
+    /// 確定後に自動で文字起こしする（SettingsStoring.autoTranscribe。FR-STT-12）
+    public var autoStartEnabled: Bool
+    /// この会議の文字起こしが、すでに始まっている（ジョブ行がある実行番号がある）か、
+    /// このプロセスの中で利用者が開始を指示した（メモリ上だけ。再起動の後は消える）
+    public var startAuthorized: Bool
+    /// 打ち切った実行の停止をまだ確かめていない（§5.2 の「止まっていない実行」）
+    public var hasUnconfirmedStop: Bool
+}
+
 public enum StartTrigger: Equatable, Sendable {
     /// 確定の直後（自動開始の設定を見る）
     case finalized
@@ -1133,9 +1197,12 @@ public enum StartTrigger: Equatable, Sendable {
 /// 開始条件（純粋関数。基本設計 §8）。満たさなければ理由を返す
 public enum TranscriptionStartPolicy {
     public static func evaluate(_ conditions: StartConditions, trigger: StartTrigger) -> TranscriptionWaitReason? {
-        // 録音中とエンジンの可否は、利用者の操作でも上書きできない
+        // 録音中・止まっていない実行・エンジンの可否は、利用者の操作でも上書きできない
         if conditions.isRecording {
             return .recording
+        }
+        if conditions.hasUnconfirmedStop {
+            return .engineNotStopped
         }
         switch conditions.engine {
         case .available: break
@@ -1152,7 +1219,11 @@ public enum TranscriptionStartPolicy {
                 return .lowPower
             }
         }
-        if trigger == .finalized, !conditions.autoStartEnabled {
+        // 自動開始が無効なら、まだ始まっていない会議は、きっかけによらず利用者の指示を待つ
+        // （finalized だけでなく conditionsChanged でも自動では始めない）。
+        // 利用者が始めた・すでに始まっている実行の続き（conditionsChanged）は止めない
+        let byUser = trigger == .userRequested || trigger == .userOverride
+        if !byUser, !conditions.startAuthorized, !conditions.autoStartEnabled {
             return .autoStartDisabled
         }
         return nil
@@ -1163,13 +1234,15 @@ public enum TranscriptionStartPolicy {
 | 条件（評価の順） | 満たさないときの理由（`TranscriptionWaitReason`） | 利用者による上書き |
 | --- | --- | --- |
 | 録音中でない | `recording` | できない |
+| 打ち切った実行の停止を確かめている（§5.2） | `engine_not_stopped` | できない（停止を確かめた時点で評価し直す） |
 | エンジンが使える | `asset_missing`・`unsupported_device`・`unsupported_locale`・`engine_unavailable` | できない（アセットの取得はできる） |
 | 温度が `serious` 未満 | `thermal` | できる（きっかけ `userOverride`） |
 | 低電力モードでない | `low_power` | できる（同上） |
-| 自動開始が有効（確定の直後だけ評価する） | `auto_start_disabled` | 設定で切り替える（[ui.md](ui.md) §4.6） |
+| 自動開始が有効。または、その会議の文字起こしが始まっている・利用者が開始を指示した（`startAuthorized`） | `auto_start_disabled` | 利用者の開始の指示（きっかけ `userRequested`）、または設定で自動開始を有効にする（[ui.md](ui.md) §4.6） |
 
 - 入力（`StartConditions`）は、録音セッションの状態、`SpeechEngine.availability()`、`DeviceConditionsProviding`（温度・低電力）、`SettingsStoring`（自動開始）から組み立てる。すべて注入点なので、試験で差し替えられる（TST-GEN-04）。
-- 評価し直すきっかけ: 録音の確定（副作用 `evaluateTranscriptionStart`。[architecture.md](architecture.md) §5）、前面への復帰、`DeviceConditionsProviding.changes()` の変化、言語アセットの導入の完了、利用者の操作。
+- 評価し直すきっかけ: 録音の確定（副作用 `evaluateTranscriptionStart`。[architecture.md](architecture.md) §5）、録音の開始の失敗、前面への復帰、`DeviceConditionsProviding.changes()` の変化、言語アセットの導入の完了、打ち切った実行の停止の確認、自動開始の設定の変更、利用者の操作。
+- **自動開始が無効な場合（FR-STT-12）:** まだ始まっていない会議（`startAuthorized` が偽）は、どのきっかけ（`finalized`・`conditionsChanged`）で評価し直しても、利用者が開始を指示するか、設定で自動開始を有効にするまで、自動では始めない。例: 自動開始が無効なまま、言語アセットの導入の完了や温度の回復で評価し直しても始めない。利用者が開始を指示した会議（エンジンが使えず待っていたものを含む）と、すでに実行番号のジョブがある会議の続き（中断していた実行の再開）は、`conditionsChanged` で評価し直して進める（設定を無効にしたことで止めない）。利用者の指示はメモリ上だけで持ち、再起動の後に、自動開始が無効でジョブのない会議は、もう一度指示を待つ（利用者の操作なしに始める側に倒さない）。
 - 満たさない理由は `meetings.waiting_reason` に記録し、画面に表示する（[ui.md](ui.md) §4.4）。エンジンが使えない間は、会議を `finalized` のまま待たせ、ジョブを作らない（BD-STT-08）。録音と確定には影響しない（INV-03）。
 
 ### 8.2 実行中の延期
@@ -1180,20 +1253,21 @@ public enum TranscriptionStartPolicy {
 
 ### 8.3 録音の開始による中止
 
-録音の開始（[recording.md](recording.md) §3.4 の手順 6）が、`TranscriptionService.suspendForRecording()` を呼んで、その完了を待つ。
+録音の開始（[recording.md](recording.md) §3.4 の手順 6）が、`TranscriptionService.suspendForRecording()` を呼ぶ。**録音の開始は、その完了（エンジンの実行の停止の確認）を待たない**（基本設計 §8。録音の継続を最優先にする。INV-01、BD-ARC-08）。`suspendForRecording()` は、次の 1・2 を中断点なしに行って直ちに戻り、3 以降は文字起こしの側で続ける。
 
 | 順 | 処理 |
 | --- | --- |
-| 1 | 新しいジョブの実行開始を受け付けなくする（理由 `recording`） |
-| 2 | 実行中のジョブがあれば、`engine.cancel()` を呼ぶ（エンジンの実行が止まってから戻る） |
-| 3 | 実行中のジョブの完了の処理（結果ファイル・版のファイルへの書き込み、ジョブの行の更新）が終わるのを待つ。中止されたジョブは、分類 `SYSTEM_EXPIRED` で `pending` に戻る（試行回数を戻す） |
-| 4 | 戻る（**中止の完了** = エンジンの実行が止まり、結果ファイル・版のファイルへの書き込みが進行していない） |
+| 1 | 新しいジョブの実行開始を受け付けなくする（理由 `recording`。録音の確定まで） |
+| 2 | 止まっていないすべての実行（実行中のジョブと、それより前に `TIMEOUT`・中止で打ち切って停止をまだ確かめていない実行）に中止を指示する（`engine.cancel()` を別のタスクで呼ぶ。待たない） |
+| 3 | 実行世代の照合で、遅れて届いた結果を捨てる。結果ファイル・版のファイルを書かない。中止されたジョブは、分類 `SYSTEM_EXPIRED` で `pending` に戻る（試行回数を戻す） |
+| 4 | `engine.cancel()` が戻ったことを停止の確認とする（§5.2）。録音の確定の後も、停止を確かめるまで次の試行を始めない |
 
-- 録音の開始の側は、注入した `Scheduler` で上限（5 秒・設計値）まで待つ。上限までに戻らなければ、録音を開始せず、`RecordingStartFailure.transcriptionCancelTimedOut` を返す（[recording.md](recording.md) §3.4）。
-- 待つのは録音の開始の**手順**であり、録音パイプラインは文字起こしの型を参照しない（INV-01、BD-ARC-08）。
+- **防止（原則。基本設計 §14）:** `cancel()` は、入力の列を終了した解析を `cancelAndFinishNow()` で止め、認識の操作全体（`operation`）の終了まで待つ（§3.3）。中止を指示した後、エンジンに新しい音声を渡さず（入力の列は開始の前に終わっている）、解析を作らず・始めない（準備の `await` の後ごとの `checkCancellation()`）。実エンジンで中止から `cancel()` が戻るまでの時間は、文字起こしの実装の最初に Mac と実機（TST-STT-07）で実測して §14 に記録する。
+- **例外（防止できない場合。NFR-PWR-02 の例外。基本設計 §14）:** 認めるのは、録音の開始より前に始まり、録音の開始時に中止を指示済みで、`cancel()` が戻らない実行だけとする（アプリからそれ以上止める手段がない）。録音の開始の後に始まる実行は 1 の受け付けの停止で作られず、中止を指示していない実行は 2 で残らない。扱いは、①新しい音声を渡さず、新しい試行・別のジョブを始めない（`engine_not_stopped`）、②結果を捨て、結果ファイル・版のファイルを書かない（3）、③`cancel()` の戻りを待ち続け、戻った時点で例外を終える（問い合わせの間隔は持たない。戻りを待つだけ）、④例外の発生をログ `engine_stop_unconfirmed`（実行番号・連番）で、終わりを `engine_stop_confirmed`（中止の指示からの時間）で記録し（本文を含めない）、会議の状態の帯に理由 `engine_not_stopped` を表示する、⑤録音の優先度・処理を変えない（録音の開始はこれを待たず、録音経路は文字起こしの状態を参照しない）、⑥録音の確定後も、停止を確かめるまで次の試行を始めない（§5.2）。**この例外の採用は、オーナーの確認を待っている**（[PROGRESS.md](../../PROGRESS.md) §3）。確認が得られるまで、文字起こしの実装に着手しない。
+- 中止を指示するのは録音の開始の**手順**であり、録音パイプラインは文字起こしの型を参照しない（INV-01、BD-ARC-08）。
 - 利用者が温度・低電力を上書きした実行にも適用する。
-- 録音の確定の後に、開始条件を評価し直す。満たせば、中断したジョブから再開する（`pending` の小さい連番から）。
-- 削除の前の中止（[storage.md](storage.md) §10 の手順 0）も、同じ「中止の完了」を使う。削除では、その会議の実行世代を無効にして、遅れて届いた結果を保存しない（§5.3 の照合と、削除要求の確認）。
+- 録音の確定の後と、録音の開始の失敗の後（入力を止め、セッションを無効化した後。[recording.md](recording.md) §3.4）に、開始条件を評価し直す。満たせば、中断したジョブから再開する（`pending` の小さい連番から。止まっていない実行が残っていれば、停止を確かめてから）。
+- 削除の前の中止（[storage.md](storage.md) §10 の手順 1。削除要求を永続化した後）は、録音の開始と違い、`engine.cancel()` の戻り（停止の確認）とジョブの完了の処理の終わりを、上限つきで待つ（[storage.md](storage.md) §9）。削除では、その会議の実行世代を無効にして、遅れて届いた結果を保存しない（§5.3 の照合と、削除要求の確認）。
 
 ---
 
@@ -1240,6 +1314,8 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     private let expirationStream: AsyncStream<Void>
     private let expirationContinuation: AsyncStream<Void>.Continuation
     private var task: BGContinuedProcessingTask?
+    /// task が届く前に end(success:) が呼ばれた場合の結果。届いたらすぐにその結果で完了させる
+    private var recordedOutcome: Bool?
     private var completedUnits: Int64 = 0
     private var totalUnits: Int64 = 0
 
@@ -1272,6 +1348,8 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     func begin(totalUnits: Int) async -> BackgroundGrant {
         self.totalUnits = Int64(totalUnits)
         completedUnits = 0
+        // 前の投入の結果を、この投入のタスクに当てない
+        recordedOutcome = nil
         let identifier = "\(identifierPrefix).\(ids.makeUUID().uuidString.lowercased())"
         let request = BGContinuedProcessingTaskRequest(
             identifier: identifier, title: Self.title, subtitle: Self.subtitle,
@@ -1295,7 +1373,12 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     }
 
     func end(success: Bool) async {
-        task?.setTaskCompleted(success: success)
+        guard let attached = task else {
+            // タスクがまだ届いていない（投入の直後に終わった）。届いたら、この結果ですぐに完了させる
+            recordedOutcome = success
+            return
+        }
+        attached.setTaskCompleted(success: success)
         task = nil
     }
 
@@ -1304,6 +1387,12 @@ actor ContinuedProcessingExecution: BackgroundExecution {
     }
 
     private func attach(_ continued: BGContinuedProcessingTask) {
+        if let outcome = recordedOutcome {
+            // 実行はもう終わっている。進行表示を残さないよう、受け取ったタスクをすぐに完了させる
+            recordedOutcome = nil
+            continued.setTaskCompleted(success: outcome)
+            return
+        }
         task = continued
         continued.progress.totalUnitCount = totalUnits
         continued.progress.completedUnitCount = completedUnits
@@ -1331,6 +1420,7 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | システムが打ち切る（`expirations()`） | 実行中のジョブを中止し（`engine.cancel()`。分類 `SYSTEM_EXPIRED`）、完了の処理を待ってから `end(success: false)` を呼ぶ |
 | 前面に戻る | 開始条件を評価し直し、`pending` のジョブがあれば `begin` からやり直す |
 | 実行番号が終わる | `end(success: true)` |
+| タスクが届く前に終わる（投入の直後に実行番号が終わる・打ち切る） | `end(success:)` が結果を記録し、後から届いたタスク（`attach`）をその結果ですぐに完了させる。`begin` のたびに記録を消す（前の投入の結果を次のタスクに当てない） |
 | アプリが終了した | 次の起動で回収して再開する（§5.4） |
 
 - どの局面でも、Chunk 単位で状態が永続化されているので、失うのは処理中の 1 Chunk 分の計算だけである。
@@ -1385,10 +1475,10 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | 4 | 失敗の分類と回数 | 回数に数えない分類で回数が戻ること。数える分類が上限で `failed` になること | FR-STT-02 |
 | 5 | 再実行の間隔と上限時間 | 2・5・10・30・60 秒と ±20%。入力の 10 倍 | NFR-REL-03 |
 | 6 | 次のジョブの選び方 | 連番の小さい `pending` から。全 Chunk が終わったら統合。実行中があれば待つ | FR-STT-02 |
-| 7 | 開始条件 | §8.1 の表の全行と、上書き | TST-STT-05・06 |
+| 7 | 開始条件 | §8.1 の表の全行と、上書き。自動開始が無効で始まっていない会議が、`finalized`・`conditionsChanged` のどちらでも `auto_start_disabled` になり、`userRequested` と、始まっている会議の `conditionsChanged` では止まらないこと。停止を確かめていない実行があると、上書きでも `engine_not_stopped` になること | TST-STT-05・06、FR-STT-12 |
 | 8 | 統合（重複の除外） | 境界で 2 回出た発話が 1 回になること。判定の記録。渡す順序を変えても同じ結果 | TST-STT-04 |
 | 9 | 統合の境界値 | 重なり 0.5、類似 0.8、包含の比 0.3 と 0.95、空文字列、正規化 | FR-STT-03 |
-| 10 | 結果ファイルと版のファイルの検証 | 番号の不一致・範囲の外・制御文字・形式の版の違いが拒否されること | SEC-INP-03 |
+| 10 | 結果ファイル・失敗の記録・版のファイルの検証 | 番号の不一致・範囲の外・制御文字・形式の版の違いが拒否されること。読めない失敗の記録が `failed` の側で扱われること（基本設計 §4.3 の 2 つの例外を含む） | SEC-INP-03 |
 | 11 | 実行世代の照合（DB） | 古い世代の完了の通知が、試行回数が同じでも捨てられ、行が変わらないこと。2 重の実行開始が 1 つだけ成功すること | TST-GEN-05 |
 | 12 | 二重実行（結合） | 同じジョブを 2 回実行する・結果ファイルの保存の直後に落として再実行する。結果ファイルとセグメントが重複しないこと | TST-STT-03 |
 | 13 | 録音を変えない（結合） | 文字起こしの前後で、全 Chunk のハッシュが変わらないこと | TST-STT-01 |
@@ -1396,11 +1486,13 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | 15 | 起動時の回収（結合） | `processing` のまま残した DB で回収する。回数切れが `failed` になること。不足分の作成が、既存の行を変えず、2 回実行しても件数が変わらないこと | TST-RCV-03 |
 | 16 | 結果ファイルの再利用（結合） | 基本設計 §13 の「結果ファイルの再利用と Overlap」の行（Overlap の条件を変えると `pending` になり、理由が記録される） | FR-STT-03 |
 | 17 | エンジンが使えない（結合） | 可否を差し替える。会議が `finalized` のまま、ジョブが作られず、録音と確定に影響しないこと | TST-STT-05 |
-| 18 | 延期と録音の開始（結合） | 温度・低電力・上書き。実行中に録音を開始し、処理中の Chunk が `pending` に戻ること、中止の完了より前に録音の入力が始まらないこと、確定の後に再開すること。試行回数が増えないこと | TST-STT-06 |
+| 18 | 延期と録音の開始（結合） | 温度・低電力・上書き。実行中に録音を開始し、処理中の Chunk が `pending` に戻ること、**録音の開始が `cancel()` の戻りを待たないこと**（差し替えのエンジンの `cancel()` を戻さないままでも録音の入力が始まる）、遅れて届いた結果が保存されないこと、確定の後に（停止を確かめてから）再開すること。試行回数が増えないこと | TST-STT-06 |
 | 19 | 版の保存（結合） | §6.3 の各段で落として再実行する。公開済みの版が変わらず、記録だけの番号が欠番になること | FR-STT-05 |
 | 20 | 再文字起こしと失敗区間の再試行（結合） | 以前の版が残ること。完成まで以前の版が読めること。失敗区間の再試行で、成功済みの区間の本文が新しい版に残ること。基本設計 §13 の「失敗区間の再試行（ジョブ行がない）」「再試行の実行番号の記録」「統合の失敗」の各行 | TST-STT-09 |
 | 21 | 版のファイルの破損（結合） | 1 バイト書き換える・切り詰める。読み込み時に検出され、その版が使われず、ファイルと記録が変わらないこと。DB を作り直した後も検出されること。記録のない版が `invalid` になること | TST-SEC-11 |
-| 22 | バックグラウンド（結合） | 投入の成功・拒否・打ち切りを差し替えて、ジョブの状態が正しく戻ること。進捗がジョブごとに報告されること | NFR-PWR-03 |
+| 22 | バックグラウンド（結合） | 投入の成功・拒否・打ち切りを差し替えて、ジョブの状態が正しく戻ること。進捗がジョブごとに報告されること。タスクが届く前に `end(success:)` を呼ぶと、後から届いたタスクがその結果ですぐに完了し、次の `begin` の後に届いたタスクには前の結果が当たらないこと | NFR-PWR-03 |
+| 23 | エンジンの中止の契約 | `AnalyzerSpeechEngine` の準備の 2 つの `await`（ロケールの問い合わせ・入力の変換）と解析の作成・開始を、試験用の初期化子で差し替えられる関数にする（本番は §3.3 の SDK の呼び出し）。それぞれの `await` で止め、そこで `cancel()` を呼ぶ。`cancel()` が操作の終了の後に戻り、解析が作られず・始まらず（作成と開始の回数が 0）、その後に何も始まらないこと。解析の実行中の `cancel()` では、`cancelAndFinishNow()` の後に戻ること。実行中でなければ直ちに戻ること。前の操作の終了前の `transcribe` が始まらないこと | NFR-PWR-02、TST-STT-06 |
+| 24 | 止まっていない実行（結合） | 差し替えのエンジンの `cancel()` を戻さず、上限（`stopConfirmTimeoutMs`）を時計の注入で過ぎさせる。次の試行も別のジョブも `processing` に入らず、理由が `engine_not_stopped` で、ログ `engine_stop_unconfirmed` が出ること。`cancel()` を戻すと `engine_stop_confirmed` が出て、再開すること | NFR-PWR-02 |
 
 ### 11.2 合成音声と差し替え
 
@@ -1491,15 +1583,17 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 
 満たす要件: NFR-MNT-04
 
-基本設計 [transcription.md](../02-basic-design/transcription.md) §14 の 5 項目。
+基本設計 [transcription.md](../02-basic-design/transcription.md) §14 の 7 項目。
 
 | 申し送り | 解決 | 節 |
 | --- | --- | --- |
 | エンジンの protocol と、`SpeechAnalyzer` への入力の組み立て方（変換・モデルの保持の設定） | `SpeechEngine`（可否・情報・アセットの取得・認識・中止）。入力は `AnalyzerInputConverter` で変換し、1 Chunk を 1 つの解析にする。モデルの保持は `lingering` | §3 |
-| 結果ファイルと版のファイルの項目 | `ChunkTranscript`・`TranscriptVersionDocument`・`TranscriptHashRecord`（どれも形式の版 1）と、読むときの検証 | §4.4・§6.2 |
+| 結果ファイル・失敗の記録（`{連番}.failed.json`。§4.3）・版のファイルの項目 | `ChunkTranscript`・`ChunkFailureRecord`・`TranscriptVersionDocument`・`TranscriptHashRecord`（どれも形式の版 1）と、読むときの検証。読めない失敗の記録は `failed` の側で扱う | §4.4・§6.2 |
 | ジョブの表の列、一意制約、次に実行するジョブの選び方 | 列と一意制約は storage.md §3.3。実行開始と完了は実行世代で照合する。次のジョブは、連番の小さい `pending` から、全 Chunk が終わったら統合 | §5.3 |
 | 統合の規則の擬似コードと設計値の最終値 | `TranscriptMerger`（10 の規則）。設計値は基本設計の初期値のまま確定（重なり 0.5・類似 0.8・包含の比 0.3〜0.95・範囲 3.5 秒） | §2・§6.1 |
 | 継続処理タスクの識別子と、進捗の報告の頻度 | 識別子は `{Bundle Identifier}.transcription.*`。進捗は、投入の直後とジョブが 1 件終わるたび | §9 |
+| 打ち切ったエンジンの実行の停止の確かめ方と、停止の待機の時間の上限（§4.2 の「止まっていない実行」） | `engine.cancel()` が戻ったこと（認識の操作全体の `Task` の終了まで待つ）を停止の確認とする。待機の上限は 5 秒（`stopConfirmTimeoutMs`）。過ぎたら次の試行を始めず `engine_not_stopped` を表示し、戻りを待ち続けて、戻った時点で再開する | §3.3・§5.2 |
+| 録音の開始の時点で停止を確かめられない実行の扱い（§8。録音の開始は待たず・拒否しない）。次の 2 段で決める | 防止は `cancel()` の 3 段（中止・`cancelAndFinishNow()`・操作の終了の待機）で、止まるまでの時間は実装の最初に実測する。例外の扱い①〜⑥は §8.3 のとおりで、確認は `cancel()` の戻りを待つ（間隔を持つ問い合わせはしない）。記録はログ `engine_stop_unconfirmed`・`engine_stop_confirmed` と理由 `engine_not_stopped` の表示。例外の採用はオーナーの確認待ち | §8.3 |
 
 ---
 
@@ -1521,6 +1615,8 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | バックグラウンド・ロック中に音声認識が動く | エンジンが必要とする資源による | TST-DEV-10・11 |
 | 起動ハンドラが、登録のときに渡したキューの上で呼ばれる | SDK のヘッダの説明による | TST-DEV-11（`assumeIsolated` が停止しないこと） |
 | 日本語の精度・速度 | 端末・話者・音質による。保証しない | 実時間比と信頼度を記録する |
+| 2026-11-27 に変えた・足したコード片（§2 の `TranscriptionTuning`、§3.3 の `transcribe`・`run`・`cancel`、§8.1 の `StartConditions`・`evaluate`、§9 の `ContinuedProcessingExecution`）がビルドできる | ビルドしていない（§11.3 の確認は、それより前の版のもの） | 文字起こしの実装の最初にビルドとテストで確かめ、本書を直す |
+| 実エンジンで、中止から `cancel()` が戻るまでの時間。上限 5 秒が足りる | 測っていない（言語アセットを取得していないので、認識を実行していない） | 文字起こしの実装の最初（Mac・実機の TST-STT-07）。測った値をここに記録し、上限を見直す |
 | 統合の規則が Minutes P2 §11 と一致する | 参照元のリポジトリが手元にないため、基本設計の記述から起こした | 基本設計と照合済み。差があれば、基本設計を正とする |
 
 ---
@@ -1536,3 +1632,5 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 - Xcode 27.2（27B52）・Swift 6.4.2 の `swift build`・`swift test`・`xcodebuild`（一時の Package で実行。§11.3 の結果はこの実行による。エンジンの可否は macOS 27.2.1 で調べたもの）
 - 基本設計 [transcription.md](../02-basic-design/transcription.md) §15 の出典（Apple Developer Forums の継続処理タスクの識別子に関する報告など。本作業では再確認していない）
 - Minutes `docs/design-local-phase2.md` §9〜§11（別リポジトリ・読み取り専用。本作業では参照できず、基本設計の記述に基づいた）
+- Apple のシンボルの文書: [SpeechTranscriber](https://developer.apple.com/documentation/speech/speechtranscriber)・[AssetInventory](https://developer.apple.com/documentation/speech/assetinventory)・[BGContinuedProcessingTaskRequest](https://developer.apple.com/documentation/backgroundtasks/bgcontinuedprocessingtaskrequest)（ページの存在を確認。確認日 2026-11-20。基本設計 §15 と同じ）
+- **出典の URL について（確認日 2026-11-27）:** 上の SDK のヘッダ・`.swiftinterface` は、Xcode に同梱されたローカルのファイルで、公開の URL はない。版の根拠は、SDK の版（iOS 27.2）は `xcodebuild -showsdks`、Xcode 27.2（27B52）は `xcodebuild -version`、Swift 6.4.2 は `swift --version`、各 API の対応 OS は SDK の宣言（`@available`・`API_AVAILABLE`）で確かめたものである（[dev-environment.md](dev-environment.md) §2）。Apple の文書のページは、本文が JavaScript で描かれ、対応 OS の記述を取得できないので、版の根拠にしない

@@ -65,10 +65,22 @@ public struct RecordingTuning: Equatable, Sendable {
     public var overrunRecordCapacity = 64
     /// 最初のバッファを待つ上限（ms）
     public var firstBufferTimeoutMs: Int64 = 3000
-    /// 実行中の文字起こしの中止を待つ上限（ms）
-    public var transcriptionCancelTimeoutMs: Int64 = 5000
     /// 中断通知を予約してから届くまで（秒）
     public var interruptionNoticeDelaySeconds = 60
+    /// 割り込みの開始の処理（排出・短い Chunk の確定・空白区間の開設・割り込みの記録の永続化の待機）の上限（ms）
+    public var interruptionBeginTimeoutMs: Int64 = 5000
+    /// 再構築の④（作り直しと入力の開始の呼び出し）の上限（ms）
+    public var rebuildRestartTimeoutMs: Int64 = 3000
+    /// 再構築の途中に届いた停止が、①〜③の完了を待つ上限（ms）
+    public var rebuildStopWaitTimeoutMs: Int64 = 5000
+    /// 割り込みの終了の①〜④の呼び出し 1 つごとの上限（ms）
+    public var resumeStepTimeoutMs: Int64 = 3000
+    /// 停止の経路で空白区間を閉じる処理の上限（ms）
+    public var stopGapCloseTimeoutMs: Int64 = 5000
+    /// 割り込みの終了の②の後・④の前に届いた停止で、末尾の Chunk の確定を待つ上限（ms）
+    public var stopSealTimeoutMs: Int64 = 5000
+    /// 入力の閉鎖の手続き（閉鎖済みにする → 停止の指示 → 閉じたことの確認）の上限（ms）
+    public var inputCloseTimeoutMs: Int64 = 2000
     /// 画面へ値を送る最小の間隔（16 kHz のサンプル数。1,600 = 100 ms）
     public var snapshotIntervalSamples: Int64 = 1600
 
@@ -371,7 +383,7 @@ nonisolated final class SystemAudioSession: AudioSessionControlling {
 | 3 | マイクの権限を確かめる。未決定なら要求する | `microphoneDenied` |
 | 4 | 空き容量を確かめる（[storage.md](storage.md) §7）。段階 2 で `lowSpaceAcknowledged` が偽なら、確認を求めて止める | —（画面が確認を出して呼び直す） |
 | 5 | 会議を作る（会議 ID の発番、ディレクトリ、`meeting.json`、DB の行。状態 `recording`、`consentConfirmedAt`） | `meetingCreationFailed` |
-| 6 | 実行中の文字起こしを中止し、中止の完了を待つ（[transcription.md](transcription.md) §8.3）。上限は 5 秒（設計値） | `transcriptionCancelTimedOut` |
+| 6 | 実行中の文字起こしがあれば中止を指示する（`suspendForRecording()`。[transcription.md](transcription.md) §8.3）。**停止の確認を待たず**、続けて手順 7 へ進む（基本設計 §4 の手順 6。停止を確かめられない実行があることを理由に録音を拒否・延期しない） | — |
 | 7 | 事象 `startRequested` を状態遷移へ渡す。副作用 `beginCapture` が、セッションの有効化 → 入力の開始 → 取り出しの開始を行う | `sessionActivationFailed`・`inputStartFailed` |
 | 8 | 最初のバッファが届いたら `capturing` になり、手順 1 からの時間を記録する（NFR-PRF-02） | `firstBufferTimedOut`（上限 3 秒・設計値） |
 
@@ -990,6 +1002,45 @@ public struct RecordingTransition: Equatable, Sendable {
 - `restart` の④が失敗した場合、③で通知を取り消し済みなので、`abortRestart` が同じ内容で予約し直す。①〜③で失敗した場合は予約が残っているので、予約し直さない（基本設計 §5.1）。再構築の失敗では、通知をまだ予約していないので、常に予約する。
 - 再開（`restart`）は、利用者が開始した同じ会議に限る。新しい会議を作る経路を持たない。
 
+### 5.4 待機の時間の上限・入力の閉鎖・割り込みの記録（基本設計 §5.1）
+
+**待機の時間の上限**（申し送り）。どれも注入した `Scheduler` で測り（INV-08 の時刻には使わない）、`RecordingTuning` の値で差し替えられる。上限の後の扱いは基本設計 §5.1 のとおりである（受け付け済みのサンプルは捨てず、確定できない Chunk は未保存として保持し、停止・再開を止めない）。
+
+| 待機 | 上限（設計値） | `RecordingTuning` |
+| --- | --- | --- |
+| 割り込みの開始の処理（停止要求がない場合を含む。排出・短い Chunk の確定・空白区間の開設と、割り込みの記録の永続化の完了の待機） | 5 秒 | `interruptionBeginTimeoutMs` |
+| 再構築の④（作り直しと入力の開始の呼び出し） | 3 秒 | `rebuildRestartTimeoutMs` |
+| 再構築の途中に届いた停止の待機（①〜③の完了） | 5 秒 | `rebuildStopWaitTimeoutMs` |
+| 割り込みの終了の①〜④の呼び出しの待機（1 つごと） | 3 秒 | `resumeStepTimeoutMs` |
+| 停止の経路で空白区間を閉じる処理の待機 | 5 秒 | `stopGapCloseTimeoutMs` |
+| 割り込みの終了の②の後・④の前に届いた停止での末尾の Chunk の確定の待機 | 5 秒 | `stopSealTimeoutMs` |
+| 入力の閉鎖の手続き（下） | 2 秒 | `inputCloseTimeoutMs` |
+
+- 値は初期値で、TST-DEV-01・02 の結果で見直す（§14）。排出の量はリングバッファの容量（5 秒分）で上限があり、上限を待つ間も取り出しと変換は止めない。
+
+**入力の閉鎖の手続き**（申し送り。入力を開く呼び出しが上限までに戻らない場合。基本設計 §5.1）:
+
+| 段 | 手段 |
+| --- | --- |
+| ① 閉鎖済みにする | 録音パイプラインの世代ごとの閉鎖の印（`Synchronization.Atomic` の世代の番号。リングバッファと同じく原子操作）を立てる。tap のブロックは書き込みの前に印を読み、閉鎖済みの世代のバッファをリングバッファに入れずに捨てる。印は呼び出しの戻りを待たずに立てられ、立てた時点からその世代のサンプルは Chunk に入らない |
+| ② 停止の指示 | `AudioInput.close(generation:)` が、入力の制御の直列キュー（入力を開く呼び出しと同じキュー）の外から、その世代の tap の取り外しと入力の停止を指示する。開く呼び出しが戻っていなければ、戻った直後に同じキューで停止と取り外しを行う予約になる |
+| ③ 閉じたことの確認 | `AudioInput.isClosed(generation:)` が、その世代の入力が止まり（`isRunning` が偽）、tap が外れていることを返す。入力の制御のキューで確かめるので、開く呼び出しが戻っていなければ確かめられない |
+| ④ セッションの無効化 | ③を確かめた後にだけ行う |
+
+- 手続きの上限は 2 秒（`inputCloseTimeoutMs`）。上限までに③を確かめられなければ、④を行わずに `interrupted`・停止・`idle` へ進み、問題 `microphone_close_unconfirmed`（マイクを閉じられたことを確かめられない）を表示してログに記録する。③の確認は、開く呼び出しが戻った時点で続け、確かめた時点で④を行う（残りの後始末）。
+- 後始末が終わるまで、新しい録音・次の再開を始めない（§3.4 の手順 6）。手続きと後始末は元の世代のものだけを対象にする。
+- 戻っていない呼び出しの外から入力を止められるか（②）は OS の実装による。実機で確かめる（§14）。
+
+**割り込みの記録**（申し送り）:
+
+| 項目 | 設計 |
+| --- | --- |
+| 形式と置き場所 | `meeting.json` の `pendingInterruption`（`PendingInterruptionRecord`: 識別子（UUID）・事象時刻（壁時計）・理由。開始位置は持たない。[storage.md](storage.md) §3.1）。DB には置かない（起動時の復旧は `meeting.json` を読む。[storage.md](storage.md) §9） |
+| 書く時点 | 割り込みの通知を受け取り、事象時刻を記録して中断通知を予約した直後、排出・確定より前に、保存の actor のメモリ上の状態に入れて `meeting.json` の新しい世代の書き込みを依頼する（[storage.md](storage.md) §5.1）。排出と変換は永続化の完了を待たない |
+| 永続化できなかった場合 | 記録は保存の actor のメモリ上の状態に残る。`meeting.json` はファイル全体の世代で書くので、再試行は「新しい世代の書き込み」である（時間の上限による失敗・失敗の後に新しい世代で書き直す。[storage.md](storage.md) §5.1）。割り込みの開始の処理の上限（5 秒）までに永続化が終わらなくても、停止・再開へ進む |
+| 空白区間の記録で置き換える取引 | 排出が終わって開始位置が決まったら、保存の actor が 1 つのメソッドの中で、メモリ上の状態から `pendingInterruption` を除き、同じ識別子（`interruptionId`）を持つ空白区間を足す。続けて ①DB の取引（`recording_gaps` の行（`interruption_id` つき）と `meetings.total_samples` の更新）→ ②その状態の全体から `meeting.json` の新しい世代を書く（記録の削除と空白区間の追加が 1 つのファイルの置き換えで同時に起きる） |
+| 起動時の復旧での扱い | `pendingInterruption` があり、同じ識別子の空白区間が DB と `meeting.json` のどちらにもなければ、「開始位置が未確定の割り込みの記録」として基本設計 storage.md §8 の規則で空白区間を作る。同じ識別子の空白区間があれば、記録だけを除く（①の後・②の前に落ちた場合） |
+
 ---
 
 ## 6. 空白区間
@@ -1224,7 +1275,7 @@ public struct RecordingTransition: Equatable, Sendable {
 
 満たす要件: NFR-MNT-04
 
-基本設計 [recording.md](../02-basic-design/recording.md) §14 の 5 項目。
+基本設計 [recording.md](../02-basic-design/recording.md) §14 の 8 項目。
 
 | 申し送り | 解決 | 節 |
 | --- | --- | --- |
@@ -1233,6 +1284,9 @@ public struct RecordingTransition: Equatable, Sendable {
 | 状態遷移の表（状態 × 事象 × 副作用）の全件 | 9 つの段 × 15 種類の事象のうち 45 通りを許す。副作用は 19 種類 | §5 |
 | 空白区間の理由の一覧（割り込みの理由、`overrun`、`route_change`、`media_reset`） | 6 つ（`interruption`・`built_in_mic_muted`・`route_disconnected`・`overrun`・`route_change`・`media_reset`） | §6 |
 | 中断通知の文言と予約までの時間 | 題名「録音が中断しています」、本文「アプリを開くと再開を試みます。」、60 秒。差し込む値は持たない | §7 |
+| 割り込みの開始の処理（停止要求がない場合を含む）・再構築の④（作り直しと入力の開始の呼び出し）・再構築の途中に届いた停止の待機・割り込みの終了の①〜④の呼び出しの待機・停止の経路で空白区間を閉じる処理の待機・割り込みの終了の②の後で④の前に届いた停止での末尾の Chunk の確定の待機の時間の上限（§5.1） | 順に 5 秒・3 秒・5 秒・3 秒（1 つごと）・5 秒・5 秒。`RecordingTuning` の値で、注入した `Scheduler` で測る | §2・§5.4 |
+| 入力の閉鎖の手続き（§5.1）の手段（戻っていない呼び出しを待たずに入力を閉じ、閉じたことを確かめる方法）と時間の上限 | 世代ごとの閉鎖の印（原子操作）で tap がサンプルを捨て、`AudioInput.close(generation:)` で停止と取り外しを指示し、`isClosed(generation:)` で入力の停止と tap の取り外しを確かめてからセッションを無効化する。上限 2 秒。確かめられなければ `microphone_close_unconfirmed` を表示して確認を続ける | §5.4 |
+| 割り込みの記録（事象時刻・理由・未確定の開始位置）の形式と置き場所（§5.1。起動時の復旧が読む。[storage.md](storage.md) §8）。永続化できなかった割り込みの記録のメモリ上の保持と再試行、空白区間の記録で置き換える取引の形（§5.1） | `meeting.json` の `pendingInterruption`（識別子・事象時刻・理由）。保存の actor のメモリ上に持ち、再試行は `meeting.json` の新しい世代の書き込み。置き換えは、メモリ上で記録を除いて同じ識別子の空白区間を足し、DB の取引 → `meeting.json` の 1 回の置き換えで行う | §5.4、[storage.md](storage.md) §3.1・§5.1 |
 
 ---
 
@@ -1247,10 +1301,13 @@ public struct RecordingTransition: Equatable, Sendable {
 | 実機の `AVAudioConverter` の変換品質 | Mac 上でだけ測った | TST-AUD-02 を実機でも実行する。満たさなければ FIR を移植する（BD-REC-03） |
 | リングバッファ 5 秒分・合図 100 ms で、あふれが起きない | 確かめていない | TST-DEV-01（あふれの回数を記録する） |
 | tap のバッファ長（要求値 100 ms）で届く実際の長さ | 確かめていない。長さは毎回読むので、設計は長さに依存しない | 録音の実装（計測値に記録する） |
-| 最初のバッファの上限 3 秒・文字起こしの中止の上限 5 秒・通知の 60 秒が妥当 | 設計値 | TST-DEV-01・02 の結果で見直す |
+| 最初のバッファの上限 3 秒・通知の 60 秒が妥当 | 設計値 | TST-DEV-01・02 の結果で見直す |
 | 簡易 VAD の数値（−60 dBFS・0.15・200 ms・100 ms） | 本書で定めた設計値。Minutes P1 の実装とは照合していない（参照元のリポジトリが手元にない） | 文字起こしの結果と突き合わせて見直す。P2 で FR-STT-10 に使う前に再確認する |
 | category `record`・mode `default` が会議の録音に最適 | 基本設計 §11 のまま | 実機で比較して記録する |
 | `activate()`・`deactivate(options:)`（iOS 27 の非同期の API）の所要時間 | 確かめていない | 計測値（開始までの時間）で見る |
+| 2026-11-27 に変えたコード片（§2 の `RecordingTuning`）がビルドできる | ビルドしていない（§11.3 の確認は、それより前の版のもの） | 録音の実装の最初に確かめる |
+| §5.4 の待機の時間の上限（5 秒・3 秒・2 秒）が妥当 | 設計値 | TST-DEV-01・02 の結果で見直す |
+| 戻っていない入力の開始の呼び出しの外から、入力を止めて閉じたことを確かめられる（§5.4 の②・③） | OS の実装による。確かめていない | 録音の実装（Mac）と TST-DEV-02 |
 
 ---
 
@@ -1266,3 +1323,4 @@ public struct RecordingTransition: Equatable, Sendable {
 - iOS 27.2 SDK の `UNUserNotificationCenter.h`・`UNNotificationRequest.h`・`UNNotificationTrigger.h`（予約・取り消し・時間の指定）
 - Xcode 27.2（27B52）・Swift 6.4.2 の `swift build`・`swift test`・`xcodebuild`（一時の Package で実行。§11.3 の測定値はこの結果である）
 - Minutes `docs/design-local-phase1.md` §3.2・§3.3・§8・§14（別リポジトリ・読み取り専用。本作業では参照できず、基本設計の記述に基づいた）
+- **出典の URL について（確認日 2026-11-27）:** 上の SDK のヘッダ・`.swiftinterface` は、Xcode に同梱されたローカルのファイルで、公開の URL はない。版の根拠は、SDK の版（iOS 27.2）は `xcodebuild -showsdks`、Xcode 27.2（27B52）は `xcodebuild -version`、Swift 6.4.2 は `swift --version`、各 API の対応 OS は SDK の宣言（`@available`・`API_AVAILABLE`）で確かめたものである（[dev-environment.md](dev-environment.md) §2）。Apple の文書のページは、本文が JavaScript で描かれ、対応 OS の記述を取得できないので、版の根拠にしない
