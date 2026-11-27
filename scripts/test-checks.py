@@ -6935,6 +6935,20 @@ def tracked_alternate_index(root: Path) -> Dict[str, str]:
     return {"GIT_INDEX_FILE": str(index)}
 
 
+def tracked_replace_gitignore(root: Path) -> None:
+    """インデックスの .gitignore（必須の行が欠けたもの）の blob を、合格する内容の blob で置き換える（git replace）。
+    検査は置き換えを使わずに、インデックスが指す元の blob を読む。"""
+    env = isolated_git_env()
+    good = root / ".git" / "good-gitignore"
+    good.write_text(OK_GITIGNORE, encoding="utf-8")
+    def output(*arguments: str) -> str:
+        result = subprocess.run(["git", "-C", str(root), *arguments], check=True, capture_output=True, env=env)
+        return result.stdout.decode("utf-8").strip()
+    original = output("rev-parse", ":.gitignore")
+    replacement = output("hash-object", "-w", str(good))
+    output("replace", original, replacement)
+
+
 def test_tracked() -> None:
     tracked_case("合格するリポジトリ", 0, "OK")
     tracked_case("似た名前のファイルは通る", 0, "OK",
@@ -6959,6 +6973,9 @@ def test_tracked() -> None:
     tracked_case("追跡されている .env", 1, "config/.env", files={"config/.env": "TOKEN=x\n"})
     tracked_case("追跡されている .env.local", 1, ".env.local", files={".env.local": "TOKEN=x\n"})
     tracked_case("追跡されている個人の設定", 1, "xcuserdata", files={"App.xcodeproj/xcuserdata/me/state.plist": "x"})
+    # ファイル名の型は、祖先のディレクトリの名前にも当てはめる（git は *.wav に合うディレクトリの下をすべて除外する）
+    tracked_case("名前が型に合うディレクトリの下のファイル", 1, "exports/rec.wav/notes.txt", files={"exports/rec.wav/notes.txt": "x"})
+    tracked_case("名前が .env のディレクトリの下のファイル", 1, "config/.env/token", files={"config/.env/token": "x"})
     tracked_case("Git の管理下でない場所は合格にしない", 2, "読めない", repository=False)
     # .gitignore の規則は、インデックスの内容で判定する（作業ツリーだけの変更で合否を変えない）
     tracked_case("作業ツリーだけで必須の行を消しても、インデックスの内容で通る", 0, "OK",
@@ -6978,6 +6995,12 @@ def test_tracked() -> None:
     # リポジトリの場所を指す変数は外し、GIT_INDEX_FILE は残す
     tracked_case("外から引き継いだ GIT_DIR などで別のリポジトリを読まない", 0, "OK", extra_env=tracked_other_repository)
     tracked_case("GIT_INDEX_FILE で渡したインデックスを検査する", 1, "staged.wav", extra_env=tracked_alternate_index)
+    # パスの指定の解釈を変える変数は外す（:(glob) を名前そのものとして読ませて、入れ子の .gitignore を見落とさない）
+    tracked_case("外から引き継いだ GIT_LITERAL_PATHSPECS で入れ子の .gitignore を見落とさない", 1, "Tests/.gitignore",
+                 files={"Tests/.gitignore": "!*.wav\n"}, extra_env=lambda root: {"GIT_LITERAL_PATHSPECS": "1"})
+    # 置き換えのオブジェクトで、インデックスの .gitignore を合格する内容に見せかけさせない
+    tracked_case("置き換えのオブジェクトを使わずにインデックスの内容を読む", 1, "*.wav の行がない",
+                 ignore=replaced(OK_GITIGNORE, "*.wav\n", ""), after_add=tracked_replace_gitignore)
 
 
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）

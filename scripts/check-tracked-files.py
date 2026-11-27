@@ -9,8 +9,9 @@
 1・2 は、インデックスにある .gitignore の内容で判定する（作業ツリーの内容ではない。コミット前の検査で、ステージしていない
 .gitignore の変更に合格を左右させない）。追跡していない入れ子の .gitignore は、インデックスに内容がないが git add の対象を
 変えうるので、2 だけを作業ツリーの内容で判定する。
-git の環境のうち、別のリポジトリを指しうる変数（GIT_DIR など）は外す。GIT_INDEX_FILE は残す（部分的なコミットのフックと
-check.sh --staged が、検査するインデックスをこの変数で渡すため）。
+git の環境のうち、別のリポジトリを指しうる変数（GIT_DIR など）と、パスの指定の解釈を変える変数（GIT_LITERAL_PATHSPECS など）は
+外す。GIT_INDEX_FILE は残す（部分的なコミットのフックと check.sh --staged が、検査するインデックスをこの変数で渡すため）。
+置き換えのオブジェクト（git replace）は使わない（--no-replace-objects。インデックスが指す元の blob を読む）。
 
 使い方: scripts/check-tracked-files.py [--root <リポジトリ>]
 終了コード: 0 = 問題なし / 1 = 違反あり / 2 = 読めない（読めないものを合格にしない）
@@ -50,18 +51,24 @@ REPOSITORY_LOCATION_VARIABLES = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 )
 
+# 外から引き継いだ場合に、パスの指定（:(glob)**/.gitignore・-- の後の名前）の解釈を変える変数。
+# GIT_LITERAL_PATHSPECS は :(glob) の指定を名前そのものとして読ませ、入れ子の .gitignore を見落とさせる
+PATHSPEC_VARIABLES = ("GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
+
 
 class Unreadable(Exception):
     """Git の管理下でない・コマンドが失敗したなど、検査そのものができない。"""
 
 
 def git_env() -> Dict[str, str]:
-    """リポジトリの場所を指す変数を除いた環境。git には --root からリポジトリを探させる。"""
-    return {key: value for key, value in os.environ.items() if key not in REPOSITORY_LOCATION_VARIABLES}
+    """リポジトリの場所を指す変数とパスの指定の解釈を変える変数を除いた環境。git には --root からリポジトリを探させる。"""
+    removed = REPOSITORY_LOCATION_VARIABLES + PATHSPEC_VARIABLES
+    return {key: value for key, value in os.environ.items() if key not in removed}
 
 
 def git(root: Path, *arguments: str) -> bytes:
-    result = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, env=git_env())
+    # 置き換えのオブジェクト（refs/replace/）で、インデックスの blob を別の内容に見せかけさせない
+    result = subprocess.run(["git", "--no-replace-objects", "-C", str(root), *arguments], capture_output=True, env=git_env())
     if result.returncode != 0:
         raise Unreadable(result.stderr.decode("utf-8", "replace").strip())
     return result.stdout
@@ -98,7 +105,8 @@ def working_lines(path: Path) -> List[str]:
 
 
 def excluded_by(name: str) -> str:
-    """そのパスを除外するはずの必須の行を返す（当てはまらなければ空文字列）。ファイル名は大文字と小文字を区別しない。"""
+    """そのパスを除外するはずの必須の行を返す（当てはまらなければ空文字列）。ファイル名は大文字と小文字を区別しない。
+    ファイル名の型（*.wav・.env など）は、git と同じくパスのどの階層の名前にも当てはめる（rec.wav/ の下のファイルも除外の対象）。"""
     parts = name.split("/")
     for pattern in REQUIRED_IGNORE_LINES:
         if pattern.startswith("/") and pattern.endswith("/"):
@@ -107,7 +115,7 @@ def excluded_by(name: str) -> str:
         elif pattern.endswith("/"):
             if pattern[:-1] in parts[:-1]:
                 return pattern
-        elif fnmatch.fnmatchcase(parts[-1].lower(), pattern.lower()):
+        elif any(fnmatch.fnmatchcase(part.lower(), pattern.lower()) for part in parts):
             return pattern
     return ""
 
