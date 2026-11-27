@@ -38,8 +38,11 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
+# スクリプトの置き場所は $(dirname …) ではなくパラメータ展開で求める（$(…) は名前の末尾の改行を落とし、別のディレクトリを指しうる）。
+# $0 に「/」がなければ今の場所、「/」の直下なら「/」
+case "$0" in */*) SCRIPT_DIR=${0%/*}; SCRIPT_DIR=${SCRIPT_DIR:-/} ;; *) SCRIPT_DIR=. ;; esac
 # $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
-ROOT=$(cd "$(dirname "$0")/.." && pwd && printf x)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd && printf x)
 ROOT=${ROOT%x}
 ROOT=${ROOT%$'\n'}
 VERSIONS="$ROOT/tools/versions"
@@ -231,7 +234,8 @@ install_tool() {
       # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）。
       # ほかのツールは、GH_HOST の設定に取得先が左右されないよう、--repo にホスト（github.com）を明示する
       # 止まった転送でロックを持ち続けないよう、接続と転送の全体に上限（秒）を付ける（ロックを待つ上限の 600 秒より短くする）
-      curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
+      # -q は最初の引数にする（.curlrc の設定を読ませず、転送の指定を左右させない）
+      curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
         -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     else
@@ -1052,12 +1056,40 @@ coverage_input() {
   # 起点は HEAD ではなく現在のインデックス（git add -f でステージした無視するファイルも測る入力に含める。追跡していない
   # 無視するファイルは git add -A が除く）。未解決の衝突があればツリーを作れず、識別できないものとして失敗する
   if ! staged=$(git write-tree) || ! GIT_INDEX_FILE="$index" git read-tree "$staged" || ! GIT_INDEX_FILE="$index" git add -A \
-    || ! tree=$(GIT_INDEX_FILE="$index" git write-tree); then
+    || ! raw_worktree_blobs "$index" || ! tree=$(GIT_INDEX_FILE="$index" git write-tree); then
     rm -f -- "$index"
     return 1
   fi
   rm -f -- "$index"
   printf 'worktree %s\n' "$tree"
+}
+
+# 一時のインデックス（$1）の通常のファイル（100644・100755）の blob を、作業ツリーのバイト列そのもの（git hash-object --no-filters。
+# .gitattributes の clean のフィルタ・改行の変換を通さない）で書き直す。git add -A が書いた blob は clean のフィルタを通した
+# 内容で、測る写し（materialize_coverage_input が blob のまま書き出す）が作業ツリーの内容と違いうる。書き直した blob を、識別子の
+# ツリーと測る写しの両方に使う（同じ格納庫の同じ blob なので、識別した内容と測る内容が一致する）。一覧とモードは git add -A の
+# ものを使う（シンボリックリンクはリンク先の文字列で、フィルタを通らない。サブモジュールは blob がない）。失敗したら非 0 を返す
+raw_worktree_blobs() {
+  local index=$1 entries info entry mode path object status=0
+  entries=$(mktemp)
+  info=$(mktemp)
+  GIT_INDEX_FILE="$index" git ls-files -s -z > "$entries" || status=1
+  if [ "$status" = 0 ]; then
+    while IFS= read -r -d '' entry; do
+      mode=${entry%% *}
+      path=${entry#*$'\t'}
+      case "$mode" in 100644 | 100755) ;; *) continue ;; esac
+      # 通常のファイルでなくなった（測定の間に消えた・リンクに変わった）ものは識別できないものとする
+      if [ ! -f "$path" ] || [ -L "$path" ]; then status=1; break; fi
+      object=$(git hash-object -w --no-filters -- "$path") || { status=1; break; }
+      printf '%s %s\t%s\0' "$mode" "$object" "$path" >> "$info"
+    done < "$entries"
+  fi
+  if [ "$status" = 0 ]; then
+    GIT_INDEX_FILE="$index" git update-index -z --index-info < "$info" || status=1
+  fi
+  rm -f -- "$entries" "$info"
+  return "$status"
 }
 
 # 手順 7・8 が書く・消すカバレッジの場所（記録・JSON・測る入力の写し・ロック）と、その祖先（起点まで）のそれぞれが、リンクを
@@ -1490,6 +1522,12 @@ step_10() {
       fail "文書の整合の検査に使うステージした内容を書き出せない"
     fi
     rm -f -- "$entries"
+    # 実行するのは、ステージした内容の通常の実行できるファイルだけ（シンボリックリンクなら、書き出した場所の外のスクリプトを
+    # ステージした内容として実行しうる）。置き場所の scripts もリンクでないこと
+    if [ -L "$STAGED_DOCS_TREE/scripts" ] || [ -L "$STAGED_DOCS_TREE/scripts/verify-docs.py" ] \
+      || [ ! -f "$STAGED_DOCS_TREE/scripts/verify-docs.py" ] || [ ! -x "$STAGED_DOCS_TREE/scripts/verify-docs.py" ]; then
+      fail "ステージした scripts/verify-docs.py が通常の実行できるファイルでない（シンボリックリンク・実行権限なしなど）"
+    fi
     "$STAGED_DOCS_TREE/scripts/verify-docs.py" --root "$STAGED_DOCS_TREE"
   else
     scripts/test-checks.py docs
