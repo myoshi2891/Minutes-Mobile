@@ -371,7 +371,18 @@ else
     if printf '%s\n' "$owner_text" > "$private/$owner_mark"; then exit 0; fi
     name=${private##*/}
     if [ "${private%/*}" != "$source_common/worktrees" ] || case "$before" in *" $name "*) true ;; *) false ;; esac \
-      || [ ! -f "$private/gitdir" ] || [ -L "$private/gitdir" ] || [ "$(cat "$private/gitdir")" != "$snapshot/.git" ]; then
+      || [ ! -f "$private/gitdir" ] || [ -L "$private/gitdir" ]; then
+      exit 5
+    fi
+    # gitdir の記録は相対パスのこともある（worktree.useRelativePaths）。相対なら記録のあるディレクトリ（管理ディレクトリ）から
+    # 解決し、実体のパスにしてから置き場所の .git と比べる
+    record=$(cat "$private/gitdir") || exit 5
+    case $record in
+      /*) ;;
+      *) record=$private/$record ;;
+    esac
+    if [ "${record##*/}" != .git ] || ! real_directory recorded_tree "${record%/*}" \
+      || [ "$recorded_tree/.git" != "$snapshot/.git" ]; then
       exit 5
     fi
     git -C "$source_root" worktree remove --force "$snapshot" || exit 4
@@ -453,5 +464,12 @@ trap 'exit 130' INT TERM
 if [ -n "$interrupted" ]; then exit 130; fi
 if [ -z "$released" ]; then echo "NG: 開発ツールの導入のロック（${tools_lock}）を外せない" >&2; exit 1; fi
 
+# 起動する check.sh は、専用の作業ツリーの中の通常の実行できるファイルであること（check.sh の手順 10 の verify-docs.py と同じ）。
+# scripts かその中の check.sh がシンボリックリンクなら、verify_checkout_blobs（リンク先の文字列の照合）は通っても、作業ツリーの外を実行しうる
+if [ -L "$snapshot/scripts" ] || [ ! -d "$snapshot/scripts" ] || [ -L "$snapshot/scripts/check.sh" ] \
+  || [ ! -f "$snapshot/scripts/check.sh" ] || [ ! -x "$snapshot/scripts/check.sh" ]; then
+  echo "NG: 送信するコミットの scripts/check.sh が通常の実行できるファイルでない（シンボリックリンク・実行権限なしなど）" >&2
+  exit 1
+fi
 # 専用の作業ツリーは送信するコミットに合わせてあり、開発ツールも写した導入に固定してあるので、check.sh に改めて展開させない（ビルドの成果物を再利用する）
 MINUTES_CHECK_ISOLATED=1 "$snapshot/scripts/check.sh" --steps 0-8,10 --require-clean --expect-head "$head" </dev/null

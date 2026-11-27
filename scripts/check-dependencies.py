@@ -9,6 +9,7 @@ Package.swift の依存は、版の指定を同じディレクトリの Package.
 終了コード: 0 = 問題なし / 1 = 許可リスト外の依存あり / 2 = 読めない（読めないものを合格にしない）
 """
 import argparse
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -36,11 +37,12 @@ REMOTE_URL = re.compile(r"^(https?|ssh|git)://|^git@", re.IGNORECASE)
 
 
 def normalize(url: str) -> str:
-    """同じリポジトリを指す書き方の違い（末尾の .git・スラッシュ、scheme とホストの大文字小文字）をそろえる。
+    """scheme とホストの大文字小文字だけをそろえる（どちらも大文字小文字を区別しない。RFC 3986）。
 
-    パスと、authority のユーザー情報（user@ の部分）の大文字小文字は区別する（別の取得元を同じものと見なさない）。
+    パス・クエリ・authority のユーザー情報（user@ の部分）は、末尾のスラッシュ・.git・前後の空白も含めてそのまま残す
+    （配布物の URL では、末尾のスラッシュや .git の有無で別のものを指しうる。別の取得元を同じものと見なさない）。
     """
-    text = url.strip().rstrip("/")
+    text = url
     found = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/]*)(.*)$", text)
     if found:
         # authority は最後の「@」でユーザー情報とホストに分ける（ユーザー情報に「@」を含みうるため）
@@ -50,7 +52,7 @@ def normalize(url: str) -> str:
         scp = re.match(r"^([^@/:]+@)([^:/]+)(:.*)$", text)  # git@host:owner/repo の形
         if scp:
             text = scp.group(1) + scp.group(2).lower() + scp.group(3)
-    return text[:-4] if text.endswith(".git") else text
+    return text
 
 
 def normalize_path(path: str) -> str:
@@ -94,8 +96,13 @@ def load_allowlist(path: Path) -> Tuple[Dict[Tuple[str, str, str], dict], Dict[s
         for field in ("checksum", "sha256"):
             if field in package and not (isinstance(package[field], str) and SHA256.fullmatch(package[field])):
                 raise Unreadable(f"{path}: {package['identity']} の {field} が 64 桁の小文字の 16 進数でない")
+        # 形（YYYY-MM-DD）に加えて、暦の上にある日付であること（2026-02-30・2026-13-01 などを承認の日付にしない）
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", package["approvedOn"]):
             raise Unreadable(f"{path}: {package['identity']} の approvedOn が YYYY-MM-DD でない")
+        try:
+            datetime.date.fromisoformat(package["approvedOn"])
+        except ValueError as error:
+            raise Unreadable(f"{path}: {package['identity']} の approvedOn が存在しない日付（{package['approvedOn']}）") from error
         # 許可するライセンス以外は、オーナーの決定（UD-nn）の記録が要る
         decision = package.get("ownerDecision", "")
         if package["license"] not in licenses and not re.fullmatch(r"UD-\d+", str(decision)):

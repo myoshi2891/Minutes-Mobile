@@ -27,7 +27,7 @@ import sys
 import tempfile
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_LINES = 2000
@@ -510,14 +510,17 @@ def snippet_marker(line: str) -> Optional[Tuple[str, str]]:
     return (found.group(1), found.group(2).strip()) if found else None
 
 
-def snippet_markers(text: str) -> Dict[int, Tuple[str, str, int]]:
-    """コード片の印を、行の位置（0 始まり）→（種類, パス, 囲む箇条書きの項目の本文の位置）で返す。照合と書き直しが同じ判定を使う。
+def snippet_markers(text: str) -> Dict[int, Tuple[str, str, int, int]]:
+    """コード片の印を、行の位置（0 始まり）→（種類, パス, 囲む箇条書きの項目の本文の位置, 引用の深さ）で返す。照合と書き直しが
+    同じ判定を使う。引用（「> 」）の中の印は、引用の印を除いてから読み、深さを持たせる（同じ深さの引用の中のフェンスとだけ対応させる。
+    snippet_fence）。引用の中の印の項目の本文の位置は 0 とする（引用の中の箇条書きは区別しない）。
 
-    フェンス・複数行のコメント・<pre> の中と、字下げしたコードブロックの中の印は、説明用の例なので含めない。
+    フェンス（引用の中のフェンスを含む）・複数行のコメント・<pre> の中と、字下げしたコードブロックの中の印は、説明用の例なので含めない。
     """
-    markers: Dict[int, Tuple[str, str, int]] = {}
+    markers: Dict[int, Tuple[str, str, int, int]] = {}
     code = IndentedCode()
     previous = 0
+    quoted = dict(quoted_fences(text))
     for number, line, inside, opened in fenced_lines(text):
         if inside:
             # フェンスの開始行も項目を閉じ・始めうる（scanned_lines と同じ）
@@ -536,8 +539,72 @@ def snippet_markers(text: str) -> Dict[int, Tuple[str, str, int]]:
         marker = snippet_marker(line)
         if marker:
             indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip(" "))
-            markers[number - 1] = (*marker, code.leave(indent))
+            markers[number - 1] = (*marker, code.leave(indent), 0)
+            continue
+        depth, content = strip_quote(line)
+        if depth and number not in quoted:
+            marker = snippet_marker(content)
+            if marker:
+                markers[number - 1] = (*marker, 0, depth)
     return markers
+
+
+def quote_content(line: str, depth: int) -> Optional[str]:
+    """深さ depth の引用の行なら、その深さまでの印を除いた残り（さらに深い引用の印は残す）。深さが足りなければ None。"""
+    found, content = strip_quote(line, depth)
+    return content if found == depth else None
+
+
+class SnippetFence(NamedTuple):
+    """印に対応するフェンス。照合（check_snippets）と書き直し（update_snippets）が同じ対応を使う。"""
+    start: int  # フェンスの開始行の位置
+    end: int  # 閉じる行の位置（閉じていなければ、本文の後の行の位置）
+    closed: bool
+    fence: Fence
+    body: List[str]  # 引用の印と開始行の字下げの桁を除いた本文
+    prefix: str  # 書き直す本文の行の頭に付ける引用の印（開始行のもの。引用の外なら空）
+    indent: str  # 開始行の、引用の印の後の字下げ（タブを含めて同じ文字）
+
+
+def snippet_fence(lines: List[str], opened_fences: Dict[int, Tuple[Fence, str]], index: int,
+                  marker: Tuple[str, str, int, int]) -> Optional[SnippetFence]:
+    """行 index の印に対応するフェンスを返す。引用の外の印は paired_fence の規則で、引用の中の印は、空行（同じ深さの引用の
+    印だけの行）を挟んだ次の行が、同じ深さの引用の中で開くフェンスの場合だけ対応させる（深さの違う引用・引用の外のフェンスとは
+    対応させない）。引用の中のフェンスは、閉じるフェンスか、その深さの引用が終わる行で終わる（CommonMark）。"""
+    depth = marker[3]
+    if not depth:
+        start = paired_fence(lines, opened_fences, index, marker[2])
+        if start is None:
+            return None
+        fence = opened_fences[start][0]
+        end = fence_end(lines, start, fence)
+        indent = fence_indent(lines[start])
+        return SnippetFence(start, end, end < len(lines), fence, [dedent(line, indent) for line in lines[start + 1:end]], "",
+                            leading_whitespace(lines[start]))
+    start = index + 1
+    while start < len(lines):
+        content = quote_content(lines[start], depth)
+        if content is None or content.strip():
+            break
+        start += 1
+    opener = quote_content(lines[start], depth) if start < len(lines) else None
+    # さらに深い引用の中のフェンスは、別の深さなので対応させない
+    opened = fence_open(opener) if opener is not None and not strip_quote(opener)[0] else None
+    if opened is None or opener is None:
+        return None
+    end, closed = start + 1, False
+    while end < len(lines):
+        content = quote_content(lines[end], depth)
+        if content is None:
+            break
+        if fence_closes(content, opened[0]):
+            closed = True
+            break
+        end += 1
+    indent = fence_indent(opener)
+    body = [dedent(quote_content(line, depth) or "", indent) for line in lines[start + 1:end]]
+    return SnippetFence(start, end, closed, opened[0], body, lines[start][:len(lines[start]) - len(opener)],
+                        leading_whitespace(opener))
 
 
 def paired_fence(lines: List[str], opened_fences: Dict[int, Tuple[Fence, str]], index: int, base: int) -> Optional[int]:
@@ -1169,11 +1236,29 @@ class Checker:
                             break
                         pending.append(later)
                 targets, openers, (line, *pending) = link_destinations(line, openers, pending)
-                for text_part, label in REFERENCE_LINK.findall(line):
-                    # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）
+                position = 0
+                while True:
+                    found = REFERENCE_LINK.search(line, position)
+                    if found is None:
+                        break
+                    text_part, label = found.groups()
+                    # 定義のないラベルはリンクにならない（GFM でもそのまま文字として表示される）。その場合は次の「[」から
+                    # 読み直す（[foo][bar][baz] の [bar] が未定義でも、後ろの [bar][baz] を参照として確かめる）
                     target = definitions.get(reference_label(label or text_part))
-                    if target is not None:
-                        targets.append(target)
+                    if target is None:
+                        following = line.find("[", found.start() + 1)
+                        position = following if following != -1 else len(line)
+                        continue
+                    targets.append(target)
+                    position = found.end()
+                    # 直後に続く「[ラベル]」（後ろに「[」「(」が続かないもの）は短縮形の参照になりうる。SHORTCUT_LINK は「]」の
+                    # 直後の「[」を除くので、ここで確かめる（後ろに「[」が続くものは、次の繰り返しが参照として読む）
+                    adjacent = re.match(r"\[(?!\^)([^\[\]]+)\](?![\[(])", line[position:])
+                    if adjacent is not None:
+                        shortcut = definitions.get(reference_label(adjacent.group(1)))
+                        if shortcut is not None:
+                            targets.append(shortcut)
+                        position += adjacent.end()
                 # 定義のないラベルはリンクにならない（定義の行は上で読み飛ばした）
                 for label in SHORTCUT_LINK.findall(line):
                     target = definitions.get(reference_label(label))
@@ -1366,18 +1451,17 @@ class Checker:
     def check_snippets(self, name: str, text: str) -> None:
         lines = split_lines(text)
         opened_fences = fences(text)
-        for index, (kind, source, base) in snippet_markers(text).items():
+        for index, marker in snippet_markers(text).items():
+            kind, source = marker[0], marker[1]
             if not source:
                 self.error(name, "コード片の印にパスがない", index + 1)
                 continue
-            start = paired_fence(lines, opened_fences, index, base)
-            if start is None:
-                self.error(name, "印の直後に、同じ箇条書きの項目（項目の外なら最上位）のコードフェンスがない", index + 1)
+            paired = snippet_fence(lines, opened_fences, index, marker)
+            if paired is None:
+                self.error(name, "印の直後に、同じ箇条書きの項目（項目の外なら最上位）・同じ深さの引用のコードフェンスがない", index + 1)
                 continue
-            end = fence_end(lines, start, opened_fences[start][0])
-            # 字下げしたフェンスの本文は、開始行の字下げの分を除いてから照合する
-            indent = fence_indent(lines[start])
-            snippet = [dedent(line, indent) for line in lines[start + 1:end]]
+            # 字下げしたフェンス・引用の中のフェンスの本文は、引用の印と開始行の字下げの分を除いてから照合する
+            snippet = paired.body
             try:
                 path = self.snippet_source(source)
             except Unresolvable as error:
@@ -1441,7 +1525,7 @@ class Checker:
         sources: Dict[Path, List[Path]] = {}
         for document, aliases in names.items():
             sources[document] = []
-            for kind, source, _ in snippet_markers(self.texts[aliases[0]]).values():
+            for kind, source, _, _ in snippet_markers(self.texts[aliases[0]]).values():
                 try:
                     path = self.snippet_source(source) if kind == "file" and source else None
                 except Unresolvable:
@@ -1518,31 +1602,32 @@ class Checker:
                 index += 1
                 if not marker or marker[0] != "file" or not marker[1]:
                     continue  # パスのない印は検査の側（check_snippets）が報告する
-                start = paired_fence(lines, opened_fences, index - 1, marker[2])
+                paired = snippet_fence(lines, opened_fences, index - 1, marker)
                 try:
                     path = self.snippet_source(marker[1])
                 except Unresolvable:
                     continue  # 検査の側（check_snippets）が印の行とともに報告する
-                if start is None:
+                if paired is None:
                     continue  # 対応するフェンスがない印も、検査の側が報告する
-                opened = opened_fences[start]
+                start, end = paired.start, paired.end
                 if path is None or not path.is_file():
                     continue  # 不備（root の外の参照先を含む）は検査の側で報告する
-                end = fence_end(lines, start, opened[0])
                 # 字下げしたフェンスには、開始行と同じ字下げ（タブを含めて同じ文字）を付けて書く（空行には付けない）。
-                # 照合は開始行の字下げの桁数で除いて行う（タブと空白の字下げで同じ桁なら同じに読む）
-                indent = leading_whitespace(lines[start])
+                # 照合は開始行の字下げの桁数で除いて行う（タブと空白の字下げで同じ桁なら同じに読む）。
+                # 引用の中のフェンスには、開始行と同じ引用の印を各行に付ける（空行には印だけを付け、引用を続ける）
+                indent = paired.indent
                 try:
                     source = split_lines(path.read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError):
                     continue  # このコード片は書き直さない。検査の側（check_snippets）が印の行とともに報告する
                 # 字下げを除いた本文が元のファイルと一致するコード片は、行も改行も変えない
-                if end < len(lines) and [dedent(line, fence_indent(lines[start])) for line in lines[start + 1:end]] == source:
+                if paired.closed and paired.body == source:
                     continue
-                content = [indent + line if line else line for line in source]
-                # このフェンスを閉じてしまう行を含む内容は書き込まない（長いフェンスに手で直す）
-                if end >= len(lines) or any(fence_closes(line, opened[0]) for line in content):
+                unquoted = [indent + line if line else line for line in source]
+                # このフェンスを閉じてしまう行を含む内容と、閉じていないフェンスは書き込まない（長いフェンスに手で直す）
+                if not paired.closed or any(fence_closes(line, paired.fence) for line in unquoted):
                     continue
+                content = [paired.prefix + line if line else paired.prefix.rstrip() for line in unquoted]
                 out.extend(lines[index:start + 1] + content + [lines[end]])
                 # 書き直した本文の行は、フェンスの開始行と同じ改行にする
                 out_endings.extend(endings[index:start + 1] + [endings[start] or "\n"] * len(content) + [endings[end]])

@@ -582,16 +582,34 @@ coverage_input() {
 # 内容で、測る写し（materialize_coverage_input が blob のまま書き出す）が作業ツリーの内容と違いうる。書き直した blob を、識別子の
 # ツリーと測る写しの両方に使う（同じ格納庫の同じ blob なので、識別した内容と測る内容が一致する）。一覧とモードは git add -A の
 # ものを使う（シンボリックリンクはリンク先の文字列で、フィルタを通らない。サブモジュールは blob がない）。失敗したら非 0 を返す
+# sparse checkout の外の項目（本来のインデックスで skip-worktree の印があるもの）は作業ツリーにないのが正常なので、印を一時の
+# インデックスにも写し（git read-tree は印を写さない）、作業ツリーにない印つきの項目はインデックスの blob のまま残す（識別子の
+# ツリーと測る写しの両方に同じ blob で入る）。印のない項目（sparse checkout の中）が消えた・リンクに変わった場合は従来どおり失敗する
 raw_worktree_blobs() {
-  local index=$1 entries info entry mode path object status=0
+  local index=$1 entries info skipped entry tag mode path object status=0
   entries=$(mktemp)
   info=$(mktemp)
-  GIT_INDEX_FILE="$index" git ls-files -s -z > "$entries" || status=1
+  skipped=$(mktemp)
+  git ls-files -t -z > "$entries" || status=1
   if [ "$status" = 0 ]; then
     while IFS= read -r -d '' entry; do
+      case "$entry" in "S "*) printf '%s\0' "${entry#S }" >> "$skipped" ;; esac
+    done < "$entries"
+    if [ -s "$skipped" ]; then
+      GIT_INDEX_FILE="$index" git update-index -z --skip-worktree --stdin < "$skipped" || status=1
+    fi
+  fi
+  if [ "$status" = 0 ]; then
+    GIT_INDEX_FILE="$index" git ls-files -s -t -z > "$entries" || status=1
+  fi
+  if [ "$status" = 0 ]; then
+    while IFS= read -r -d '' entry; do
+      tag=${entry%% *}
+      entry=${entry#* }
       mode=${entry%% *}
       path=${entry#*$'\t'}
       case "$mode" in 100644 | 100755) ;; *) continue ;; esac
+      if [ "$tag" = S ] && [ ! -e "$path" ] && [ ! -L "$path" ]; then continue; fi
       # 通常のファイルでなくなった（測定の間に消えた・リンクに変わった）ものは識別できないものとする
       if [ ! -f "$path" ] || [ -L "$path" ]; then status=1; break; fi
       object=$(git hash-object -w --no-filters -- "$path") || { status=1; break; }
@@ -601,7 +619,7 @@ raw_worktree_blobs() {
   if [ "$status" = 0 ]; then
     GIT_INDEX_FILE="$index" git update-index -z --index-info < "$info" || status=1
   fi
-  rm -f -- "$entries" "$info"
+  rm -f -- "$entries" "$info" "$skipped"
   return "$status"
 }
 
@@ -1140,6 +1158,12 @@ if [ "$REQUIRE_CLEAN" = 1 ] && [ -z "${MINUTES_CHECK_ISOLATED:-}" ]; then
   copy_tools "$ROOT/.tools" "$ISOLATED_TREE/.tools"
   # 入れ子の check.sh も同じ開始時のコミットを確かめる。呼び出し側の --expect-head（参照の名前などで、指すコミットが変わりうる）
   # より後に置き、後の指定を優先させる
+  # 起動する check.sh は、専用の作業ツリーの中の通常の実行できるファイルであること（手順 10 の verify-docs.py と同じ）。
+  # scripts かその中の check.sh がシンボリックリンクなら、blob の照合（リンク先の文字列）は通っても、作業ツリーの外を実行しうる
+  if [ -L "$ISOLATED_TREE/scripts" ] || [ ! -d "$ISOLATED_TREE/scripts" ] || [ -L "$ISOLATED_TREE/scripts/check.sh" ] \
+    || [ ! -f "$ISOLATED_TREE/scripts/check.sh" ] || [ ! -x "$ISOLATED_TREE/scripts/check.sh" ]; then
+    fail "専用の作業ツリーの scripts/check.sh が通常の実行できるファイルでない（シンボリックリンク・実行権限なしなど）"
+  fi
   echo "== 開始時のコミット ${START_HEAD} を専用の作業ツリー（${ISOLATED_TREE}）に展開して検査する"
   MINUTES_CHECK_ISOLATED=1 "$ISOLATED_TREE/scripts/check.sh" "${ARGUMENTS[@]}" --expect-head "$START_HEAD"
   exit 0

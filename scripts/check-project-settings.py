@@ -660,22 +660,20 @@ def check_plist_entry(source: str, key: str, value: object, errors: List[str], e
         errors.append(f"[SEC-PLT-04] {source}: 拡張 {value} を置かない")
     if visited is None:
         visited = set()
-    # 鍵ごとの規則（上）は参照のたびに判定し、中の項目は同じ辞書・配列について 1 回だけ調べる
-    if isinstance(value, dict):
-        containers = [value]
-    elif isinstance(value, list):
-        if id(value) in visited:
-            return
-        visited.add(id(value))
-        containers = [item for item in value if isinstance(item, dict)]
-    else:
-        return
-    for container in containers:
+    # 鍵ごとの規則（上）は参照のたびに判定し、中の項目は同じ辞書・配列について 1 回だけ調べる。
+    # 配列の中の配列（[[{…}]] など）も、どの深さでもたどり、その中の辞書の鍵を調べる（入れ子の配列で禁止の鍵を隠させない）
+    pending: List[object] = [value] if isinstance(value, (dict, list)) else []
+    while pending:
+        container = pending.pop()
         if id(container) in visited:
             continue
         visited.add(id(container))
-        for child_key, child_value in container.items():
-            check_plist_entry(source, str(child_key), child_value, errors, expand, visited)
+        if isinstance(container, dict):
+            for child_key, child_value in container.items():
+                check_plist_entry(source, str(child_key), child_value, errors, expand, visited)
+        elif isinstance(container, list):
+            # 書かれた順に調べる（報告の順を決定的にする）
+            pending.extend(reversed([item for item in container if isinstance(item, (dict, list))]))
 
 
 def check_build_settings(

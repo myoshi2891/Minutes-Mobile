@@ -217,9 +217,11 @@ custom_rules:
   # 裸の sleep( はメソッドの宣言（func sleep(）を除く（no_bsd_socket と同じ後読み）
   # Task.sleep は型引数つきの呼び出し（Task<Never, Never>.sleep）も検出する（型引数は 1 段の入れ子まで読む）
   # Thread.sleep・Timer.scheduledTimer・Timer.publish も「.」の前後の空白（Thread . sleep）を Swift と同じく許して検出する
+  # Timer の初期化子（Timer(timeInterval:…)・Timer(fire:…)・Timer.init(…)・型の注釈つきの : Timer = .init(…)）も、作った後に
+  # RunLoop に足すと実時間で動くので検出する。名前の一部が Timer の型（ManualTimer(…)・TimerScheduler(…)）は認める
   no_direct_sleep_timer:
     name: "待機とタイマーの直接の利用の禁止"
-    regex: '\bTask\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\.\s*sleep\b|\bThread\s*\.\s*sleep\b|(?<![.\w])(?<!\.\s{1,16})(?<!func\s)u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\s*\.\s*(scheduledTimer|publish)\b|\bmakeTimerSource\b|\.asyncAfter\s*\('
+    regex: '\bTask\s*(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\.\s*sleep\b|\bThread\s*\.\s*sleep\b|(?<![.\w])(?<!\.\s{1,16})(?<!func\s)u?sleep\s*\(|\bDarwin\s*\.\s*u?sleep\s*\(|\bTimer\s*\.\s*(scheduledTimer|publish)\b|\bTimer\s*(?:\.\s*init\s*)?\(|:\s*(?:Foundation\s*\.\s*)?Timer\s*[?!]?\s*=\s*\.\s*init\s*\(|\bmakeTimerSource\b|\.asyncAfter\s*\('
     excluded:
       - '.*/SystemDependencies/.*\.swift'
     match_kinds: *code
