@@ -189,6 +189,10 @@ def resolved_pins(path: Path) -> List[Tuple[str, dict]]:
     legacy = version == 1
     if ("object" in data) != legacy or ("pins" in data) == legacy:
         raise Unreadable(f"{path}: 形式の版（version {version}）と pins の位置が合わない")
+    # 版 3 の originHash は省略・null・文字列のどれか。ほかの型は形式が壊れたものとして読まない
+    origin_hash = data.get("originHash")
+    if version == 3 and origin_hash is not None and not isinstance(origin_hash, str):
+        raise Unreadable(f"{path}: originHash の形式が違う（{origin_hash!r}）")
     holder = data["object"] if legacy else data
     pins = holder.get("pins") if isinstance(holder, dict) else None
     if not isinstance(pins, list) or not all(isinstance(pin, dict) for pin in pins):

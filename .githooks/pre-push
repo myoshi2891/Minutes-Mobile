@@ -74,22 +74,33 @@ git cat-file blob "$head:scripts/worktree-location.py" > "$location_script" \
   || { echo "NG: 送信するコミットの scripts/worktree-location.py を読めない" >&2; exit 1; }
 # -I: 書き出した場所（一時ディレクトリ）に置かれた同名のモジュール（subprocess.py など）を読み込ませない
 worktree_location() { /usr/bin/python3 -I "$location_script" "$@"; }
-# 判定の結果のパスは NUL で終わる記録で受け取る（$(…) はパスの末尾の改行を落とすので使わない）
-location_status=0
-location_out=$(mktemp)
-worktree_location check "$base" "$source_root" > "$location_out" || location_status=$?
-resolved_base=""
-if [ "$location_status" = 0 ] && ! IFS= read -r -d '' resolved_base < "$location_out"; then location_status=2; fi
-rm -f -- "$location_out"
-case $location_status in
-  0) base=$resolved_base ;;
-  1) exit 1 ;;  # 理由は worktree-location.py が標準エラーに書いた
-  *)
-    echo "NG: 専用の作業ツリーの置き場所を判定できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
-    exit 1
-    ;;
-esac
+# 判定の結果のパスは NUL で終わる記録で受け取り、変数 resolved_base に入れる（$(…) はパスの末尾の改行を落とすので使わない）
+check_location() {
+  local location_status=0 location_out
+  location_out=$(mktemp)
+  worktree_location check "$1" "$source_root" > "$location_out" || location_status=$?
+  resolved_base=""
+  if [ "$location_status" = 0 ] && ! IFS= read -r -d '' resolved_base < "$location_out"; then location_status=2; fi
+  rm -f -- "$location_out"
+  case $location_status in
+    0) ;;
+    1) exit 1 ;;  # 理由は worktree-location.py が標準エラーに書いた
+    *)
+      echo "NG: 専用の作業ツリーの置き場所を判定できない（${MINUTES_PRE_PUSH_DIR:-既定の場所}）" >&2
+      exit 1
+      ;;
+  esac
+}
+check_location "$base"
+base=$resolved_base
 mkdir -p "$base"
+# 作った後にも判定し直す（最初の判定と作るまでの間に、置き場所を含む作業ツリーが登録された・置き場所の途中がリンクに
+# 変わった場合に、そのまま使わない）。同じ実体のパスに解決されることも求める
+check_location "$base"
+if [ "$resolved_base" != "$base" ]; then
+  echo "NG: 専用の作業ツリーの置き場所（${base}）が、作った後に別の場所（${resolved_base}）に解決される。やり直す" >&2
+  exit 1
+fi
 key=$(printf '%s' "$common_dir" | shasum -a 256)
 snapshot="$base/${key%% *}"
 lock="$snapshot.lock"
@@ -344,18 +355,36 @@ else
   # 登録してから、作った作業ツリーの専用の管理ディレクトリにこのフックの印を書く（次の検査で再利用してよいかの判定に使う）まで、
   # 中断を無視する（間で終わって、印のない作業ツリーを残さない。このシェルの trap は、サブシェルの終了を待ってから動くので、
   # 控えた中断にはその後で従う）。登録に失敗したら、既存のものに印を書かずに止める
+  # 印を書けなかった場合は、この実行が作った登録だと確かめられたときだけ外す（印のない作業ツリーを残すと、次の検査は持ち主を
+  # 確かめられずに止まる）。確かめる: 管理ディレクトリが登録の置き場所の直下にあり、add の前にはなかった名前で、その gitdir の
+  # 記録が置き場所の .git を指すこと。確かめられない・外せない場合は外さずに、場所と直し方を示して止める
   created=0
   (
     trap '' INT TERM
+    real_directory source_common "$common_dir" || exit 2
+    before=" "
+    for entry in "$source_common/worktrees"/*; do
+      if [ -e "$entry" ] || [ -L "$entry" ]; then before="$before${entry##*/} "; fi
+    done
     git -C "$source_root" worktree add -q --no-checkout --detach "$snapshot" "$head" || exit 1
     git_path private "$snapshot" --git-dir && real_directory private "$private" || exit 2
-    printf '%s\n' "$owner_text" > "$private/$owner_mark" || exit 3
+    if printf '%s\n' "$owner_text" > "$private/$owner_mark"; then exit 0; fi
+    name=${private##*/}
+    if [ "${private%/*}" != "$source_common/worktrees" ] || case "$before" in *" $name "*) true ;; *) false ;; esac \
+      || [ ! -f "$private/gitdir" ] || [ -L "$private/gitdir" ] || [ "$(cat "$private/gitdir")" != "$snapshot/.git" ]; then
+      exit 5
+    fi
+    git -C "$source_root" worktree remove --force "$snapshot" || exit 4
+    exit 3
   ) || created=$?
+  recovery="中身を確かめてから git worktree remove --force で外す（ディレクトリだけがなければ git worktree prune）か、MINUTES_PRE_PUSH_DIR で別の場所を指定してから push し直す"
   case $created in
     0) ;;
     1) echo "NG: 専用の作業ツリー（${snapshot}）を作れない" >&2; exit 1 ;;
-    2) echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1 ;;
-    *) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けない" >&2; exit 1 ;;
+    2) echo "NG: 作った専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない。印のない作業ツリーが残った可能性がある。${recovery}" >&2; exit 1 ;;
+    3) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けない（作った登録は外した）。管理ディレクトリ（${common_dir}/worktrees）に書き込めるかを確かめてから push し直す" >&2; exit 1 ;;
+    4) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けず、登録も外せない。${recovery}" >&2; exit 1 ;;
+    *) echo "NG: 作った専用の作業ツリー（${snapshot}）に印を書けず、この検査が作った登録だと確かめられないので外さない。${recovery}" >&2; exit 1 ;;
   esac
   git -C "$snapshot" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout -q --detach --force "$head"
   full_checkout "$snapshot"

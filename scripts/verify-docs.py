@@ -1151,7 +1151,9 @@ class Checker:
                 # 見出し・区切りの線・表の行は 1 行で終わり、次の行に続かない
                 alone = PARAGRAPH_END.match(line) is not None or number in rows or is_separator(line) or not line.strip()
                 continued = not alone
-                line = CODE_SPAN.sub("", line)  # インラインのコードの中はリンクとして確かめない
+                # インラインのコードの中はリンクとして確かめない。消さずに同じ長さの空白に置き換え、前後の文字がつながって
+                # リンクに見えないようにする（「[a]`x`(b.md)」を「[a](b.md)」にしない）
+                line = CODE_SPAN.sub(lambda span: " " * len(span.group(0)), line)
                 line = INLINE_COMMENT.sub("", line)  # 同じ行で閉じるコメントの中も表示されないので確かめない
                 entries.append((number, line, not (starts or alone)))
             openers: List[Opener] = []  # 同じ段落の前の行から開いたままの「[」

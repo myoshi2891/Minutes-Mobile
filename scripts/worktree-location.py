@@ -4,7 +4,8 @@
 使い方:
   scripts/worktree-location.py check <置き場所> <元のリポジトリ>
       置き場所を実体のパスに解決して標準出力に書く（NUL で終える）。置き場所（自身を含む）か祖先に SwiftFormat の設定（.swiftformat・
-      .swift-version）があるもの、元のリポジトリか登録された作業ツリーの中にあるものは認めない。
+      .swift-version）があるもの、元のリポジトリか登録された作業ツリーの中にあるもの、判定の前後で作業ツリーの一覧が変わったものは
+      認めない。
       SwiftFormat は検査するディレクトリの親のディレクトリの設定も読み、読む範囲を止める指定を持たないので、そうした
       置き場所の作業ツリーの検査に、リポジトリの外の設定や別の作業ツリーの設定が混ざる。
       終了コード: 0 = 認める / 1 = 認めない（理由は標準エラー） / 2 = 判定できない
@@ -143,7 +144,8 @@ def check(requested: str, source: str) -> int:
     # どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら認めない（大文字小文字を区別しないボリュームで
     # 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）
     roots: Dict[Tuple[int, int], str] = {}
-    for path in [source] + [os.fsdecode(listed) for listed in registered_worktrees(source)]:
+    listed_first = registered_worktrees(source)
+    for path in [source] + [os.fsdecode(listed) for listed in listed_first]:
         found_identity = identity(path, registered=True)
         if found_identity is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
             roots[found_identity] = path
@@ -158,6 +160,11 @@ def check(requested: str, source: str) -> int:
         if parent == current:
             break
         current = parent
+    # 判定の間に作業ツリーが登録・解除された場合は、判定に使った一覧が古いので認めない（呼び出し側は置き場所を作った後にも
+    # 判定し直す。最初の一覧にあった作業ツリーの中は、上で拒否している）
+    if sorted(registered_worktrees(source)) != sorted(listed_first):
+        print(f"NG: 専用の作業ツリーの置き場所（{base}）の判定の間に作業ツリーの登録が変わった。やり直す", file=sys.stderr)
+        return 1
     # パスは NUL で終える（末尾の改行を含むパスも、呼び出し側が read -d '' でそのまま受け取れる）
     sys.stdout.buffer.write(os.fsencode(base) + b"\0")
     sys.stdout.flush()

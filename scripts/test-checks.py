@@ -1446,7 +1446,10 @@ def test_dependencies() -> None:
             failures.append("dependencies: 末尾の「/」だけが違うリンクを同じ内容のハッシュにした")
         (framework / "Current").unlink()
         (framework / "Current").symlink_to("ios")
-        for label, target in {"外の相対パス": "../../outside", "絶対パス": "/etc/hosts", "外を指すリンクの連鎖": "Chain"}.items():
+        # 外を指すリンクの先は実在するファイルにする（先が存在しないことで拒否したのを、外を指すことの拒否と取り違えない。
+        # 先が存在しないリンクは下の Missing で別に確かめる）
+        (Path(directory) / "outside").write_text("outside", encoding="utf-8")
+        for label, target in {"外の相対パス": "../outside", "絶対パス": "/etc/hosts", "外を指すリンクの連鎖": "Chain"}.items():
             (framework / "Bad").unlink() if (framework / "Bad").is_symlink() else None
             if label == "外を指すリンクの連鎖":
                 (framework / "Chain").symlink_to("../outside")
@@ -1456,8 +1459,9 @@ def test_dependencies() -> None:
                 module.content_digest(framework)
                 failures.append(f"dependencies: 成果物の外を指すリンク（{label}）を受け入れた")
             except module.Unreadable as error:
-                # 拒否した項目が Bad であること（連鎖では、外を指す Chain だけを拒否して Bad を通すと合格にしない）
-                if not str(error).startswith(f"{framework / 'Bad'}:"):
+                # 拒否した項目が Bad で、理由が成果物の外を指すことであること（連鎖では、外を指す Chain だけを拒否して Bad を
+                # 通すと合格にしない）
+                if not str(error).startswith(f"{framework / 'Bad'}:") or "成果物の外を指す" not in str(error):
                     failures.append(f"dependencies: 成果物の外を指すリンク（{label}）で Bad 以外を拒否した: {error}")
         # 循環するリンクは、例外（RuntimeError）で落ちずに、リンクのパスを示して読めないものとして扱う
         (framework / "Bad").unlink()
@@ -1541,6 +1545,11 @@ def test_dependencies() -> None:
         ("版 1 で両方", {"version": 1, "pins": empty, "object": {"pins": empty}}, 2),
         ("版 3 で両方", {"version": 3, "pins": empty, "object": {"pins": empty}}, 2),
         ("版 1 で object が配列", {"version": 1, "object": empty}, 2), ("最上位が配列", empty, 2),
+        # 版 3 の originHash は省略・null・文字列を認め、ほかの型は読まない
+        ("版 3 で originHash がない", {"version": 3, "pins": empty}, 0),
+        ("版 3 で originHash が null", {"version": 3, "originHash": None, "pins": empty}, 0),
+        ("版 3 で originHash が数値", {"version": 3, "originHash": 1, "pins": empty}, 2),
+        ("版 3 で originHash が配列", {"version": 3, "originHash": ["x"], "pins": empty}, 2),
     ):
         dependencies_case(f"Package.resolved の形式（{label}）", want, "依存を読めない" if want else "OK", {"Package.resolved": json.dumps(value)})
     # 版 2・3 の pin は kind を必ず持つ（ない・知らない値・文字列でないものは読まない）。版 1 は kind を持たない
@@ -2018,6 +2027,19 @@ def worktree_location_case() -> None:
         finally:
             closed.chmod(0o755)
         expect("worktree-location: 設定のない場所", [*command, str(closed / "base"), str(repository)], 0, env=env)
+        # 判定の間に作業ツリーが登録された（2 回目の一覧にだけ登録がある）場合は認めない。git の代わりは、2 回目以降の
+        # worktree list の出力に登録を 1 つ足す
+        shims = Path(directory) / "shims"
+        shims.mkdir()
+        (shims / "git").write_text(
+            '#!/bin/bash\nlisting=""\nfor argument in "$@"; do if [ "$argument" = list ]; then listing=1; fi; done\n'
+            '"$MINUTES_REAL_GIT" "$@" || exit $?\n'
+            'if [ -n "$listing" ]; then\n  if [ -e "$MINUTES_TEST_OUT" ]; then printf "worktree /registered-later\\0detached\\0\\0"; fi\n'
+            '  touch "$MINUTES_TEST_OUT"\nfi\n', encoding="utf-8")
+        (shims / "git").chmod(0o755)
+        expect("worktree-location: 判定の間に登録が変わった", [*command, str(closed / "base"), str(repository)], 1, "登録が変わった",
+               env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_REAL_GIT=shutil.which("git") or "git",
+                        MINUTES_TEST_OUT=str(Path(directory) / "listed")))
         # 登録だけが残り、親がファイルに置き換わった作業ツリーはないものとする。置き場所の途中がファイルなら判定できない
         subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
                         "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "base"], env=env, check=True, capture_output=True)
@@ -2596,6 +2618,51 @@ def staged_raw_tree_case() -> None:
         if result.returncode != 0:
             failures.append(f"check: --staged の規則の試験・文書の整合の書き出しの試験が通らない（終了コード {result.returncode}）\n"
                             f"{(result.stdout + result.stderr).strip()}")
+
+
+def staged_docs_link_case() -> None:
+    """check.sh --staged の手順 10 が、ステージした scripts/verify-docs.py がシンボリックリンク（書き出した場所の外のスクリプトを
+    指す）なら、実行せずに失敗すること。対照として、通常の実行できるファイルなら実行して通ること。"""
+    global count
+    for label, linked in (("シンボリックリンク", True), ("通常のファイル", False)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            repository = Path(directory) / "repository"
+            (repository / "scripts").mkdir(parents=True)
+            (repository / ".tools" / "bin").mkdir(parents=True)
+            called = Path(directory) / "called"
+            outside = Path(directory) / "outside.sh"
+            outside.write_text('#!/bin/sh\ntouch "$MINUTES_TEST_OUT"\n', encoding="utf-8")
+            outside.chmod(0o755)
+            (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            (repository / "scripts" / "test-lint-rules.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            verify = repository / "scripts" / "verify-docs.py"
+            if linked:
+                verify.symlink_to(outside)
+            else:
+                verify.write_text(outside.read_text(encoding="utf-8"), encoding="utf-8")
+            for name in ("check.sh", "test-lint-rules.py", *(() if linked else ("verify-docs.py",))):
+                (repository / "scripts" / name).chmod(0o755)
+            stage_tool_stubs(repository)
+            gitleaks = repository / ".tools" / "bin" / "gitleaks"
+            gitleaks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            gitleaks.chmod(0o755)
+            (repository / ".gitleaks.toml").write_text("", encoding="utf-8")
+            (repository / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+            (repository / "doc.md").write_text("doc\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repository), "add", "-A"], env=env, check=True, capture_output=True)
+            result = subprocess.run([str(repository / "scripts" / "check.sh"), "--staged"], capture_output=True, text=True,
+                                    env=dict(env, MINUTES_TEST_OUT=str(called)), timeout=60)
+            output = (result.stdout + result.stderr).strip()
+            if linked and (result.returncode == 0 or called.exists() or "通常の実行できるファイルでない" not in output):
+                failures.append(f"check: --staged の手順 10 が、リンクの verify-docs.py を拒否しない（終了コード {result.returncode}・"
+                                f"実行 {called.exists()}）\n{output}")
+            if not linked and (result.returncode != 0 or not called.exists()):
+                failures.append(f"check: --staged の手順 10 が、通常の verify-docs.py で通らない（{label}・終了コード {result.returncode}）"
+                                f"\n{output}")
 
 
 def staged_index_change_case() -> None:
@@ -3576,6 +3643,123 @@ def step4_tracked_case() -> None:
                 failures.append(f"check: 手順 4 の引数が違う（{label}。終了コード {result.returncode}・記録 {recorded!r}）\n{result.stderr.strip()}")
 
 
+def pre_push_mark_failure_case() -> None:
+    """プッシュ前のフックが、初回の作成で印を書けなかった場合に、この実行が作った登録だと確かめられたときだけ登録を外すこと。
+
+    git の代わりが、worktree add の直後に印の位置へディレクトリを置く（印を書けなくする）。「確かめられない」場合は、加えて
+    gitdir の記録を別の場所に書き換え、登録を外さずに止めること。外した場合は、次の push が作り直して通ること。
+    """
+    global count
+    real_git = shutil.which("git") or "git"
+    for label, foreign in (("この実行の登録", False), ("確かめられない登録", True)):
+        count += 1
+        with tempfile.TemporaryDirectory() as directory:
+            env = isolated_git_env()
+            env.pop("MINUTES_CHECK_ISOLATED", None)
+            work, base, shims = Path(directory) / "work", Path(directory) / "base", Path(directory) / "shims"
+            hook = Path(directory) / "pre-push"
+            hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
+            hook.chmod(0o755)
+            identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", f"core.hooksPath={os.devnull}"]
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(["git", *identity, *arguments], cwd=work, env=env, check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            work.mkdir()
+            git("init", "-q", "--template=", "-b", "main")
+            (work / "scripts").mkdir()
+            (work / ".tools" / "bin").mkdir(parents=True)
+            copy_location_script(work)
+            (work / "scripts" / "check.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (work / "scripts" / "check.sh").chmod(0o755)
+            (work / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "base")
+            head = git("rev-parse", "HEAD")
+            shims.mkdir()
+            rewrite = 'printf "%s\\n" /elsewhere/.git > "$private/gitdir"\n' if foreign else ""
+            (shims / "git").write_text(
+                '#!/bin/bash\n"$MINUTES_REAL_GIT" "$@"\nstatus=$?\nprevious=""\nfor argument in "$@"; do\n'
+                '  if [ "$previous" = worktree ] && [ "$argument" = add ] && [ "$status" = 0 ]; then\n'
+                '    snapshot=${*: -2:1}\n'
+                '    private=$("$MINUTES_REAL_GIT" -C "$snapshot" rev-parse --path-format=absolute --git-dir)\n'
+                '    mkdir "$private/minutes-pre-push-owner"\n' + rewrite +
+                '  fi\n  previous=$argument\ndone\nexit "$status"\n', encoding="utf-8")
+            (shims / "git").chmod(0o755)
+
+            def push(shimmed: bool) -> "subprocess.CompletedProcess[str]":
+                extra = {"PATH": f"{shims}:{env['PATH']}", "MINUTES_REAL_GIT": real_git} if shimmed else {}
+                return subprocess.run([str(hook)], cwd=work, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
+                                      capture_output=True, text=True, timeout=60,
+                                      env=dict(env, MINUTES_PRE_PUSH_DIR=str(base), **extra))
+
+            refused = push(True)
+            # 登録が残ったかは管理ディレクトリで見る（gitdir の記録を書き換えた場合、一覧は別の場所を示す）
+            admin = work / ".git" / "worktrees"
+            registered = admin.is_dir() and any(admin.iterdir())
+            want = "確かめられないので外さない" if foreign else "作った登録は外した"
+            if refused.returncode != 1 or want not in refused.stderr or registered != foreign:
+                failures.append(f"pre-push: 印を書けない場合（{label}）の扱いが違う（終了コード {refused.returncode}・登録が残った {registered}）"
+                                f"\n{refused.stderr.strip()}")
+                continue
+            if not foreign:
+                renewed = push(False)
+                if renewed.returncode != 0:
+                    failures.append(f"pre-push: 印を書けずに登録を外した後に作り直せない（終了コード {renewed.returncode}）"
+                                    f"\n{renewed.stderr.strip()}")
+
+
+def pre_push_recheck_case() -> None:
+    """プッシュ前のフックが、置き場所を作った後にも判定し直し、作るまでの間に置き場所へ作業ツリーが登録されたら止まること。
+
+    mkdir の代わりが、置き場所を作った直後にそこへ作業ツリーを登録する（最初の判定の後・2 回目の判定の前）。
+    """
+    global count
+    count += 1
+    real_mkdir = shutil.which("mkdir") or "/bin/mkdir"
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        work, base, shims = Path(directory) / "work", Path(directory) / "base", Path(directory) / "shims"
+        hook = Path(directory) / "pre-push"
+        hook.write_text((ROOT / ".githooks" / "pre-push").read_text(encoding="utf-8"), encoding="utf-8")
+        hook.chmod(0o755)
+        identity = ["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+                    "-c", f"core.hooksPath={os.devnull}"]
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", *identity, *arguments], cwd=work, env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        work.mkdir()
+        git("init", "-q", "--template=", "-b", "main")
+        (work / "scripts").mkdir()
+        (work / ".tools" / "bin").mkdir(parents=True)
+        copy_location_script(work)
+        (work / "scripts" / "check.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (work / "scripts" / "check.sh").chmod(0o755)
+        (work / ".gitignore").write_text("/.tools\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        head = git("rev-parse", "HEAD")
+        shims.mkdir()
+        (shims / "mkdir").write_text(
+            '#!/bin/bash\n"$MINUTES_REAL_MKDIR" "$@" || exit $?\n'
+            'if [ "${*: -1}" = "$MINUTES_TEST_BASE" ]; then\n'
+            '  git -C "$MINUTES_TEST_WORK" worktree add -q --detach "$MINUTES_TEST_BASE" HEAD >/dev/null 2>&1\nfi\n', encoding="utf-8")
+        (shims / "mkdir").chmod(0o755)
+        resolved = os.path.realpath(base)
+        result = subprocess.run([str(hook)], cwd=work, input=f"refs/heads/main {head} refs/heads/main {'0' * 40}\n",
+                                capture_output=True, text=True, timeout=60,
+                                env=dict(env, MINUTES_PRE_PUSH_DIR=str(base), PATH=f"{shims}:{env['PATH']}",
+                                         MINUTES_REAL_MKDIR=real_mkdir, MINUTES_TEST_BASE=resolved, MINUTES_TEST_WORK=str(work)))
+        if result.returncode != 1 or "作業ツリー" not in result.stderr or not (base / ".git").is_file():
+            failures.append(f"pre-push: 置き場所を作った後に登録された作業ツリーで止まらない（終了コード {result.returncode}）"
+                            f"\n{result.stderr.strip()}")
+
+
 def pre_push_newline_case() -> None:
     """プッシュ前のフックと check.sh の isolated_checkout が、共通のディレクトリの名前が改行で終わっても、作業ツリーを見分けること。
 
@@ -4247,7 +4431,13 @@ def pre_push_interrupted_case() -> None:
         refused = push(base)
         if refused.returncode != 1 or out.exists() or not (clone / "mine.txt").is_file() or "clone/" not in refused.stderr:
             failures.append(f"pre-push: 追跡していない複製を消した・止まらない（終了コード {refused.returncode}）\n{refused.stderr.strip()}")
-        shutil.rmtree(clone)
+        # フックが複製を消した場合（上で失敗を記録済み）は、ないことだけを認めて後続の試験を続ける。ほかの削除の失敗は記録する
+        try:
+            shutil.rmtree(clone)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            failures.append(f"pre-push: 複製の試験の後片付けで {clone} を消せない（{error}）")
         # 残すビルドの成果物の中の .git のディレクトリ（依存の複製）は認め、.git のファイル（登録された作業ツリー）は止める
         for build in (".build", "Packages/MinutesKit/.build"):
             for label, is_file in (("ディレクトリ", False), ("ファイル", True)):
@@ -4419,8 +4609,48 @@ def coverage_links_case() -> None:
                                capture_output=True)
             result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "7"], capture_output=True, text=True,
                                     timeout=60, env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_OUT=str(out)))
-            if out.exists() != want_call or (not want_call and "写しの外を指す" not in result.stderr):
-                failures.append(f"check: 手順 7 の入力の{label}の扱いが違う（swift の呼び出し {out.exists()}）\n{result.stderr.strip()}")
+            # 拒否するリンクは、診断を出し、swift を呼ばずに、終了コード 1 で止まること
+            if out.exists() != want_call or (not want_call and ("写しの外を指す" not in result.stderr or result.returncode != 1)):
+                failures.append(f"check: 手順 7 の入力の{label}の扱いが違う（swift の呼び出し {out.exists()}・終了コード {result.returncode}）"
+                                f"\n{result.stderr.strip()}")
+
+
+def coverage_filter_case() -> None:
+    """check.sh の手順 7 が、未コミットの変更を含む作業ツリーを測るとき、.gitattributes の clean のフィルタを通さない作業ツリーの
+    バイト列そのものを測る写しに書き出すこと（swift の代わりが、測る写しのファイルの内容を記録する）。"""
+    global count
+    count += 1
+    with tempfile.TemporaryDirectory() as directory:
+        env = isolated_git_env()
+        env.pop("MINUTES_CHECK_ISOLATED", None)
+        repository = Path(directory) / "repository"
+        package = repository / "Packages" / "MinutesKit"
+        (repository / "scripts").mkdir(parents=True)
+        (package / "Sources").mkdir(parents=True)
+        (package / "Package.swift").write_text("", encoding="utf-8")
+        (package / "Sources" / "A.swift").write_text("let base = 0\n", encoding="utf-8")
+        (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        (repository / "scripts" / "check.sh").chmod(0o755)
+        (repository / ".gitignore").write_text(".build/\n", encoding="utf-8")
+        (repository / ".gitattributes").write_text("*.swift filter=upper\n", encoding="utf-8")
+        shims, out = Path(directory) / "shims", Path(directory) / "measured"
+        shims.mkdir()
+        (shims / "swift").write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = --package-path ]; then cp "$2/Sources/A.swift" '
+                                     '"$MINUTES_TEST_OUT"; fi\n  shift\ndone\nexit 1\n', encoding="utf-8")
+        (shims / "swift").chmod(0o755)
+        for arguments in (["init", "-q", "--template=", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "base"],
+                          ["config", "filter.upper.clean", "tr a-z A-Z"]):
+            subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                            "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={os.devnull}", *arguments], env=env, check=True,
+                           capture_output=True)
+        # 未コミットの変更（clean のフィルタは大文字に変える）
+        (package / "Sources" / "A.swift").write_text("let raw = 1\n", encoding="utf-8")
+        result = subprocess.run([str(repository / "scripts" / "check.sh"), "--steps", "7"], capture_output=True, text=True,
+                                timeout=60, env=dict(env, PATH=f"{shims}:{env['PATH']}", MINUTES_TEST_OUT=str(out)))
+        measured = out.read_text(encoding="utf-8") if out.exists() else None
+        if measured != "let raw = 1\n":
+            failures.append(f"check: 手順 7 が作業ツリーのバイト列と違う内容（{measured!r}）を測った（clean のフィルタ）"
+                            f"\n{result.stderr.strip()}")
 
 
 def coverage_paths_case() -> None:
@@ -4901,10 +5131,13 @@ def test_versions() -> None:
     staged_dash_case()
     step4_tracked_case()
     pre_push_newline_case()
+    pre_push_mark_failure_case()
+    pre_push_recheck_case()
     staged_scripts_case()
     reinstall_command_case()
     pre_push_interrupted_case()
     coverage_links_case()
+    coverage_filter_case()
     coverage_paths_case()
     snapshot_timeout_case()
     copy_tools_lock_case()
@@ -4942,6 +5175,7 @@ def test_versions() -> None:
     staged_setup_tools_case()
     staged_raw_blob_case()
     staged_raw_tree_case()
+    staged_docs_link_case()
     coverage_record_message_case()
     # 明示した --steps が空なら、全手順を実行せずに使い方の誤りにする。
     # リポジトリの外の一時ディレクトリに写した check.sh で試す（誤って全手順を実行しても、手順 0 がこの自己試験を
@@ -5347,6 +5581,8 @@ def test_gitleaks() -> None:
         ("通常の色の設定", ()),
         ("color.diff=always", (("color.diff", "always"),)),
         ("color.ui=always", (("color.ui", "always"),)),
+        # 日時の形式を変える設定でも、履歴を読める（--pretty の日時は固定の形式の %aI）
+        ("log.date=relative", (("log.date", "relative"),)),
     ):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
@@ -6022,6 +6258,7 @@ def gitleaks_merge_case() -> None:
 
 def coverage_case(label: str, want_code: int, want_text: str, count_value: object, covered_value: object, nested: bool = False,
                   target: str = "90", forbidden: str = "", duplicate: bool = False) -> None:
+    global count
     with tempfile.TemporaryDirectory() as directory:
         sources = Path(directory) / "Sources"
         sources.mkdir()
@@ -6035,8 +6272,18 @@ def coverage_case(label: str, want_code: int, want_text: str, count_value: objec
         if nested:
             report.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")  # json の読み込みが RecursionError になる深さ
         command = [str(SCRIPTS / "coverage-report.py"), str(report), "--sources", str(sources), "--target", target]
-        expect(f"coverage: {label}", command, want_code, want_text)
-        if forbidden and forbidden in run(command)[1]:
+        # 終了コード・期待する文字列・出てはいけない文字列を、同じ 1 回の実行の結果で確かめる
+        count += 1
+        try:
+            code, output = run(command)
+        except OSError as error:
+            failures.append(f"coverage: {label}: {command[0]} を起動できない: {error}")
+            return
+        if code != want_code:
+            failures.append(f"coverage: {label}: 終了コードが {code}（期待 {want_code}）\n{output.strip()}")
+        elif want_text and want_text not in output:
+            failures.append(f"coverage: {label}: 出力に「{want_text}」がない\n{output.strip()}")
+        if forbidden and forbidden in output:
             failures.append(f"coverage: {label}: 出力に「{forbidden}」がある")
 
 
@@ -6676,6 +6923,9 @@ def run_docs_cases() -> None:
                   "[要件](../01-requirements/requirements.md) `[例](missing.md)` ``[例](`missing.md`)``"),
         docs_case("インラインのコードの外のリンク", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
                   "`コード` [例](missing.md)"),
+        # 間のインラインのコードは空白に置き換える（消して前後をつなげ、リンクでない書き方をリンクとして確かめない）
+        docs_case("インラインのコードを挟んだ角括弧と括弧", 0, "OK", basic, "[要件](../01-requirements/requirements.md)",
+                  "[例]`コード`(missing.md)"),
         # 節が小節から始まる場合は、最初の小節の冒頭だけを見る（後ろの小節の「満たす要件:」で節を合格にしない）
         cyclic_snippet_case(),
         linked_document_case(),

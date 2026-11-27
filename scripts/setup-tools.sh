@@ -16,8 +16,11 @@ set -euo pipefail
 
 # CDPATH が設定されていると、相対パスの cd が別の場所へ移り、移った先を標準出力に書いて ROOT に混ぜる。外してから解決する
 unset CDPATH
+# スクリプトの置き場所は $(dirname …) ではなくパラメータ展開で求める（$(…) は名前の末尾の改行を落とし、別のディレクトリを指しうる）。
+# $0 に「/」がなければ今の場所、「/」の直下なら「/」
+case "$0" in */*) SCRIPT_DIR=${0%/*}; SCRIPT_DIR=${SCRIPT_DIR:-/} ;; *) SCRIPT_DIR=. ;; esac
 # $(…) はパスの末尾の改行もすべて落とすので、印の x を付けて受け取り、x と pwd が付けた区切りの改行 1 つだけを外す
-ROOT=$(cd "$(dirname "$0")/.." && pwd && printf x)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd && printf x)
 ROOT=${ROOT%x}
 ROOT=${ROOT%$'\n'}
 VERSIONS="$ROOT/tools/versions"
@@ -209,7 +212,8 @@ install_tool() {
       # gh 自身は、公式のリリースの固定の URL から取得する（HTTPS だけ。リダイレクト先も HTTPS に限る）。
       # ほかのツールは、GH_HOST の設定に取得先が左右されないよう、--repo にホスト（github.com）を明示する
       # 止まった転送でロックを持ち続けないよう、接続と転送の全体に上限（秒）を付ける（ロックを待つ上限の 600 秒より短くする）
-      curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
+      # -q は最初の引数にする（.curlrc の設定を読ませず、転送の指定を左右させない）
+      curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
         -o "$work/download/$asset" "https://github.com/$repo/releases/download/$tag/$asset" </dev/null \
         || fail "$name の配布ファイルを取得できない（$repo $tag ${asset}）"
     else
