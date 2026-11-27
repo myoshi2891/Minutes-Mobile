@@ -105,7 +105,7 @@
 | SEC-APP-01 | アプリがバックグラウンドに移るとき、アプリ切り替え画面のスナップショットに D1〜D3 の情報（文字起こし・要約・ノートに加え、会議タイトルなどのメタデータ）が写らないように、内容を隠す画面に切り替える。どの画面を表示中でも適用し、会議一覧を表示中の場合も、タイトルに含まれる案件名や参加者名が残らないようにする | MVP | 実装 / 実機 | PLATFORM |
 | SEC-APP-02 | アプリのロック（Face ID / Touch ID / パスコード。LocalAuthentication）を任意で設定できる。ロック中でも録音状態の表示と停止はできる（録音を失わない） | P2 | 設計 / 単体・実機 | AUTH |
 | SEC-PLT-01 | 文字起こし・ノート・会議タイトルをコピーするときは、ユニバーサルクリップボード（他の Apple 端末への同期）を使わない（ペーストボードに端末内限定の指定をする）。有効期限も付ける。会議タイトル（D3）のコピーは許可し、文字起こし・ノートと同じくコピーを集約する型を通す。文字起こし・ノートの表示からのコピーは専用の操作に限る。タイトルの入力欄と、P2 のノートの編集欄で、OS 標準の編集メニューから利用者がコピー・切り取りする場合は制御の外であり、残る危険として扱う。この操作でコピー・切り取りした内容は、ユニバーサルクリップボードを通じて同じ Apple アカウントの他の端末へ同期されうる（アプリ自身の送信ではないが、Zero External Data Egress の例外になる）（編集欄では切り取り・貼り付けが編集の基本操作で、無効にすると編集ができなくなるため。[ui.md](../02-basic-design/ui.md) §7.3） | MVP | 実装 / 単体 | PLATFORM、PRIVACY |
-| SEC-PLT-02 | 文字起こし・要約・ノートの本文を Spotlight の索引や Siri の提案（App Intents・NSUserActivity の提供）に渡さない。会議タイトルも渡さない | MVP | 設計 / レビュー | PLATFORM、PRIVACY |
+| SEC-PLT-02 | 文字起こし・要約・ノートの本文を Spotlight の索引や Siri の提案（App Intents・NSUserActivity の提供）に渡さない。会議タイトルも渡さない | MVP | 設計 / レビュー・静的解析（§10.1） | PLATFORM、PRIVACY |
 | SEC-PLT-03 | P2 で追加するノート編集・検索などの入力欄にも、SEC-PLT-06 のサードパーティー製キーボードの禁止を適用する（キーボードの拡張機能は入力内容を外部へ送れるため。T-04）。利用者による解除は SEC-PLT-06 と同じく認めない | P2 | 設計 / 実機（TST-SEC-10） | PLATFORM |
 | SEC-PLT-04 | URL スキーム・ユニバーサルリンク・共有拡張は MVP では提供しない。追加する場合は、受け取る値をすべて外部入力として検証する | MVP | 設計 | PLATFORM |
 | SEC-PLT-05 | WebView を使わない。必要になったら、ローカルの内容だけを表示し、JavaScript を無効にする | MVP | 設計 | PLATFORM |
@@ -120,7 +120,7 @@
 | --- | --- | --- | --- | --- |
 | SEC-PRV-01 | マイクの利用目的（`NSMicrophoneUsageDescription`）は、日本語で具体的に書く（例:「会議を録音し、この iPhone の中だけで文字起こしするためにマイクを使用します。音声は端末外へ送信されません。」）。音声認識の利用目的（`NSSpeechRecognitionUsageDescription`）が必要な API を使う場合も同様にする | MVP | 実装 / レビュー | PRIVACY |
 | SEC-PRV-02 | 録音は同意確認（FR-CNS-01）の後にだけ開始する。アプリが録音していない間はマイク入力を開かない。録音中であることをアプリの画面で常に示す。ロック画面での表示は NFR-UX-03 の条件に従う（①Live Activity が使える場合は、ロック画面にも録音の状態と経過時間を示す。②使えない場合は、ロック画面での表示を求めず、アプリ内の表示と OS の録音インジケータで確認できることを条件とする） | MVP | 設計 / 単体・実機 | PRIVACY |
-| SEC-PRV-03 | プライバシーマニフェスト（`PrivacyInfo.xcprivacy`）を用意する。データ収集は「なし」、トラッキングは「しない」と申告する。使う「理由の申告が必要な API」（ファイルの日時・ディスクの空き容量・`UserDefaults`・システム起動時間など）とその理由コードを詳細設計で確定する | MVP | 詳細設計 / レビュー | PRIVACY |
+| SEC-PRV-03 | プライバシーマニフェスト（`PrivacyInfo.xcprivacy`）を用意する。データ収集は「なし」、トラッキングは「しない」と申告する。使う「理由の申告が必要な API」（ファイルの日時・ディスクの空き容量・`UserDefaults`・システム起動時間など）とその理由コードを詳細設計で確定する | MVP | 詳細設計 / レビュー・CI（TST-SEC-03） | PRIVACY |
 | SEC-PRV-04 | 初回起動時の説明（FR-CNS-03）で、端末内で処理すること、データの保存場所、バックアップから除外していること、書き出したファイルは利用者の責任で扱うことを説明する | MVP | 設計 / 実機 | PRIVACY |
 
 ---
@@ -149,7 +149,7 @@
 | SEC-SUP-01 | すべての依存（ライブラリ・開発ツール・モデル）の版を固定し、更新は PR で差分を見て行う。版は「最新安定版を確認日付きで固定」する。固定の方法は区分ごとに定める。アプリに組み込むライブラリは Swift Package Manager で管理し、`Package.resolved` をコミットする。SPM 以外の開発ツール（公式のリリースページから取得する gitleaks CLI など）とモデルは、版・取得元・SHA-256 を台帳に記録し、記録した版を導入スクリプトで再現して導入し、検査スクリプトで照合する（[dependencies-and-costs.md](dependencies-and-costs.md) §4 手順 5） | MVP | 実装 / CI | CODE |
 | SEC-SUP-02 | 依存を追加する前に、ライセンス（許可: MIT / Apache-2.0 / BSD 系。その他はオーナーに確認）、有償要素、通信の有無、保守状況を確認し、[dependencies-and-costs.md](dependencies-and-costs.md) に記録する | MVP | 設計 / レビュー・CI（ライセンス確認） | CODE |
 | SEC-SUP-03 | 秘密情報の検出（gitleaks）をコミット前（pre-commit）と CI で実行する | MVP | CI | CODE |
-| SEC-SUP-04 | `.gitignore` で、録音データ（`*.wav` など）・個人の Xcode 設定（`xcuserdata`）・ビルド成果物・`.env` を管理対象から外す | MVP | 実装 / レビュー | CODE |
+| SEC-SUP-04 | `.gitignore` で、録音データ（`*.wav` など）・個人の Xcode 設定（`xcuserdata`）・ビルド成果物・`.env` を管理対象から外す | MVP | 実装 / レビュー・CI（除外の行と追跡するファイルの検査） | CODE |
 | SEC-SUP-05 | 実機で録音した試験データは、リポジトリに入れない。試験記録には、試験の様式（test-requirements.md §3.7）の項目（日付・ビルドのコミット・端末機種・OS 版・試験 ID・結果・観測値（件数・ハッシュを含む）・不合格の理由）だけを残し、音声とその書き起こしの本文は残さない | MVP | 運用 | PRIVACY |
 | SEC-SUP-06 | 改ざん検知・脱獄検知（MASVS-RESILIENCE）は、個人利用（UD-02）の段階では対象外とする。配布範囲を広げるときに再評価する | P3 | — | RESILIENCE |
 
@@ -173,9 +173,9 @@
 | コピーを集約する型の外での `UIPasteboard`、D2 と会議タイトル（D3）の表示への `.textSelection(` | 端末内限定と有効期限の付け忘れを防ぐため（標準のコピーは他の端末へ同期されうる） | SEC-PLT-01 |
 | `ShareLink` | 共有の完了を受け取って一時ファイルを消すため | SEC-DAT-06 |
 | `NSTemporaryDirectory`、保存ルートを管理する型の外でのディレクトリ作成 | バックアップ除外と保護クラスの付け忘れを防ぐため | SEC-DAT-01・03 |
-| `WKWebView`・`CoreSpotlight`・`NSUserActivity` | WebView を使わず、Spotlight・Siri にデータを渡さないため | SEC-PLT-02・05 |
+| `WKWebView`・`CoreSpotlight`・`NSUserActivity`・`import AppIntents` | WebView を使わず、Spotlight・Siri にデータを渡さないため | SEC-PLT-02・05 |
 
-「`SFSpeechRecognizer`」以降の 6 行は基本設計（2026-11-15）で追加した。規則の実現方法と例外を認める場所は [dev-environment.md](../02-basic-design/dev-environment.md) §7 にある。
+「`SFSpeechRecognizer`」以降の 6 行は基本設計（2026-11-15）で追加した。規則の実現方法と例外を認める場所は [dev-environment.md](../02-basic-design/dev-environment.md) §7 にある。`import AppIntents` は 2026-11-17 に追加した（SEC-PLT-02 が名前を挙げているのに、規則の対象に入っていなかったため。[security-check-items.md](../04-test-records/security-check-items.md) §7）。
 
 ### 10.2 PR のセキュリティチェックリスト
 

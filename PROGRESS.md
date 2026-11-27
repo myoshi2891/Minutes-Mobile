@@ -13,29 +13,30 @@
 | `scripts/check.sh` の各手順の現在の結果 | [docs/03-detailed-design/dev-environment.md](docs/03-detailed-design/dev-environment.md) §4.1 |
 | 未解決事項（OQ）の解決状況 | [docs/02-basic-design/README.md](docs/02-basic-design/README.md) §3 |
 | 実機試験の結果 | [docs/04-test-records/README.md](docs/04-test-records/README.md) |
+| 実機で人が操作する試験の観点・骨子・未確定事項 | [docs/04-test-records/device-test-design.md](docs/04-test-records/device-test-design.md) |
+| 機能・結合テストと E2E の項目、要件からの逆引き | [integration-test-items.md](docs/04-test-records/integration-test-items.md)・[e2e-test-items.md](docs/04-test-records/e2e-test-items.md) |
+| セキュリティの確認項目と、SEC ID・脅威からの逆引き | [security-check-items.md](docs/04-test-records/security-check-items.md) |
 
 ## 1. 作業の順番
 
-詳細設計 n を書く → 実装してテストが通る → 詳細設計 n+1 へ進む（[詳細設計 README](docs/03-detailed-design/README.md) §2）。前の行が「完了」になるまで次の行に着手しない。
+詳細設計は、実装より先に全文書を作ってある（UD-10）。実装の各行は「該当する詳細設計を再確認して改訂する → 実装してテストが通る」の順で進める（再確認の内容は [詳細設計 README](docs/03-detailed-design/README.md) §2）。前の行が「完了」になるまで次の行に着手しない。
 
 | 順 | 作業 | 種別 | 正 | 状態 |
 | --- | --- | --- | --- | --- |
 | 1 | 作業単位 1: 検査基盤（`scripts/`・静的解析の規則・フックのファイル） | 実装 | [dev-environment.md](docs/03-detailed-design/dev-environment.md) §1〜§10 | 完了（2026-11-16） |
-| 2 | 作業単位 2: プロジェクト設定（`project.xcproj` の変更・`Packages/MinutesKit`・テストターゲット・プライバシーマニフェスト・フックの有効化） | 実装 | [dev-environment.md](docs/03-detailed-design/dev-environment.md) §11〜§14 | **次** |
-| 3 | 詳細設計 `architecture.md`（層・注入点の protocol・並行性・エラー） | 設計 | [基本設計 architecture.md](docs/02-basic-design/architecture.md) §14 の申し送り | 未着手 |
-| 4 | 共通基盤の実装（注入点の protocol・時計・一時ディレクトリなど） | 実装 | 詳細設計 `architecture.md` | 未着手 |
-| 5 | 詳細設計 `recording.md` | 設計 | [基本設計 recording.md](docs/02-basic-design/recording.md) §14 の申し送り | 未着手 |
-| 6 | 録音の実装（WAV・リサンプラ・Chunk 分割・割り込みの状態遷移） | 実装 | 詳細設計 `recording.md` | 未着手 |
-| 7 | 詳細設計 `storage.md`（保存・確定・復旧を含む） | 設計 | [基本設計 storage.md](docs/02-basic-design/storage.md) | 未着手 |
-| 8 | 保存の実装（ファイル配置・SQLite・Chunk の保存・空き容量） | 実装 | 詳細設計 `storage.md` | 未着手 |
-| 9 | 確定の実装 | 実装 | 詳細設計 `storage.md` | 未着手 |
-| 10 | 復旧の実装 | 実装 | 詳細設計 `storage.md` | 未着手 |
-| 11 | 詳細設計 `transcription.md` → 文字起こしの実装 | 設計・実装 | [基本設計 transcription.md](docs/02-basic-design/transcription.md) | 未着手 |
-| 12 | 詳細設計 `ui.md` → 画面の実装（Live Activity のターゲットを含む） | 設計・実装 | [基本設計 ui.md](docs/02-basic-design/ui.md) | 未着手 |
-| 13 | 詳細設計 `export.md` → 書き出しの実装 | 設計・実装 | [基本設計 export.md](docs/02-basic-design/export.md) | 未着手 |
-| 14 | P2 の基本設計 `summary-and-notes.md`（OQ-06 を扱う） | 設計 | [基本設計 README](docs/02-basic-design/README.md) §1 | MVP の後（UD-07） |
+| 2 | 詳細設計の残り 6 文書（`architecture`・`recording`・`storage`・`transcription`・`ui`・`export`） | 設計 | [詳細設計 README](docs/03-detailed-design/README.md) §1 | 完了（2026-11-17。初版・実装前） |
+| 3 | 作業単位 2: プロジェクト設定（`project.xcproj` の変更・`Packages/MinutesKit`・テストターゲット・プライバシーマニフェスト・フックの有効化） | 実装 | [dev-environment.md](docs/03-detailed-design/dev-environment.md) §11〜§14 | **次** |
+| 4 | 共通基盤の実装（注入点の protocol・時計・一時ディレクトリなど） | 再確認・実装 | [architecture.md](docs/03-detailed-design/architecture.md) | 未着手 |
+| 5 | 録音の実装（WAV・リサンプラ・Chunk 分割・割り込みの状態遷移） | 再確認・実装 | [recording.md](docs/03-detailed-design/recording.md) | 未着手 |
+| 6 | 保存の実装（ファイル配置・SQLite・Chunk の保存・空き容量） | 再確認・実装 | [storage.md](docs/03-detailed-design/storage.md) | 未着手 |
+| 7 | 確定の実装 | 実装 | [storage.md](docs/03-detailed-design/storage.md) | 未着手 |
+| 8 | 復旧の実装 | 実装 | [storage.md](docs/03-detailed-design/storage.md) | 未着手 |
+| 9 | 文字起こしの実装 | 再確認・実装 | [transcription.md](docs/03-detailed-design/transcription.md) | 未着手 |
+| 10 | 画面の実装（Live Activity のターゲットを含む） | 再確認・実装 | [ui.md](docs/03-detailed-design/ui.md) | 未着手 |
+| 11 | 書き出しの実装 | 再確認・実装 | [export.md](docs/03-detailed-design/export.md) | 未着手 |
+| 12 | P2 の基本設計 `summary-and-notes.md`（OQ-06 を扱う） | 設計 | [基本設計 README](docs/02-basic-design/README.md) §1 | MVP の後（UD-07） |
 
-11〜13 は着手時に「設計」と「実装」の 2 行へ分ける。
+7・8 は 6 と同じ文書（`storage.md`）なので、再確認は 6 の着手時に 1 回行い、6・7 の実装で文書を改訂した場合だけ読み直す。
 
 ## 2. 次のアクション
 
@@ -43,7 +44,8 @@
 
 - **次の 1 手**: 設定を変える前に `scripts/check.sh --steps 4` を実行し、失敗の出力（違反の件数と各行）を下の「Red の記録」に書く。その後 [dev-environment.md](docs/03-detailed-design/dev-environment.md) §12.1 の表のとおり `MinutesMobile.xcodeproj/project.xcproj` の設定を変更し、`scripts/check.sh --steps 4` を通す
 - **その後**: テンプレートの Swift ファイルを既存の手順（[dev-environment.md](docs/03-detailed-design/dev-environment.md) §7 の「直すときは `.tools/bin/swiftformat .` を実行する」）で整形し、`scripts/check.sh --steps 1` が通ることを確かめる → [dev-environment.md](docs/03-detailed-design/dev-environment.md) §12.2 の Info.plist のファイルを作り、`UIBackgroundModes` に `audio` を入れる（ロック中・背面での録音の継続。FR-REC-05）→ §11 の Package（`Packages/MinutesKit`）とテストターゲットを追加 → §14.1 のプライバシーマニフェスト → `scripts/check.sh` の全手順が通る → `scripts/setup.sh --hooks` でフックを有効にする
-- **作業**: 順 2（作業単位 2: プロジェクト設定）
+- **実装の各単位の前に（マージで生じた再確認）**: 詳細設計の 6 文書（architecture・recording・storage・transcription・ui・export）は、ブランチ `docs/detailed-design` で 2026-11-16〜17 の基本設計をもとに書いた。`dev` の基本設計・要件は、その後のレビュー対応（〜43 回目、2026-11-27）で大きく変わっている。このため `scripts/verify-docs.py`（手順 10）が、申し送りの解決の表の食い違い 32 件（architecture 6・recording 3・storage 10・transcription 4・ui 5・export 4）で失敗する（[dev-environment.md](docs/03-detailed-design/dev-environment.md) §4.1）。§1 の 4 以降の各行の着手時に、UD-10 の再確認で基本設計との食い違いを洗い出し、スキル `update-specs` で詳細設計を先に直す（その文書の分の手順 10 の失敗もそこで消す）。**既知の食い違い**: 基本設計 [storage.md](docs/02-basic-design/storage.md) §4 の「既存のハッシュの記録」は、正式名の WAV があって記録がない場合に `.part` から記録を作らないが、詳細設計 [storage.md](docs/03-detailed-design/storage.md) §4.4 の `SealDecision`（「WAV あり・同じ内容・記録なし」）は記録を作る。§1 の 6 の着手時に解消する
+- **作業**: 順 3（作業単位 2: プロジェクト設定）
 - **終わりの条件**: `scripts/check.sh` の手順 0〜10 がすべて通る（Bundle Identifier の警告を除く）。かつ、アプリの Info.plist の `UIBackgroundModes` に `audio` がある（§12.2。検査は使ってよい値だけを確かめ、`audio` の有無は確かめないので、この条件で確かめる）
 - **Red の記録**: —（PR を作るまで、失敗を確かめたテスト名と失敗の理由をここに書き、PR の説明へ移す。[test-requirements.md](docs/01-requirements/test-requirements.md) §6 の 2）
 
@@ -54,8 +56,9 @@
 | Bundle Identifier が未確定 | 実機での実際の会議の録音（CON-09） | 作業単位 2 のほかの変更（検査は警告にとどめる） | [dev-environment.md](docs/03-detailed-design/dev-environment.md) §12.1 |
 | Git のフックが無効 | — | 作業単位 2 の最後に有効にする | [dev-environment.md](docs/03-detailed-design/dev-environment.md) §5 |
 | 作業単位 2 の前の PR は全手順の合格を得られない | 作業単位 2 の前の PR の統合（PR ごとに、手順 0〜10 の結果・失敗の記録とオーナーの承認が要る） | 作業単位 2 の作業・手元での確認（`--steps 0,2,3,5,6,10`）。作業単位 2 を済ませれば解消する | [基本設計 dev-environment.md](docs/02-basic-design/dev-environment.md) §6.2 の「初期導入の手順」 |
-| NFR-PWR-02 の例外（止める手段のない文字起こしの実行の残り）のオーナーの確認 | 文字起こしの詳細設計（§1 の 11） | 作業単位 2・録音・保存の作業 | [基本設計 transcription.md](docs/02-basic-design/transcription.md) §14 |
+| NFR-PWR-02 の例外（止める手段のない文字起こしの実行の残り）のオーナーの確認 | 文字起こしの実装と、その前の詳細設計 transcription.md の再確認（§1 の 9） | 作業単位 2・録音・保存の作業 | [基本設計 transcription.md](docs/02-basic-design/transcription.md) §14 |
 | OQ-06 は持ち越し | P2 の基本設計 | MVP の全作業 | [基本設計 README](docs/02-basic-design/README.md) §3 |
+| 試験の候補（TST・詳細設計に定義のないもの）の採否: 実機 28 件・結合 13 件・E2E 13 件・セキュリティの確認 2 件（実機 1 件・検査に足すもの 1 件。ほかの 3 件は 2026-11-17 に採用して検査に入れた） | 候補を TST と詳細設計の一覧に足す作業 | 定義済みの試験と、実装の全作業 | [device-test-design.md](docs/04-test-records/device-test-design.md) §7、[integration-test-items.md](docs/04-test-records/integration-test-items.md) §6、[e2e-test-items.md](docs/04-test-records/e2e-test-items.md) §6、[security-check-items.md](docs/04-test-records/security-check-items.md) §7 |
 
 ## 4. 記録
 
@@ -63,6 +66,7 @@
 
 | 日付 | 内容 |
 | --- | --- |
+| 2026-11-27 | ブランチ `docs/detailed-design`（詳細設計の残り 6 文書・UD-10・試験設計書と項目書 4 件・SEC-PLT-02／PRV-03／SUP-04 の検査）を `dev` に取り込んだ。コンフリクト 12 ファイルは両方の変更を合わせて解決した。検査は `dev` の構造に移植した: プライバシーマニフェストの照合は `--tracked-only` でも追跡したものに限り、`check-tracked-files.py` は `dev` の `.gitignore` の `/build/`（直下だけ）に合わせた。§14.1 の理由コードはブランチの決定（3 つ。`35F9.1` は申告しない）。基本設計 storage.md の衝突は `dev` 側を採り、詳細設計 §4.4 との食い違いを §2 に記録した。突然変異 4 件で自己試験の失敗を確かめた（[check-self-tests.md](docs/04-test-records/check-self-tests.md)） |
 | 2026-11-27 | レビュー対応（43 回目。17 件。すべて対応）: 要件・文書は、FR-STT-12 の自動開始の有効・無効の 2 つの方式、CLAUDE.md の Zero External Data Egress に SEC-PLT-01 の残る危険（ノートの編集欄の標準のコピー・切り取り）を例外として明記、初期導入の手順で手順 7・8 を 1 回の `--steps 7,8` でまとめて実行する（基本設計 dev-environment.md §6.2）、戻らない rename の回復の②と例外確定の意図（§5.2 (a)）でディレクトリの同期の完了を確かめてから完了とする（storage.md §5.1・§5.2・テスト観点）。検査は、`pre-push` と `check.sh --require-clean` が起動する `scripts/check.sh` の通常の実行できるファイルの確認、`pre-push` の相対パスの gitdir の記録の解決、`raw_worktree_blobs` が skip-worktree の項目をインデックスの blob のまま残す、`no_direct_sleep_timer` が Timer の初期化子を検出、`check-dependencies.py` の承認日の暦の確認と URL の正規化を scheme とホストに限る、`check-project-settings.py` の入れ子の配列のたどり、`verify-docs.py` の引用の中のコード片と参照のリンクの読み直し。自己試験は、gitleaks の報告の形の確認（`gitleaks_report`）、正の試験の TMPDIR を SwiftFormat の設定を継がない場所にする、カバレッジの入力のバイト比較。試験を足し、変異で失敗することを確かめた（全件 1422 件が通過）。詳細設計の自己試験の件数を更新 |
 | 2026-11-27 | レビュー対応（42 回目。16 件。すべて対応）: 文書は、段階 3 の再試行の `.part.new` の照合を書いたバイト列（最終のヘッダ＋PCM の全体）のハッシュとファイル全体のハッシュで行う、`meeting.json` の rename が戻らない場合の公開の文脈の回復（時間の上限で世代ごとの一時ファイルを削除して取り消してから次の世代を公開し、古い世代の上書きを防ぐ。例外確定の取り消しと保留した登録を止めない。storage.md §5.1・§5.2・§11・§13・§14）、スキル `update-specs` の影響の調査に変える前の値と機能の名前の検索を足す。検査は、`check.sh` の未コミットのカバレッジの入力を clean のフィルタを通さない作業ツリーのバイト列で識別・測定する（`raw_worktree_blobs`）、手順 10 の `--staged` でリンクの `verify-docs.py` を実行しない、`pre-push` が印を書けない場合にこの実行の登録と確かめてから外す・置き場所を作った後に判定し直す、`worktree-location.py check` が判定の前後の一覧の違いを拒否する、`check-dependencies.py` の版 3 の `originHash` の型、`gitleaks-history.sh` の日時を `%aI` に、`setup-tools.sh` の `curl -q` と ROOT の求め方、`verify-docs.py` のインラインのコードを空白に置き換える。自己試験を足し（clean のフィルタ・手順 10 のリンク・印を書けない場合・判定の間の登録・置き場所を作った後の登録・`originHash`・コードを挟んだリンク・`log.date=relative`）、変異で失敗することを確かめた（`log.date=relative` は 8.30.1 では `%ad` でも通るので回帰の守りとして置く）。詳細設計の自己試験の件数を更新 |
 | 2026-11-26 | レビュー対応（41 回目。18 件。17 件対応・1 件は対応不要）: 文書は、TST-DEV-03 の録音をロックの 5 秒以上前に始めて解除の 5 秒以上後まで続ける手順、TST-DEV-12 の通知なしで Live Activity が使える場合も録音の状態と経過時間を NFR-UX-03 ①で判定する（recording.md §11 も）、`preparing` 中の停止要求を開始の取り消しとして受け付ける（recording.md §4・§5・§13）、`unsaved_chunks` の範囲を古い試行で戻さない・復旧で救済済みの範囲を WAV から求め直す（storage.md §5.1）、許可リストはアプリに組み込む依存だけ（dependencies-and-costs.md §4 の手順 7）。検査は、`.swiftlint.yml` の `Thread . sleep`・`Timer . scheduledTimer`、`check-dependencies.py` の真偽値の `formatVersion` と先が存在しないリンク、`check-project-settings.py` の辞書の外の `<key>`（IndexError）、`check.sh` のカバレッジのハッシュを標準入力から読む、`find-simulator.py` の一覧の取得の上限（`--timeout`）、`setup-tools.sh` の空の `--dest`、`setup.sh` の既に .githooks なら書かない・複数の行は `--replace-all`、`verify-docs.py` の行をまたぐ定義のタイトルと定義の行を段落の切れ目にする、自己試験の gitleaks の報告の形と作者の変数の隔離。`pre-push` の `.git` の判定は、`-a` が `-o` より強く結ぶので既に指摘どおり（変更なし）。確認は [check-self-tests.md](docs/04-test-records/check-self-tests.md)。§2 の次のアクションは変わらない |
@@ -118,6 +122,12 @@
 | 2026-11-17 | レビュー対応（8 件。1 件見送り）: `no_empty_catch` が複数行の `where` に対応、`check.sh --staged` で `git diff` の失敗を検出、`setup.sh` は `--hooks` を付けたときだけフックを有効に、`verify-docs.py` の網羅判定を「／」の前に限定・`docs/` と定義文書の欠落を終了コード 2 に、storage.md §9 に削除の開始後の文字起こしの拒否（transcription.md §8 の開始条件にも追加）、スキル 2 件を補足。手順 7・8 を Package がないときに飛ばす案は、検査を弱めるため見送り |
 | 2026-11-17 | レビュー対応（検査 7 件）: `no_empty_catch` の一致範囲を `catch` に限定（条件に文字列を含む空の catch の見逃し）、`check-dependencies.py` で Package.swift のコメントを除外、`check-project-settings.py` でマイクの利用目的を構成ごとの生成後の Info.plist で判定・`CODE_SIGN_ENTITLEMENTS` の参照先を検査、`verify-docs.py` で申し送りを項目名で照合・設計書の配下のディレクトリも検査・フェンスの中の印を無視。dev-environment.md §19 の表の先頭の列を基本設計の項目名に合わせた。突然変異の確認で、条件の文字列の中の `{` の誤検出と、補間の中の文字列による宣言の隠蔽も見つけて直した（§17） |
 | 2026-11-17 | レビュー対応: `no_empty_catch` の誤検出 2 件を修正、MVP の網羅の判定から基本設計の索引を除外、`test-lint-rules.py` の git 失敗を終了コード 2 に、recording.md（割り込みの開始中の停止・④の後の停止）と transcription.md（再試行の失敗区間の結果ファイルを復旧で再利用しない）を修正、スキル 2 件を補足 |
+| 2026-11-17 | セキュリティ確認項目書の候補のうち、採用を推奨した 3 件を検査に入れた（オーナーの指示）。(1) 規則 `no_spotlight_user_activity` の対象に `import AppIntents` を追加（SEC-PLT-02）。(2) 設定の検査がプライバシーマニフェストの申告を照合（SEC-PRV-03。自己試験 15 件。実物はマニフェストがまだなく、手順 4 の違反が 7 件から 8 件になった）。(3) `scripts/check-tracked-files.py` を追加し、手順 3 で `.gitignore` の必須の行と追跡しているファイルを照合（SEC-SUP-04。自己試験 20 件。コミット前にも効く）。どれも、足す前に自己試験が失敗すること・検査を壊すと自己試験が失敗することを確かめた。TST-SEC-03・TST-CI-04 と SEC の検証の列、基本設計・詳細設計 `dev-environment.md` を同じ作業で直した。詳細設計 §17.1 の自己試験の件数を実際の値に直した（依存 23 件 → 36 件、文書 28 件 → 29 件。前から食い違っていた）。任意（SCI-PRV-16）と保留（SCI-SUP-15）は候補のまま。手順 0・2・3・5・10 が通る |
+| 2026-11-17 | セキュリティ確認項目書 `docs/04-test-records/security-check-items.md` を追加（10 領域・158 件: 定義済み 145・既出の候補 8・新しい候補 5。P2・P3 は 13 行だけ）。SEC 48 件・脅威 12 件・設計書の注意点 73 件からの逆引きを置いた。SEC・TST・設計書は変えていない。分かったこと: 定義済みの確認がレビューだけの MVP の要件が 3 件（SEC-PRV-03・04、SEC-SUP-04）、App Intents が静的解析の対象外（SEC-PLT-02）。未確定事項: リリース前の確認の記録の様式、対応するテストの行がない注意点 2 件（NS-U-07・11）。`scripts/verify-docs.py` が通る |
+| 2026-11-17 | 機能・結合テスト項目書 `integration-test-items.md`（定義済み 54・候補 13。MVP の FR 52 件からの逆引き）と、E2E テスト項目書 `e2e-test-items.md`（定義済み 8・候補 13）を `docs/04-test-records/` に追加。TST と詳細設計の対応表は変えていない。未確定事項: 2 層以上をつなぐ試験の置き場所、UI テストで確定待ち・失敗区間を作る手段、差し替えた入力が音声を流す速さ。`scripts/verify-docs.py` が通る |
+| 2026-11-17 | 実機手動試験のテスト設計書の土台 `docs/04-test-records/device-test-design.md` を追加（観点 77 件: 定義済み 48（うち P2 が 2）・候補 28・対象外 1。試験ケースの骨子 14 件）。TST は足していない。実機で値を読む手段が設計書にないもの 4 件（計測値・実時間比・保護クラスの属性・ファイルの有無）を同書 §4 に挙げた。`scripts/verify-docs.py` が通る |
+| 2026-11-17 | 詳細設計の残り 6 文書が揃った（`storage.md`・`transcription.md`・`ui.md`・`export.md` の初版は 2026-11-16）。UD-10（詳細設計を実装より先にすべて作り、実装の直前に再確認する）を記録し、作業の順番・各文書の状態・スキル `tdd-implement` の着手条件を UD-10 の順に直した。依存台帳に詳細設計での確認結果を追記（新しい依存・費用は 0 件）。`architecture.md` の対応表に TST-SEC-02・TST-DEV-07 を追加。`scripts/verify-docs.py` が通る |
+| 2026-11-16 | 詳細設計 `architecture.md`・`recording.md` の初版を作成。`storage.md` は作成中。iOS 27 で割り込みの通知と従来の入力 tap が非推奨になったことを SDK で確認し、`recording.md` に反映 |
 | 2026-11-16 | 進捗の管理（本書）と、スキル `update-specs`（仕様書の更新）・`tdd-implement`（TDD での実装）を追加 |
 | 2026-11-16 | 作業単位 1（検査基盤）を完了。詳細設計 `dev-environment.md` 初版 |
 | 2026-11-15 | 基本設計 MVP の 7 文書の初版 |

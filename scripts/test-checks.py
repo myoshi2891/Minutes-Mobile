@@ -5,7 +5,7 @@
 試験用の設定はこのスクリプトの中で組み立て、一時ディレクトリに置く
 （リポジトリに「検査の対象外にするディレクトリ」を作らないため）。
 
-使い方: scripts/test-checks.py [settings] [dependencies] [versions] [gitleaks] [docs] [coverage]   （省略時は全部）
+使い方: scripts/test-checks.py [settings] [dependencies] [versions] [gitleaks] [tracked] [docs] [coverage]   （省略時は全部）
 終了コード: 0 = 全件が期待どおり / 1 = 期待と違う結果あり / 2 = 使い方の誤り
 """
 import contextlib
@@ -71,6 +71,18 @@ OK_PROJECT = """{
 }
 """
 OK_INFO_PLIST = {"UIBackgroundModes": ["audio", "processing"], "BGTaskSchedulerPermittedIdentifiers": ["a.b"]}
+# 合格するプライバシーマニフェスト（アプリのターゲット Sample のもの。SEC-PRV-03）
+PRIVACY_MANIFEST = "Sample/PrivacyInfo.xcprivacy"
+OK_PRIVACY_MANIFEST = {
+    "NSPrivacyTracking": False,
+    "NSPrivacyTrackingDomains": [],
+    "NSPrivacyCollectedDataTypes": [],
+    "NSPrivacyAccessedAPITypes": [
+        {"NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryFileTimestamp", "NSPrivacyAccessedAPITypeReasons": ["C617.1"]},
+        {"NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryDiskSpace", "NSPrivacyAccessedAPITypeReasons": ["E174.1"]},
+        {"NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults", "NSPrivacyAccessedAPITypeReasons": ["CA92.1"]},
+    ],
+}
 
 
 def run(command: List[str], timeout: Optional[float] = None, env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
@@ -117,6 +129,12 @@ def replaced(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
+def write_privacy_manifest(root: Path) -> None:
+    """合格するアプリのプライバシーマニフェストを root の下に置く（自前のフィクスチャを組み立てる試験用）。"""
+    (root / PRIVACY_MANIFEST).parent.mkdir(parents=True, exist_ok=True)
+    (root / PRIVACY_MANIFEST).write_bytes(plistlib.dumps(OK_PRIVACY_MANIFEST))
+
+
 def settings_case(
     label: str,
     want_code: int,
@@ -125,14 +143,17 @@ def settings_case(
     plists: Optional[Dict[str, dict]] = None,
     raw: Optional[Dict[str, bytes]] = None,
     timeout: Optional[float] = None,
+    without: Tuple[str, ...] = (),
 ) -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         text = project(OK_PROJECT) if project else OK_PROJECT
         (root / "project.xcproj").write_text(text, encoding="utf-8")
-        files = {"App/Info.plist": OK_INFO_PLIST}
+        files = {"App/Info.plist": OK_INFO_PLIST, PRIVACY_MANIFEST: OK_PRIVACY_MANIFEST}
         files.update(plists or {})
         for name, content in files.items():
+            if name in without:
+                continue
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             with (root / name).open("wb") as handle:
                 plistlib.dump(content, handle)
@@ -523,6 +544,7 @@ def test_settings() -> None:
             contents = plistlib.dumps(OK_INFO_PLIST)
             (root / "project.xcproj").write_text(info_plist_file("Config/App-Settings.plist")(OK_PROJECT), encoding="utf-8")
             (root / ".gitignore").write_text("Ignored.plist\n" + ("App-Settings.plist\n" if target == "ignored" else ""), encoding="utf-8")
+            write_privacy_manifest(root)
             real = {"link": root / "Config" / "Real.plist", "link-ignored": root / "Config" / "Ignored.plist",
                     "outside": Path(directory) / "Outside.plist"}.get(target, reference)
             if real != reference:
@@ -551,6 +573,7 @@ def test_settings() -> None:
                 found.parent.mkdir(parents=True)
                 (root / "project.xcproj").write_text(OK_PROJECT, encoding="utf-8")
                 (root / ".gitignore").write_text("ignored.data\n" + (f"{name}\n" if label == "無視するファイル" else ""), encoding="utf-8")
+                write_privacy_manifest(root)
                 real = {"追跡したファイルを指すリンク": found.parent / "real.data", "起点の外を指すリンク": Path(directory) / "outside.data",
                         "無視するファイルを指すリンク": found.parent / "ignored.data"}.get(label, found)
                 real.write_bytes(plistlib.dumps({}))
@@ -560,6 +583,33 @@ def test_settings() -> None:
                 expect(f"settings: 見つけた {name}: {label}（{options}）", [
                     str(SCRIPTS / "check-project-settings.py"), "--project", str(root / "project.xcproj"), "--root", str(root), *options],
                     want_code, want_text, env=env)
+    for label, ignored, options, want_code, want_text in (
+        ("追跡したアプリのマニフェスト", False, ["--tracked-only"], 0, "OK"),
+        ("追跡していないアプリのマニフェスト", True, ["--tracked-only"], 2, "追跡していない"),
+        ("追跡していないアプリのマニフェスト（通常の実行）", True, [], 0, "OK"),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root, env = Path(directory) / "root", isolated_git_env()
+            root.mkdir()
+            (root / "project.xcproj").write_text(OK_PROJECT, encoding="utf-8")
+            (root / ".gitignore").write_text("PrivacyInfo.xcprivacy\n" if ignored else "", encoding="utf-8")
+            write_privacy_manifest(root)
+            commit_all(root, env)
+            expect(f"settings: マニフェスト: {label}", [
+                str(SCRIPTS / "check-project-settings.py"), "--project", str(root / "project.xcproj"), "--root", str(root), *options],
+                want_code, want_text, env=env)
+    # 起点の外のプロジェクトのアプリのマニフェストは、名前の走査で見つからないので、参照先と同じく位置から照合する
+    for options, want_code, want_text in ((["--tracked-only"], 2, "起点の外"), ([], 0, "OK")):
+        with tempfile.TemporaryDirectory() as directory:
+            root, env = Path(directory) / "root", isolated_git_env()
+            root.mkdir()
+            (Path(directory) / "project.xcproj").write_text(OK_PROJECT, encoding="utf-8")
+            write_privacy_manifest(Path(directory))
+            (root / ".gitignore").write_text("", encoding="utf-8")  # 空のリポジトリはコミットできない
+            commit_all(root, env)
+            expect(f"settings: マニフェスト: 起点の外のアプリのマニフェスト（{options}）", [
+                str(SCRIPTS / "check-project-settings.py"), "--project", str(Path(directory) / "project.xcproj"), "--root", str(root),
+                *options], want_code, want_text, env=env)
     settings_case("どのターゲットも参照しない plist の変数は判定できない", 1, "UIFileSharingEnabled の値を展開できない",
                   plists={"Other/Info.plist": {"UIFileSharingEnabled": "$(SHARING)"}})
 
@@ -794,6 +844,38 @@ def test_settings() -> None:
     settings_case("CODE_SIGN_ENTITLEMENTS の展開できない変数", 2, "展開できない",
                   project=entitlements_file("$(UNKNOWN)/App.entitlements"))
     settings_case("読めない設定は合格にしない", 2, "読めない", project=lambda t: t + "{")
+    # プライバシーマニフェスト（SEC-PRV-03）
+    def manifest(**changes: object) -> Dict[str, dict]:
+        content = dict(OK_PRIVACY_MANIFEST, **changes)
+        return {PRIVACY_MANIFEST: {key: value for key, value in content.items() if value is not None}}
+
+    def accessed(category: str, *reasons: str) -> dict:
+        return {"NSPrivacyAccessedAPIType": f"NSPrivacyAccessedAPICategory{category}", "NSPrivacyAccessedAPITypeReasons": list(reasons)}
+
+    declared = OK_PRIVACY_MANIFEST["NSPrivacyAccessedAPITypes"]
+    settings_case("アプリのプライバシーマニフェストがない", 1, "Sample/PrivacyInfo.xcprivacy がない", without=(PRIVACY_MANIFEST,))
+    settings_case("トラッキングをすると申告している", 1, "NSPrivacyTracking を false", plists=manifest(NSPrivacyTracking=True))
+    settings_case("トラッキングの申告がない", 1, "NSPrivacyTracking を false", plists=manifest(NSPrivacyTracking=None))
+    settings_case("トラッキングのドメインがある", 1, "NSPrivacyTrackingDomains を空",
+                  plists=manifest(NSPrivacyTrackingDomains=["example.com"]))
+    settings_case("収集するデータの申告がある", 1, "NSPrivacyCollectedDataTypes を空",
+                  plists=manifest(NSPrivacyCollectedDataTypes=[{"NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeAudioData"}]))
+    settings_case("収集するデータの申告の鍵がない", 1, "NSPrivacyCollectedDataTypes を空", plists=manifest(NSPrivacyCollectedDataTypes=None))
+    settings_case("決めていない API の種類を申告している", 1, "NSPrivacyAccessedAPICategorySystemBootTime",
+                  plists=manifest(NSPrivacyAccessedAPITypes=declared + [accessed("SystemBootTime", "35F9.1")]))
+    settings_case("理由コードが決めたものと違う", 1, "理由コード 1C8F.1",
+                  plists=manifest(NSPrivacyAccessedAPITypes=declared[:2] + [accessed("UserDefaults", "CA92.1", "1C8F.1")]))
+    settings_case("決めた申告が足りない", 1, "NSPrivacyAccessedAPICategoryDiskSpace の申告",
+                  plists=manifest(NSPrivacyAccessedAPITypes=[declared[0], declared[2]]))
+    settings_case("申告の一覧がない", 1, "NSPrivacyAccessedAPICategoryFileTimestamp の申告", plists=manifest(NSPrivacyAccessedAPITypes=None))
+    settings_case("申告の形式が違うマニフェストは合格にしない", 2, "読めない", plists=manifest(NSPrivacyAccessedAPITypes=["C617.1"]))
+    settings_case("壊れたマニフェストは合格にしない", 2, "読めない", raw={PRIVACY_MANIFEST: b"<plist"}, without=(PRIVACY_MANIFEST,))
+    extension = dict(OK_PRIVACY_MANIFEST, NSPrivacyAccessedAPITypes=[])
+    settings_case("拡張のマニフェストは、決めた申告の一部だけでよい", 0, "OK", plists={"Widgets/PrivacyInfo.xcprivacy": extension})
+    settings_case("拡張のマニフェストのトラッキング", 1, "Widgets/PrivacyInfo.xcprivacy: NSPrivacyTracking",
+                  plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyTracking=True)})
+    settings_case("拡張のマニフェストの決めていない申告", 1, "NSPrivacyAccessedAPICategoryActiveKeyboards",
+                  plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyAccessedAPITypes=[accessed("ActiveKeyboards", "3EC4.1")])})
     settings_case("ターゲットがない設定は合格にしない", 2, "読めない", project=lambda t: '{"build-settings": {}, "targets": []}')
     # 除外するディレクトリ（build など）は root 直下だけ。下位の同じ名前のディレクトリは検査する
     ats = {"NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True}}
@@ -2006,6 +2088,8 @@ def ordinary_tools_snapshot_case() -> None:
                                                                        encoding="utf-8")
             (repository / "scripts" / "gitleaks-history.sh").write_text('#!/bin/sh\n"$MINUTES_TOOLS_DIR/bin/gitleaks"\n',
                                                                         encoding="utf-8")
+            # 手順 3 の最後の録音データの混入の検査は開発ツールを使わない。代わりを置く（本物は test_tracked で試す）
+            (repository / "scripts" / "check-tracked-files.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             for path in (repository / "scripts").iterdir():
                 path.chmod(0o755)
             for arguments in (["init", "-q", "--template=", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "base"]):
@@ -2602,6 +2686,10 @@ def stage_tool_stubs(repository: Path) -> None:
     (repository / "tools").mkdir(parents=True, exist_ok=True)
     (repository / "tools" / "versions").write_text("# 試験用の台帳（照合は代わりの setup-tools.sh が行う）\n", encoding="utf-8")
     stub = repository / "scripts" / "setup-tools.sh"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    # 手順 3 の最後の録音データの混入の検査（SEC-SUP-04）の代わり。本物は test_tracked で試す
+    stub = repository / "scripts" / "check-tracked-files.py"
     stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     stub.chmod(0o755)
     # ステージした内容を書き出す一時ディレクトリの置き場所も、本物の判定で確かめる（check.sh の make_staged_tree）
@@ -6055,13 +6143,14 @@ def step3_tool_verify_case() -> None:
 def step_order_verify_case() -> None:
     """開発ツールを使う最初の手順より前に手順 0 があるときだけ、先の照合を省くこと（手順 0 が後なら照合する）。"""
     global count
-    verify, versions, history, secrets, docs = "setup-tools.sh --verify", "test-checks.py versions", "gitleaks-history.sh .", "test-checks.py gitleaks", "verify-docs.py"
+    verify, versions, history, secrets, docs = "setup-tools.sh --verify", "test-checks.py versions", "gitleaks-history.sh .", "test-checks.py gitleaks tracked", "verify-docs.py"
+    files = "check-tracked-files.py"  # 手順 3 の最後（SEC-SUP-04）
     for steps, want, want_calls in (
-        ("3,0", True, [verify, history, secrets, verify, versions]), ("3", True, [verify, history, secrets]),
-        ("0,3", False, [verify, versions, history, secrets]), ("10", False, ["test-checks.py docs", docs]),
+        ("3,0", True, [verify, history, secrets, files, verify, versions]), ("3", True, [verify, history, secrets, files]),
+        ("0,3", False, [verify, versions, history, secrets, files]), ("10", False, ["test-checks.py docs", docs]),
         ("10,0", False, ["test-checks.py docs", docs, verify, versions]),
-        ("10,0,3", False, ["test-checks.py docs", docs, verify, versions, history, secrets]),
-        ("10,3,0", True, [verify, "test-checks.py docs", docs, history, secrets, verify, versions]),
+        ("10,0,3", False, ["test-checks.py docs", docs, verify, versions, history, secrets, files]),
+        ("10,3,0", True, [verify, "test-checks.py docs", docs, history, secrets, files, verify, versions]),
     ):
         count += 1
         with tempfile.TemporaryDirectory() as directory:
@@ -6071,7 +6160,7 @@ def step_order_verify_case() -> None:
             (repository / "scripts").mkdir(parents=True)
             (repository / ".tools").mkdir()  # 写す開発ツール
             (repository / "scripts" / "check.sh").write_text((SCRIPTS / "check.sh").read_text(encoding="utf-8"), encoding="utf-8")
-            for name in ("test-checks.py", "setup-tools.sh", "gitleaks-history.sh", "verify-docs.py"):
+            for name in ("test-checks.py", "setup-tools.sh", "gitleaks-history.sh", "check-tracked-files.py", "verify-docs.py"):
                 # 呼び出しの名前と引数を順に記録する（写しの場所を渡す --dest は除く）
                 (repository / "scripts" / name).write_text('#!/bin/bash\narguments="$*"\n'
                                                            'echo "${0##*/}${arguments:+ ${arguments%% --dest*}}" >> "$MINUTES_TEST_OUT"\n',
@@ -6122,7 +6211,9 @@ def step3_history_case() -> None:
         (repository / "scripts" / "gitleaks-history.sh").write_text(
             '#!/bin/sh\n{ printf \'%s\\0\' "$(pwd -P)"; for argument in "$@"; do printf \'%s\\0\' "$argument"; done; } > "$MINUTES_TEST_OUT"\n',
             encoding="utf-8")
-        for name in ("check.sh", "test-checks.py", "gitleaks-history.sh"):
+        # 手順 3 の最後の録音データの混入の検査の代わり（本物は test_tracked で試す）
+        (repository / "scripts" / "check-tracked-files.py").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for name in ("check.sh", "test-checks.py", "gitleaks-history.sh", "check-tracked-files.py"):
             (repository / "scripts" / name).chmod(0o755)
         subprocess.run(["git", "init", "-q", "--template=", "-b", "main", str(repository)], env=env, check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
@@ -6607,6 +6698,58 @@ ARCHITECTURE = (
     "## 3. 設計決定\n\n満たす要件: FR-AAA-01\n\n| ID | 決定 |\n| --- | --- |\n| BD-ARC-01 | 決定 |\n\n"
     "## 4. テスト観点\n\n満たす要件: TST-AAA-01\n"
 )
+
+
+# 合格する .gitignore（check-tracked-files.py が求める行。SEC-SUP-04）
+OK_GITIGNORE = "\n".join([
+    "# 録音データ", "*.wav", "*.m4a", "*.caf", "*.zip", "", "*.sqlite", "*.sqlite-wal", "*.sqlite-shm",
+    ".env", ".env.*", "xcuserdata/", "DerivedData/", ".build/", "/build/", ".DS_Store",
+]) + "\n"
+
+
+def tracked_case(label: str, want_code: int, want_text: str, ignore: Optional[str] = OK_GITIGNORE,
+                 files: Optional[Dict[str, str]] = None, repository: bool = True) -> None:
+    """一時ディレクトリに Git のリポジトリを作り、.gitignore を越えて（--force）ファイルをインデックスに入れてから検査する。"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        contents = {"Sources/App.swift": "let a = 1\n"}
+        contents.update(files or {})
+        if ignore is not None:
+            contents[".gitignore"] = ignore
+        for name, content in contents.items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text(content, encoding="utf-8")
+        if repository:
+            subprocess.run(["git", "init", "--quiet", directory], check=True, capture_output=True)
+            subprocess.run(["git", "-C", directory, "add", "--force", "--all"], check=True, capture_output=True)
+        expect(f"tracked: {label}", [str(SCRIPTS / "check-tracked-files.py"), "--root", directory], want_code, want_text)
+
+
+def test_tracked() -> None:
+    tracked_case("合格するリポジトリ", 0, "OK")
+    tracked_case("似た名前のファイルは通る", 0, "OK",
+                 files={"Sources/wave.swift": "", "docs/notes.wav.md": "", "docs/environment.md": "", ".envrc": "", "docs/builds.md": ""})
+    tracked_case(".gitignore がない", 1, ".gitignore がない", ignore=None)
+    tracked_case("録音データの行がない", 1, "*.wav", ignore=replaced(OK_GITIGNORE, "*.wav\n", ""))
+    tracked_case("行がコメントになっている", 1, "*.m4a", ignore=replaced(OK_GITIGNORE, "*.m4a\n", "# *.m4a\n"))
+    tracked_case("DB の行がない", 1, "*.sqlite-wal", ignore=replaced(OK_GITIGNORE, "*.sqlite-wal\n", ""))
+    tracked_case("秘密情報の行がない", 1, ".env.*", ignore=replaced(OK_GITIGNORE, ".env.*\n", ""))
+    tracked_case("個人の設定の行がない", 1, "xcuserdata/", ignore=replaced(OK_GITIGNORE, "xcuserdata/\n", ""))
+    tracked_case("直下の build の行がない", 1, "/build/ の行がない", ignore=replaced(OK_GITIGNORE, "/build/\n", "build/\n"))
+    tracked_case("追跡されている直下の build", 1, "build/App.o", files={"build/App.o": "x"})
+    tracked_case("下位の build は追跡してよい", 0, "OK", files={"Sources/build/Generated.swift": "let b = 1\n"})
+    tracked_case("除外を取り消す行", 1, "除外を取り消す行", ignore=OK_GITIGNORE + "!sample.wav\n")
+    tracked_case("入れ子の .gitignore の取り消し", 1, "Tests/.gitignore", files={"Tests/.gitignore": "!*.wav\n"})
+    tracked_case("入れ子の .gitignore に取り消しがなければ通る", 0, "OK", files={"Tests/.gitignore": "*.tmp\n"})
+    tracked_case("追跡されている録音データ", 1, "Tests/Fixtures/meeting.wav", files={"Tests/Fixtures/meeting.wav": "RIFF"})
+    tracked_case("大文字の拡張子", 1, "REC.WAV", files={"REC.WAV": "RIFF"})
+    tracked_case("空白と日本語を含む名前", 1, "録音 1.m4a", files={"docs/録音 1.m4a": "x"})
+    tracked_case("追跡されているアーカイブ", 1, "export.zip", files={"export.zip": "PK"})
+    tracked_case("追跡されている DB", 1, "db/minutes.sqlite-wal", files={"db/minutes.sqlite-wal": "x"})
+    tracked_case("追跡されている .env", 1, "config/.env", files={"config/.env": "TOKEN=x\n"})
+    tracked_case("追跡されている .env.local", 1, ".env.local", files={".env.local": "TOKEN=x\n"})
+    tracked_case("追跡されている個人の設定", 1, "xcuserdata", files={"App.xcodeproj/xcuserdata/me/state.plist": "x"})
+    tracked_case("Git の管理下でない場所は合格にしない", 2, "読めない", repository=False)
 
 
 # 文書の検査の試験に使う、最小の文書一式（定義文書・基本設計・詳細設計・コード片の元のファイル）
@@ -7911,7 +8054,7 @@ def run_docs_cases() -> None:
 
 
 TESTS = {"settings": test_settings, "dependencies": test_dependencies, "versions": test_versions, "gitleaks": test_gitleaks,
-         "docs": test_docs, "coverage": test_coverage}
+         "tracked": test_tracked, "docs": test_docs, "coverage": test_coverage}
 
 
 def main() -> int:

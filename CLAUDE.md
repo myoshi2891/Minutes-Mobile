@@ -15,8 +15,10 @@ iPhone 専用・端末内完結の議事録アプリ（録音 → 端末内文�
 - テスト要件（TST）と CI ゲート: `docs/01-requirements/test-requirements.md`
 - 依存・費用台帳（COST）と依存追加手順: `docs/01-requirements/dependencies-and-costs.md`
 - 基本設計（MVP の 7 文書。設計決定は `BD-<領域>-nn`）: `docs/02-basic-design/`。入口は `README.md`（索引・OQ の解決状況）と `architecture.md`（全体構成・セキュリティとテストの注意点の総覧）
-- 詳細設計: `docs/03-detailed-design/`。1 文書目の `dev-environment.md`（検査スクリプト・静的解析の規則・プロジェクト設定の変更手順）だけ作成済み。残り 6 文書は未着手で、作る順は README にある
-- 実機試験の記録: `docs/04-test-records/`（様式のみ）
+- 詳細設計: `docs/03-detailed-design/`。MVP の 7 文書の初版を作成済み（`dev-environment.md` は検査スクリプト・静的解析の規則・プロジェクト設定の変更手順。残り 6 文書は基本設計と同じ名前で、実装より先に作った。UD-10）。**各作業単位の実装の直前に、該当する文書を再確認して改訂する**（確かめる内容は README §2）
+- 実機試験の記録: `docs/04-test-records/`（様式のみ）。実機で人が操作する試験の観点と骨子は `docs/04-test-records/device-test-design.md`（土台）
+- 試験の項目書: `docs/04-test-records/integration-test-items.md`（機能・結合）・`docs/04-test-records/e2e-test-items.md`（E2E）。機能から項目を引くときに使う。テストの名前と状態の正は、詳細設計の各文書の「要件 ID ↔ テストの対応表」のまま
+- セキュリティの確認項目: `docs/04-test-records/security-check-items.md`。SEC ID・脅威・設計書の注意点（NS 番号）から、確認の手段（静的解析・自動テスト・実機・レビュー）を引くときに使う。要件の正は `security-requirements.md` のまま
 
 ## ビルド・テスト
 
@@ -61,7 +63,7 @@ scripts/test-checks.py            # 検査スクリプトの自己試験
 scripts/verify-docs.py            # 文書の整合（--update-snippets で詳細設計のコード片を実ファイルから書き直す）
 ```
 
-- **現在、手順 1・4・7〜9 は失敗する**（テンプレートの import の並び順、プロジェクト設定が未変更、Package とテストターゲットがない）。次の作業単位（プロジェクト設定の変更。詳細設計 §12）で解消する。検査を弱めて通さない。
+- **現在、手順 1・4・7〜9 は失敗する**（テンプレートの import の並び順、プロジェクト設定が未変更でプライバシーマニフェストもない、Package とテストターゲットがない）。次の作業単位（プロジェクト設定の変更。詳細設計 §12）で解消する。**手順 10 も失敗する**（ブランチ `docs/detailed-design` の取り込みで、詳細設計 6 文書の申し送りの表が、その後に変わった基本設計と合わない。各実装単位の前の再確認（UD-10）で詳細設計を直して解消する）。検査を弱めて通さない。
 - Git のフック（`.githooks/`）はまだ有効にしていない。上の失敗が解消したら `scripts/setup.sh --hooks` で有効にする（`--hooks` なしはツールの導入だけ）。
 - 規則を足す・変えるときは、`tools/lint-fixtures/<規則名>/` の違反例（`// expect: <規則名>` の印）と正常例も同じ作業で直す。検査を足したら、自己試験に加えて、検査の側をわざと壊して自己試験が失敗することも確かめる。
 - スクリプトは macOS 同梱の bash 3.2 と Xcode 同梱の python3（標準ライブラリだけ）で動かす。bash の注意点（全角文字の直前の変数は `${name}`、手順の関数を条件の中で呼ばない、EXIT の trap で明示的に `exit` する）は詳細設計 §2.3 にある。
