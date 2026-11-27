@@ -60,11 +60,11 @@ grep -rnE "FR-REC-[0-9]+ ?/ ?[0-9]+" docs/ CLAUDE.md README.md .claude/skills/ P
 
 `scripts/verify-docs.py` も範囲（〜）・並び（・）・スラッシュ区切り（`/`）と群を展開して ID を照合している（展開の規則は同じ）。ただし検査が確かめるのは参照先の ID が定義されていることだけで、変えた ID を参照している箇所の内容が正しいかは確かめないので、上の検索の結果を目で読む。検索の結果から、参照している文書と節をすべて挙げてから直す。
 
-ID を書かずに同じ内容を述べている箇所もある（説明の文・コメント・スクリプトの表示の文言など）。ID の検索に加えて、**変える前の値**（数値・閾値・版・ファイル名・状態の名前など）と、**影響する機能の名前**（「緊急書き出し」「未保存の記録」など、その要件を本文で呼ぶ言葉）でも同じ範囲を検索し、ID のない一致も目で読んで、古い内容が残っていないかを確かめる。
+ID を書かずに同じ内容を述べている箇所もある（説明の文・コメント・スクリプトの表示の文言・スクリプトの既定値など）。ID の検索に加えて、**変える前の値**（数値・閾値・版・ファイル名・状態の名前など）と、**影響する機能の名前**（「緊急書き出し」「未保存の記録」など、その要件を本文で呼ぶ言葉）でも、上の範囲に `scripts/` を加えて検索し、ID のない一致も目で読んで、古い内容が残っていないかを確かめる。たとえば最低 OS（CON-01）を変えたら、`scripts/find-simulator.py` の既定値（`--minimum-os`）とその説明、`scripts/check.sh` の `MINIMUM_OS` も同じ版にそろえる。
 
 ```bash
-grep -rn "<変える前の値>" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md   # 例: 変える前の上限の「600 秒」
-grep -rn "<機能の名前>" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md     # 例: 「緊急書き出し」
+grep -rn "<変える前の値>" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md scripts/   # 例: 変える前の上限の「600 秒」、最低 OS の「27.2」
+grep -rn "<機能の名前>" docs/ CLAUDE.md README.md .claude/skills/ PROGRESS.md scripts/     # 例: 「緊急書き出し」
 ```
 
 - 要件を変えたら、それを「満たす要件:」に挙げている設計書の節と、それを「対応する要件」に持つ TST を同じ作業で直す。
