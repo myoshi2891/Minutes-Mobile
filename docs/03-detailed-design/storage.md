@@ -11,7 +11,7 @@
 
 本書は、Chunk とメタデータをファイルと SQLite に保存する方法、停止から確定までの手順、起動時の復旧、削除を、型とアルゴリズムの単位で定める。Chunk を作るまでは [recording.md](recording.md)、文字起こしのジョブと版は [transcription.md](transcription.md) にある。
 
-**本書のコード片は、実装前に一時の Package でビルドとテストを通したものである**（§12.3）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
+**本書のコード片のうち、ビルドとテストを通したのは、実装前（2026-11-16）に一時の Package で確かめた版である**（§12.3）。その後に変えた・足したコード片はビルドしていない（「断定しない事項」の表に挙げる）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
 
 ---
 
@@ -381,7 +381,7 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
         public var sequenceNo: ChunkSequence
         /// 元の範囲。書き換えない
         public var original: SampleRange
-        /// 救済済みのサンプル数（元の範囲の先頭から）。なければ null
+        /// 救済済みのサンプル数。位置は登録済みの WAV の開始サンプルで決める（§9 の「未保存の記録」）。なければ null
         public var salvagedCount: Int64?
         public var heldSince: Timestamp
         public var cause: StorageFailureKind
@@ -640,7 +640,7 @@ public struct MeetingDocument: Equatable, Sendable, Codable {
 | `meetings` | `waiting_reason` は文字起こしを待っている理由（[transcription.md](transcription.md) §8）。`deletion_requested_at` が DB の中の墓標（§10）。`protection_state` は §8 |
 | `audio_chunks` | `sha256` は保存時の値（ハッシュの記録と同じ値）。隔離した書きかけ（`quarantined`）の行は `sha256` が `NULL`、サンプル数が 0。`vad_permille` は VAD の割合を 1,000 倍した整数。`start_sample` が `NULL` の行は開始位置が不明で、`file_state` は `invalid` である（DB に行のない WAV を、開始サンプルを読めるハッシュの記録なしで復旧が登録した行。§9 の照合 d）。総サンプル数の計算に使わない |
 | `chunk_conflicts` | `kind` は `different_content`（同じ連番で内容の異なる Chunk）・`record_mismatch`（既存のハッシュの記録と合わない）・`record_unreadable`（既存の記録が読めない）・`record_missing`（正式名の WAV があり、記録がない）。主キーにより、同じ競合を何度記録しても 1 行である |
-| `unsaved_chunks` | 書き込めずにメモリへ保持した Chunk（§7）。保存に成功したら、Chunk の登録と同じ取引で消す。`attempt_no` は actor がその記録の書き込みごとに発行する試行の連番で、範囲の更新は `INSERT … ON CONFLICT DO UPDATE … WHERE excluded.attempt_no > unsaved_chunks.attempt_no` で行う（後から完了した古い試行が、新しい範囲を戻さない。§5.1） |
+| `unsaved_chunks` | 書き込めずにメモリへ保持した Chunk（§7）。保存に成功したら、Chunk の登録と同じ取引で消す。`attempt_no` は actor がその記録の書き込みごとに発行する試行の連番で、範囲の更新は `INSERT … ON CONFLICT DO UPDATE … WHERE excluded.attempt_no > unsaved_chunks.attempt_no` で行う（後から完了した古い試行が、新しい範囲を戻さない。§5.1）。**登録で行を消した後も古い試行を拒否するため、書き込みは `INSERT … SELECT … WHERE NOT EXISTS (SELECT 1 FROM audio_chunks WHERE meeting_id = ?1 AND sequence_no = ?2)` の形にし、同じ取引の中で、その連番の `audio_chunks` の行（登録と同じ取引で作られ、消えない境界）があれば書かない** |
 | `route_events`・`loss_entries` | 番号（`event_no`・`entry_no`）は `meeting.json` の配列の位置。作り直しても同じ行になる |
 | `transcript_versions` | `integrity` は `valid`・`corrupt`・`invalid`（[transcription.md](transcription.md) §6）。`engine` はエンジンの識別名（本文ではない） |
 | `usage_metrics` | 計測値の名前は閉じた列挙型で、値は整数（ミリ秒・件数・割合の 1,000 倍）。会議を消すと一緒に消える |
@@ -1324,7 +1324,7 @@ Chunk の登録（1 取引）:
 | 場面 | 扱い |
 | --- | --- |
 | 録音中の記録（経路・空白区間）の保存の失敗 | **録音を止めない**（Recording-First）。録音中の正はメモリ上の値である（[recording.md](recording.md) §6）。次の Chunk の確定のたびに、保存できていない記録をまとめて保存し直す。保存は、同じ番号の行を置き換える形（`INSERT … ON CONFLICT DO UPDATE`）なので、何度行っても結果は同じである |
-| 停止の保存の失敗 | メモリ上の状態は `stop_requested` に進め、問題（`chunk_unsaved` と同じ扱いの保存の失敗）を表示する。前面への復帰と、確定の再試行の操作のたびに保存し直す。保存できないままプロセスが終了した場合は、起動時の復旧が `recording` の会議を `stop_requested` にする（停止理由は `terminated` になり、もとの理由は失われる。§9 の手順 5） |
+| 停止の保存の失敗 | メモリ上の状態は `stop_requested` に進め、問題（`chunk_unsaved` と同じ扱いの保存の失敗）を表示する。前面への復帰と、確定の再試行の操作のたびに保存し直す。保存できていない閉じた空白区間（`recording_gaps`）も同じ契機で保存し直し、保存できるまで確定（Barrier の評価）へ進めない（[recording.md](recording.md) §5.3 の `closeGapUnresumed`）。保存できないままプロセスが終了した場合は、起動時の復旧が `recording` の会議を `stop_requested` にする（停止理由は `terminated` になり、もとの理由は失われる。§9 の手順 5） |
 | 確定・例外確定の保存の失敗 | 状態を進めない（`finalizing` のまま、または確定待ちのまま）。理由を表示し、利用者の再試行を待つ。`reduce` が返した遷移を保存できたときにだけ、メモリ上の状態を進める |
 | ①は成功・②が失敗 | 失敗を返さず、ログに記録する。次の書き換え、または起動時の照合で `meeting.json` が DB に追いつく |
 
@@ -1340,7 +1340,7 @@ Chunk の登録（1 取引）:
 | --- | --- |
 | I/O を行う実行の文脈（申し送り） | `MeetingStore`（actor）は、未保存の記録・保存済みの Chunk の一覧（連番とファイルの状態）・確定中の Chunk・長さが不明な欠落の記録・総サンプル数をメモリ上の状態として持ち、追加・削除・登録の順序と内容をこの状態の上で 1 件ずつ決める。`unsaved_chunks` と `meeting.json` への書き込みの I/O は、会議ごとの公開の文脈 `MeetingDocumentPublisher`（専用の直列キュー `DispatchSerialQueue` を実行器にした actor。会議ごとに 1 つ）が行う。`MeetingStore` は依頼を待たずに投げ（`Task` で呼び、`await` しない）、完了を `MeetingStore.didComplete(_:)` で受け取る。`unsaved_chunks` の書き込みには、公開の文脈が持つ同じ DB の 2 本目の接続（WAL。`busy_timeout` 1 秒）を使う。Barrier の入力の問い合わせと書き出しのスナップショットは、I/O を待たずにメモリ上の状態から答える |
 | 未保存の記録の書き込みの時間の上限（申し送り） | **5 秒**（設計値。`StorageTuning.unsavedWriteTimeoutMs`）。注入した `Scheduler` で測り、過ぎたら I/O の完了を待たずに actor の状態で失敗として扱う（段階 3 の表示と再試行の対象。試行の連番を新しくして再試行する） |
-| 試行の連番 | actor が対象（会議・連番）ごとに発行する。遅れて届いた完了は、その対象の最新の試行でなければ状態に反映しない。DB の範囲の更新は、取引の中で試行の連番を比べる（`unsaved_chunks.attempt_no`。§3.3）ので、古い試行の書き込みが後から完了しても新しい範囲を DB に戻さない |
+| 試行の連番 | actor が対象（会議・連番）ごとに発行する。遅れて届いた完了は、その対象の最新の試行でなければ状態に反映しない。DB の範囲の更新は、取引の中で試行の連番を比べる（`unsaved_chunks.attempt_no`。§3.3）ので、古い試行の書き込みが後から完了しても新しい範囲を DB に戻さない。登録の取引が未保存の記録を消した後に、遅れて完了した古い試行の書き込みが記録を作り直さないよう、書き込みの取引は、その連番の `audio_chunks` の行があれば何も書かない（§3.3） |
 | `meeting.json` の世代 | actor が会議ごとに単調に増える世代を発行し、内容はその時点の状態の全体から作る。一時ファイルの名前は**世代ごとに別**で、`meeting.json.g{世代 10 桁}.tmp`（同じディレクトリ）。一時ファイルへの書き込みと同期は公開の文脈の外で並行してよく、公開済みの世代の確認と rename だけを公開の文脈で直列に行う |
 | rename の時間の上限（申し送り） | **5 秒**（設計値。`StorageTuning.documentRenameTimeoutMs`。rename とディレクトリの同期を合わせた時間）。過ぎたら、後の世代を公開する前に取り消す |
 | 取り消し（申し送り） | その世代の一時ファイルを削除する（`unlink`）。上限は **5 秒**（`StorageTuning.documentCancelTimeoutMs`）。①削除が成功: その世代を時間の上限による失敗として actor に通知し、次の世代へ進む。②削除が「ない」（`ENOENT`）で失敗: rename は終わっている。公開の文脈がディレクトリを同期し（上限 5 秒）、成功を確かめてからその世代を公開済み・完了済みに数える。同期が失敗・上限切れなら失敗として通知する。③削除の呼び出しも戻らない: 公開の文脈はそのまま止まる（後の世代を公開しない）。actor は時間の上限による失敗として表示と再試行の対象にする |
@@ -1703,7 +1703,7 @@ public enum PartSalvage: Equatable, Sendable {
 
 | 計画 | 処理 |
 | --- | --- |
-| `salvage` | ①ファイルを `truncatedSize`（44 + サンプル数 × 2）まで切り詰める（奇数バイトの端数を捨てる）→ ②ヘッダを書き直す → ③媒体まで同期する → ④全体を読み直して SHA-256 を計算する → ⑤§4.4 の判定（`SealDecision`）で公開・登録する。**この登録では、どの判定の分岐でも未保存の記録を消さない**（`ChunkTable.register` に `retainingUnsavedRecord: true` を渡す）。記録は、救済したサンプル数をその元の範囲と比べる照合（下の「未保存の記録」の手順 2・3。照合の f）まで残し、比べて `fullySalvaged` のときにだけ消す（短い `.part` の救済で失われた末尾を、元の範囲から求めてから消すかを決める）。記録を作る場合の開始サンプルは、その連番自身の未保存の記録の開始サンプルを先に使い、なければ直前の連番の終わり（直前の連番のハッシュの記録の `startSample` + サンプル数）とする（基本設計 §8）。**連番 0 は直前の連番がないので、自身の未保存の記録がなければ 0 とする**（Chunk の位置は会議の開始からの累積サンプル数で、連番 0 は 0 から始まる。基本設計 §8 の②）。自身の記録の開始サンプルが 0 と食い違う場合は、基本設計 §8 のとおり推定した記録を作らずに隔離する。メモリ上の PCM はないので、照合の相手は読み直したファイル自身である。VAD は読み直した PCM から計算し直す |
+| `salvage` | ①ファイルを `truncatedSize`（44 + サンプル数 × 2）まで切り詰める（奇数バイトの端数を捨てる）→ ②ヘッダを書き直す → ③媒体まで同期する → ④全体を読み直して SHA-256 を計算する → ⑤§4.4 の判定（`SealDecision`）で公開・登録する。**この登録では、どの判定の分岐でも未保存の記録を消さない**（`ChunkTable.register` に `retainingUnsavedRecord: true` を渡す）。記録は、救済したサンプル数をその元の範囲と比べる照合（下の「未保存の記録」の手順 2・3。照合の f）まで残し、比べて `fullySalvaged` のときにだけ消す（短い `.part` の救済で失われた末尾を、元の範囲から求めてから消すかを決める）。記録を作る場合の開始サンプルは、その連番自身の未保存の記録の開始サンプルを先に使い、なければ直前の連番の終わり（直前の連番のハッシュの記録の `startSample` + サンプル数）とする（基本設計 §8）。**連番 0 は直前の連番がないので、自身の未保存の記録がなければ 0 とする**（Chunk の位置は会議の開始からの累積サンプル数で、連番 0 は 0 から始まる。基本設計 §8 の②）。自身の記録の開始サンプルが 0 と食い違う場合は、基本設計 §8 のとおり推定した記録を作らずに隔離する。**連番 1 以降で、自身の未保存の記録がなく、直前の連番のハッシュの記録もない・読めない・`startSample` を持たない場合は、開始位置を推定しない:** 切り詰めとヘッダの書き直し（①〜④）までを行って正式名で公開し、ハッシュの記録を作らずに、照合の d と同じ入口 `ChunkTable.registerWithUnknownStart`（開始位置不明・`invalid`）で登録して、「位置の分からない録音」として復旧の結果に数える（Barrier の不成立の理由になる。音声は消さない）。メモリ上の PCM はないので、照合の相手は読み直したファイル自身である。VAD は読み直した PCM から計算し直す |
 | `quarantine` | 0 サンプル・44 バイト以下・Chunk の上限（480,000 サンプル）を超える・読めない場合。削除せず、会議の `quarantine/part-{連番}.wav.part` へ置換しない rename で移す。連番を `audio_chunks` に `quarantined` として登録し、`meeting.json` の `quarantinedSequences` にも書く。隔離した連番は Barrier の不成立の理由になる（§6.1） |
 
 **未保存の記録**（FR-SAV-05）は、毎回もとの範囲から欠落を求める。
@@ -1713,18 +1713,23 @@ public enum PartSalvage: Equatable, Sendable {
 public enum UnsavedReconcile: Equatable, Sendable {
     /// 救済済みの範囲が元の範囲と一致した。記録を消してよい
     case fullySalvaged
-    /// 足りない分が欠落として残る（救済できなかった場合は元の範囲の全体）
-    case lost(SampleRange)
-    /// 救済した WAV が元の範囲より長い。記録と合わないので invalid にする
+    /// 足りない分が欠落として残る（元の範囲 − 救済した WAV の範囲。前後の 2 つになりうる。救済できなかった場合は元の範囲の全体）
+    case lost([SampleRange])
+    /// 救済した WAV が元の範囲の外にはみ出す。記録と合わないので invalid にする
     case inconsistent
 
-    /// 毎回、元の範囲から求める（前回求めた欠落から差し引かない）
-    public static func compare(original: SampleRange, salvagedCount: Int64) -> UnsavedReconcile {
-        guard salvagedCount <= original.count else { return .inconsistent }
-        guard salvagedCount < original.count,
-              let rest = SampleRange(start: original.start + salvagedCount, count: original.count - salvagedCount)
-        else { return .fullySalvaged }
-        return .lost(rest)
+    /// 毎回、元の範囲と救済した WAV の範囲（開始と終わりの位置）から求める（前回求めた欠落から差し引かない）。
+    /// salvaged は登録済みの WAV の開始サンプルとサンプル数。開始位置が分からない（nil）なら、元の範囲の全体を欠落とする
+    public static func compare(original: SampleRange, salvaged: SampleRange?) -> UnsavedReconcile {
+        guard let salvaged else { return .lost([original]) }
+        let originalEnd = original.start + original.count
+        let salvagedEnd = salvaged.start + salvaged.count
+        guard salvaged.start >= original.start, salvagedEnd <= originalEnd else { return .inconsistent }
+        let rest = [
+            SampleRange(start: original.start, count: salvaged.start - original.start),
+            SampleRange(start: salvagedEnd, count: originalEnd - salvagedEnd),
+        ].compactMap(\.self).filter { $0.count > 0 }
+        return rest.isEmpty ? .fullySalvaged : .lost(rest)
     }
 }
 ```
@@ -1732,8 +1737,8 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 順 | 処理 |
 | --- | --- |
 | 1 | DB の `unsaved_chunks` と `meeting.json` の `unsavedChunks` を、連番ごとに和集合にする。同じ連番で元の範囲が食い違う場合は、両方を含む範囲を元の範囲とする（欠落を小さく見積もらない） |
-| 2 | 同じ連番の登録済みの WAV（上の c・d で救済・登録したものを含む）があれば、そのサンプル数を「救済済みのサンプル数」として、両方の記録に書く（既にあれば同じ値で上書きする） |
-| 3 | `UnsavedReconcile.compare` で比べる（c の救済の登録は記録を消さないので、比べる元の範囲が残っている）。`fullySalvaged` なら記録を消す。`lost` なら記録を残し、その範囲を「失われた未保存」として Barrier へ渡す。`inconsistent`（救済した WAV の方が長い）なら、Chunk を `invalid` にする |
+| 2 | 同じ連番の登録済みの WAV（上の c・d で救済・登録したものを含む）があれば、そのサンプル数を「救済済みのサンプル数」として、両方の記録に書く（既にあれば同じ値で上書きする）。比べるときの WAV の範囲は、サンプル数だけでなく `audio_chunks.start_sample` との組（開始と終わり）で作る（開始が `NULL` なら範囲は不明） |
+| 3 | `UnsavedReconcile.compare` で比べる（c の救済の登録は記録を消さないので、比べる元の範囲が残っている）。`fullySalvaged` なら記録を消す。`lost` なら記録を残し、その範囲を「失われた未保存」として Barrier へ渡す。`inconsistent`（救済した WAV が元の範囲の外にはみ出す）なら、Chunk を `invalid` にする。例: DB の記録が [0, 150)・`meeting.json` の記録が [100, 150) なら元の範囲は和集合の [0, 150) で、救済した WAV が [50, 150) なら欠落は [0, 50) である（サンプル数だけで比べた [100, 150) ではない） |
 
 - 欠落は「元の範囲 − 救済済みの範囲」として毎回求め、前回求めた欠落から差し引かない。同じ WAV を再起動のたびに照合しても、欠落は縮まない（基本設計 §8）。
 - MVP の照合の対象は、`recording`・`stop_requested`・`finalizing` の会議である。DB を作り直した場合と印が残っている場合だけ、全会議に広げる。利用者が全件を再構築する機能（FR-RCV-03）は P2 とする。
@@ -1749,7 +1754,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 順 | 処理 | 途中で落ちた場合 |
 | --- | --- | --- |
 | 0 | 録音中の会議なら拒否する。その会議の文字起こしの開始・再試行・不足分の作成、新しい書き出しの要求（[export.md](export.md) §3）、録音データと記録の書き込みを拒否し始める（永続化した削除要求がある間は、再起動の後も拒否を続ける） | 何も消えていない |
-| 1 | 削除要求（`tombstones/{meetingId}`）を原子的に作って同期し、続けて `meetings.deletion_requested_at` を記録する。この時点で一覧から消える。削除要求を作れなければ、文字起こし・書き出しを中止せずに削除を中止し、手順 0 で始めた拒否（その会議の文字起こしの開始・再試行・不足分の作成、録音データと記録の書き込み、`ExportService.rejectExports(for:)`）を同じプロセスの中で解除する（`ExportService.acceptExports(for:)`。再起動を待たない。拒否が続くのは永続化した削除要求がある間だけ）。**続けて**、文字起こし中・書き出し中なら中止を要求し、中止の完了（エンジンの停止の確認とジョブの完了の処理の終わり。書き出しの後始末の終わり。[transcription.md](transcription.md) §8.3）を、注入した `Scheduler` で上限 **10 秒**（設計値。`StorageTuning.deletionCancelTimeoutMs`）まで待つ。上限までに完了しなければ、削除要求を残したまま手順 2 以降に進まず、問題 `deletion_incomplete` を表示する | 削除要求があれば、次の起動で手順 2 から続ける（再起動の後には、前の起動のエンジンの実行は残らない） |
+| 1 | 削除要求（`tombstones/{meetingId}`）を原子的に作って同期し、続けて `meetings.deletion_requested_at` を記録する。この時点で一覧から消える。削除要求を作れなければ（`replaceAtomically` が失敗したら）、先に `tombstones/{meetingId}` があるかを確かめる。**あれば**（rename の後のディレクトリの同期で失敗した場合など）、削除要求は作られているので、失敗として扱わずに削除を続ける（次の起動も削除を続けるため）。確かめられなければ、拒否を解除せずに問題 `deletion_incomplete` を表示する（次の起動で、削除要求の有無で決まる）。**なければ**（一時ファイル `{名前}.tmp` も消してから）、文字起こし・書き出しを中止せずに削除を中止し、手順 0 で始めた拒否（その会議の文字起こしの開始・再試行・不足分の作成、録音データと記録の書き込み、`ExportService.rejectExports(for:)`）を同じプロセスの中で解除する（`ExportService.acceptExports(for:)`。再起動を待たない。拒否が続くのは永続化した削除要求がある間だけ）。**続けて**、文字起こし中・書き出し中なら中止を要求し、中止の完了（エンジンの停止の確認とジョブの完了の処理の終わり。書き出しの後始末の終わり。[transcription.md](transcription.md) §8.3）を、注入した `Scheduler` で上限 **10 秒**（設計値。`StorageTuning.deletionCancelTimeoutMs`）まで待つ。上限までに完了しなければ、削除要求を残したまま手順 2 以降に進まず、問題 `deletion_incomplete` を表示する | 削除要求があれば、次の起動で手順 2 から続ける（再起動の後には、前の起動のエンジンの実行は残らない） |
 | 2 | `tmp/export/{meetingId}/` を丸ごと消す | 同上 |
 | 3 | 会議ディレクトリを丸ごと消す | 同上 |
 | 4 | DB の行を消し（子の表は連鎖して消える）、`checkpointTruncate()` で WAL を切り詰める | 同上 |
@@ -1973,7 +1978,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 空き容量の値が、実際の書き込みの可否と一致する | OS の推定値である | 書き込みの失敗の捕捉を最後の防衛線にする |
 | `PRAGMA quick_check` で、壊れた DB を検出できる範囲 | 全ページの検査ではない | 壊れた DB の試験（§12.1 の 18）。読み書きの途中で `database_corrupt` が返った場合も、次の起動で退避する |
 | 保護データを読めない状態でアプリが起動される経路があるか | 分からない（録音・継続処理タスクは前面から始める設計） | TST-DEV-03。経路がなくても、退避しない規則（§3.5）は残す |
-| 2026-11-27 に変えた・足したコード片（§4.4 の `ExistingHashRecord`・`SealDecision`・`seal`、§8 の `ProtectionCoordinating`）がビルドできる | ビルドしていない（§12.3 の確認は、それより前の版のもの） | 保存の実装の最初にビルドとテストで確かめ、本書を直す |
+| 2026-11-27・28 に変えた・足したコード片（§3.1 の `UnsavedChunkRecord`、§4.4 の `ExistingHashRecord`・`SealDecision`・`seal`・`ChunkTable.removeUnsavedRecord`、§8 の `ProtectionCoordinating`、§9 の `UnsavedReconcile`）がビルドできる | ビルドしていない（§12.3 の確認は、それより前の版のもの） | 保存の実装の最初にビルドとテストで確かめ、本書を直す |
 | `MeetingRecordStoring` などの protocol のシグネチャ | `ChunkStoring` だけをビルドして確かめた | 保存の実装で確定し、本書に追記する |
 | 120 分の会議の Barrier（約 220 MiB の読み直し）にかかる時間 | 測っていない | 保存の実装（計測値）。進み具合を表示する |
 

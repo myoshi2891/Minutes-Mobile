@@ -11,7 +11,7 @@
 
 本書は、録音と文字起こしをアプリの外へ出す手順、アーカイブ（ZIP）のバイト配置、目録、ファイル名の無害化、一時ファイルの寿命、緊急書き出しを、型とアルゴリズムの単位で定める。書き出しは、データがアプリの保護の外へ出る唯一の経路である。
 
-**本書のコード片は、実装前に一時の Package でビルドとテストを通したものである**（§10.3）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
+**本書のコード片のうち、ビルドとテストを通したのは、実装前（2026-11-16）に一時の Package で確かめた版である**（§10.3）。その後に変えた・足したコード片はビルドしていない（「断定しない事項」の表に挙げる）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
 
 ---
 
@@ -525,6 +525,10 @@ public struct ExportManifest: Equatable, Sendable, Codable {
         public var sampleCount: Int
         /// 保存時の値（ハッシュの記録）
         public var sha256: SHA256Digest
+        /// 書き出した WAV のバイト列の値。受け取った側は、展開した WAV をこの値で確かめる（転送の後の改変を見つける）。
+        /// 手順 6 の 1 回目の読みで計算する（手順 8 の 2 回目の値と違えば中止するので、アーカイブに入れたバイト列の値と同じ）。
+        /// verified なら sha256 と同じ値、hashMismatch なら異なる
+        public var exportedSHA256: SHA256Digest
         public var verification: Verification
     }
 
@@ -642,7 +646,7 @@ public struct ArchiveWriter {
 public enum ExportFileName {
     public static let maxTitleBytes = 80
     public static let fallbackTitle = "会議"
-    private static let forbidden: Set<Character> = ["/", "\\", ":", "?", "*", "\"", "<", ">", "|"]
+    private static let forbidden: Set<Unicode.Scalar> = ["/", "\\", ":", "?", "*", "\"", "<", ">", "|"]
     private static let reserved: Set<String> = ["CON", "PRN", "AUX", "NUL"]
 
     /// "{タイトル}_{開始日時 yyyyMMdd-HHmm}.{拡張子}"
@@ -652,11 +656,16 @@ public enum ExportFileName {
 
     /// タイトルを、1 つのファイル名の部品として安全な形にする
     public static func sanitizedTitle(_ title: String) -> String {
-        // 1. 正規化（NFC）。2. パス区切り・制御文字・改行・Windows で使えない記号を取り除く
-        let kept = title.precomposedStringWithCanonicalMapping.filter { character in
-            !forbidden.contains(character) && !character.isNewline
-                && !character.unicodeScalars.contains { $0.properties.generalCategory == .control }
-        }
+        // 1. 正規化（NFC）。2. パス区切り・制御文字・改行・Windows で使えない記号を、スカラー値の単位で取り除く
+        //    （文字の単位で比べると、結合文字と 1 つの文字になった「/」などを見落とす）。改行は制御文字（LF・CR・NEL など）と、
+        //    行・段落の区切り（U+2028・U+2029）で除く
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: title.precomposedStringWithCanonicalMapping.unicodeScalars.filter { scalar in
+            let category = scalar.properties.generalCategory
+            return !forbidden.contains(scalar) && category != .control
+                && category != .lineSeparator && category != .paragraphSeparator
+        })
+        let kept = String(scalars)
         // 3. 前後の空白とドットを取り除く（先頭のドットも含む）
         var name = kept.trimmingCharacters(in: CharacterSet(charactersIn: " .\u{3000}"))
         // 4. OS が予約する名前（CON・NUL・COM1 など。拡張子つきも含む）を避ける
@@ -894,7 +903,7 @@ public enum TranscriptLine {
 | 14 | 一時ファイル（結合） | 完了・取り消し・失敗・中止のそれぞれで、`tmp/export/` に何も残らないこと。起動時の復旧で消えること | SEC-DAT-06 |
 | 15 | 削除との関係（結合） | 削除を始めた会議の書き出しが拒否されること。書き出し中の会議を削除すると、中止の完了の後に `tmp/export/{meetingId}/` が消え、ほかの会議の一時ファイルが残ること | TST-SEC-05 |
 | 16 | 容量（結合） | 緊急書き出し以外の種類で、空き容量が足りないとき、作成を始めずに `insufficientSpace` を返すこと | FR-EXP-01 |
-| 17 | 緊急書き出し（結合） | 書き込みを失敗させてメモリに保持させ、書き出した WAV が再生できること。保持が解放されないこと。次の 3 つのそれぞれで `insufficientSpace`・`storage` を返さずにメモリ上のデータの経路になり、一時ファイルが残らないこと: ①一時のディレクトリの作成の失敗、②空き容量が予備（200 MB）より少ない（`FixedFreeSpace`。事前の確認をしない）、③一時ファイルの書き込みの失敗（`FaultInjectingFileSystem`） | TST-SAV-04 |
+| 17 | 緊急書き出し（結合） | 書き込みを失敗させてメモリに保持させ、書き出した WAV が再生できること。保持が解放されないこと。次の 3 つのそれぞれで `insufficientSpace`・`storage` を返さずにメモリ上のデータの経路になり、一時ファイルが残らないこと: ①一時のディレクトリの作成の失敗、②一時ファイルの書き込みの失敗、③一時ファイルの同期の失敗（どれも `FaultInjectingFileSystem`）。あわせて、空き容量が予備（200 MB）より少ない（`FixedFreeSpace` で 199 MB）だけで書き込みは成功する場合は、事前の確認をせずに一時ファイルの経路で渡し、`insufficientSpace` を返さないこと | TST-SAV-04 |
 | 20 | 連結した録音の注記 | `ICMT` の本文の長さが偶数・奇数のそれぞれで、§2 の表のバイト配置（詰め物の有無）になること。RIFF の大きさがファイル全体 − 8 と一致し、`data` が 44 バイト目から始まること。上限の判定が注記の長さ（詰め物を含む）で変わること。ASCII 以外の本文を拒否すること | FR-EXP-01、SEC-INT-01 |
 | 21 | スナップショット（結合） | §3.4 の試験の行 | FR-EXP-01 |
 | 18 | 古い応答（単体） | 前の書き出し ID の進み具合・完了が、`ExportStore` に捨てられること | TST-GEN-05 |

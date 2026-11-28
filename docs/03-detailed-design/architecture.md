@@ -11,7 +11,7 @@
 
 本書は、ほかの 5 文書が共通で使う土台（ターゲットの分割、共通の型、状態遷移、注入点、並行性、エラー、ログ、テストの規約）を定める。個別機能の型とアルゴリズムは関連文書にある。
 
-**本書のコード片は、実装前に一時の Package でビルドとテストを通したものである**（§13.3）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
+**本書のコード片のうち、ビルドとテストを通したのは、実装前（2026-11-16）に一時の Package で確かめた版である**（§13.3）。その後に変えた・足したコード片はビルドしていない（「断定しない事項」の表に挙げる）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
 
 ---
 
@@ -811,6 +811,11 @@ public actor RecordingPipelineSkeleton {
 
     public init() {}
 
+    /// 解放されたら取り出しを止める（弱参照の self が消えても、合図の列を待ち続けて列を握ったままにしない）
+    deinit {
+        drainTask?.cancel()
+    }
+
     /// 合図のたびに取り出す。テストは合図を使わず drainOnce() を直接呼ぶ
     public func startDraining(with signal: some DrainSignal) {
         drainTask?.cancel()
@@ -1316,7 +1321,7 @@ struct MeetingStateMachineTests {
 | 4 | 時間軸の境界 | §4 の表の 4 つの値。空白が 2 つある場合。長さが不明な空白 | TST-AUD-06 |
 | 5 | 経過時間 | 累積サンプル数と閉じた空白の合計だけで決まる。時計を進めても変わらない | FR-REC-06 |
 | 6 | 会議の状態遷移の網羅 | 全状態 × 全事象。表の 9 行だけが許される | TST-FIN-03 |
-| 7 | 停止の副作用 | 5 つの停止理由のそれぞれで、理由の記録・中断通知の取り消し・セッションの無効化が指示される | TST-INT-07 |
+| 7 | 停止の副作用 | 6 つの停止理由（`manual`・`interruption_unresumed`・`no_input`・`disk_full`・`write_failed`・`terminated`）のそれぞれで、理由の記録・中断通知の取り消し・セッションの無効化が指示される | TST-INT-07 |
 | 8 | 世代番号 | 進めた後は、前の世代と一致しない | TST-GEN-05 |
 | 9 | 手動の時計 | 進めた分だけ進む。壁時計だけを動かしても単調時計は変わらない | TST-GEN-01 |
 | 10 | 連番の ID | 同じ順序で同じ UUID が出る。版と variant の位置が UUID として正しい | TST-GEN-07 |
@@ -1419,7 +1424,7 @@ struct MeetingStateMachineTests {
 | アプリターゲット（既定の分離が MainActor）に置くアダプタの `nonisolated` の書き方 | アプリターゲットではビルドしていない（一時の Package で確かめたのは Package 側だけ） | 共通基盤の実装 |
 | 型付きの `throws` を protocol の要件に使った場合の、差し替えの書きやすさ | `FreeSpaceProviding` の 1 つでだけ確かめた | 共通基盤の実装。書きにくければ `Result` を返す形に改める |
 | Mac 上の `swift test` と、シミュレータ・実機で結果が一致する | Mac でだけ実行した | 作業単位 2（シミュレータでの実行）、各実機試験 |
-| 2026-11-27 に変えたコード片（§8.1 の `RecordingStartFailure`・`RecordingIssue`、§8.2 の写像）がビルドできる | ビルドしていない | 共通基盤の実装 |
+| 2026-11-27・28 に変えたコード片（§7.2 の `RecordingPipelineSkeleton` の `deinit`、§8.1 の `RecordingStartFailure`・`RecordingIssue`、§8.2 の写像）がビルドできる | ビルドしていない | 共通基盤の実装 |
 | §11.2 の直し方で、2 つの検査が両立する | 直した設定では確かめていない（SwiftFormat の側は、規則を無効にして整形できることだけを確かめた） | 作業単位 2 の最初 |
 
 ---

@@ -11,7 +11,7 @@
 
 本書は、マイクの音声を 16 kHz・16 bit・モノラルの Chunk にするまでと、割り込み・経路変更への対応を、型とアルゴリズムの単位で定める。Chunk をファイルへ書く手順は [storage.md](storage.md) §4 にある。
 
-**本書のコード片は、実装前に一時の Package でビルドとテストを通したものである**（§11.3）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
+**本書のコード片のうち、ビルドとテストを通したのは、実装前（2026-11-16）に一時の Package で確かめた版である**（§11.3）。その後に変えた・足したコード片はビルドしていない（「断定しない事項」の表に挙げる）。実ファイルはまだないので、照合の印（`<!-- file: -->`）は付けていない。実装の作業で印を付ける（[README.md](README.md) §3）。
 
 ---
 
@@ -916,6 +916,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | `preparing` | `firstBufferArrived` | `capturing` | `recordStartLatency` → `recordRoute(recording_started)` → 保留した事象を配り直す |
 | `preparing` | `startFailed(分類)` | `idle` | `stopInput` → `deactivateSession` → `discardMeetingIfEmpty` → `reportStartFailure(分類)` |
 | `preparing` | `interruptionBegan`・`configurationChanged`・`mediaServicesReset` | `preparing` | なし（事象を保留する） |
+| `preparing` | `resumeRequested`・`resumeDenied` | `preparing` | なし（保留した `interruptionBegan` があれば、その後ろに届いた順で保留する。なければ捨てる）。開始に成功した直後に、保留した割り込みの後に配り直すので、`interrupted_draining` の行で再開の要求として保留され（または `resumeDenied` で取り消され）、割り込みの後に再開できる |
 | `preparing` | `stopRequested(理由)` | `stopping`（世代+1。保留した事象を捨てる） | `stopInput` → `deactivateSession` → `discardMeetingIfEmpty` → `post(stopCompleted)`。開始の取り消し（基本設計 §4 の「`preparing` 中の停止要求」）で、停止の並びにも会議の `stop_requested` にも進まず、停止理由を記録しない。`stopInput` の前に、その世代の閉鎖の印（§5.4 の①）を**必ず**立てる（開く呼び出しが戻ったかによらない）。組み立て中の音声（印の前に受け付けたサンプル）も確定せずに捨てるので、その世代のサンプルは Chunk に入らず、会議は音声のないものとして削除される。開く呼び出しが戻っていなければ、`stopInput` は戻るのを待たずに §5.4 の②〜④を行い、後で戻った入力・セッションを閉じる。世代が進むので、遅れて届いた `firstBufferArrived`・`startFailed` は拒否されて `capturing` へ進まない。`stopCompleted` まで `startRequested` を受け付けず、その後の新しい開始の入力を開く呼び出しも、§5.4 の②の入力の制御の直列キューに並ぶので、遅れて戻った呼び出しの停止と取り外しより先には実行されない |
 | `capturing` | `interruptionBegan(理由, 時刻)` | `interrupted_draining`（世代+1） | `scheduleNotice` → `stopInput` → `drainAndFlush` → `sealPartialChunk` → `openGap(理由, 時刻)` → `post(drainCompleted)` |
 | `capturing` | `configurationChanged(時刻)` | `rebuilding_draining`（世代+1） | `stopInput` → `drainAndFlush` → `openGap(route_change, 時刻)` → `post(drainCompleted)` |
@@ -945,7 +946,7 @@ public struct RecordingTransition: Equatable, Sendable {
 
 **停止の並び:** `stopInput` → `drainAndFlush` → `discardHeldSamples` → `sealPartialChunk` → `closeGapUnresumed` → `submitMeetingStop(理由)` → `post(stopCompleted)`。受け付ける理由は `manual`・`disk_full`・`write_failed`・`no_input` の 4 つで（`write_failed` の並びは `disk_full` と同じ。違うのは記録する理由と利用者への文言だけ）、`terminated`・`interruption_unresumed` は起動時の復旧だけが使う（[storage.md](storage.md) §9）。`submitMeetingStop` は会議の状態遷移（[architecture.md](architecture.md) §5）へ事象 `stopRequested` を渡し、そこで停止理由の記録・中断通知の取り消し・セッションの無効化が指示される。**中断通知の取り消しは、どの段から停止しても必ず通る。**
 
-表の行は 45 通り（段 × 事象の種類）で、テストはこの表を配列で持ち、全部の段 × 全部の事象を回す（§11.1）。
+表の行は 48 通り（段 × 事象の種類）で、テストはこの表を配列で持ち、全部の段 × 全部の事象を回す（§11.1）。
 
 ```swift
     private static func capturing(_ session: RecordingSession, _ event: RecordingEvent) -> RecordingTransition? {
@@ -998,13 +999,13 @@ public struct RecordingTransition: Equatable, Sendable {
 
 | 副作用 | 実行すること | 失敗したとき |
 | --- | --- | --- |
-| `beginCapture(世代)` | セッションを設定して有効化する → 3 秒の時間切れ（`firstBufferTimeoutMs`）を仕掛ける → 入力を作り直して形式を読む → リングバッファと変換器を作る → 入力を開始する → 取り出しを始める。最初のサンプルを取り出したら `firstBufferArrived(世代)` を届ける。**入力を開く呼び出し（作り直し・開始）の戻りは、時間切れか世代の前進（停止の要求）までしか待たない。** どちらかが先に来たら、戻るのを待たずに `beginCapture` を終え、副作用の流れを空ける（後ろの `stopInput` が §5.4 の②〜④を行えるようにする）。戻っていない呼び出しは入力の制御の直列キューで続き、戻った直後に §5.4 の②の予約で止められる | `startFailed(世代, 分類)` を届ける（時間切れは「最初のバッファの時間切れ」。世代が進んだ後は届けない） |
+| `beginCapture(世代)` | 3 秒の時間切れ（`firstBufferTimeoutMs`）を仕掛ける → セッションを設定して有効化する → 入力を作り直して形式を読む → リングバッファと変換器を作る → 入力を開始する → 取り出しを始める。最初のサンプルを取り出したら `firstBufferArrived(世代)` を届ける。**セッションの設定と有効化、入力を開く呼び出し（作り直し・開始）の戻りは、時間切れか世代の前進（停止の要求）までしか待たない。** どちらかが先に来たら、戻るのを待たずに `beginCapture` を終え、副作用の流れを空ける（後ろの `stopInput` が §5.4 の②〜④を行えるようにする）。戻っていない入力の呼び出しは入力の制御の直列キューで続き、戻った直後に §5.4 の②の予約で止められる。戻っていない有効化は、セッションの設定・有効化・無効化を出した順に 1 つずつ行う直列キューで続き、後ろに並ぶ停止の並びの `deactivateSession` が、遅れて戻った有効化の後に無効化する（次の録音の有効化はさらに後ろに並ぶので、遅れた有効化・無効化が新しい録音のセッションを変えない）。`stopCompleted` まで次の開始を受け付けない | `startFailed(世代, 分類)` を届ける（時間切れは「最初のバッファの時間切れ」。世代が進んだ後は届けない） |
 | `stopInput` | 入力を止めて tap を外す。取り出しの合図を止める | 失敗しない |
 | `drainAndFlush` | リングバッファが空になるまで取り出す（§4.3）。末尾のあふれを空白区間にする。変換器を吐き出す | 失敗しない（保存の失敗は [storage.md](storage.md) §7 の段階 3） |
 | `sealPartialChunk` | 組み立て中の音声を短い Chunk として確定する。0 サンプルなら何もしない | 保存の失敗は段階 3（メモリに保持して続ける） |
 | `openGap(理由, 時刻)` | メモリ上の空白区間の一覧に足す（位置 = 累積サンプル数、開始 = 時刻）。続けて DB と `meeting.json` に保存する | 保存の失敗は記録して続ける。メモリ上の一覧を正とし、次の Chunk の確定のたびに保存を再試行する |
-| `closeGapUnresumed` | 開いている空白区間があれば閉じる（§6 の「再開しなかった」の行） | 同上 |
-| `restart(世代)` | ①セッションを設定して有効化する → ②入力を作り直して開始する（サンプルは保持する） → ③中断通知を取り消す → ④空白区間を閉じる → ⑤保持したサンプルを Chunk の組み立てへ渡す。成功したら `restartSucceeded(世代)`。**途中の停止（基本設計 §5.1 の「割り込みの終了」「利用者の停止」の行）:** 停止の要求は `restart` の実行中にも受け付けて世代を進め（§5.2）、停止の並びは `restart` の後ろに並ぶ。`restart` は ②・③・④・⑤ の前（段の境目）と、呼び出しが戻った時点に世代を確かめ、進んでいれば残りの段を行わず、`restartSucceeded` を届けずに戻る（①・②の呼び出しの待機は `resumeStepTimeoutMs`、再構築の作り直しと入力の開始は `rebuildRestartTimeoutMs` までで、上限を超えたら §5.4 の入力の閉鎖の手続きを行って戻る。その世代のサンプルは捨てる）。②で入力を開く前に止めた場合は、保持したサンプルはなく、空白区間は開いたまま残り、後ろの `closeGapUnresumed` が停止時刻で閉じる。②で入力を開いた後に止めた場合は、`restart` の中で入力を止める → 受け付けたサンプルを取り出し終える → 空白区間を閉じる（再開後のサンプルが 1 つ以上あれば最初のサンプルで閉じ、長さは事象時刻から再開まで。なければ停止時刻で閉じる）→ 保持したサンプルと取り出したサンプルを Chunk の組み立てへ渡す、を行ってから戻る（停止の要求までに受け付けたサンプルは捨てない。Recording-First）。後ろの停止の並びの `discardHeldSamples` は捨てるものがなく、`closeGapUnresumed` は閉じる空白区間がなく、**`sealPartialChunk` は `restart` が渡したサンプルを含めて末尾の Chunk として確定する**。停止による世代の前進では §5.4 の閉鎖の印を立てない（印を立てるのは入力の閉鎖の手続きだけ。立てると、渡すと決めたサンプルが消費側で捨てられる） | 最初に失敗した段で止め、`restartFailed(世代, 段)` を届ける。②で使える入力がなければ `noInputFound(世代)`。世代が進んだ後の失敗は届けない（世代で捨てられる） |
+| `closeGapUnresumed` | 開いている空白区間があれば閉じる（§6 の「再開しなかった」の行） | 保存の失敗は記録して続ける（メモリ上の一覧が正）。停止の後は Chunk の確定が来ないことがあるので、保存できていない閉じた空白区間は、停止の保存（[storage.md](storage.md) §5 の「停止の保存の失敗」）と同じ契機（前面への復帰・確定の再試行の操作）で再試行し、`recording_gaps` の行を閉じた状態で保存できるまで確定（Barrier の評価）へ進めない |
+| `restart(世代)` | ①セッションを設定して有効化する → ②入力を作り直して開始する（サンプルは保持する） → ③中断通知を取り消す → ④空白区間を閉じる → ⑤保持したサンプルを Chunk の組み立てへ渡す。成功したら `restartSucceeded(世代)`。**④の長さは、②の後に最初に取り出したサンプルの時刻（単調時計。③の間に届いたものを含む）− 事象を受け取った時刻とする（④を行った時刻は使わない）。** 最初のサンプルより後の時間は、⑤で渡すサンプルが時間軸に数えるので、空白区間に二重に数えない。④の時点で最初のサンプルがまだなければ、最初のサンプルを取り出すまで待ち（上限は `resumeStepTimeoutMs`。超えたら `restartFailed(世代, close_gap)`）、その時刻で閉じる。**途中の停止（基本設計 §5.1 の「割り込みの終了」「利用者の停止」の行）:** 停止の要求は `restart` の実行中にも受け付けて世代を進め（§5.2）、停止の並びは `restart` の後ろに並ぶ。`restart` は ②・③・④・⑤ の前（段の境目）と、呼び出しが戻った時点に世代を確かめ、進んでいれば残りの段を行わず、`restartSucceeded` を届けずに戻る（①・②の呼び出しの待機は `resumeStepTimeoutMs`、再構築の作り直しと入力の開始は `rebuildRestartTimeoutMs` までで、上限を超えたら §5.4 の入力の閉鎖の手続きを行って戻る。その世代のサンプルは捨てる）。②で入力を開く前に止めた場合は、保持したサンプルはなく、空白区間は開いたまま残り、後ろの `closeGapUnresumed` が停止時刻で閉じる。②で入力を開いた後に止めた場合は、`restart` の中で入力を止める → 受け付けたサンプルを取り出し終える → 空白区間を閉じる（再開後のサンプルが 1 つ以上あれば最初のサンプルで閉じ、長さは事象時刻から再開まで。なければ停止時刻で閉じる）→ 保持したサンプルと取り出したサンプルを Chunk の組み立てへ渡す、を行ってから戻る（停止の要求までに受け付けたサンプルは捨てない。Recording-First）。後ろの停止の並びの `discardHeldSamples` は捨てるものがなく、`closeGapUnresumed` は閉じる空白区間がなく、**`sealPartialChunk` は `restart` が渡したサンプルを含めて末尾の Chunk として確定する**。停止による世代の前進では §5.4 の閉鎖の印を立てない（印を立てるのは入力の閉鎖の手続きだけ。立てると、渡すと決めたサンプルが消費側で捨てられる） | 最初に失敗した段で止め、`restartFailed(世代, 段)` を届ける。②で使える入力がなければ `noInputFound(世代)`。世代が進んだ後の失敗は届けない（世代で捨てられる） |
 | `abortRestart(通知の予約)` | 入力を止める → 保持したサンプルを捨てる → セッションを無効化する → 指定があれば中断通知を予約する | 失敗しない |
 | `discardHeldSamples` | 保持したサンプルを捨てる（空白区間が開いたままなので、Chunk に入れない） | — |
 | `scheduleNotice` | 中断通知を予約する（§7） | `report(noticeSchedulingFailed)`（録音には影響しない） |
@@ -1190,7 +1191,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | 5 | リングバッファの順序 | 未処理の音声が残る間に 2 回あふれさせ、あふれの記録が音声の間の正しい位置に出ること。連続するあふれが 1 組になること | NFR-PRF-01 |
 | 6 | 記録列の満杯 | 記録列が満杯の間、空きがあっても受け付けずに数え続けること | NFR-PRF-01 |
 | 7 | 折り返しと通過帯域 | 48 kHz・44.1 kHz の 12 kHz 正弦波で、4 kHz の成分が −40 dB 以下。1 kHz・3 kHz の振幅が ±0.5 dB 以内。取り出しの大きさを変えても結果が同じ | TST-AUD-02 |
-| 8 | 遷移の表の網羅 | 9 つの段 × 15 種類の事象。表の 45 通りだけが許されること | TST-INT-01〜05、TST-GEN-06 |
+| 8 | 遷移の表の網羅 | 9 つの段 × 15 種類の事象。表の 48 通りだけが許されること | TST-INT-01〜05、TST-GEN-06 |
 | 9 | 古い世代 | 世代の合わない完了が、どの段でも拒否されること。入力の閉鎖の手続きの①の後に、閉鎖した世代のリングバッファへ書いたサンプル（印を立てる前に印を読んだ tap の書き込みを模す）が、Chunk に入らずに捨てられること | TST-GEN-05 |
 | 10 | 割り込みの開始の並び | 通知の予約が先頭、空白区間の開設が短い Chunk の確定の後にあること。排出の途中で届いた再開の要求が保留され、排出の完了で再開が始まること。保留の後に `resumeDenied` が届くと保留が取り消され、`interruptedNotResumed` が報告され、排出の完了で `restart` せずに `interrupted_waiting` へ進むこと | TST-INT-01 |
 | 11 | 再開の失敗 | 4 つの段のそれぞれで失敗させ、入力の停止・保持分の破棄・無効化が指示されること。通知の予約し直しが `close_gap` のときだけであること | TST-INT-02 |
@@ -1223,7 +1224,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | ビルド | 本書のコード片（§2〜§5）を一時の Package に置き、Swift 6.4.2・Swift 6 言語モード・警告をエラーとして扱う設定でビルドできた |
 | アプリ側のコード | `SystemAudioSession`（§3.3）を、既定の分離を MainActor にした設定で、iOS 27.2 SDK に対してビルドできた（`xcodebuild` の `generic/platform=iOS`） |
 | テスト | 15 件が通った（WAV・Chunk の境界・VAD の 3 件、遷移の表・世代・副作用の並びの 6 件、リングバッファの 2 件、変換の 3 件、待ち合わせの差し替えの 1 件ほか） |
-| 遷移の表 | 9 段 × 15 種類の事象のうち、許されるのは 45 通りで、§5.2 の表と一致した |
+| 遷移の表 | 9 段 × 15 種類の事象のうち、許されるのは 45 通りで、当時の §5.2 の表と一致した（その後の改訂で表は 48 通りになった。改訂後の表ではテストしていない） |
 | リングバッファ | 容量 8,000 フレームで、6,000 を書いた後に 3,000 と 2,500 を続けて落とし、64 を読んでから 50 を書き、4,000 を落とした。読み手には「6,000 フレーム → あふれ 5,500 → 50 フレーム」の順で届き、末尾のあふれ 4,000 は入力の停止後に読めた |
 | 変換（Mac 上の `AVAudioConverter`） | 48 kHz・44.1 kHz の 12 kHz 正弦波（振幅 0.5）で、出力の 4 kHz の成分は Int16 の量子化で 0 になった（−40 dB の基準を満たす）。1 kHz・3 kHz の振幅の差は ±0.001 dB 以内。2 秒の入力から、ちょうど 32,000 サンプルが出た |
 
@@ -1294,7 +1295,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | --- | --- | --- |
 | リングバッファの実装（原子操作の方法）と、取り出しを起こす合図の方式。あふれの記録列の容量と、記録列自体があふれた場合の扱い | `Synchronization.Atomic` のカウンタで、書き手と読み手が自分の側だけを進める。合図は周期 100 ms（architecture.md §7.2）。記録列は 64 組で、満杯の間は音声も受け付けずに数え続ける | §4.1 |
 | 変換器の設定値、モノラル化の方法、入力形式が変わるときの吐き出しの手順 | 品質は最大・方式は Mastering。モノラル化は取り出しの段で全チャンネルの平均。形式が変わるときは、排出 → 吐き出し → 作り直しの順で、吐き出した変換器は使わない | §4.3 |
-| 状態遷移の表（状態 × 事象 × 副作用）の全件 | 9 つの段 × 15 種類の事象のうち 45 通りを許す。副作用は 19 種類 | §5 |
+| 状態遷移の表（状態 × 事象 × 副作用）の全件 | 9 つの段 × 15 種類の事象のうち 48 通りを許す。副作用は 19 種類 | §5 |
 | 空白区間の理由の一覧（割り込みの理由、`overrun`、`route_change`、`media_reset`） | 6 つ（`interruption`・`built_in_mic_muted`・`route_disconnected`・`overrun`・`route_change`・`media_reset`） | §6 |
 | 中断通知の文言と予約までの時間 | 題名「録音が中断しています」、本文「アプリを開くと再開を試みます。」、60 秒。差し込む値は持たない | §7 |
 | 割り込みの開始の処理（停止要求がない場合を含む）・再構築の④（作り直しと入力の開始の呼び出し）・再構築の途中に届いた停止の待機・割り込みの終了の①〜④の呼び出しの待機・停止の経路で空白区間を閉じる処理の待機・割り込みの終了の②の後で④の前に届いた停止での末尾の Chunk の確定の待機の時間の上限（§5.1） | 順に 5 秒・3 秒・5 秒・3 秒（1 つごと）・5 秒・5 秒。`RecordingTuning` の値で、注入した `Scheduler` で測る | §2・§5.4 |
@@ -1318,7 +1319,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | 簡易 VAD の数値（−60 dBFS・0.15・200 ms・100 ms） | 本書で定めた設計値。Minutes P1 の実装とは照合していない（参照元のリポジトリが手元にない） | 文字起こしの結果と突き合わせて見直す。P2 で FR-STT-10 に使う前に再確認する |
 | category `record`・mode `default` が会議の録音に最適 | 基本設計 §11 のまま | 実機で比較して記録する |
 | `activate()`・`deactivate(options:)`（iOS 27 の非同期の API）の所要時間 | 確かめていない | 計測値（開始までの時間）で見る |
-| 2026-11-27 に変えたコード片（§2 の `RecordingTuning`）がビルドできる | ビルドしていない（§11.3 の確認は、それより前の版のもの） | 録音の実装の最初に確かめる |
+| 2026-11-27・28 に変えたコード片（§2 の `RecordingTuning`、§3 の `AudioInput`、§4.2 の `EngineAudioInput`、§4.5 の `WAVHeader.validate`）がビルドできる | ビルドしていない（§11.3 の確認は、それより前の版のもの） | 録音の実装の最初に確かめる |
 | §5.4 の待機の時間の上限（5 秒・3 秒・2 秒）が妥当 | 設計値 | TST-DEV-01・02 の結果で見直す |
 | 戻っていない入力の開始の呼び出しの外から、入力を止めて閉じたことを確かめられる（§5.4 の②・③） | OS の実装による。確かめていない | 録音の実装（Mac）と TST-DEV-02 |
 

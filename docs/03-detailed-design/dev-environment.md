@@ -545,7 +545,10 @@ held_tree_verified() {
 # 確かめられない移し先は、移さず・登録も直さず・消さずに止める
 for held in "$snapshot".work.*; do
   if [ ! -d "$held" ] || [ -L "$held" ]; then continue; fi
-  if [ -e "$held/tree" ] && ! held_tree_verified "$held"; then
+  # 中に作業ツリーのないものは、このフックが作ったものと確かめる手段がないので、記録（admin）も含めて変えずに残す
+  # （restore_staging の「tree がない」場合の後始末は、この実行が作った移し先にだけ行う）
+  if [ ! -e "$held/tree" ] && [ ! -L "$held/tree" ]; then continue; fi
+  if ! held_tree_verified "$held"; then
     echo "NG: ${held}/tree がこの検査の作業ツリーと確かめられない（移す前に記録した管理ディレクトリ ${held}/admin と合わない、記録がない、またはこの検査の印がない）。中身を確かめて外してから push し直す" >&2
     exit 1
   fi
