@@ -1219,8 +1219,9 @@ class Checker:
                 if code.is_code(line):
                     continue
                 # コメントで始まる行は、行の全体が HTML のブロックで、閉じた後ろの文字もリンクにならない（CommonMark）。
-                # 段落も切れる。コード片の印の照合は check_snippets が別に行う
-                if COMMENT_OPEN.match(line):
+                # 段落も切れる。引用の中では印を除いた本文で判定する（「> <!-- 注 -->」も HTML のブロック）。
+                # コード片の印の照合は check_snippets が別に行う
+                if COMMENT_OPEN.match(body):
                     code.interrupt()
                     continue
                 # 定義が使った行（ラベル・リンク先・タイトル）は段落ではない。インラインのリンクとしても参照の使用としても読まず、

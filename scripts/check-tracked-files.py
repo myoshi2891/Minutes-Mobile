@@ -106,9 +106,11 @@ def indexed_lines(root: Path, name: str) -> List[str]:
 
 
 def working_lines(path: Path) -> List[str]:
-    """作業ツリーのファイルの行（追跡していない .gitignore だけに使う）。"""
+    """作業ツリーのファイルの行（追跡していない .gitignore だけに使う）。改行は変換せずに読む（git と同じく、単独の CR を
+    行の区切りにしない。「# 注<CR>!*.wav」は 1 行のコメント）。行末の CRLF は meaningful_lines が扱う"""
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8", newline="") as handle:
+            text = handle.read()
     except (OSError, UnicodeDecodeError) as error:
         raise Unreadable(f"{path}: {error}") from error
     return meaningful_lines(text)

@@ -4921,6 +4921,18 @@ def pre_push_interrupted_case() -> None:
                 (held / "tree").rename(snapshot)
                 git("worktree", "repair", str(snapshot))
             shutil.rmtree(held, ignore_errors=True)
+        # 中に作業ツリーのない移し先は、このフックのものと確かめられないので、記録（admin）も含めて変えずに残して検査する
+        count += 1
+        out.unlink(missing_ok=True)
+        stray = Path(f"{snapshot}.work.stray")
+        stray.mkdir()
+        (stray / "admin").write_text("someone", encoding="utf-8")
+        resumed = push(base)
+        kept = (stray / "admin").is_file() and (stray / "admin").read_text(encoding="utf-8") == "someone"
+        if resumed.returncode != 0 or not out.exists() or not kept:
+            failures.append(f"pre-push: 作業ツリーのない移し先の記録を消した・検査しない（終了コード {resumed.returncode}・残した {kept}）\n"
+                            f"{resumed.stderr.strip()}")
+        shutil.rmtree(stray, ignore_errors=True)
         # 元の作業ツリーの sparse checkout に scripts/ がなくても、置き場所と登録を判定できる
         count += 1
         out.unlink(missing_ok=True)
@@ -7016,6 +7028,11 @@ def test_tracked() -> None:
                  files={"Tests/.gitignore": "!*.wav\n"}, after_add=lambda root: (root / "Tests/.gitignore").unlink())
     tracked_case("追跡していない入れ子の .gitignore の取り消しは、作業ツリーの内容で判定する", 1, "Docs/.gitignore",
                  after_add=lambda root: ((root / "Docs").mkdir(), (root / "Docs/.gitignore").write_text("!*.zip\n", encoding="utf-8")))
+    # 作業ツリーの内容も、git と同じく LF だけで区切る（単独の CR の後ろはコメントの続き。CRLF の行は取り消しとして読む）
+    tracked_case("追跡していない入れ子の .gitignore の単独の CR は行を切らない", 0, "OK",
+                 after_add=lambda root: ((root / "Docs").mkdir(), (root / "Docs/.gitignore").write_bytes(b"# x\r!*.zip\n")))
+    tracked_case("追跡していない入れ子の .gitignore の CRLF の取り消し", 1, "Docs/.gitignore",
+                 after_add=lambda root: ((root / "Docs").mkdir(), (root / "Docs/.gitignore").write_bytes(b"*.tmp\r\n!*.zip\r\n")))
     # それ自身が無視された .gitignore の取り消しの行も、git は使うので確かめる（無視されたディレクトリの中は git が読まない）
     tracked_case("無視された入れ子の .gitignore の取り消し", 1, "Docs/.gitignore",
                  after_add=lambda root: ((root / "Docs").mkdir(),
@@ -8038,7 +8055,8 @@ def run_docs_cases() -> None:
               "[要件](../01-requirements/requirements.md) <!-- [旧](missing.md) -->")
     # コメントで始まる行は全体が HTML のブロックなので、後ろの文字もリンクにならない。次の行のリンクは確かめる
     for label, text in (("インライン", "<!-- 注 --> [要件](missing.md)"), ("参照形式", "<!-- 注 --> [要件][a]\n\n[a]: missing.md"),
-                        ("開いた括弧", "<!-- 注 --> [要件\n続き](missing.md)"), ("前の行の括弧", "[例\n<!-- 注 -->\n続き](missing.md)")):
+                        ("開いた括弧", "<!-- 注 --> [要件\n続き](missing.md)"), ("前の行の括弧", "[例\n<!-- 注 -->\n続き](missing.md)"),
+                        ("引用の中", "> <!-- 注 --> [要件](missing.md)"), ("引用の前の行の括弧", "> [例\n> <!-- 注 -->\n> 続き](missing.md)")):
         docs_case(f"コメントで始まる行の後ろは確かめない: {label}", 0, "OK", basic, "[要件](../01-requirements/requirements.md)", text)
     docs_case("コメントの次の行のリンクは確かめる", 1, "リンクの先がない: missing.md", basic, "[要件](../01-requirements/requirements.md)",
               "<!-- 注 -->\n[要件](missing.md)")
