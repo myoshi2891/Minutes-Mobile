@@ -43,7 +43,8 @@ def normalize(url: str) -> str:
     （配布物の URL では、末尾のスラッシュや .git の有無で別のものを指しうる。別の取得元を同じものと見なさない）。
     """
     text = url
-    found = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/]*)(.*)$", text)
+    # authority は「/」「?」「#」のどれかの前で終わる（RFC 3986。https://Host?Q の ?Q をホストとして小文字にしない）
+    found = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#]*)(.*)$", text)
     if found:
         # authority は最後の「@」でユーザー情報とホストに分ける（ユーザー情報に「@」を含みうるため）
         userinfo, at, host = found.group(2).rpartition("@")
@@ -909,7 +910,9 @@ def manifest_errors(
                 if actual != by_path[location]["sha256"]:
                     errors.append(f"ローカルのバイナリ {location} の内容が承認したものと違う（現在 {actual}）。"
                                   "確かめてから許可リストの sha256 を更新し、再承認を得る")
-                inner = outside_inner_link(root, location)
+                # 中のリンクを探すのはディレクトリの成果物（.xcframework など）だけ。通常のファイルは上の内容のハッシュで照合が
+                # 済んでおり、中を走査できない（os.walk がファイルを読めない場所として扱う）
+                inner = outside_inner_link(root, location) if (root / location).is_dir() else None
                 if inner is not None:
                     errors.append(f"ローカルのバイナリ {location} の中の {inner} が {LOCAL_PACKAGE_ROOT}/ の外を経由するリンク: "
                                   f".binaryTarget({summary})")

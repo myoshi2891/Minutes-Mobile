@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-"""プロジェクト設定・Info.plist・entitlements の検査（TST-CI-06、TST-SEC-03）。
+"""プロジェクト設定・Info.plist・entitlements・プライバシーマニフェストの検査（TST-CI-06、TST-SEC-03）。
 
 基本設計 dev-environment.md §3 の「変更後の値」になっていること、
-「設定しないもの」が入っていないことを確かめる。
+「設定しないもの」が入っていないこと、プライバシーマニフェストの申告が決めたとおりであることを確かめる。
 
 使い方: scripts/check-project-settings.py [--project <project.xcproj>] [--root <探す起点>] [--tracked-only]
   --tracked-only  ビルド設定が指すファイル（INFOPLIST_FILE・CODE_SIGN_ENTITLEMENTS）と、名前で見つけたファイルの実体が、起点の中の、HEAD のコミットで
@@ -79,8 +79,22 @@ FORBIDDEN_ENTITLEMENT_PREFIXES = {
     "com.apple.developer.ubiquity": "SEC-NET-01（iCloud）",
 }
 
+# プライバシーマニフェスト（SEC-PRV-03）。アプリのターゲットは <ターゲット名>/PrivacyInfo.xcprivacy に置く
+PRIVACY_MANIFEST_NAME = "PrivacyInfo.xcprivacy"
+# 空の配列で明示する申告（トラッキングのドメイン・収集するデータ）
+PRIVACY_EMPTY_KEYS = ("NSPrivacyTrackingDomains", "NSPrivacyCollectedDataTypes")
+# 申告してよい API の種類 → 理由コード。アプリのマニフェストは、この全部をちょうど申告する
+PRIVACY_ACCESSED_API_REASONS: Dict[str, Tuple[str, ...]] = {
+    "NSPrivacyAccessedAPICategoryFileTimestamp": ("C617.1",),
+    "NSPrivacyAccessedAPICategoryDiskSpace": ("E174.1",),
+    "NSPrivacyAccessedAPICategoryUserDefaults": ("CA92.1",),
+}
+
+
 # SDK の版つきの名前（iphoneos27.2 など）。条件 [sdk=…] はこの名前と照合する。取得できなければ None
 _SDK_NAMES: Dict[str, Optional[str]] = {}
+# SDK の版の問い合わせ（xcrun）を待つ上限（秒）。応答しない xcrun で検査を止めない。過ぎたら版を取得できないものとする
+SDK_QUERY_TIMEOUT = 30
 
 
 def sdk_name(sdk: str) -> Optional[str]:
@@ -90,10 +104,10 @@ def sdk_name(sdk: str) -> Optional[str]:
         env.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
         try:
             result = subprocess.run(["xcrun", "--sdk", sdk, "--show-sdk-version"], env=env,
-                                    capture_output=True, text=True, check=True)
+                                    capture_output=True, text=True, check=True, timeout=SDK_QUERY_TIMEOUT)
             version = result.stdout.strip()
             _SDK_NAMES[sdk] = f"{sdk}{version}" if re.fullmatch(r"\d+(\.\d+)*", version) else None
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             _SDK_NAMES[sdk] = None
     return _SDK_NAMES[sdk]
 
@@ -750,6 +764,51 @@ def load_plist(path: Path) -> dict:
     raise Unreadable(f"{path}: 入れ子が深すぎるか循環している（{MAX_PLIST_DEPTH} 段を超える）")
 
 
+def declared_api_reasons(path: Path, manifest: dict) -> Dict[str, List[str]]:
+    """マニフェストの申告を「API の種類 → 理由コードの一覧」にする。形式が違うものは合格にしない。"""
+    entries = manifest.get("NSPrivacyAccessedAPITypes", [])
+    if not isinstance(entries, list):
+        raise Unreadable(f"{path}: NSPrivacyAccessedAPITypes が配列でない")
+    declared: Dict[str, List[str]] = {}
+    for entry in entries:
+        category = entry.get("NSPrivacyAccessedAPIType") if isinstance(entry, dict) else None
+        reasons = entry.get("NSPrivacyAccessedAPITypeReasons") if isinstance(entry, dict) else None
+        if not isinstance(category, str) or not isinstance(reasons, list) or not all(isinstance(r, str) for r in reasons):
+            raise Unreadable(f"{path}: NSPrivacyAccessedAPITypes の要素の形式が違う")
+        declared.setdefault(category, []).extend(reasons)
+    return declared
+
+
+def check_privacy_manifest(source: str, path: Path, complete: bool, errors: List[str]) -> None:
+    """プライバシーマニフェストの申告を調べる。complete（アプリのマニフェスト）なら、決めた申告がすべてあることも確かめる。"""
+    manifest = load_plist(path)
+    if manifest.get("NSPrivacyTracking") is not False:
+        errors.append(f"[SEC-PRV-03] {source}: NSPrivacyTracking を false にする")
+    for key in PRIVACY_EMPTY_KEYS:
+        if manifest.get(key) != []:
+            errors.append(f"[SEC-PRV-03] {source}: {key} を空の配列にする")
+    declared = declared_api_reasons(path, manifest)
+    # 申告した API の種類には、理由コードが 1 つ以上要る（空の配列では申告にならない）。拡張のマニフェスト（complete が偽）も
+    # 同じ。種類ごとに見るので、同じ種類の要素が複数あれば、どれか 1 つでも空なら違反にする
+    for entry in manifest.get("NSPrivacyAccessedAPITypes", []):
+        if not entry["NSPrivacyAccessedAPITypeReasons"]:
+            errors.append(f"[SEC-PRV-03] {source}: {entry['NSPrivacyAccessedAPIType']} の理由コードが空（1 つ以上申告する）")
+    for category, reasons in declared.items():
+        allowed = PRIVACY_ACCESSED_API_REASONS.get(category)
+        if allowed is None:
+            errors.append(f"[SEC-PRV-03] {source}: 決めていない API の種類 {category} を申告しない（使うなら設計書と検査を同じ作業で直す）")
+            continue
+        for reason in reasons:
+            if reason not in allowed:
+                errors.append(f"[SEC-PRV-03] {source}: {category} の理由コード {reason} は、決めたもの（{'・'.join(allowed)}）と違う")
+    if complete:
+        for category, allowed in PRIVACY_ACCESSED_API_REASONS.items():
+            missing = [reason for reason in allowed if reason not in declared.get(category, [])]
+            if missing:
+                errors.append(f"[SEC-PRV-03] {source}: {category} の申告（理由コード {'・'.join(missing)}）がない")
+
+
+
 def tracked_files(root: Path) -> Set[Path]:
     """root の下の、HEAD のコミットで追跡した通常のファイルのパス。取得できなければ、読めないものとして扱う。"""
     # 外から引き継いだリポジトリを指す変数（GIT_DIR など）を外し、置き換えのオブジェクトを使わない
@@ -848,6 +907,7 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
     referenced: Dict[Path, List[Expander]] = {}
     unbuilt: Dict[Path, List[Expander]] = {}  # ビルドしない arch の参照先（上と同じ形）
     entitlements: List[Path] = []
+    application_manifests: List[Path] = []
     tracked = tracked_files(root) if tracked_only else None
     for target in targets:
         name = f"ターゲット {target.get('name', '?')}"
@@ -871,6 +931,15 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         if target.get("product-type") == "application":
             check_plist_values(project_path, name, target_name, own, shared, configurations, root, errors)
             check_plist_orientation(project_path, name, target_name, own, shared, configurations, root, errors)
+            # プライバシーマニフェスト（SEC-PRV-03）は <ターゲット名>/PrivacyInfo.xcprivacy に置く
+            parent = resolved(project_path).parent
+            source_root = parent.parent if parent.suffix == ".xcodeproj" else parent
+            manifest = resolved(source_root / target_name / PRIVACY_MANIFEST_NAME)
+            if manifest.is_file():
+                require_tracked(f"{name} のプライバシーマニフェスト", manifest, root, tracked)
+                application_manifests.append(manifest)
+            else:
+                errors.append(f"[SEC-PRV-03] {name}: {target_name or '?'}/{PRIVACY_MANIFEST_NAME} がない")
         check_build_settings(name, own, errors,
                              lambda key, own=own: target_expander(own, shared, configurations, key, True))
         for key, value in variants(own, "PRODUCT_BUNDLE_IDENTIFIER"):
@@ -887,6 +956,11 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
         visited: Set[int] = set()  # この plist のたどりだけで使う（ほかの plist・ビルド設定の検査とは分ける）
         for key, value in load_plist(path).items():
             check_plist_entry(source, str(key), value, errors, expand, visited)
+    # プライバシーマニフェストは、アプリのもの以外（拡張など）も調べる。アプリのものだけ、決めた申告がすべてあることを求める
+    manifests = discovered_files(root, (".xcprivacy",), tracked)
+    for path in manifests + [path for path in application_manifests if path not in manifests]:
+        source = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+        check_privacy_manifest(source, path, path in application_manifests, errors)
     # CODE_SIGN_ENTITLEMENTS が指すファイルも、拡張子にかかわらず読む。ないファイル・読めないファイルは Unreadable
     scanned = discovered_files(root, (".entitlements",), tracked)
     for path in scanned + [path for path in dict.fromkeys(entitlements) if path not in scanned]:
@@ -901,7 +975,7 @@ def check(project_path: Path, root: Path, tracked_only: bool = False) -> Tuple[L
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="プロジェクト設定・Info.plist・entitlements の検査")
+    parser = argparse.ArgumentParser(description="プロジェクト設定・Info.plist・entitlements・プライバシーマニフェストの検査")
     parser.add_argument("--project", type=Path, default=ROOT / "MinutesMobile.xcodeproj" / "project.xcproj")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--tracked-only", action="store_true")
@@ -918,7 +992,7 @@ def main() -> int:
     if errors:
         print(f"NG: 設定の違反 {len(errors)} 件")
         return 1
-    print("OK: プロジェクト設定・Info.plist・entitlements に違反なし")
+    print("OK: プロジェクト設定・Info.plist・entitlements・プライバシーマニフェストに違反なし")
     return 0
 
 

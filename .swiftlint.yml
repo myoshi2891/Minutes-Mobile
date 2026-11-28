@@ -180,9 +180,12 @@ custom_rules:
     message: "WebView を使わない（SEC-PLT-05）"
     severity: error
 
+  # import は、キーワードと名前の間（import と種類・種類と名前の間）のコメント（ブロックコメントは 1 段の入れ子まで、
+  # 行コメントは行末まで）を空白として読み、バッククォートで囲んだ名前（import `AppIntents`）も検出する。
+  # 判定は先読みに置き、一致範囲をキーワードの「import」に限る（一致範囲にコメントが入ると match_kinds で外れるため。no_empty_catch と同じ）
   no_spotlight_user_activity:
-    name: "Spotlight と NSUserActivity の禁止"
-    regex: '\bimport\s+(\w+\s+)?CoreSpotlight\b|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
+    name: "Spotlight・NSUserActivity・App Intents の禁止"
+    regex: '\bimport\b(?=(?:\s|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+)+(?:\w+(?:\s|/\*(?:[^*/]|\*(?!/)|/(?!\*)|/\*(?:[^*]|\*(?!/))*\*/)*\*/|//[^\r\n]*+)+)?`?(?:CoreSpotlight|AppIntents)\b)|\bCSSearchable\w+|\bNSUserActivity\b|\.userActivity\s*\(|\.onContinueUserActivity\s*\('
     match_kinds: *code
     message: "Spotlight・Siri にデータを渡さない（SEC-PLT-02）"
     severity: error

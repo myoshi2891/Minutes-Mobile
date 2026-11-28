@@ -453,8 +453,8 @@ title() {
     0) echo "開発ツールの版" ;;
     1) echo "整形（SwiftFormat）" ;;
     2) echo "静的解析（SwiftLint）" ;;
-    3) echo "秘密情報の検出（gitleaks）" ;;
-    4) echo "プロジェクト設定と Info.plist" ;;
+    3) echo "秘密情報の検出（gitleaks）と、録音データの混入" ;;
+    4) echo "プロジェクト設定・Info.plist・プライバシーマニフェスト" ;;
     5) echo "依存" ;;
     6) echo "ビルド" ;;
     7) echo "単体・結合テスト" ;;
@@ -500,6 +500,12 @@ step_2() {
     esac
     # 作業ツリーではなくステージした内容で試験する。入れ子の設定の列挙（git ls-files）もインデックスに対して行う
     prepare_rules_tree
+    # 実行する試験のスクリプトは、書き出した場所の中の通常の実行できるファイルであること（手順 10 の verify-docs.py と同じ）。
+    # ステージした scripts かその中の test-lint-rules.py がシンボリックリンクなら、書き出した場所の外を実行しうる
+    if [ -L "$STAGED_TREE/scripts" ] || [ -L "$STAGED_TREE/scripts/test-lint-rules.py" ] \
+      || [ ! -f "$STAGED_TREE/scripts/test-lint-rules.py" ] || [ ! -x "$STAGED_TREE/scripts/test-lint-rules.py" ]; then
+      fail "ステージした scripts/test-lint-rules.py が通常の実行できるファイルでない（シンボリックリンク・実行権限なしなど）"
+    fi
     (cd "$STAGED_TREE" && GIT_DIR="$(git -C "$ROOT" rev-parse --absolute-git-dir)" GIT_WORK_TREE="$STAGED_TREE" \
       "$STAGED_TREE/scripts/test-lint-rules.py" --staged)
     return 0
@@ -530,8 +536,10 @@ step_3() {
   else
     # 全履歴の検査は、自己試験（test-checks.py gitleaks）と同じコマンドで行う
     scripts/gitleaks-history.sh .
-    scripts/test-checks.py gitleaks
+    scripts/test-checks.py gitleaks tracked
   fi
+  # 録音データ・試験の DB・秘密情報のファイルが、インデックス（ステージした分を含む）に入っていないこと（SEC-SUP-04）
+  scripts/check-tracked-files.py
 }
 
 step_4() {

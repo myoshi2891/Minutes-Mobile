@@ -131,15 +131,17 @@ restore_staging() {
   local held=$staging
   if [ -z "$held" ]; then return 0; fi
   staging=""
-  if [ ! -e "$held/tree" ]; then rmdir "$held" 2>/dev/null || true; return 0; fi
+  if [ ! -e "$held/tree" ]; then rm -f -- "$held/admin"; rmdir "$held" 2>/dev/null || true; return 0; fi
   if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
     echo "NG: 専用の作業ツリーの置き場所（${snapshot}）に、検査の間に別のものができた。中身を確かめて外す（作業ツリーなら git worktree move か remove）か削除してから push し直す（元の専用の作業ツリーは ${held}/tree に残した）: $(ls -A -- "$snapshot" 2>/dev/null | sed 's|$|/|' | tr '\n' ' ')" >&2
     return 1
   fi
-  # 移す途中の強制終了で、登録されたパスと実際の場所が食い違っている場合だけ、登録を直してから戻す。移動は中断を無視して実行する
-  if ! worktree_location registered "$source_root" "$held/tree"; then git -C "$held/tree" worktree repair > /dev/null || true; fi
+  # 移す途中の強制終了で、登録されたパスと実際の場所が食い違っている場合だけ、元のリポジトリから登録を直してから戻す
+  # （移した作業ツリーの中からではなく、元のリポジトリの側で、移した場所を示して直す）。移動は中断を無視して実行する
+  if ! worktree_location registered "$source_root" "$held/tree"; then git -C "$source_root" worktree repair "$held/tree" > /dev/null || true; fi
   (trap '' INT TERM; exec git -C "$source_root" worktree move "$held/tree" "$snapshot") \
     || { echo "NG: 専用の作業ツリー（${held}/tree）を元の場所（${snapshot}）に戻せない$(nested_hint)" >&2; return 1; }
+  rm -f -- "$held/admin"
   rmdir "$held" 2>/dev/null || true
   # 確かめてから移すまでの間に元の場所ができると、git worktree move はその中に移す（上書きはしない）。検査せずに止める
   if [ ! -e "$snapshot/.git" ] || [ -e "$snapshot/tree/.git" ]; then
@@ -186,12 +188,29 @@ owned_tree() {
     && [ -f "$private/$owner_mark" ] && [ ! -L "$private/$owner_mark" ] \
     && [ "$(cat "$private/$owner_mark")" = "$owner_text" ]
 }
+# 移し先（$1）の作業ツリーが、移す前に記録した専用の管理ディレクトリ（$1/admin。実体のパス）の作業ツリーそのもので、その管理
+# ディレクトリにこのフックの印があるか。印だけでは、印のある別の作業ツリー（の .git を写したもの）と区別できないので、移す前の記録と
+# 照らす。記録がない・読めない・合わないものは確かめられないとする
+held_tree_verified() {
+  local recorded held_private
+  if [ ! -f "$1/admin" ] || [ -L "$1/admin" ]; then return 1; fi
+  recorded=$(cat -- "$1/admin" && printf x) || return 1
+  recorded=${recorded%x}
+  [ -n "$recorded" ] || return 1
+  owned_tree "$1/tree" || return 1
+  git_path held_private "$1/tree" --git-dir && real_directory held_private "$held_private" || return 1
+  [ "$held_private" = "$recorded" ]
+}
 # 前の検査が、専用の作業ツリーを移したまま終わった（強制終了・元の場所に別のものができた）場合は、先に元の場所へ戻す。元の場所に
-# 何かがあれば（空のディレクトリを含む）、このフックのものと確かめられないので消さず、restore_staging が戻さずに止める
+# 何かがあれば（空のディレクトリを含む）、このフックのものと確かめられないので消さず、restore_staging が戻さずに止める。
+# 確かめられない移し先は、移さず・登録も直さず・消さずに止める
 for held in "$snapshot".work.*; do
   if [ ! -d "$held" ] || [ -L "$held" ]; then continue; fi
-  if [ -e "$held/tree" ] && ! owned_tree "$held/tree"; then
-    echo "NG: ${held}/tree がこの検査の作業ツリーと確かめられない。中身を確かめて外してから push し直す" >&2
+  # 中に作業ツリーのないものは、このフックが作ったものと確かめる手段がないので、記録（admin）も含めて変えずに残す
+  # （restore_staging の「tree がない」場合の後始末は、この実行が作った移し先にだけ行う）
+  if [ ! -e "$held/tree" ] && [ ! -L "$held/tree" ]; then continue; fi
+  if ! held_tree_verified "$held"; then
+    echo "NG: ${held}/tree がこの検査の作業ツリーと確かめられない（移す前に記録した管理ディレクトリ ${held}/admin と合わない、記録がない、またはこの検査の印がない）。中身を確かめて外してから push し直す" >&2
     exit 1
   fi
   staging=$held
@@ -297,6 +316,11 @@ if [ "$owned" -eq 1 ]; then
   # 登録された作業ツリーは、合わせる作業ツリーとは別の場所になる（checkout・clean・rm が及ばない）。移すまでに登録されたものは
   # 一緒に移り（中身は変わらない）、下の .git の検査で止めて元の場所へ戻す。検査する場所とビルドの成果物は変わらない
   staging=$(mktemp -d "$snapshot.work.XXXXXX")
+  # 移す前に、この作業ツリーの専用の管理ディレクトリ（実体のパス）を移し先に記録する。移したまま終わった場合に、次の検査が
+  # 移し先の作業ツリーをこの記録と印の両方で確かめてから、元のリポジトリの側で登録を直して戻す（held_tree_verified）
+  git_path admin_directory "$snapshot" --git-dir && real_directory admin_directory "$admin_directory" \
+    || { echo "NG: 専用の作業ツリー（${snapshot}）の管理ディレクトリを特定できない" >&2; exit 1; }
+  printf '%s' "$admin_directory" > "$staging/admin" || { echo "NG: 移し先（${staging}）に管理ディレクトリを記録できない" >&2; exit 1; }
   (trap '' INT TERM; exec git -C "$source_root" worktree move "$snapshot" "$staging/tree") \
     || { echo "NG: 専用の作業ツリー（${snapshot}）を移せない" >&2; exit 1; }
   # 中に別の作業ツリー・リポジトリ（.git を持つもの）があれば、何も変えずに止める。残すビルドの成果物（.build）の中の .git の

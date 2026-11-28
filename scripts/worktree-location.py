@@ -20,6 +20,7 @@ import os
 import stat
 import subprocess
 import sys
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
 # 引き継いだリポジトリを指す変数を外して git を実行する（-C で指定したリポジトリの一覧を読む）
@@ -116,6 +117,51 @@ def identity(path: str, registered: bool = False) -> Optional[Tuple[int, int]]:
     return (info.st_dev, info.st_ino)
 
 
+def components(path: str, top: str) -> List[str]:
+    """top（path の祖先か path 自身）より下の要素の並び。"""
+    relative = os.path.relpath(path, top)
+    return [] if relative == os.curdir else relative.split(os.sep)
+
+
+def missing_contains(base: str, registered_path: str) -> Optional[bool]:
+    """置き場所（base）が、ディレクトリのない登録のパスそのものかその下か。判定できなければ理由を書いて None。
+
+    登録のパスの既存の最も深い祖先までは同一性で比べ（綴りの違う祖先・ハードリンクを見逃さない）、それより下のない要素は、
+    その祖先のボリュームの名前の規則で要素ごとに比べる（文字列の前方一致では、隣の gone-other を中と取り違える）。
+    大文字と小文字を区別しないボリュームでは大小を無視し、正規化の違い（APFS は区別しない）はどちらでも無視する（認めない側に倒す）。
+    """
+    existing = os.path.dirname(registered_path)
+    while identity(existing, registered=True) is None:
+        existing = os.path.dirname(existing)  # ルートは必ずある
+    anchor = identity(existing, registered=True)
+    rest = components(registered_path, existing)
+    # 置き場所の祖先（自身を含む）から、登録の既存の祖先と同じディレクトリを探す
+    current = base
+    while identity(current, registered=True) != anchor:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False  # 登録の既存の祖先の下にない
+        current = parent
+    below = components(base, current)
+    if len(below) < len(rest):
+        return False
+    try:
+        # _PC_CASE_SENSITIVE（macOS の sys/unistd.h の 11）。Python の os.pathconf_names にはないので番号で問い合わせる
+        sensitive = os.pathconf(existing, 11)
+    except OSError as error:
+        print(f"NG: {existing} の名前の規則（大文字と小文字の区別）を調べられない: {error}", file=sys.stderr)
+        return None
+    if sensitive not in (0, 1):
+        print(f"NG: {existing} の名前の規則（大文字と小文字の区別）を判定できない（{sensitive}）", file=sys.stderr)
+        return None
+
+    def key(name: str) -> str:
+        folded = name if sensitive else unicodedata.normalize("NFD", name).casefold()
+        return unicodedata.normalize("NFD", folded)
+
+    return [key(name) for name in below[:len(rest)]] == [key(name) for name in rest]
+
+
 def check(requested: str, source: str) -> int:
     # 置き場所を作る前に実体のパスへ解決する（まだない部分を含んでよい。git worktree list が示す実体のパスとも比べる）
     base = os.path.realpath(requested)
@@ -144,11 +190,25 @@ def check(requested: str, source: str) -> int:
     # どれかが、元のリポジトリか登録された作業ツリーと同じディレクトリなら認めない（大文字小文字を区別しないボリュームで
     # 綴りの違うパス・ハードリンクなどを、文字列の比較で見逃さない。区別するボリュームの別のディレクトリは別物として認める）
     roots: Dict[Tuple[int, int], str] = {}
+    missing: List[str] = []  # 登録だけが残り、ディレクトリのない作業ツリー（解決した登録のパス）
     listed_first = registered_worktrees(source)
     for path in [source] + [os.fsdecode(listed) for listed in listed_first]:
         found_identity = identity(path, registered=True)
-        if found_identity is not None:  # ないものは、登録だけが残りディレクトリのない作業ツリー（その中に置き場所はありえない）
+        if found_identity is not None:
             roots[found_identity] = path
+        else:
+            missing.append(path)
+    # ディレクトリのない作業ツリーは同一性で比べられない。置き場所を作るとその登録のパスの中にディレクトリができるので、
+    # 作る前に、解決した登録のパスと置き場所（自身を含む祖先）を比べて認めない（作った後の判定に任せない）。比べ方は
+    # missing_contains（ある部分は同一性、ない部分はそのボリュームの名前の規則）
+    for path in missing:
+        contained = missing_contains(base, os.path.realpath(path))
+        if contained is None:
+            return 2
+        if contained:
+            print(f"NG: 専用の作業ツリーの置き場所（{base}）が作業ツリー（{path}。ディレクトリがない）の中にある。どの作業ツリーの外も指定する",
+                  file=sys.stderr)
+            return 1
     current = base
     while True:
         info = identity(current)  # None はまだない部分（作る予定の場所）
