@@ -906,6 +906,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | `preparing` | `firstBufferArrived` | `capturing` | `recordStartLatency` → `recordRoute(recording_started)` → 保留した事象を配り直す |
 | `preparing` | `startFailed(分類)` | `idle` | `stopInput` → `deactivateSession` → `discardMeetingIfEmpty` → `reportStartFailure(分類)` |
 | `preparing` | `interruptionBegan`・`configurationChanged`・`mediaServicesReset` | `preparing` | なし（事象を保留する） |
+| `preparing` | `stopRequested(理由)` | `stopping`（世代+1。保留した事象を捨てる） | `stopInput` → `deactivateSession` → `discardMeetingIfEmpty` → `post(stopCompleted)`。開始の取り消し（基本設計 §4 の「`preparing` 中の停止要求」）で、停止の並びにも会議の `stop_requested` にも進まず、停止理由を記録しない。`stopInput` の前に、その世代の閉鎖の印（§5.4 の①）を**必ず**立てる（開く呼び出しが戻ったかによらない）。組み立て中の音声（印の前に受け付けたサンプル）も確定せずに捨てるので、その世代のサンプルは Chunk に入らず、会議は音声のないものとして削除される。開く呼び出しが戻っていなければ、`stopInput` は戻るのを待たずに §5.4 の②〜④を行い、後で戻った入力・セッションを閉じる。世代が進むので、遅れて届いた `firstBufferArrived`・`startFailed` は拒否されて `capturing` へ進まない。`stopCompleted` まで `startRequested` を受け付けず、その後の新しい開始の入力を開く呼び出しも、§5.4 の②の入力の制御の直列キューに並ぶので、遅れて戻った呼び出しの停止と取り外しより先には実行されない |
 | `capturing` | `interruptionBegan(理由, 時刻)` | `interrupted_draining`（世代+1） | `scheduleNotice` → `stopInput` → `drainAndFlush` → `sealPartialChunk` → `openGap(理由, 時刻)` → `post(drainCompleted)` |
 | `capturing` | `configurationChanged(時刻)` | `rebuilding_draining`（世代+1） | `stopInput` → `drainAndFlush` → `openGap(route_change, 時刻)` → `post(drainCompleted)` |
 | `capturing` | `mediaServicesReset(時刻)` | `rebuilding_draining`（世代+1） | `stopInput` → `drainAndFlush` → `openGap(media_reset, 時刻)` → `post(drainCompleted)` |
@@ -1188,7 +1189,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | 15 | sample rate の変化（結合） | 合成音声を 48 kHz で流し、途中で 24 kHz に変えて再構築する。出力のサンプル番号が連続し、空白区間が 1 つ記録されること | TST-AUD-05 |
 | 16 | 時刻の正（結合） | 録音の途中で壁時計を進める・戻す。Chunk の位置が変わらないこと | TST-AUD-06 |
 | 17 | 割り込みと再開（結合） | 差し替えたセッションで割り込みを流す。割り込み前の音声が短い Chunk になり、再開後のサンプルが次の連番の Chunk に入り、空白区間の長さが手動の時計で進めた分になること | TST-INT-01、FR-INT-01 |
-| 18 | 開始の失敗（結合） | 入力の開始を失敗させる・最初のバッファを届けない。`idle` に戻り、無効化が呼ばれ、会議が残らないこと | SEC-PRV-02 |
+| 18 | 開始の失敗・開始の取り消し（結合） | 入力の開始を失敗させる・最初のバッファを届けない。`idle` に戻り、無効化が呼ばれ、会議が残らないこと。`preparing` で停止を要求すると、`stop_requested` を経ずに同じ後始末で `idle` に戻り、その後に届いた最初のバッファ・開始の失敗が拒否されること。入力の開始の呼び出しを戻さないまま停止すると、閉鎖の手続きが行われ、後始末の前の `startRequested` が拒否されること | SEC-PRV-02 |
 | 19 | 単体での再生（結合） | 保存した Chunk を `AVAudioFile` で開き、長さが記録と一致すること | TST-AUD-04 |
 
 ### 11.2 合成音声と差し替え

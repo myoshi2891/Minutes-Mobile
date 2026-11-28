@@ -757,8 +757,9 @@ public enum JobSelector {
             return .transcribe(sequence: pending.sequence)
         }
         guard let merge = jobs.first(where: { $0.kind == .mergeTranscript }) else {
-            // 全 Chunk のジョブが終わっていて、統合のジョブがまだない
-            return chunks.isEmpty ? .finished : .merge
+            // 全 Chunk のジョブが終わっていて、統合のジョブがまだない。transcribe_chunk が 0 件（利用できる Chunk が
+            // ない）の実行も統合して版を作り、利用できなかった Chunk を版に示す（§6.2。transcribing に残さない）
+            return .merge
         }
         return merge.state == .pending ? .merge : .finished
     }
@@ -878,8 +879,9 @@ public enum JobSelector {
             return .transcribe(sequence: pending.sequence)
         }
         guard let merge = jobs.first(where: { $0.kind == .mergeTranscript }) else {
-            // 全 Chunk のジョブが終わっていて、統合のジョブがまだない
-            return chunks.isEmpty ? .finished : .merge
+            // 全 Chunk のジョブが終わっていて、統合のジョブがまだない。transcribe_chunk が 0 件（利用できる Chunk が
+            // ない）の実行も統合して版を作り、利用できなかった Chunk を版に示す（§6.2。transcribing に残さない）
+            return .merge
         }
         return merge.state == .pending ? .merge : .finished
     }
@@ -1147,12 +1149,12 @@ public enum TranscriptMerger {
 
 | 順 | 処理 |
 | --- | --- |
-| 1 | 開始条件を評価する（§8）。満たさなければ、理由を `meetings.waiting_reason` に記録して待つ |
+| 1 | 開始条件を評価する（§8）。満たさなければ、理由を `meetings.waiting_reason` に記録して待つ。あわせて、会議の状態（`finalized`・`transcribed`）と `meetings.current_version` が、開始を決めた時点のもの（元の版）と一致することを確かめ、合わなければ何も書かずに止める（遅れて届いた重複の開始に、手順 2〜5 の書き込みをさせない。最終の判定は手順 6 の取引の中の `reduce`） |
 | 2 | 保管中（`sealed`）の会議なら、処理中の保護クラスへ戻す（[storage.md](storage.md) §8） |
 | 3 | 全 Chunk を検査して、ファイルの状態を最新にする（[storage.md](storage.md) §6.1） |
 | 4 | 実行番号を発番し、`stt/run-{実行番号}/` を作る |
 | 5 | 再文字起こしでは、`meeting.json` から失敗区間の再試行の実行番号を消す（DB の取引より前。基本設計 §7） |
-| 6 | DB の 1 取引: ジョブを作る（§5.4）、`meetings.current_run`、会議を `transcribing`（事象 `transcriptionStarted`） |
+| 6 | DB の 1 取引: ジョブを作る（§5.4）、`meetings.current_run`、会議を `transcribing`（事象 `transcriptionStarted(basedOn:)`。元の版は手順 1 の時点の `meetings.current_version` で、同じ取引で読んだ現在の版と合わなければ拒否される。[architecture.md](architecture.md) §5.1） |
 | 7 | `meeting.json` に状態と現在の実行番号を書く |
 | 8 | 継続処理タスクを投入し（§9）、ジョブの実行を始める |
 
@@ -1160,10 +1162,10 @@ public enum TranscriptMerger {
 
 | 順 | 処理 |
 | --- | --- |
-| 1 | 開始条件を評価する。表示中の版のファイルを読み、完全性の照合（§6.3）に通ることを確かめる。通らなければ再試行せず、再文字起こし（全体）を案内する |
+| 1 | 開始条件を評価する。会議が `transcribed` で、`meetings.current_version` が再試行を決めた時点の版（元の版）と一致することを確かめ、合わなければ何も書かずに止める（遅れて届いた重複の再試行に、手順 3 の `meeting.json` の書き込みをさせない）。表示中の版のファイルを読み、完全性の照合（§6.3）に通ることを確かめる。通らなければ再試行せず、再文字起こし（全体）を案内する |
 | 2 | 版のファイルの実行番号を、この再試行の実行番号とする |
 | 3 | その実行番号を、失敗区間の再試行の実行番号として `meeting.json` に書く（**DB の取引より前**） |
-| 4 | DB の 1 取引: ①版のファイルの `failedChunks` の連番ごとに、`transcribe_chunk` がなければ `pending` で作り、`failed` なら事象 `userRetry` で `pending` に戻す。②失敗区間でない利用できる Chunk に行がなければ、§5.4 の再利用の条件で `succeeded` または `pending` として作る。③`merge_transcript` がなければ `pending` で作り、あれば事象 `mergeReset` で `pending` に戻す。④`meetings.current_run` をこの実行番号にし、会議を `transcribing` にする |
+| 4 | DB の 1 取引: ①版のファイルの `failedChunks` の連番ごとに、`transcribe_chunk` がなければ `pending` で作り、`failed` なら事象 `userRetry` で `pending` に戻す。②失敗区間でない利用できる Chunk に行がなければ、§5.4 の再利用の条件で `succeeded` または `pending` として作る。③`merge_transcript` がなければ `pending` で作り、あれば事象 `mergeReset` で `pending` に戻す。④`meetings.current_run` をこの実行番号にし、会議を `transcribing` にする（事象 `transcriptionStarted(basedOn: 元の版)`。合わなければ取引を取り消す） |
 | 5 | `meeting.json` に状態を書き、ジョブの実行を始める |
 
 - 新しい版ができるまで、以前の版を表示し続ける。画面が読むのは版のファイルだけなので、処理の途中の結果が混ざらない。
@@ -1504,7 +1506,7 @@ actor ContinuedProcessingExecution: BackgroundExecution {
 | 3 | ジョブの状態遷移の網羅 | 全状態 × 全事象。§5.1 の表だけが許されること | TST-GEN-06 |
 | 4 | 失敗の分類と回数 | 回数に数えない分類で回数が戻ること。数える分類が上限で `failed` になること | FR-STT-02 |
 | 5 | 再実行の間隔と上限時間 | 2・5・10・30・60 秒と ±20%。入力の 10 倍。空でない短い入力（1 サンプル・1 秒）が下限の 30 秒になり、0 にならないこと。330 秒の入力の値が変わらないこと。空の入力が 0 | NFR-REL-03 |
-| 6 | 次のジョブの選び方 | 連番の小さい `pending` から。全 Chunk が終わったら統合。実行中があれば待つ | FR-STT-02 |
+| 6 | 次のジョブの選び方 | 連番の小さい `pending` から。全 Chunk が終わったら統合。`transcribe_chunk` が 0 件の実行（利用できる Chunk がない）も統合を選ぶ（`finished` にしない）。実行中があれば待つ | FR-STT-02 |
 | 7 | 開始条件 | §8.1 の表の全行と、上書き。自動開始が無効で始まっていない会議が、`finalized`・`conditionsChanged` のどちらでも `auto_start_disabled` になり、`userRequested` と、始まっている会議の `conditionsChanged` では止まらないこと。停止を確かめていない実行があると、上書きでも `engine_not_stopped` になること | TST-STT-05・06、FR-STT-12 |
 | 8 | 統合（重複の除外） | 境界で 2 回出た発話が 1 回になること。判定の記録。渡す順序を変えても同じ結果 | TST-STT-04 |
 | 9 | 統合の境界値 | 重なり 0.5、類似 0.8、包含の比 0.3 と 0.95、空文字列、正規化。類似の判定で、前の側だけ・後ろの側だけ・両方の信頼度が `nil` のどれでも前の側を残すこと（前の側が `nil` で後ろの側が 0.9 でも前を残す） | FR-STT-03 |

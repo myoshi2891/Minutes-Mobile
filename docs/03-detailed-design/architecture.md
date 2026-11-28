@@ -426,14 +426,14 @@ public struct AudioTimeline: Equatable, Sendable {
 | `finalizing` | `barrierPassed` | `finalized` | 確定方式 `barrier` を記録 → 状態を保存 → 文字起こしの開始条件を評価 → 保護クラスを見直す |
 | `finalizing` | `barrierFailed` | `stop_requested` | 状態を保存（理由は Barrier の結果として別に保存する） |
 | `stop_requested` | `lossAcknowledged` | `finalized` | 確定方式 `acknowledged_loss` を記録 → 状態を保存 → 文字起こしの開始条件を評価 → 保護クラスを見直す |
-| `finalized` | `transcriptionStarted` | `transcribing` | 状態を保存 |
-| `transcribed` | `transcriptionStarted` | `transcribing` | 状態を保存 |
+| `finalized` | `transcriptionStarted(元の版)`（元の版が現在の版と一致する） | `transcribing` | 状態を保存 |
+| `transcribed` | `transcriptionStarted(元の版)`（元の版が現在の版と一致する） | `transcribing` | 状態を保存 |
 | `transcribing` | `transcriptionPartiallyFailed` | `transcribing` | なし |
 | `transcribing` | `transcriptionCompleted` | `transcribed` | 状態を保存 → 保護クラスを見直す |
 
 - `stopRequested` の理由は `manual`・`interruption_unresumed`・`no_input`・`disk_full`・`terminated`（FR-INT-05）。起動時の復旧で `recording` の会議を止める場合も同じ事象を使う（理由が `terminated` または `interruption_unresumed`）。
 - `finalizationStarted` は「末尾の Chunk の保存が終わった」と「確定待ちからの再試行」の両方で使う（どちらも `stop_requested` → `finalizing`）。
-- `transcriptionStarted` は、最初の文字起こし・再文字起こし・失敗区間の再試行で共通に使う。
+- `transcriptionStarted` は、最初の文字起こし・再文字起こし・失敗区間の再試行で共通に使う。**元の版**（開始を決めた時点で表示していた版。`meetings.current_version`。版がなければ `nil`）を持ち、`reduce` に渡した現在の版と一致するときだけ受け付ける。遅れて届いた重複の開始は、その開始が作った版（または別の開始が作った版）で現在の版が進んでいるので拒否される。失敗区間の再試行は実行番号を変えない（[transcription.md](transcription.md) §7）ので、実行番号では区別しない
 - 「状態を保存」は、SQLite と `meeting.json` の両方への保存を指す。順序と失敗時の扱いは [storage.md](storage.md) §5 にある。
 - P2 の状態（`summarizing`・`completed`）は、この列挙型にまだない。永続データに未知の状態があれば、検証の失敗として「読めない会議」にする（クラッシュも削除もしない。TST-RCV-04）。
 
@@ -458,8 +458,8 @@ public enum MeetingEvent: Equatable, Sendable {
     case barrierPassed
     case barrierFailed
     case lossAcknowledged
-    /// 最初の文字起こし・再文字起こし・失敗区間の再試行
-    case transcriptionStarted
+    /// 最初の文字起こし・再文字起こし・失敗区間の再試行。basedOn は開始を決めた時点の版（なければ nil）
+    case transcriptionStarted(basedOn: Int?)
     case transcriptionPartiallyFailed
     case transcriptionCompleted
 }
@@ -482,8 +482,10 @@ public struct MeetingTransition: Equatable, Sendable {
 }
 
 public enum MeetingStateMachine {
-    /// 許されない遷移は nil を返す
-    public static func reduce(_ state: MeetingStatus, _ event: MeetingEvent) -> MeetingTransition? {
+    /// 許されない遷移は nil を返す。currentVersion は meetings.current_version（版がなければ nil）
+    public static func reduce(
+        _ state: MeetingStatus, _ event: MeetingEvent, currentVersion: Int?,
+    ) -> MeetingTransition? {
         switch (state, event) {
         case let (.recording, .stopRequested(reason)):
             let record: [MeetingEffect] = [.recordStopReason(reason), .persistStatus(.stopRequested)]
@@ -499,7 +501,9 @@ public enum MeetingStateMachine {
             return MeetingTransition(next: .stopRequested, effects: [.persistStatus(.stopRequested)])
         case (.stopRequested, .lossAcknowledged):
             return finalized(.acknowledgedLoss)
-        case (.finalized, .transcriptionStarted), (.transcribed, .transcriptionStarted):
+        case let (.finalized, .transcriptionStarted(basedOn)), let (.transcribed, .transcriptionStarted(basedOn)):
+            // 遅れて届いた重複の開始は、元の版が現在の版と合わないので拒否する（§5.3）
+            guard basedOn == currentVersion else { return nil }
             return MeetingTransition(next: .transcribing, effects: [.persistStatus(.transcribing)])
         case (.transcribing, .transcriptionPartiallyFailed):
             return MeetingTransition(next: .transcribing, effects: [])
@@ -522,7 +526,7 @@ public enum MeetingStateMachine {
 ### 5.3 サービスの決まり
 
 - サービスは、**`reduce` が返した遷移だけを保存する**。`nil` が返った事象は捨てて、ログに `meeting_status_changed` を出さない。状態を直接書き換える入口（`setStatus` のような関数）を保存の側に作らない。
-- 同じ事象が 2 回届いても、2 回目は表にない組み合わせになって拒否される（例: `finalized` に `barrierPassed`）。冪等性を状態遷移で担保する。
+- 同じ事象が 2 回届いても、2 回目は表にない組み合わせになって拒否される（例: `finalized` に `barrierPassed`）。冪等性を状態遷移で担保する。`transcribed` から `transcribing` へ戻る `transcriptionStarted` だけは、2 回目も表にある組み合わせになりうるので、元の版の照合（§5.1）で拒否する。
 - 録音セッションの状態遷移（プロセス内だけ）は [recording.md](recording.md) §5、ジョブの状態遷移は [transcription.md](transcription.md) §5 にある。どちらも同じ形（状態 + 事象 → 次の状態 + 副作用の指示）で書く。
 
 ---
@@ -568,7 +572,7 @@ public protocol WallClock: Sendable {
     func now() -> Date
 }
 
-/// 単調時計の時刻。起点はプロセスごとに決まり、プロセスをまたいで比べられない
+/// 単調時計の時刻。起点はプロセスに 1 つで、同じプロセスの中ならどの時計の値とも比べられる。プロセスをまたいでは比べられない
 public struct MonotonicInstant: Comparable, Sendable {
     public let nanoseconds: Int64
 
@@ -632,15 +636,14 @@ public struct SystemWallClock: WallClock {
 }
 
 /// スリープ中も進む時計を使う。割り込み中に端末がスリープしても空白区間の長さを測れる
+/// 起点はプロセスに 1 つ（型のプロパティ）。別々に作った時計の値どうしも比べられる
 public struct SystemMonotonicClock: MonotonicClock {
-    private let origin: ContinuousClock.Instant
+    private static let origin = ContinuousClock.now
 
-    public init() {
-        origin = ContinuousClock.now
-    }
+    public init() {}
 
     public func now() -> MonotonicInstant {
-        let elapsed = ContinuousClock.now - origin
+        let elapsed = ContinuousClock.now - Self.origin
         let (seconds, attoseconds) = elapsed.components
         return MonotonicInstant(nanoseconds: seconds * 1_000_000_000 + attoseconds / 1_000_000_000)
     }
@@ -650,7 +653,7 @@ public struct SystemMonotonicClock: MonotonicClock {
 | 決めたこと | 理由 |
 | --- | --- |
 | 単調時計は `ContinuousClock`（スリープ中も進む）を使う。`SuspendingClock`・`ProcessInfo.systemUptime` は使わない | 割り込み中はアプリがサスペンドされ、端末がスリープしうる。スリープで止まる時計では、空白区間の長さが実際より短くなる |
-| 単調時計の値を永続化しない | 起点がプロセスごとに違う。再起動をまたぐと比べられない。強制終了で開いたままになった空白区間の長さは「不明」にする（[storage.md](storage.md) §9） |
+| 単調時計の起点はプロセスに 1 つにする（`SystemMonotonicClock.origin` は型のプロパティ）。値を永続化しない | 時計をインスタンスごとの起点にすると、別々に作った時計（録音と保存など）の値を比べたときに差が狂う。起点がプロセスごとに違うので、再起動をまたぐと比べられない。強制終了で開いたままになった空白区間の長さは「不明」にする（[storage.md](storage.md) §9） |
 | プライバシーマニフェストから「システムの起動時間」（`35F9.1`）の申告を外す | Apple の一覧で対象になっているのは `systemUptime` と `mach_absolute_time()` で、どちらも呼ばない（[dev-environment.md](dev-environment.md) §14.1 を同じ作業で直した）。`no_direct_clock` がこの 2 つを `SystemDependencies/` の外で禁止している |
 | 待ち合わせは `Scheduler.sleep(for:)` の 1 つだけ。本番の実装（`SystemScheduler`）は `Task.sleep` を呼ぶ（`no_direct_sleep_timer` の例外の場所に置く） | 最初のバッファの時間切れ（[recording.md](recording.md) §3.4）と、ジョブの再試行の間隔・時間切れ（[transcription.md](transcription.md)）に使う。待った時間を時刻として数えない（INV-08） |
 | ID は `makeUUID()` の 1 つだけ | 会議 ID・書き出し ID・ジョブの実行世代のどれも UUID で足りる。用途ごとの型（`MeetingID` など）へは呼び出し側で包む |
@@ -1045,8 +1048,8 @@ public protocol LogSink: Sendable {
 | `recording_started` | recording | info | あり | `route`、`sample_rate`、`channels`、`duration_ms`（開始までの時間） |
 | `recording_start_failed` | recording | error | あり | `reason`、`os_code` |
 | `recording_state_changed` | recording | info | あり | `state` |
-| `recording_stopped` | recording | notice | あり | `reason`、`samples`、`count`（Chunk の数） |
-| `gap_opened` | recording | notice | あり | `reason`、`samples`（位置） |
+| `recording_stopped` | recording | notice | あり | `reason` |
+| `gap_opened` | recording | notice | あり | `reason` |
 | `gap_closed` | recording | notice | あり | `reason`、`duration_ms`、`resumed` |
 | `route_changed` | recording | info | あり | `route`、`sample_rate`、`channels`、`reason` |
 | `ring_overrun` | recording | error | あり | `count`（落としたフレーム数） |
@@ -1080,7 +1083,7 @@ public protocol LogSink: Sendable {
 | `problem_presented` | interface | info | — | `kind`（`ProblemKind`） |
 
 - **イベントを足すときは、この表と `LogEventName` を同じ作業で直す**（NFR-MNT-04）。
-- 欄 `bytes`・`samples`・`duration_ms` は大きさと長さで、内容ではない。会議の長さ（D3）を 1 つの値として出すことは避け、`recording_stopped` の `samples` も Chunk の数と合わせた記録に留める。**開始日時・確定日時などの日付と時刻は欄にしない**（SEC-LOG-02）。
+- 欄 `bytes`・`samples`・`duration_ms` は大きさと長さで、内容ではない。**会議の長さ（D3）と録音の中の位置を直接表す値は欄にしない**（SEC-LOG-02）: 累積のサンプル数（録音の中の位置・会議の全体の長さ）は出さない。`recording_stopped`・`gap_opened` に `samples` を置かないのはこのためである（`recording_stopped` の `count` も、停止のイベントに会議の大きさを添えないために外した）。SEC-LOG-02 が認める件数・連番（`chunk_sealed` の `sequence` など）は出してよいが、連番や大きさの組から長さをおおよそ推定できることは許容する範囲として扱い、長さそのものは書かない。`samples` は 1 つの Chunk の中の数（`chunk_sealed`。上限 30 秒）、`duration_ms` は会議の長さでない区間の長さ（開始までの時間・空白区間など）に限る。会議の位置や長さを診断に使う欄を足すときは、先に定義と公開の範囲を決めて SEC-LOG-02 との関係を本節に書く。**開始日時・確定日時などの日付と時刻は欄にしない**（SEC-LOG-02）。
 - ログは診断のためのもので、処理の記録（ジョブの状態・計測値）の代わりにしない。永続化が要る値は SQLite に置く（[storage.md](storage.md) §3）。
 
 ### 9.3 出力と privacy の指定
@@ -1204,7 +1207,7 @@ struct MeetingStateMachineTests {
     }
 
     static let events: [MeetingEvent] = [.stopRequested(.manual), .finalizationStarted, .barrierPassed, .barrierFailed]
-        + [.lossAcknowledged, .transcriptionStarted, .transcriptionPartiallyFailed, .transcriptionCompleted]
+        + [.lossAcknowledged, .transcriptionStarted(basedOn: nil), .transcriptionPartiallyFailed, .transcriptionCompleted]
 
     static let allowed: [Row] = [
         Row(from: .recording, event: .stopRequested(.manual), next: .stopRequested),
@@ -1212,8 +1215,8 @@ struct MeetingStateMachineTests {
         Row(from: .finalizing, event: .barrierPassed, next: .finalized),
         Row(from: .finalizing, event: .barrierFailed, next: .stopRequested),
         Row(from: .stopRequested, event: .lossAcknowledged, next: .finalized),
-        Row(from: .finalized, event: .transcriptionStarted, next: .transcribing),
-        Row(from: .transcribed, event: .transcriptionStarted, next: .transcribing),
+        Row(from: .finalized, event: .transcriptionStarted(basedOn: nil), next: .transcribing),
+        Row(from: .transcribed, event: .transcriptionStarted(basedOn: nil), next: .transcribing),
         Row(from: .transcribing, event: .transcriptionPartiallyFailed, next: .transcribing),
         Row(from: .transcribing, event: .transcriptionCompleted, next: .transcribed),
     ]
@@ -1223,9 +1226,17 @@ struct MeetingStateMachineTests {
         for state in MeetingStatus.allCases {
             for event in Self.events {
                 let expected = Self.allowed.first { $0.from == state && $0.event == event }?.next
-                #expect(MeetingStateMachine.reduce(state, event)?.next == expected)
+                #expect(MeetingStateMachine.reduce(state, event, currentVersion: nil)?.next == expected)
             }
         }
+    }
+
+    @Test("TST-GEN-05 元の版が現在の版と合わない文字起こしの開始（遅れて届いた重複）は拒否される")
+    func staleTranscriptionStart() {
+        let duplicate = MeetingStateMachine.reduce(.transcribed, .transcriptionStarted(basedOn: nil), currentVersion: 1)
+        let retry = MeetingStateMachine.reduce(.transcribed, .transcriptionStarted(basedOn: 1), currentVersion: 1)
+        #expect(duplicate == nil)
+        #expect(retry?.next == .transcribing)
     }
 }
 ```
@@ -1354,6 +1365,7 @@ struct MeetingStateMachineTests {
 | NFR-UX-04 | エラー / NFR-UX-04 すべての分類が問題の種類に写る | MinutesDomainTests | 未実装 |
 | TST-GEN-01 | 差し替え / TST-GEN-01 手動の時計は進めた分だけ進む | MinutesDomainTests | 未実装 |
 | TST-GEN-05 | 共通の型 / TST-GEN-05 世代を進めると前の世代と一致しない | MinutesDomainTests | 未実装 |
+| TST-GEN-05 | 会議の状態遷移 / TST-GEN-05 元の版が現在の版と合わない文字起こしの開始… | MinutesDomainTests | 未実装 |
 | TST-GEN-07 | 差し替え / TST-GEN-07 連番の ID は同じ順序で同じ値を返す | MinutesDomainTests | 未実装 |
 | TST-GEN-02 | 各結合テストが `TemporaryDirectory` を使う（[storage.md](storage.md) §12） | MinutesStorageTests | 未実装 |
 | TST-GEN-04 | 各サービスのテストが差し替えだけで動く（各文書） | MinutesApplicationTests | 未実装 |

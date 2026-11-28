@@ -1646,7 +1646,7 @@ public protocol ProtectionCoordinating: Sendable {
 | 2 | DB を開く。壊れていれば退避して作り直す | §3.5。作り直した・`db/rebuild-pending` が残っている場合は、手順 4 の対象を全会議にする |
 | 3 | 削除の続きを行う | `tombstones/` の記録と、DB の墓標のある会議（§10 の手順 2 から）。**照合より先に行う** |
 | 4 | 会議を照合する | 下の「照合」。`transcribing`・`transcribed` の会議は、状態を DB と `meeting.json` で比べて `meeting.json` を書き直すだけ |
-| 5 | `recording` のまま残っていた会議を `stop_requested` にする | 事象 `stopRequested`。理由は、開いたままの空白区間があれば `interruption_unresumed`、なければ `terminated`。検出時刻は起動の時刻 |
+| 5 | `recording` のまま残っていた会議を `stop_requested` にする | 事象 `stopRequested`。理由は、長さと終了時刻が「不明」で再開しなかった空白区間（照合の g が閉じたもの。`pendingInterruption` から作ったものを含む）が永続データにあれば `interruption_unresumed`、なければ `terminated`（手順 4 と 5 の間で落ちても、次の起動で同じ理由になる）。検出時刻は起動の時刻 |
 | 6 | `stop_requested`・`finalizing` の会議の Barrier を評価し、通れば `finalized` にする | §6.2 の手順 3〜5（メモリ上の未保存は 0 件）。通らなければ確定待ちとして残す。`finalizing` のまま残っていた会議は、先に `barrierFailed` で `stop_requested` に戻してから評価する |
 | 7 | `processing` のジョブを回収し、`transcribing` の会議の不足したジョブを作る | [transcription.md](transcription.md) §5 |
 | 8 | 書き出しの一時ファイルを削除する | [export.md](export.md) §6 |
@@ -1666,7 +1666,7 @@ public protocol ProtectionCoordinating: Sendable {
 | d | 正式名のファイルがあり DB に行がないものを、検査（§6.1 の順 2〜5）のうえで登録する。**開始サンプルは、同じ連番のハッシュの記録の `startSample` を使う**（§3.2。前の Chunk のファイルから求めない）。記録がない・読めない・`startSample` を持たない場合は、開始位置を不明（`start_sample` が `NULL`）として `invalid` で登録し（`register` とは別の入口 `ChunkTable.registerWithUnknownStart`: 1 取引で、`start_sample` を `NULL`・`file_state` を `invalid` にして行を作り、`total_samples` を更新しない。`ChunkRow.startSample` は seal の経路では常に分かっているので、`register` は変えない）、その連番を「位置の分からない録音」として復旧の結果に数え（[ui.md](ui.md) §4.7）、Barrier の不成立の理由にする（位置を推定しない）。DB を作り直した場合は、WAV のない連番もハッシュの記録があれば、記録の開始サンプルとサンプル数で行を作って `missing` にする（記録は WAV と別のファイルなので、WAV が失われても失われた音声の位置を示せる） |
 | e | DB に行がありファイルがないものを `missing` にする |
 | f | 未保存の記録を突き合わせる（下の「未保存の記録」） |
-| g | 開いたままの空白区間を閉じる: 長さと終了時刻を「不明」（`null`）、再開を「いいえ」にする（基本設計 §8）。単調時計の値はプロセスをまたいで比べられないので、推定値で埋めない（[architecture.md](architecture.md) §6.2） |
+| g | `meeting.json` に割り込みの記録（`pendingInterruption`。§3.1）があれば、先に [recording.md](recording.md) §5.4 の「起動時の復旧での扱い」で空白区間に置き換える（同じ識別子の空白区間がなければ、基本設計 §8 の「開始位置が未確定の割り込みの記録」の規則で、c〜f の後の音声の末尾に開いた空白区間と長さが不明の欠落 `interruption_drain` を作る。あれば記録だけを除く）。そのうえで、開いたままの空白区間を閉じる: 長さと終了時刻を「不明」（`null`）、再開を「いいえ」にする（基本設計 §8）。単調時計の値はプロセスをまたいで比べられないので、推定値で埋めない（[architecture.md](architecture.md) §6.2） |
 | h | 音声が 1 サンプルもなく、会議の `quarantine/` が空で、未保存の記録もない会議を削除する（§10 の手順で。件数だけ記録する）。隔離したデータまたは未保存の記録があれば、削除せず一覧に残す |
 
 **書きかけの救済**（FR-RCV-02）は、ファイルの長さだけから計画を決める。
@@ -1737,7 +1737,7 @@ public enum UnsavedReconcile: Equatable, Sendable {
 | 順 | 処理 | 途中で落ちた場合 |
 | --- | --- | --- |
 | 0 | 録音中の会議なら拒否する。その会議の文字起こしの開始・再試行・不足分の作成、新しい書き出しの要求（[export.md](export.md) §3）、録音データと記録の書き込みを拒否し始める（永続化した削除要求がある間は、再起動の後も拒否を続ける） | 何も消えていない |
-| 1 | 削除要求（`tombstones/{meetingId}`）を原子的に作って同期し、続けて `meetings.deletion_requested_at` を記録する。この時点で一覧から消える。削除要求を作れなければ、文字起こし・書き出しを中止せずに削除を中止する。**続けて**、文字起こし中・書き出し中なら中止を要求し、中止の完了（エンジンの停止の確認とジョブの完了の処理の終わり。書き出しの後始末の終わり。[transcription.md](transcription.md) §8.3）を、注入した `Scheduler` で上限 **10 秒**（設計値。`StorageTuning.deletionCancelTimeoutMs`）まで待つ。上限までに完了しなければ、削除要求を残したまま手順 2 以降に進まず、問題 `deletion_incomplete` を表示する | 削除要求があれば、次の起動で手順 2 から続ける（再起動の後には、前の起動のエンジンの実行は残らない） |
+| 1 | 削除要求（`tombstones/{meetingId}`）を原子的に作って同期し、続けて `meetings.deletion_requested_at` を記録する。この時点で一覧から消える。削除要求を作れなければ、文字起こし・書き出しを中止せずに削除を中止し、手順 0 で始めた拒否（その会議の文字起こしの開始・再試行・不足分の作成、録音データと記録の書き込み、`ExportService.rejectExports(for:)`）を同じプロセスの中で解除する（`ExportService.acceptExports(for:)`。再起動を待たない。拒否が続くのは永続化した削除要求がある間だけ）。**続けて**、文字起こし中・書き出し中なら中止を要求し、中止の完了（エンジンの停止の確認とジョブの完了の処理の終わり。書き出しの後始末の終わり。[transcription.md](transcription.md) §8.3）を、注入した `Scheduler` で上限 **10 秒**（設計値。`StorageTuning.deletionCancelTimeoutMs`）まで待つ。上限までに完了しなければ、削除要求を残したまま手順 2 以降に進まず、問題 `deletion_incomplete` を表示する | 削除要求があれば、次の起動で手順 2 から続ける（再起動の後には、前の起動のエンジンの実行は残らない） |
 | 2 | `tmp/export/{meetingId}/` を丸ごと消す | 同上 |
 | 3 | 会議ディレクトリを丸ごと消す | 同上 |
 | 4 | DB の行を消し（子の表は連鎖して消える）、`checkpointTruncate()` で WAL を切り詰める | 同上 |

@@ -246,7 +246,7 @@ public enum WAVAnnotation {
 | 書き出し ID | 書き出しごとに `IDGenerator.makeUUID()` で作る。一時のディレクトリの名前と、要求と応答の対応付けに使う |
 | 同時の書き出し | 1 つの会議につき、同時に 1 つ。進行中に次の要求が来たら、前の書き出しを中止して片付けてから始める |
 | 古い応答 | 進み具合・完了・失敗には、書き出し ID を添える。`ExportStore` は、現在の書き出し ID と合わない応答を捨てる（TST-GEN-05） |
-| 削除との関係 | `DeletionService` は、確認の後すぐに `ExportService.rejectExports(for:)` を呼ぶ。以後、その会議の `begin` は `meetingBeingDeleted` を返す（書き出し中でなくても）。書き出し中なら、削除要求を永続化した後に中止し、中止の完了（一時ファイルへの書き込みが止まったこと）を返してから、削除が進む（上限 10 秒。[storage.md](storage.md) §10 の手順 1） |
+| 削除との関係 | `DeletionService` は、確認の後すぐに `ExportService.rejectExports(for:)` を呼ぶ。以後、その会議の `begin` は `meetingBeingDeleted` を返す（書き出し中でなくても）。削除要求を作れずに削除を中止した場合は、`DeletionService` が同じプロセスの中で `ExportService.acceptExports(for:)` を呼んで拒否を解除する（再起動を待たない）。書き出し中なら、削除要求を永続化した後に中止し、中止の完了（一時ファイルへの書き込みが止まったこと）を返してから、削除が進む（上限 10 秒。[storage.md](storage.md) §10 の手順 1） |
 | 保存の入口 | `ExportService` は、Domain の protocol（`ExportSource`: Chunk の一覧と検証つきの読み出し、版の読み出し、会議のメタデータ。`ExportSink`: 一時ファイルの作成・追記・削除）越しに `MeetingStore` を使う。一時ファイルを作る関数は、会議に削除要求がないことを確かめる |
 
 ### 3.3 書き出しの画面（SC-07）と共有シート

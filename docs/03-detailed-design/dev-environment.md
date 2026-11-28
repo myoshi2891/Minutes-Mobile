@@ -1372,11 +1372,11 @@ useDefault = true
 
 | 規則 | 内容 |
 | --- | --- |
-| 必須の行 | リポジトリ直下の `.gitignore` に、次の 13 行がある: `*.wav`・`*.m4a`・`*.caf`・`*.zip`（録音データと書き出したアーカイブ）、`*.sqlite`・`*.sqlite-wal`・`*.sqlite-shm`（試験で作った DB）、`.env`・`.env.*`（秘密情報）、`xcuserdata/`・`DerivedData/`・`.build/`・`/build/`（個人の設定とビルドの成果物。`/build/` はリポジトリ直下だけを除外し、下位の `build` という名前のディレクトリは追跡して検査する。`.gitignore` の注記と同じ）。コメントにした行は、ないものとして扱う |
+| 必須の行 | リポジトリ直下の `.gitignore` に、次の 14 行がある: `*.wav`・`*.m4a`・`*.caf`・`*.zip`（録音データと書き出したアーカイブ）、`*.sqlite`・`*.sqlite-wal`・`*.sqlite-shm`（試験で作った DB）、`.env`・`.env.*`（秘密情報）、`xcuserdata/`・`DerivedData/`・`.build/`・`/build/`・`*.xcresult`（個人の設定とビルドの成果物。`*.xcresult` はテストの結果のバンドルで、添付・ログを含みうる。`/build/` はリポジトリ直下だけを除外し、下位の `build` という名前のディレクトリは追跡して検査する。`.gitignore` の注記と同じ）。コメントにした行は、ないものとして扱う |
 | 取り消しの禁止 | どの階層の `.gitignore` にも、除外を取り消す行（`!` で始まる行）を置かない |
 | インデックスの中身 | 追跡しているファイルとステージしたファイル（`git ls-files`）に、必須の行が除外する対象がない。ファイル名は大文字と小文字を区別しない（`REC.WAV` も違反）。ファイル名の型（`*.wav`・`.env` など）は、git と同じくパスのどの階層の名前にも当てはめる（`rec.wav/notes.txt` のように、名前が型に合うディレクトリの下のファイルも違反。`docs/environment.md` のように型に合わない名前は通る） |
 
-- **規則はインデックスの内容で判定する。** 必須の行と、追跡している `.gitignore`（入れ子を含む。作業ツリーから消したものも）の取り消しの行は、インデックスにある内容（`git cat-file blob :<パス>`。textconv などのフィルタを通さない）で確かめ、作業ツリーの内容を使わない。そのため、コミット前（`--staged`）でも、コミットに入る `.gitignore` の内容で合否が決まる（ステージしていない `.gitignore` の変更で合否を変えない）。直下の `.gitignore` がインデックスになければ失敗する。追跡していない入れ子の `.gitignore` は、インデックスに内容がないが `git add` の対象を変えうるので、取り消しの行だけを作業ツリーの内容で確かめる。録音データをステージすると、コミット前の検査が手順 3 で止まる。
+- **規則はインデックスの内容で判定する。** 必須の行と、追跡している `.gitignore`（入れ子を含む。作業ツリーから消したものも）の取り消しの行は、インデックスにある内容（`git cat-file blob :<パス>`。textconv などのフィルタを通さない）で確かめ、作業ツリーの内容を使わない。そのため、コミット前（`--staged`）でも、コミットに入る `.gitignore` の内容で合否が決まる（ステージしていない `.gitignore` の変更で合否を変えない）。直下の `.gitignore` がインデックスになければ失敗する。追跡していない入れ子の `.gitignore` は、インデックスに内容がないが `git add` の対象を変えうるので、取り消しの行だけを作業ツリーの内容で確かめる。それ自身が無視された `.gitignore`（`.gitignore` の行を持つものなど）も、git はその規則を使うので含める（`git ls-files --others --ignored --exclude-standard --directory` で探す。無視されたディレクトリの中は git が読まないので降りない）。行は git と同じく LF だけで区切り、行末の CR を 1 つと末尾の空白だけを除く（U+2028 などを区切りにしない。タブは除かない）。録音データをステージすると、コミット前の検査が手順 3 で止まる。
 - `git` は、リポジトリの場所を指す引き継いだ変数（`GIT_DIR`・`GIT_WORK_TREE`・`GIT_COMMON_DIR`・`GIT_OBJECT_DIRECTORY`・`GIT_ALTERNATE_OBJECT_DIRECTORIES`）を外した環境で実行する（`--root` 以外のリポジトリを読まない。`setup.sh` と同じ考え方）。`GIT_INDEX_FILE` は外さない（部分的なコミットのフックと `check.sh --staged` が、検査するインデックスをこの変数で渡すため）。パスの指定の解釈を変える引き継いだ変数（`GIT_LITERAL_PATHSPECS`・`GIT_GLOB_PATHSPECS`・`GIT_NOGLOB_PATHSPECS`・`GIT_ICASE_PATHSPECS`）も外す（`GIT_LITERAL_PATHSPECS` は `:(glob)**/.gitignore` を名前そのものとして読ませ、入れ子の `.gitignore` を見落とさせるため）。`git` には `--no-replace-objects` を付け、置き換えのオブジェクト（`git replace`）で、インデックスが指す `.gitignore` の blob を別の内容に見せかけさせない（`gitleaks-history.sh` の `GIT_NO_REPLACE_OBJECTS=1` と同じ考え方）。
 - ファイルの一覧は NUL 区切りで受け取る（空白・日本語を含む名前を、そのまま扱うため）。
 - **読めないものを合格にしない。** Git の管理下でない場所・`git` の失敗は、終了コード 2 で失敗する。
@@ -1482,7 +1482,7 @@ PRIVACY_ACCESSED_API_REASONS: Dict[str, Tuple[str, ...]] = {
 - 共有拡張かどうかは、Info.plist の拡張の種類で判定する。ウィジェット（Live Activity）だけを認める。
 - プライバシーマニフェスト（2026-11-17 に追加。SEC-PRV-03）は、リポジトリ内のすべての `.xcprivacy` を読む。
   - どのマニフェストも、`NSPrivacyTracking` が `false`、`NSPrivacyTrackingDomains` と `NSPrivacyCollectedDataTypes` が空の配列であること（鍵がない場合も違反。申告を明示させる）。
-  - どのマニフェストも、申告する API の種類と理由コードが、上の表（`PRIVACY_ACCESSED_API_REASONS`）にあるものだけであること。
+  - どのマニフェストも、申告する API の種類と理由コードが、上の表（`PRIVACY_ACCESSED_API_REASONS`）にあるものだけであること。申告した種類ごとに、理由コードが 1 つ以上あること（拡張のマニフェストも同じ。種類そのものを申告しないことは認める）。
   - アプリのターゲットは、`<ターゲット名>/PrivacyInfo.xcprivacy` があり、表の 3 つをすべて申告していること。拡張のマニフェスト（置く場合）は、表の一部だけでよい。
   - 検査が確かめるのは「申告が設計どおりか」までである。実際に使っている API と申告が合っているかは確かめられないので、理由の申告が必要な API を新しく使うときは、§14.1 とこの表を同じ作業で直す（レビューで確かめる）。
 
