@@ -2240,6 +2240,14 @@ def worktree_location_case() -> None:
                env=env)
         if not count_before or gone.exists():
             failures.append("worktree-location: ディレクトリのない作業ツリーの場所に、判定でディレクトリを作った")
+        # 大文字と小文字を区別しないボリュームでは、綴りの大小だけが違う置き場所も同じ作業ツリーの中として認めない。
+        # 名前の前の部分が同じ隣の場所（gone と GONE-other）は認める。区別するボリュームでは別の名前として認める
+        sensitive = os.pathconf(directory, 11)  # _PC_CASE_SENSITIVE（macOS の sys/unistd.h）
+        expect("worktree-location: 大小だけが違う、ディレクトリのない作業ツリーの中", [*command, str(Path(directory) / "GONE" / "base"),
+               str(repository)], 0 if sensitive else 1, "" if sensitive else "ディレクトリがない", env=env)
+        expect("worktree-location: 大小だけが違う名前の隣", [*command, str(Path(directory) / "GONE-other"), str(repository)], 0, env=env)
+        if gone.exists():
+            failures.append("worktree-location: 大小の違う置き場所の判定でディレクトリを作った")
         # 判定の間に作業ツリーが登録された（2 回目の一覧にだけ登録がある）場合は認めない。git の代わりは、2 回目以降の
         # worktree list の出力に登録を 1 つ足す
         shims = Path(directory) / "shims"
@@ -8201,6 +8209,11 @@ def run_docs_cases() -> None:
         ("引用の怠惰な続きの行をまたぐリンクの文", "> [例\n続き](missing.md)", "missing.md"),
         ("入れ子の引用の浅くなる続きの行をまたぐリンクの文", "> > [例\n> 続き](missing.md)", "missing.md"),
         ("怠惰な続きの行をまたぐ、あるリンク先", "> [例\n続き](../README.md)", ""),
+        # 怠惰な続きの行の後に元の深さへ戻る行は、同じ段落の続き（段落の深さは怠惰な続きの行で浅くならない）。
+        # 段落の深さより深くなる行だけが入れ子に入る
+        ("浅くなった後に元の深さへ戻る続きの行", "> > [例\n> 続き\n> > 続き](missing.md)", "missing.md"),
+        ("怠惰な続きの後に引用へ戻る続きの行", "> [例\n続き\n> 続き](missing.md)", "missing.md"),
+        ("怠惰な続きの後に段落より深くなる括弧", "> [例\n続き\n> > 続き](missing.md)", ""),
         # リンクの中にリンクは入らない。内側がリンクになれば、外側の「[」は文字のまま表示される。画像の外側は無効にしない
         ("入れ子のリンクの外側", "[外 [内](../README.md)](missing.md)", ""),
         ("入れ子のリンクの内側", "[外 [内](missing.md)](../README.md)", "missing.md"),

@@ -1192,7 +1192,7 @@ class Checker:
             entries: List[Tuple[int, str, bool]] = []
             previous = 0  # 前の行の番号
             continued = False  # 前の行が段落の途中で、次の行に続きうる
-            previous_depth = 0  # 前の行の引用の深さ（「>」の数）
+            previous_depth = 0  # 前の行までの段落の引用の深さ（「>」の数。怠惰な続きの行では浅くならない）
             code = IndentedCode()
             for number, line in prose_lines(text):
                 # 引用の行は、印を除いた本文で段落の続きを判定する（「> [例」「> 続き](x.md)」を 1 つの段落として読む）。
@@ -1204,7 +1204,9 @@ class Checker:
                 # 段落の切れ目（空行・フェンスなどで番号が続かない・新しいブロックの始まり）をまたいでリンクの文は続かない
                 starts = (number != previous + 1 or not body.strip() or BLOCK_START.match(body) is not None or not continued
                           or depth > previous_depth)
-                previous_depth = depth
+                # 怠惰な続きの行（段落の途中で浅くなる行）は段落の深さを保つ。続く行が元の深さに戻っても入れ子に入ったとは
+                # みなさない（「> > [例」「> 続き」「> > 続き](x.md)」は 1 つの段落）。段落が始まる行で深さを読み直す
+                previous_depth = depth if starts else max(depth, previous_depth)
                 if number != previous + 1:
                     code.interrupt()
                 previous = number
