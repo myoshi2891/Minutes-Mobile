@@ -6994,6 +6994,11 @@ def test_tracked() -> None:
     tracked_case("コメントの中の U+2028 の後の型を行と見なさない", 1, "*.wav の行がない",
                  ignore=replaced(OK_GITIGNORE, "*.wav\n", "# 録音\u2028*.wav\n"))
     tracked_case("行末のタブは除かない", 1, "*.wav の行がない", ignore=replaced(OK_GITIGNORE, "*.wav\n", "*.wav\t\n"))
+    # 先頭の BOM は git と同じく 1 つだけ除く（途中の BOM は git も除かないので、行の一部として残す）
+    tracked_case("先頭の BOM の後の必須の行を読む", 0, "OK", ignore="\ufeff" + OK_GITIGNORE.replace("# 録音データ\n", "", 1))
+    tracked_case("先頭の BOM の後の取り消しを見落とさない", 1, "Tests/.gitignore", files={"Tests/.gitignore": "\ufeff!*.wav\n"})
+    tracked_case("途中の BOM の後の型を行と見なさない", 1, "*.wav の行がない",
+                 ignore=replaced(OK_GITIGNORE, "*.wav\n", "\ufeff*.wav\n"))
     # ファイル名の型は、祖先のディレクトリの名前にも当てはめる（git は *.wav に合うディレクトリの下をすべて除外する）
     tracked_case("名前が型に合うディレクトリの下のファイル", 1, "exports/rec.wav/notes.txt", files={"exports/rec.wav/notes.txt": "x"})
     tracked_case("名前が .env のディレクトリの下のファイル", 1, "config/.env/token", files={"config/.env/token": "x"})

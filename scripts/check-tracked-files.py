@@ -87,7 +87,10 @@ def meaningful_lines(text: str) -> List[str]:
 
     splitlines は U+2028・U+0085・U+000C なども区切りにするので使わない（「# 注記<U+2028>*.wav」のコメントの中から
     必須の行を拾わない）。タブなどほかの空白も、git が残すので除かない（「*.wav<TAB>」を *.wav の行と見なさない）。
+    先頭の UTF-8 の BOM は、git と同じく 1 つだけ除く（「<BOM>!*.wav」を取り消しの行として読む）。途中の BOM は残す。
     """
+    if text.startswith("\ufeff"):
+        text = text[1:]
     lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
     lines = [line.rstrip(" ") for line in lines]
     return [line for line in lines if line and not line.startswith("#")]
