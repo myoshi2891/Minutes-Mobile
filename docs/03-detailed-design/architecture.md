@@ -434,6 +434,7 @@ public struct AudioTimeline: Equatable, Sendable {
 - `stopRequested` の理由は `manual`・`interruption_unresumed`・`no_input`・`disk_full`・`write_failed`・`terminated`（FR-INT-05）。`write_failed` は保持の上限による停止のうち、原因がすべて容量の不足とは判定できない場合で、停止の手順・保持・再試行・通知の有無は `disk_full` と同じ（違うのは記録する理由と利用者への文言だけ。基本設計 [storage.md](../02-basic-design/storage.md) §6 の「停止理由」）。起動時の復旧で `recording` の会議を止める場合も同じ事象を使う（理由が `terminated` または `interruption_unresumed`）。
 - `finalizationStarted` は「末尾の Chunk の保存が終わった」と「確定待ちからの再試行」の両方で使う（どちらも `stop_requested` → `finalizing`）。
 - `transcriptionStarted` は、最初の文字起こし・再文字起こし・失敗区間の再試行で共通に使う。**元の版**（開始を決めた時点で表示していた版。`meetings.current_version`。版がなければ `nil`）を持ち、`reduce` に渡した現在の版と一致するときだけ受け付ける。遅れて届いた重複の開始は、その開始が作った版（または別の開始が作った版）で現在の版が進んでいるので拒否される。失敗区間の再試行は実行番号を変えない（[transcription.md](transcription.md) §7）ので、実行番号では区別しない
+- `transcriptionCompleted` は、試行ごとに一意な識別として `merge_transcript` の**実行世代**（`processing` に入るたびに発行する UUID。失敗区間の再試行でも新しく発行する。[transcription.md](transcription.md) §5.3）で対応付ける。`reduce` に渡すのは、版の保存の取引（[transcription.md](transcription.md) §6.3 の手順 5）の中で、通知の実行世代が行の実行世代と一致し、`merge_transcript` を `succeeded` にできたときだけである。遅れて届いた古い試行・重複の完了は、この照合で取引ごと捨てられ、事象として届かない。照合を通らない経路で `transcriptionCompleted` を届けない（NS-T-04）
 - 「状態を保存」は、SQLite と `meeting.json` の両方への保存を指す。順序と失敗時の扱いは [storage.md](storage.md) §5 にある。
 - P2 の状態（`summarizing`・`completed`）は、この列挙型にまだない。永続データに未知の状態があれば、検証の失敗として「読めない会議」にする（クラッシュも削除もしない。TST-RCV-04）。
 

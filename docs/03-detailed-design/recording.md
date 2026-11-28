@@ -175,12 +175,17 @@ public enum AudioInputFailure: Error, Equatable, Sendable {
 
 /// 音声入力（注入点）。本番は EngineAudioInput、テストは ScriptedAudioInput
 public protocol AudioInput: Sendable {
-    /// 入力を作り直し、ネイティブ形式を読む（まだ開始しない）。使える入力がなければ失敗する
-    func prepare() async throws(AudioInputFailure) -> InputFormat
-    /// prepare で読んだ形式のまま開始する。コールバックは sink へ書くだけにする
-    func start(sink: any CaptureSink) async throws(AudioInputFailure)
+    /// その世代の入力を作り直し、ネイティブ形式を読む（まだ開始しない）。使える入力がなければ失敗する
+    func prepare(generation: Generation) async throws(AudioInputFailure) -> InputFormat
+    /// prepare で読んだ形式のまま、その世代の入力を開始する。コールバックは sink へ書くだけにする
+    func start(generation: Generation, sink: any CaptureSink) async throws(AudioInputFailure)
     /// 入力を止めて tap を外す。止まっていれば何もしない
     func stop() async
+    /// その世代の tap の取り外しと入力の停止を、入力の制御の直列キューの外から指示する（§5.4 の②）。
+    /// その世代の開く呼び出しが戻っていなければ、戻った直後に同じキューで行う予約にして、戻るのを待たない
+    func close(generation: Generation)
+    /// その世代の入力が止まり、tap が外れていれば真（§5.4 の③）。開く呼び出しが戻っていなければ偽
+    func isClosed(generation: Generation) async -> Bool
 }
 
 /// オーディオセッションから届く事象（iOS 27 の通知を写したもの。§3.3）
@@ -524,11 +529,14 @@ public final class CaptureRingBuffer: CaptureSink, @unchecked Sendable {
 ```swift
 public actor EngineAudioInput: AudioInput {
     private var engine: AVAudioEngine?
+    /// 開いている入力の世代。close・isClosed は、この世代のものだけを対象にする（§5.4）
+    private var generation: Generation?
 
-    // （prepare・stop は省略。prepare はエンジンを作り直し、入力ノードの形式を読む）
+    // （prepare・close・isClosed は省略。prepare はエンジンを作り直し、入力ノードの形式を読んで世代を記録する。
+    //   close は nonisolated で、開く呼び出しの完了を待たずに、その世代の停止と取り外しを予約する）
 
-    public func start(sink: any CaptureSink) throws(AudioInputFailure) {
-        guard let engine else { throw .noInputAvailable }
+    public func start(generation: Generation, sink: any CaptureSink) throws(AudioInputFailure) {
+        guard let engine, self.generation == generation else { throw .noInputAvailable }
         let node = engine.inputNode
         let native = node.outputFormat(forBus: 0)
         let channels = Int(native.channelCount)
@@ -581,7 +589,7 @@ public actor EngineAudioInput: AudioInput {
 | --- | --- |
 | 1 | リングバッファから取り出す（事前に確保した作業用の配列へ。最大 0.5 秒分ずつ） |
 | 2 | `.frames(n)` なら、全チャンネルの平均でモノラルにし、変換器へ渡す。出てきた 16 kHz・Int16 のサンプルを手順 4 へ |
-| 3 | `.overrun(d)` なら、変換器の残りを吐き出して手順 4 へ渡し、変換器を作り直す。その位置（Chunk の組み立ての累積サンプル数）に、長さ `d × 1000 ÷ sample rate`（ms。切り捨て）の空白区間（理由 `overrun`）を開いてすぐ閉じる（§6） |
+| 3 | `.overrun(d)` なら、変換器の残りを吐き出して手順 4 へ渡し、変換器を作り直す。その位置（Chunk の組み立ての累積サンプル数）に、長さ `d × 1000 ÷ sample rate`（ms。切り捨て）の空白区間（理由 `overrun`）を開いてすぐ閉じる（§6）。**空白区間がすでに開いている間（再開の途中。手順 4 でサンプルを保持している間）は、新しい空白区間を開かない**（§6 の「同時に開く数」）。あふれ（落としたフレーム数と、保持したサンプルの中の位置）を保持したサンプルと並べて記録し、開いている空白区間を閉じて保持したサンプルを Chunk の組み立てへ渡すとき（§5.3 の `restart` の⑤）に、その位置で開いてすぐ閉じる。保持したサンプルを捨てる場合（`discardHeldSamples`・`abortRestart`）は、記録したあふれも捨て、落としたフレーム数をログ `ring_overrun` に残す |
 | 4 | 受け取ったサンプルを、入力レベルの計算（§4.6）と Chunk の組み立て（§4.4）へ渡す。空白区間が開いている間（再開の途中）は渡さずに保持する（§5 の `restart`） |
 | 5 | `.empty` になったら終える |
 
@@ -740,6 +748,8 @@ public enum WAVHeader {
         let sizes = Int64(uint32(header, 4)) == 36 + dataBytes && fileSize == Int64(byteCount) + dataBytes
         guard sizes, dataBytes % 2 == 0 else { return .failure(.sizeMismatch) }
         guard dataBytes > 0 else { return .failure(.emptyData) }
+        // Chunk の上限（480,000 サンプル）を超えるものは、登録の前に不正として扱う
+        guard dataBytes / 2 <= Int64(AudioConstants.chunkSamples) else { return .failure(.sizeMismatch) }
         return .success(Int(dataBytes / 2))
     }
 
@@ -988,7 +998,7 @@ public struct RecordingTransition: Equatable, Sendable {
 
 | 副作用 | 実行すること | 失敗したとき |
 | --- | --- | --- |
-| `beginCapture(世代)` | セッションを設定して有効化する → 入力を作り直して形式を読む → リングバッファと変換器を作る → 入力を開始する → 取り出しを始める → 3 秒の時間切れを仕掛ける。最初のサンプルを取り出したら `firstBufferArrived(世代)` を届ける | `startFailed(世代, 分類)` を届ける |
+| `beginCapture(世代)` | セッションを設定して有効化する → 3 秒の時間切れ（`firstBufferTimeoutMs`）を仕掛ける → 入力を作り直して形式を読む → リングバッファと変換器を作る → 入力を開始する → 取り出しを始める。最初のサンプルを取り出したら `firstBufferArrived(世代)` を届ける。**入力を開く呼び出し（作り直し・開始）の戻りは、時間切れか世代の前進（停止の要求）までしか待たない。** どちらかが先に来たら、戻るのを待たずに `beginCapture` を終え、副作用の流れを空ける（後ろの `stopInput` が §5.4 の②〜④を行えるようにする）。戻っていない呼び出しは入力の制御の直列キューで続き、戻った直後に §5.4 の②の予約で止められる | `startFailed(世代, 分類)` を届ける（時間切れは「最初のバッファの時間切れ」。世代が進んだ後は届けない） |
 | `stopInput` | 入力を止めて tap を外す。取り出しの合図を止める | 失敗しない |
 | `drainAndFlush` | リングバッファが空になるまで取り出す（§4.3）。末尾のあふれを空白区間にする。変換器を吐き出す | 失敗しない（保存の失敗は [storage.md](storage.md) §7 の段階 3） |
 | `sealPartialChunk` | 組み立て中の音声を短い Chunk として確定する。0 サンプルなら何もしない | 保存の失敗は段階 3（メモリに保持して続ける） |

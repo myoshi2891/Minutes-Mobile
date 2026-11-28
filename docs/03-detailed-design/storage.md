@@ -1149,6 +1149,9 @@ public enum SealDecision: Equatable, Sendable {
                 // 既存のファイルの状態は、読み直したハッシュと記録の照合で決める
                 row.fileState = record.digest == nil || record.digest == incoming ? .present : .hashMismatch
                 _ = try ChunkTable.register(row, at: Timestamp(clock.now()), in: connection)
+            } else {
+                // 行があり登録を省く再試行でも、保存は済んでいるので同じ連番の未保存の記録を消す
+                try ChunkTable.removeUnsavedRecord(row, in: connection)
             }
             try files.remove(part)
             return .saved
@@ -1255,6 +1258,14 @@ Chunk の登録（1 取引）:
             }
             return .inserted
         }
+    }
+
+    /// 同じ連番の未保存の記録を消す（register の削除と同じ文。行があって登録を省いた重複の確定で使う）
+    static func removeUnsavedRecord(_ row: ChunkRow, in connection: SQLiteConnection) throws(StorageFailure) {
+        let key: [SQLValue] = [.text(row.meeting.description), .integer(Int64(row.sequence.value))]
+        try connection.execute(
+            "DELETE FROM unsaved_chunks WHERE meeting_id = ?1 AND sequence_no = ?2", key, stage: .register,
+        )
     }
 ```
 
@@ -1645,7 +1656,7 @@ public protocol ProtectionCoordinating: Sendable {
 | 1 | 保存ルートの属性を検証する | `StorageRoot.prepare()`（§2.3） |
 | 2 | DB を開く。壊れていれば退避して作り直す | §3.5。作り直した・`db/rebuild-pending` が残っている場合は、手順 4 の対象を全会議にする |
 | 3 | 削除の続きを行う | `tombstones/` の記録と、DB の墓標のある会議（§10 の手順 2 から）。**照合より先に行う** |
-| 4 | 会議を照合する | 下の「照合」。`transcribing`・`transcribed` の会議は、状態を DB と `meeting.json` で比べて `meeting.json` を書き直すだけ |
+| 4 | 会議を照合する | 下の「照合」。`transcribing`・`transcribed` の会議は、状態を DB と `meeting.json` で比べて `meeting.json` を書き直す。DB を作り直した会議では、加えて版のファイルの索引を戻す（照合の h） |
 | 5 | `recording` のまま残っていた会議を `stop_requested` にする | 事象 `stopRequested`。理由は、長さと終了時刻が「不明」で再開しなかった空白区間（照合の g が閉じたもの。`pendingInterruption` から作ったものを含む）が永続データにあれば `interruption_unresumed`、なければ `terminated`（手順 4 と 5 の間で落ちても、次の起動で同じ理由になる）。検出時刻は起動の時刻 |
 | 6 | `stop_requested`・`finalizing` の会議の Barrier を評価し、通れば `finalized` にする | §6.2 の手順 3〜5（メモリ上の未保存は 0 件）。通らなければ確定待ちとして残す。`finalizing` のまま残っていた会議は、先に `barrierFailed` で `stop_requested` に戻してから評価する |
 | 7 | `processing` のジョブを回収し、`transcribing` の会議の不足したジョブを作る | [transcription.md](transcription.md) §5 |
@@ -1667,7 +1678,8 @@ public protocol ProtectionCoordinating: Sendable {
 | e | DB に行がありファイルがないものを `missing` にする |
 | f | 未保存の記録を突き合わせる（下の「未保存の記録」） |
 | g | `meeting.json` に割り込みの記録（`pendingInterruption`。§3.1）があれば、先に [recording.md](recording.md) §5.4 の「起動時の復旧での扱い」で空白区間に置き換える（同じ識別子の空白区間がなければ、基本設計 §8 の「開始位置が未確定の割り込みの記録」の規則で、c〜f の後の音声の末尾に開いた空白区間と長さが不明の欠落 `interruption_drain` を作る。あれば記録だけを除く）。そのうえで、開いたままの空白区間を閉じる: 長さと終了時刻を「不明」（`null`）、再開を「いいえ」にする（基本設計 §8）。単調時計の値はプロセスをまたいで比べられないので、推定値で埋めない（[architecture.md](architecture.md) §6.2） |
-| h | 音声が 1 サンプルもなく、会議の `quarantine/` が空で、未保存の記録もない会議を削除する（§10 の手順で。件数だけ記録する）。隔離したデータまたは未保存の記録があれば、削除せず一覧に残す |
+| h | 版の索引を戻す: DB を作り直した会議で、`transcript/` の版のファイル（`v{版}.json`）ごとに、`transcript_versions` の行をハッシュの記録（`v{版}.sha256.json`）から作る。記録の値と版のファイルから計算し直した値が合わなければ完全性を `corrupt`、記録がない・読めない・版の番号が合わなければ `invalid` にする（計算し直した値を記録として採用しない。[transcription.md](transcription.md) §6.3）。`meetings.current_version` は `meeting.json` の現在の版を使う。一時ファイル（`v{版}.json.tmp` など）は行にしない |
+| i | 音声が 1 サンプルもなく、会議の `quarantine/` が空で、未保存の記録もない会議を削除する（§10 の手順で。件数だけ記録する）。隔離したデータまたは未保存の記録があれば、削除せず一覧に残す |
 
 **書きかけの救済**（FR-RCV-02）は、ファイルの長さだけから計画を決める。
 
