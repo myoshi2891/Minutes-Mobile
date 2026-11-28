@@ -7,8 +7,8 @@
    （git add --force は .gitignore を越えるので、インデックスの側も調べる）
 
 1・2 は、インデックスにある .gitignore の内容で判定する（作業ツリーの内容ではない。コミット前の検査で、ステージしていない
-.gitignore の変更に合格を左右させない）。追跡していない入れ子の .gitignore は、インデックスに内容がないが git add の対象を
-変えうるので、2 だけを作業ツリーの内容で判定する。
+.gitignore の変更に合格を左右させない）。追跡していない入れ子の .gitignore（それ自身が無視されたものを含む）は、インデックスに内容がないが
+git add の対象を変えうるので、2 だけを作業ツリーの内容で判定する。
 git の環境のうち、別のリポジトリを指しうる変数（GIT_DIR など）と、パスの指定の解釈を変える変数（GIT_LITERAL_PATHSPECS など）は
 外す。GIT_INDEX_FILE は残す（部分的なコミットのフックと check.sh --staged が、検査するインデックスをこの変数で渡すため）。
 置き換えのオブジェクト（git replace）は使わない（--no-replace-objects。インデックスが指す元の blob を読む）。
@@ -42,6 +42,8 @@ REQUIRED_IGNORE_LINES: Dict[str, str] = {
     ".build/": "ビルドの成果物",
     # build はリポジトリ直下だけ（下位の build という名前のディレクトリは追跡して検査する。.gitignore の注記と同じ）
     "/build/": "ビルドの成果物",
+    # テストの結果のバンドル（添付・ログ・画面の記録を含みうる）。ディレクトリなので、パスのどの階層の名前にも当てはめる
+    "*.xcresult": "テストの結果",
 }
 
 
@@ -81,8 +83,13 @@ def git_paths(root: Path, *arguments: str) -> List[str]:
 
 
 def meaningful_lines(text: str) -> List[str]:
-    """コメントと空行を除いた行を返す。"""
-    lines = [line.rstrip() for line in text.splitlines()]
+    """コメントと空行を除いた行を返す。git と同じく LF だけで区切り、行末の CR を 1 つと末尾の空白（U+0020）だけを除く。
+
+    splitlines は U+2028・U+0085・U+000C なども区切りにするので使わない（「# 注記<U+2028>*.wav」のコメントの中から
+    必須の行を拾わない）。タブなどほかの空白も、git が残すので除かない（「*.wav<TAB>」を *.wav の行と見なさない）。
+    """
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    lines = [line.rstrip(" ") for line in lines]
     return [line for line in lines if line and not line.startswith("#")]
 
 
@@ -137,7 +144,12 @@ def check(root: Path) -> List[str]:
                 errors.append(f"[SEC-SUP-04] .gitignore に {pattern} の行がない（{reason}。インデックスの内容で判定）")
     # 取り消しの行: 追跡している .gitignore はインデックスの内容（作業ツリーから消したものも含む）、
     # 追跡していない .gitignore は作業ツリーの内容で判定する
-    untracked = sorted(set(git_paths(root, "--others", "--exclude-standard", *patterns)) - set(indexed))
+    # 追跡していない .gitignore には、それ自身が無視されているもの（「.gitignore」の行を持つものなど）も含める。
+    # git は無視された .gitignore の規則も使うので、取り消しの行を見落とさない。--directory で、無視されたディレクトリは
+    # 中に降りずに「名前/」の 1 行にする（.tools・.build などを辿らない。git は無視されたディレクトリの .gitignore を読まない）
+    ignored = [name for name in git_paths(root, "--others", "--ignored", "--exclude-standard", "--directory", *patterns)
+               if not name.endswith("/") and name.rsplit("/", 1)[-1] == ".gitignore"]
+    untracked = sorted((set(git_paths(root, "--others", "--exclude-standard", *patterns)) | set(ignored)) - set(indexed))
     sources = [(name, indexed_lines(root, name)) for name in indexed]
     sources += [(name, working_lines(root / name)) for name in untracked if (root / name).is_file()]
     for name, lines in sources:

@@ -788,6 +788,11 @@ def check_privacy_manifest(source: str, path: Path, complete: bool, errors: List
         if manifest.get(key) != []:
             errors.append(f"[SEC-PRV-03] {source}: {key} を空の配列にする")
     declared = declared_api_reasons(path, manifest)
+    # 申告した API の種類には、理由コードが 1 つ以上要る（空の配列では申告にならない）。拡張のマニフェスト（complete が偽）も
+    # 同じ。種類ごとに見るので、同じ種類の要素が複数あれば、どれか 1 つでも空なら違反にする
+    for entry in manifest.get("NSPrivacyAccessedAPITypes", []):
+        if not entry["NSPrivacyAccessedAPITypeReasons"]:
+            errors.append(f"[SEC-PRV-03] {source}: {entry['NSPrivacyAccessedAPIType']} の理由コードが空（1 つ以上申告する）")
     for category, reasons in declared.items():
         allowed = PRIVACY_ACCESSED_API_REASONS.get(category)
         if allowed is None:

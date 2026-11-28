@@ -912,6 +912,11 @@ def test_settings() -> None:
                   plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyTracking=True)})
     settings_case("拡張のマニフェストの決めていない申告", 1, "NSPrivacyAccessedAPICategoryActiveKeyboards",
                   plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyAccessedAPITypes=[accessed("ActiveKeyboards", "3EC4.1")])})
+    # 申告した種類には理由コードが 1 つ以上要る（同じ種類の別の要素で決めた申告が揃っていても、空の要素は違反。拡張も同じ）
+    settings_case("アプリのマニフェストの空の理由コード", 1, "NSPrivacyAccessedAPICategoryDiskSpace の理由コードが空",
+                  plists=manifest(NSPrivacyAccessedAPITypes=declared + [accessed("DiskSpace")]))
+    settings_case("拡張のマニフェストの空の理由コード", 1, "Widgets/PrivacyInfo.xcprivacy: NSPrivacyAccessedAPICategoryDiskSpace の理由コードが空",
+                  plists={"Widgets/PrivacyInfo.xcprivacy": dict(extension, NSPrivacyAccessedAPITypes=[accessed("DiskSpace")])})
     settings_case("ターゲットがない設定は合格にしない", 2, "読めない", project=lambda t: '{"build-settings": {}, "targets": []}')
     # 除外するディレクトリ（build など）は root 直下だけ。下位の同じ名前のディレクトリは検査する
     ats = {"NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True}}
@@ -6873,7 +6878,7 @@ ARCHITECTURE = (
 # 合格する .gitignore（check-tracked-files.py が求める行。SEC-SUP-04）
 OK_GITIGNORE = "\n".join([
     "# 録音データ", "*.wav", "*.m4a", "*.caf", "*.zip", "", "*.sqlite", "*.sqlite-wal", "*.sqlite-shm",
-    ".env", ".env.*", "xcuserdata/", "DerivedData/", ".build/", "/build/", ".DS_Store",
+    ".env", ".env.*", "xcuserdata/", "DerivedData/", ".build/", "/build/", "*.xcresult", ".DS_Store",
 ]) + "\n"
 
 
@@ -6973,6 +6978,14 @@ def test_tracked() -> None:
     tracked_case("追跡されている .env", 1, "config/.env", files={"config/.env": "TOKEN=x\n"})
     tracked_case("追跡されている .env.local", 1, ".env.local", files={".env.local": "TOKEN=x\n"})
     tracked_case("追跡されている個人の設定", 1, "xcuserdata", files={"App.xcodeproj/xcuserdata/me/state.plist": "x"})
+    tracked_case("テストの結果の行がない", 1, "*.xcresult の行がない", ignore=replaced(OK_GITIGNORE, "*.xcresult\n", ""))
+    tracked_case("追跡されているテストの結果", 1, "Run.xcresult/Info.plist", files={"build-logs/Run.xcresult/Info.plist": "x"})
+    # 行は git と同じく LF だけで区切り、行末の CR と空白だけを除く（splitlines・rstrip の区切りと空白で必須の行を作らせない）
+    tracked_case("CRLF の .gitignore は通る", 0, "OK", ignore=OK_GITIGNORE.replace("\n", "\r\n"))
+    tracked_case("行末の空白は除く", 0, "OK", ignore=replaced(OK_GITIGNORE, "*.wav\n", "*.wav  \n"))
+    tracked_case("コメントの中の U+2028 の後の型を行と見なさない", 1, "*.wav の行がない",
+                 ignore=replaced(OK_GITIGNORE, "*.wav\n", "# 録音\u2028*.wav\n"))
+    tracked_case("行末のタブは除かない", 1, "*.wav の行がない", ignore=replaced(OK_GITIGNORE, "*.wav\n", "*.wav\t\n"))
     # ファイル名の型は、祖先のディレクトリの名前にも当てはめる（git は *.wav に合うディレクトリの下をすべて除外する）
     tracked_case("名前が型に合うディレクトリの下のファイル", 1, "exports/rec.wav/notes.txt", files={"exports/rec.wav/notes.txt": "x"})
     tracked_case("名前が .env のディレクトリの下のファイル", 1, "config/.env/token", files={"config/.env/token": "x"})
@@ -6990,6 +7003,13 @@ def test_tracked() -> None:
                  files={"Tests/.gitignore": "!*.wav\n"}, after_add=lambda root: (root / "Tests/.gitignore").unlink())
     tracked_case("追跡していない入れ子の .gitignore の取り消しは、作業ツリーの内容で判定する", 1, "Docs/.gitignore",
                  after_add=lambda root: ((root / "Docs").mkdir(), (root / "Docs/.gitignore").write_text("!*.zip\n", encoding="utf-8")))
+    # それ自身が無視された .gitignore の取り消しの行も、git は使うので確かめる（無視されたディレクトリの中は git が読まない）
+    tracked_case("無視された入れ子の .gitignore の取り消し", 1, "Docs/.gitignore",
+                 after_add=lambda root: ((root / "Docs").mkdir(),
+                                         (root / "Docs/.gitignore").write_text(".gitignore\n!*.wav\n", encoding="utf-8")))
+    tracked_case("無視されたディレクトリの中の .gitignore は読まない", 0, "OK",
+                 after_add=lambda root: ((root / "build/sub").mkdir(parents=True),
+                                         (root / "build/sub/.gitignore").write_text("!*.wav\n", encoding="utf-8")))
     tracked_case("インデックスにない .gitignore は合格にしない", 1, "インデックスにない",
                  after_add=lambda root: tracked_git(root, "rm", "--cached", "--quiet", ".gitignore"))
     # リポジトリの場所を指す変数は外し、GIT_INDEX_FILE は残す
