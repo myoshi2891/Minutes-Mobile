@@ -1,5 +1,7 @@
 # 詳細設計書（残り 6 文書）の作成計画
 
+> **この計画は 2026-11-16 時点のもので、今は使わない（履歴）。** 6 文書は 2026-11-17 に初版を作り、作業は済んでいる（[PROGRESS.md](../../PROGRESS.md) §1 の順 2「完了」）。**下の「作業の順番」を繰り返さない。** 今の状態と次に行う作業は [PROGRESS.md](../../PROGRESS.md) §2 の「次のアクション」を正とする。
+
 ## Context
 
 - 詳細設計は 7 文書中 `dev-environment.md` だけ作成済み。残りは `architecture` / `recording` / `storage` / `transcription` / `ui` / `export` の 6 文書（[docs/03-detailed-design/README.md](../../docs/03-detailed-design/README.md) §1）。
