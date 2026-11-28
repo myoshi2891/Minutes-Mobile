@@ -933,7 +933,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | `interrupted_resuming`・`rebuilding_restarting` | `stopRequested(理由)` | `stopping`（世代+1） | 停止の並び |
 | `stopping` | `stopCompleted` | `idle` | なし |
 
-**停止の並び:** `stopInput` → `drainAndFlush` → `discardHeldSamples` → `sealPartialChunk` → `closeGapUnresumed` → `submitMeetingStop(理由)` → `post(stopCompleted)`。受け付ける理由は `manual`・`disk_full`・`no_input` の 3 つで、`terminated`・`interruption_unresumed` は起動時の復旧だけが使う（[storage.md](storage.md) §9）。`submitMeetingStop` は会議の状態遷移（[architecture.md](architecture.md) §5）へ事象 `stopRequested` を渡し、そこで停止理由の記録・中断通知の取り消し・セッションの無効化が指示される。**中断通知の取り消しは、どの段から停止しても必ず通る。**
+**停止の並び:** `stopInput` → `drainAndFlush` → `discardHeldSamples` → `sealPartialChunk` → `closeGapUnresumed` → `submitMeetingStop(理由)` → `post(stopCompleted)`。受け付ける理由は `manual`・`disk_full`・`write_failed`・`no_input` の 4 つで（`write_failed` の並びは `disk_full` と同じ。違うのは記録する理由と利用者への文言だけ）、`terminated`・`interruption_unresumed` は起動時の復旧だけが使う（[storage.md](storage.md) §9）。`submitMeetingStop` は会議の状態遷移（[architecture.md](architecture.md) §5）へ事象 `stopRequested` を渡し、そこで停止理由の記録・中断通知の取り消し・セッションの無効化が指示される。**中断通知の取り消しは、どの段から停止しても必ず通る。**
 
 表の行は 45 通り（段 × 事象の種類）で、テストはこの表を配列で持ち、全部の段 × 全部の事象を回す（§11.1）。
 
@@ -961,9 +961,10 @@ public struct RecordingTransition: Equatable, Sendable {
         }
     }
 
-    /// 停止の順序（基本設計 §4）。停止理由は manual・disk_full・no_input だけを受け付ける
+    /// 停止の順序（基本設計 §4）。停止理由は manual・disk_full・write_failed・no_input だけを受け付ける
     private static func stop(_ session: RecordingSession, reason: StopReason) -> RecordingTransition? {
-        guard reason == .manual || reason == .diskFull || reason == .noInput else { return nil }
+        let accepted: [StopReason] = [.manual, .diskFull, .writeFailed, .noInput]
+        guard accepted.contains(reason) else { return nil }
         var next = session
         let generation = next.generation.advance()
         next.phase = .stopping
@@ -993,7 +994,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | `sealPartialChunk` | 組み立て中の音声を短い Chunk として確定する。0 サンプルなら何もしない | 保存の失敗は段階 3（メモリに保持して続ける） |
 | `openGap(理由, 時刻)` | メモリ上の空白区間の一覧に足す（位置 = 累積サンプル数、開始 = 時刻）。続けて DB と `meeting.json` に保存する | 保存の失敗は記録して続ける。メモリ上の一覧を正とし、次の Chunk の確定のたびに保存を再試行する |
 | `closeGapUnresumed` | 開いている空白区間があれば閉じる（§6 の「再開しなかった」の行） | 同上 |
-| `restart(世代)` | ①セッションを設定して有効化する → ②入力を作り直して開始する（サンプルは保持する） → ③中断通知を取り消す → ④空白区間を閉じる → ⑤保持したサンプルを Chunk の組み立てへ渡す。成功したら `restartSucceeded(世代)` | 最初に失敗した段で止め、`restartFailed(世代, 段)` を届ける。②で使える入力がなければ `noInputFound(世代)` |
+| `restart(世代)` | ①セッションを設定して有効化する → ②入力を作り直して開始する（サンプルは保持する） → ③中断通知を取り消す → ④空白区間を閉じる → ⑤保持したサンプルを Chunk の組み立てへ渡す。成功したら `restartSucceeded(世代)`。**途中の停止（基本設計 §5.1 の「割り込みの終了」「利用者の停止」の行）:** 停止の要求は `restart` の実行中にも受け付けて世代を進め（§5.2）、停止の並びは `restart` の後ろに並ぶ。`restart` は ②・③・④・⑤ の前（段の境目）と、呼び出しが戻った時点に世代を確かめ、進んでいれば残りの段を行わず、`restartSucceeded` を届けずに戻る（①・②の呼び出しの待機は `resumeStepTimeoutMs`、再構築の作り直しと入力の開始は `rebuildRestartTimeoutMs` までで、上限を超えたら §5.4 の入力の閉鎖の手続きを行って戻る。その世代のサンプルは捨てる）。②で入力を開く前に止めた場合は、保持したサンプルはなく、空白区間は開いたまま残り、後ろの `closeGapUnresumed` が停止時刻で閉じる。②で入力を開いた後に止めた場合は、`restart` の中で入力を止める → 受け付けたサンプルを取り出し終える → 空白区間を閉じる（再開後のサンプルが 1 つ以上あれば最初のサンプルで閉じ、長さは事象時刻から再開まで。なければ停止時刻で閉じる）→ 保持したサンプルと取り出したサンプルを Chunk の組み立てへ渡す、を行ってから戻る（停止の要求までに受け付けたサンプルは捨てない。Recording-First）。後ろの停止の並びの `discardHeldSamples` は捨てるものがなく、`closeGapUnresumed` は閉じる空白区間がなく、**`sealPartialChunk` は `restart` が渡したサンプルを含めて末尾の Chunk として確定する**。停止による世代の前進では §5.4 の閉鎖の印を立てない（印を立てるのは入力の閉鎖の手続きだけ。立てると、渡すと決めたサンプルが消費側で捨てられる） | 最初に失敗した段で止め、`restartFailed(世代, 段)` を届ける。②で使える入力がなければ `noInputFound(世代)`。世代が進んだ後の失敗は届けない（世代で捨てられる） |
 | `abortRestart(通知の予約)` | 入力を止める → 保持したサンプルを捨てる → セッションを無効化する → 指定があれば中断通知を予約する | 失敗しない |
 | `discardHeldSamples` | 保持したサンプルを捨てる（空白区間が開いたままなので、Chunk に入れない） | — |
 | `scheduleNotice` | 中断通知を予約する（§7） | `report(noticeSchedulingFailed)`（録音には影響しない） |
@@ -1012,7 +1013,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | --- | --- | --- |
 | 割り込みの開始の処理（停止要求がない場合を含む。排出・短い Chunk の確定・空白区間の開設と、割り込みの記録の永続化の完了の待機） | 5 秒 | `interruptionBeginTimeoutMs` |
 | 再構築の④（作り直しと入力の開始の呼び出し） | 3 秒 | `rebuildRestartTimeoutMs` |
-| 再構築の途中に届いた停止の待機（①〜③の完了） | 5 秒 | `rebuildStopWaitTimeoutMs` |
+| 再構築の途中に届いた停止の待機（①〜③の完了。`rebuilding_draining` で停止を受け付けると世代が進み、遅れて届いた `drainCompleted` は拒否されるので `restart` は並ばない。停止の並びは①〜③の副作用の後ろに並び、それを終えたところで進む。`rebuilding_restarting` での停止は §5.3 の `restart` の「途中の停止」のとおり） | 5 秒 | `rebuildStopWaitTimeoutMs` |
 | 割り込みの終了の①〜④の呼び出しの待機（1 つごと） | 3 秒 | `resumeStepTimeoutMs` |
 | 停止の経路で空白区間を閉じる処理の待機 | 5 秒 | `stopGapCloseTimeoutMs` |
 | 割り込みの終了の②の後・④の前に届いた停止での末尾の Chunk の確定の待機 | 5 秒 | `stopSealTimeoutMs` |
@@ -1183,7 +1184,7 @@ public struct RecordingTransition: Equatable, Sendable {
 | 9 | 古い世代 | 世代の合わない完了が、どの段でも拒否されること。入力の閉鎖の手続きの①の後に、閉鎖した世代のリングバッファへ書いたサンプル（印を立てる前に印を読んだ tap の書き込みを模す）が、Chunk に入らずに捨てられること | TST-GEN-05 |
 | 10 | 割り込みの開始の並び | 通知の予約が先頭、空白区間の開設が短い Chunk の確定の後にあること。排出の途中で届いた再開の要求が保留され、排出の完了で再開が始まること。保留の後に `resumeDenied` が届くと保留が取り消され、`interruptedNotResumed` が報告され、排出の完了で `restart` せずに `interrupted_waiting` へ進むこと | TST-INT-01 |
 | 11 | 再開の失敗 | 4 つの段のそれぞれで失敗させ、入力の停止・保持分の破棄・無効化が指示されること。通知の予約し直しが `close_gap` のときだけであること | TST-INT-02 |
-| 12 | 停止の並びと理由 | `capturing`・`interrupted_waiting`・`rebuilding_draining`・`rebuilding_restarting` のそれぞれから、同じ並びで停止すること。`terminated` を受け付けないこと | TST-INT-07 |
+| 12 | 停止の並びと理由 | `capturing`・`interrupted_waiting`・`rebuilding_draining`・`rebuilding_restarting` のそれぞれから、同じ並びの停止が指示されること。`interrupted_resuming`・`rebuilding_restarting` で停止した場合（結合）: ②の後に再開後のサンプルを届けてから停止すると、残りの段が行われず `restartSucceeded` が届かず、そのサンプルが末尾の Chunk に入り、空白区間が再開後の最初のサンプルで閉じること。②の前に停止すると、空白区間が停止時刻で閉じ、新しい入力のサンプルが Chunk に入らないこと。`.stopRequested(.manual)`・`.stopRequested(.diskFull)`・`.stopRequested(.writeFailed)`・`.stopRequested(.noInput)` を受け付け、`submitMeetingStop` に同じ理由が渡ること（`write_failed` の並びが `disk_full` と同じであること）。`terminated` を受け付けないこと | TST-INT-07 |
 | 13 | 入力の喪失 | 再構築で使える入力がなければ、停止理由 `no_input` で停止の並びが指示されること | TST-INT-04 |
 | 14 | 保留した事象の配り直し | 入力の開始の途中で届いた割り込みが、開始の成功の後に配り直されること | TST-INT-01・05 |
 | 15 | sample rate の変化（結合） | 合成音声を 48 kHz で流し、途中で 24 kHz に変えて再構築する。出力のサンプル番号が連続し、空白区間が 1 つ記録されること | TST-AUD-05 |

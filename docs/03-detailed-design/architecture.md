@@ -431,7 +431,7 @@ public struct AudioTimeline: Equatable, Sendable {
 | `transcribing` | `transcriptionPartiallyFailed` | `transcribing` | なし |
 | `transcribing` | `transcriptionCompleted` | `transcribed` | 状態を保存 → 保護クラスを見直す |
 
-- `stopRequested` の理由は `manual`・`interruption_unresumed`・`no_input`・`disk_full`・`terminated`（FR-INT-05）。起動時の復旧で `recording` の会議を止める場合も同じ事象を使う（理由が `terminated` または `interruption_unresumed`）。
+- `stopRequested` の理由は `manual`・`interruption_unresumed`・`no_input`・`disk_full`・`write_failed`・`terminated`（FR-INT-05）。`write_failed` は保持の上限による停止のうち、原因がすべて容量の不足とは判定できない場合で、停止の手順・保持・再試行・通知の有無は `disk_full` と同じ（違うのは記録する理由と利用者への文言だけ。基本設計 [storage.md](../02-basic-design/storage.md) §6 の「停止理由」）。起動時の復旧で `recording` の会議を止める場合も同じ事象を使う（理由が `terminated` または `interruption_unresumed`）。
 - `finalizationStarted` は「末尾の Chunk の保存が終わった」と「確定待ちからの再試行」の両方で使う（どちらも `stop_requested` → `finalizing`）。
 - `transcriptionStarted` は、最初の文字起こし・再文字起こし・失敗区間の再試行で共通に使う。**元の版**（開始を決めた時点で表示していた版。`meetings.current_version`。版がなければ `nil`）を持ち、`reduce` に渡した現在の版と一致するときだけ受け付ける。遅れて届いた重複の開始は、その開始が作った版（または別の開始が作った版）で現在の版が進んでいるので拒否される。失敗区間の再試行は実行番号を変えない（[transcription.md](transcription.md) §7）ので、実行番号では区別しない
 - 「状態を保存」は、SQLite と `meeting.json` の両方への保存を指す。順序と失敗時の扱いは [storage.md](storage.md) §5 にある。
@@ -448,6 +448,15 @@ public enum MeetingStatus: String, Sendable, CaseIterable, Codable, LogSymbolSou
     case finalized
     case transcribing
     case transcribed
+
+    /// 未知の状態（P2 の summarizing など）は DecodingError ではなく PersistedDataError にする（TST-RCV-04）
+    public init(from decoder: any Decoder) throws {
+        let text = try decoder.singleValueContainer().decode(String.self)
+        guard let value = MeetingStatus(rawValue: text) else {
+            throw PersistedDataError.invalidValue(field: .status)
+        }
+        self = value
+    }
 }
 
 public enum MeetingEvent: Equatable, Sendable {
@@ -521,7 +530,7 @@ public enum MeetingStateMachine {
 }
 ```
 
-`StopReason`（5 種）と `FinalizationMode`（`barrier`・`acknowledged_loss`）は、`MeetingStatus` と同じ形の列挙型で、rawValue が永続データの表記になる。
+`StopReason`（6 種）と `FinalizationMode`（`barrier`・`acknowledged_loss`）は、`MeetingStatus` と同じ形の列挙型で、rawValue が永続データの表記になる。
 
 ### 5.3 サービスの決まり
 
@@ -920,7 +929,7 @@ public enum RecordingIssue: Equatable, Sendable {
 | 空き容量の段階 1 | `storage_low` | 録音は続いている |
 | 空き容量の段階 2 | `storage_critical` | 録音は続いている |
 | 空き容量の段階 3（`StorageFailure` で Chunk をメモリに保持） | `chunk_unsaved` | 録音は続いている。保持中の分は終了すると失われる |
-| 物理的な限界（`disk_full` で停止） | `storage_exhausted` | 停止した。保持中の分は終了すると失われる |
+| 物理的な限界（`disk_full`・`write_failed` で停止） | `storage_exhausted` | 停止した。保持中の分は終了すると失われる |
 | `FinalizationBlocker`（1 つ以上） | `finalization_blocked` | 欠けている範囲を示す |
 | `PersistedDataError`（会議の読み込み） | `unreadable_meeting` | 録音のファイルは残っている |
 | 復旧で `recording` の会議を検出 | `recovered_after_termination` | 保存済みの分は無事。直近の未保存分は失われた可能性がある |
