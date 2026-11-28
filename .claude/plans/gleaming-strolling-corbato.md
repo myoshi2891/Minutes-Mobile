@@ -2,7 +2,7 @@
 
 ## Context
 
-- 詳細設計は 7 文書中 `dev-environment.md` だけ作成済み。残りは `architecture` / `recording` / `storage` / `transcription` / `ui` / `export` の 6 文書（[docs/03-detailed-design/README.md](docs/03-detailed-design/README.md) §1）。
+- 詳細設計は 7 文書中 `dev-environment.md` だけ作成済み。残りは `architecture` / `recording` / `storage` / `transcription` / `ui` / `export` の 6 文書（[docs/03-detailed-design/README.md](../../docs/03-detailed-design/README.md) §1）。
 - オーナーの決定（2026-11-16、本セッション）: **残り 6 文書をすべて実装前に作る**。現行規則「1 文書書く → 実装 → 次の文書」は書き換える。
 - 依頼のほかの点はすでに規則として存在するので、新設せず守る:
   - 置き場所: `docs/03-detailed-design/`（索引は `docs/README.md`）。新しい置き場所は作らない
@@ -60,11 +60,11 @@
 
 | ファイル | 変更 |
 | --- | --- |
-| [docs/README.md](docs/README.md) | §1 の詳細設計の行の状態。§5 に **UD-10**（残り 6 文書を実装前にまとめて作る。各単位の実装直前に該当文書を再確認して改訂する。2026-11-16）を追加 |
-| [docs/03-detailed-design/README.md](docs/03-detailed-design/README.md) | §1 の状態を「初版（実装前）」に。§1・§2 の「前の単位の実装とテストが通ってから次に着手する」を、UD-10 の順（全文書を先に書く → 単位ごとに「再確認 → 実装」）へ書き換える。実装の順序（上流から）は変えない |
-| [PROGRESS.md](PROGRESS.md) | §1 の表を組み替える（設計の行は完了、各実装の行の前提を「詳細設計の再確認」に）。§2 の次のアクション（作業単位 2 のまま）、§4 の記録 |
-| [README.md](README.md)・[CLAUDE.md](CLAUDE.md) | 「現在の状態」「残り 6 文書は未着手」の記述を直す |
-| [docs/01-requirements/dependencies-and-costs.md](docs/01-requirements/dependencies-and-costs.md) | 上記の確認結果 |
+| [docs/README.md](../../docs/README.md) | §1 の詳細設計の行の状態。§5 に **UD-10**（残り 6 文書を実装前にまとめて作る。各単位の実装直前に該当文書を再確認して改訂する。2026-11-16）を追加 |
+| [docs/03-detailed-design/README.md](../../docs/03-detailed-design/README.md) | §1 の状態を「初版（実装前）」に。§1・§2 の「前の単位の実装とテストが通ってから次に着手する」を、UD-10 の順（全文書を先に書く → 単位ごとに「再確認 → 実装」）へ書き換える。実装の順序（上流から）は変えない |
+| [PROGRESS.md](../../PROGRESS.md) | §1 の表を組み替える（設計の行は完了、各実装の行の前提を「詳細設計の再確認」に）。§2 の次のアクション（作業単位 2 のまま）、§4 の記録 |
+| [README.md](../../README.md)・[CLAUDE.md](../../CLAUDE.md) | 「現在の状態」「残り 6 文書は未着手」の記述を直す |
+| [docs/01-requirements/dependencies-and-costs.md](../../docs/01-requirements/dependencies-and-costs.md) | 上記の確認結果 |
 | 基本設計の各文書 | 詳細設計で BD・設計値を改めた場合だけ |
 
 ## ブランチ
